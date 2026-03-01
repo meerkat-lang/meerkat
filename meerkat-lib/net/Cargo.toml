@@ -1,0 +1,27 @@
+[package]
+name = "meerkat-net"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+kameo = "0.14"
+libp2p-stream = "0.4.0-alpha"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+libp2p = { version = "0.56", features = ["tokio", "tcp", "dns", "websocket", "noise", "yamux", "relay", "dcutr", "identify", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+libp2p = { version = "0.56", default-features = false, features = ["macros", "wasm-bindgen", "websocket-websys", "noise", "yamux", "relay", "identify"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
+[dev-dependencies]
+tokio-test = "0.4"

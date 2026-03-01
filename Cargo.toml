@@ -1,0 +1,5 @@
+[workspace]
+members = [
+    "meerkat-lib/net",
+]
+resolver = "2"

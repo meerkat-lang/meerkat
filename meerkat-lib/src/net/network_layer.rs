@@ -1,4 +1,4 @@
-use crate::messages::*;
+use super::messages::*;
 
 /// The interface the Manager uses to talk to the network layer.
 /// Both NetworkActor (real libp2p) and MockNetwork (in-memory) implement this.

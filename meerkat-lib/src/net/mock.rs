@@ -1,4 +1,4 @@
-use crate::{messages::*, types::*};
+use super::{messages::*, types::*};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -139,7 +139,7 @@ fn uuid_simple() -> String {
     format!("{:08x}", t)
 }
 
-impl crate::network_layer::NetworkLayer for MockNetwork {
+impl super::network_layer::NetworkLayer for MockNetwork {
     async fn handle_command(&mut self, cmd: NetworkCommand) -> NetworkReply {
         self.handle_command(cmd).await
     }

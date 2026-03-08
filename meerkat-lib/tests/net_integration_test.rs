@@ -1,4 +1,4 @@
-use meerkat_net::*;
+use meerkat_lib::net::*;
 use tokio::time::{sleep, Duration};
 
 #[tokio::test(flavor = "multi_thread")]
@@ -213,7 +213,7 @@ async fn test_mock_unreachable_address() {
 
 // ── NetworkLayer trait tests ──────────────────────────────────────────────────
 
-async fn send_ping_via_trait<N: meerkat_net::NetworkLayer>(
+async fn send_ping_via_trait<N: meerkat_lib::net::NetworkLayer>(
     sender: &mut N,
     addr: Address,
 ) {

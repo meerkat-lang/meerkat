@@ -1,0 +1,91 @@
+service foo_service {
+    var one = 1;
+    var x = 1;
+    var y = 2;
+    def f = x + y;
+    def g = x * y;
+    def h = g - f;
+    def i = g + f;
+    def j = (h + i) / 2; // should be g
+    def k = (i - h) / 2; // should be f
+    def l = k * k - 2 * j; // should be x * x + y * y
+    def m = l - y * y;   // should be x * x
+
+
+    pub def inc_x = action { x = x + 1; };
+    pub def inc_y = action { y = y + 1; };
+    pub def inc_x_y = action { x = x + 1; y = y + 1; };
+
+    pub def inc_x_by = fn z => action { x = x + z; };
+    // pub def inc_x_by = fn x => action { x = x + z; }; // should not pass!
+    // pub def inc_x_by = fn z => action { x = x + w; }; // should not pass!
+
+    pub def inc_x_ = inc_x_by(one);
+
+    pub def inc_x_f = action { x = x + f; };
+    pub def inc_x_h = action { x = x + h; };
+    pub def square_x = action { x = m; };
+
+}
+
+/*
+@test(foo_service) {
+    /* test for action consider all previous actions full effect */
+    assert(x == 1 && y == 2);
+    do inc_x;
+    assert(x == 2 && y == 2);
+
+    assert(f == 4 && g == 4);
+    assert(h == 0);
+    assert(x == 2 && y == 2);
+    // notice running these asserts have side effect of the system
+    // they artificially wait for f, g, h become to desired values
+    // in some way avoid incomplete value propagation
+    assert(f == 4 && g == 4);
+    assert(h == 2); // should fail
+    do square_x;
+
+    do square_x;
+    do square_x;
+    do square_x;
+
+}
+*/
+
+
+
+@test(foo_service) {
+    
+    do inc_x;  // txn 1
+    assert(g == 4);
+    assert(f == 4);
+
+    do inc_x;  // txn 2
+    // assert(f == 4);
+    /* 
+    if we move assert f == 4 here 
+    there's a chance of passed test
+    */
+    /* 
+    will fix this by adding txn2 as pred 
+    of def actor of assert(f == 4)
+    */
+    assert(x == 3 && y == 2);
+    assert(g == 6);
+    assert(f == 5);
+    assert(h == 1);
+
+    do inc_y;
+    assert(x == 3 && y == 3);
+    assert(g == 9);
+    assert(f == 6);
+    assert(h == 3);
+
+    do inc_x_y;
+    assert(x == 4 && y == 4);
+    assert(f == 8);
+
+    do inc_x_f;
+    assert(x == 12 && y == 4);
+
+}

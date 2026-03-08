@@ -1,0 +1,27 @@
+service foo_service {
+    var x = 0;
+    var y = 1;
+
+    def g = x + y;
+    
+    pub def plus_y = fn z => z + y;
+    pub def plus_x = fn y => y + x;
+    pub def plus = fn x => fn y => x + y;
+
+    pub def inc_y = action { y = y + 1; };
+    pub def inc_x = action { x = plus_y(x); };
+
+}
+
+
+@test(foo_service) {
+    /* test for action consider all previous actions full effect */
+    assert(x == 0 && y == 1);
+    
+    do inc_x;
+    assert(x == 1);
+    do inc_y;
+    do inc_x;
+
+    assert(x == 3);
+}

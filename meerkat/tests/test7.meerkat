@@ -1,0 +1,35 @@
+service test7 {
+
+  table sample {
+    id: number, 
+    name: string, 
+    age: number, 
+    };
+
+  def b = select id, name from sample where sample.id < 3;
+
+  def sum = fn x,y => x + y;
+  def prod = fn x,y => x * y;
+
+  def act = fn x => fn y => fn z => action {
+    insert {id: x, name: y, age: z } into sample
+  };
+
+  def total_sum = fold (sample.age, sum, 0);
+  def total_product = fold (sample.age, prod, 1);
+}
+
+@test(test7) {
+  
+    do act(1)("Sunay")(18);
+    do act(2)("A")(20);
+    //do act(3)("B")(34);
+    //do act(4)("C")(50);
+    //do act(5)("D")(25);
+    //do act(6)("E")(23);
+
+    assert(total_sum == 38);
+    assert(total_product == 360);
+
+    assert(b == {{1, "Sunay"}, { 2, "A"}});
+}

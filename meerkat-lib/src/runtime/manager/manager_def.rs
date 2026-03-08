@@ -10,16 +10,12 @@ use crate::runtime::manager::assert::TestManager;
 use crate::runtime::message::CmdMsg;
 use crate::runtime::TestId;
 
-use super::def_actor::DefActor;
-use super::evaluator::Evaluator;
-use super::transaction::TxnId;
-use super::var_actor::VarActor;
-use super::table_actor::TableActor;
+use crate::runtime::def_actor::DefActor;
+use crate::runtime::evaluator::Evaluator;
+use crate::runtime::transaction::TxnId;
+use crate::runtime::var_actor::VarActor;
+use crate::runtime::table_actor::TableActor;
 
-pub mod action;
-pub mod assert;
-pub mod handler;
-pub mod init;
 
 #[derive(Debug)]
 pub struct Manager {

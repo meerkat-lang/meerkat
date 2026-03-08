@@ -7,11 +7,8 @@ use std::{
     fmt::Display,
 };
 
-use super::{manager::Manager, message::Msg};
+use crate::runtime::{manager::Manager, message::Msg};
 
-mod eval_expr;
-mod eval_stmt;
-mod utils;
 
 #[derive(Debug, Clone)]
 pub enum Val {
@@ -23,7 +20,7 @@ pub enum Val {
 
 #[derive(Debug, Clone)]
 pub struct Evaluator {
-    var_id_cnt: i32,
+    pub var_id_cnt: i32,
     pub reactive_names: HashSet<String>,
 
     /// context are modally separated into, we didn't use lambda expr var

@@ -31,23 +31,14 @@ use crate::{
 use futures::future::join_all;
 use kameo::{actor::ActorRef, spawn};
 use log::info;
-use manager::Manager;
+use super::manager::Manager;
 use tokio::{
     sync::mpsc::{self, Receiver, Sender},
     task::JoinSet,
 };
 
 // pub mod instr;
-pub mod evaluator;
-pub mod lock;
-pub mod message;
-pub mod transaction;
 
-pub mod def_actor;
-pub mod manager;
-pub mod pubsub;
-pub mod var_actor;
-pub mod table_actor;
 
 pub type TestId = (usize, usize);
 const MPSC_CHANNEL_SIZE: usize = 100;
@@ -63,7 +54,7 @@ pub async fn run(prog: &Prog) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut services = HashMap::new();
     for srv in &prog.services {
-        let srv_actor_ref = run_srv(srv, dev_tx.clone()).await?;
+        let srv_actor_ref: ActorRef<Manager> = run_srv(srv, dev_tx.clone()).await?;
         services.insert(srv.name.clone(), srv_actor_ref);
     }
 

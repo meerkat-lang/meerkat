@@ -1,0 +1,11 @@
+[package]
+name = "meerkat"
+version = "0.3.0"
+edition = "2021"
+
+[dependencies]
+meerkat-lib = { path = "../meerkat-lib" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+log = "0.4"
+env_logger = "0.10"

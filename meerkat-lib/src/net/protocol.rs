@@ -1,4 +1,4 @@
-use crate::types::MeerkatMessage;
+use super::types::MeerkatMessage;
 use futures::{AsyncReadExt, AsyncWriteExt};
 use libp2p::StreamProtocol;
 

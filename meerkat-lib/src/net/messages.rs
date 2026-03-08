@@ -1,4 +1,4 @@
-use crate::types::*;
+use super::types::*;
 use kameo::Reply;
 use kameo::message::Message;
 
@@ -27,13 +27,13 @@ pub enum NetworkReply {
     Failure(String),  // renamed from Error to avoid conflict with Reply trait
 }
 
-impl Message<NetworkCommand> for crate::NetworkActor {
+impl Message<NetworkCommand> for super::NetworkActor {
     type Reply = NetworkReply;
 
     async fn handle(
         &mut self,
         msg: NetworkCommand,
-        _ctx: kameo::message::Context<'_, Self, Self::Reply>,
+        _ctx: &mut kameo::message::Context<Self, Self::Reply>,
     ) -> Self::Reply {
         self.handle_command(msg).await
     }

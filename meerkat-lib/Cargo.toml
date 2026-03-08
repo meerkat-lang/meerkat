@@ -1,27 +1,36 @@
 [package]
-name = "meerkat-net"
-version = "0.1.0"
+name = "meerkat-lib"
+version = "0.3.0"
 edition = "2021"
 
+[build-dependencies]
+lalrpop = "0.20.2"
+
 [dependencies]
-kameo = "0.14"
-libp2p-stream = "0.4.0-alpha"
+logos = "0.12.1"
+enum-as-inner = "0.6.0"
+serde = { version = "1.0.130", features = ["derive"] }
+serde_json = "1.0.61"
+strum_macros = "0.25.3"
+lalrpop-util = { version = "0.20.2", features = ["lexer", "unicode"] }
+kameo = "0.16"
+tokio = { version = "1", features = ["full"] }
+json = "0.12.4"
 futures = "0.3"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+dashmap = "5"
+priority-queue = "1.3"
+inline_colorization = "0.1.5"
+log = "0.4"
 anyhow = "1"
 thiserror = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 libp2p = { version = "0.56", features = ["tokio", "tcp", "dns", "websocket", "noise", "yamux", "relay", "dcutr", "identify", "macros"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+libp2p-stream = "0.4.0-alpha"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 libp2p = { version = "0.56", default-features = false, features = ["macros", "wasm-bindgen", "websocket-websys", "noise", "yamux", "relay", "identify"] }
-tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+libp2p-stream = "0.4.0-alpha"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 getrandom = { version = "0.3", features = ["wasm_js"] }
-
-[dev-dependencies]
-tokio-test = "0.4"

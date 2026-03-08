@@ -1,4 +1,4 @@
-use crate::{messages::*, types::*, protocol::*};
+use super::{messages::*, types::*, protocol::*};
 use futures::AsyncWriteExt;
 use kameo::Actor;
 use libp2p::{Multiaddr, PeerId};
@@ -523,7 +523,7 @@ impl NetworkActor {
     }
 }
 
-impl crate::network_layer::NetworkLayer for NetworkActor {
+impl super::network_layer::NetworkLayer for NetworkActor {
     async fn handle_command(&mut self, cmd: NetworkCommand) -> NetworkReply {
         self.handle_command(cmd).await
     }

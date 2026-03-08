@@ -1,5 +1,5 @@
 // L1 Compiler
-//! Parser Grammar
+// Parser Grammar
 // Author: Miles Conn <mconn@andrew.cmu.edu>
 
 // Initial grammar for L1 
@@ -9,7 +9,7 @@ grammar<'input>;
 
 use crate::ast::{ReplCmd, Prog, Service, Decl, Assn, Expr, UnOp, BinOp, Test, DataType, Field, Insert};
 use lalrpop_util::ParseError;
-use crate::parser::lex::Token;
+use crate::runtime::parser::lex::Token;
 
 use std::str::FromStr;
 

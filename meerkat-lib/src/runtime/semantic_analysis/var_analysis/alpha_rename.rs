@@ -11,7 +11,7 @@ impl Expr {
         renames: &HashMap<String, String>,
     ) {
         match self {
-            Expr::Number { .. } | Expr::Bool { .. } | Expr::String { .. } => {}
+            Expr::Literal { .. } => {}
             Expr::Variable { ident } => {
                 if !var_binded.contains(ident) && renames.contains_key(ident) {
                     *ident = renames.get(ident).unwrap().clone();
@@ -71,7 +71,7 @@ impl Expr {
                 }
             }
             Expr::TableColumn { .. } => {},
-            Expr::Fold { args } => {
+            Expr::Fold { table_column, operation, identity } => {
                 for arg in args {
                     arg.alpha_rename(var_binded, renames);
                 }

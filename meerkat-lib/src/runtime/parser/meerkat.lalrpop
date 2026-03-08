@@ -7,7 +7,7 @@
 // Grammar 
 grammar<'input>;
 
-use crate::ast::{ReplCmd, Prog, Service, Decl, Assn, Expr, UnOp, BinOp, Test, DataType, Field, Insert};
+use crate::ast::{ReplCmd, Prog, Service, Decl, Assn, Expr, UnOp, BinOp, Test, DataType, Field, Insert, Value};
 use lalrpop_util::ParseError;
 use crate::runtime::parser::lex::Token;
 
@@ -203,9 +203,9 @@ Args: Vec<Expr> = {
 
 
 SubExpr: Expr = {
-    <n:Number> => Expr::Number { val: n },
-    <b:Bool> => Expr::Bool { val: b },
-    <s: "strlit"> => Expr::String {val: s.to_owned()},
+    <n:Number> => Expr::Literal { val: Value::Number { val: n } },
+    <b:Bool> => Expr::Literal { val: Value::Bool { val: b } },
+    <s: "strlit"> => Expr::Literal { val: Value::String { val: s.to_owned() } },
     <i:Ident> => Expr::Variable { ident: i },
     "{" <args: Args> "}" => Expr::Vector {val: args},
     "(" <Expr> ")" => <>,

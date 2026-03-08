@@ -7,10 +7,12 @@ impl TypecheckEnv {
     pub fn infer_expr(&mut self, expr: &Expr) -> Type {
         use Type::*;
         match expr {
-            Expr::Number { val: _ } => Int,
-            Expr::Bool { val: _ } => Bool,
-            Expr::String {val: _} => String,
-            Expr::KeyVal { key, value } => self.infer_expr(&value),
+            Expr::Literal { val } => match val {
+                Value::Number { .. } => Int,
+                Value::Bool { .. } => Bool,
+                Value::String { .. } => String,
+                Value::Closure { .. } => panic!("Cannot typecheck closure literal"),
+            },            Expr::KeyVal { key, value } => self.infer_expr(&value),
             Expr::Tuple { val } => {
                 let mut type_vec = Vec::new();
                 for el in val {
@@ -225,7 +227,7 @@ impl TypecheckEnv {
                 }
             }
             Expr::Table {schema, records } => Table(schema.to_vec()),
-            Expr::Fold { args } => {
+            Expr::Fold { table_column, operation, identity } => {
                 if args.len()!=3 {
                     panic!("Fold expects 3 arguments, got {} arguments", args.len());
                 }

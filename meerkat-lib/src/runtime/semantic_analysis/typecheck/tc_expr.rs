@@ -12,6 +12,7 @@ impl TypecheckEnv {
                 Value::Bool { .. } => Bool,
                 Value::String { .. } => String,
                 Value::Closure { .. } => panic!("Cannot typecheck closure literal"),
+                Value::ActionClosure { .. } => panic!("Cannot typecheck action closure literal"),
             },
             Expr::KeyVal { key, value } => self.infer_expr(&value),
             Expr::Tuple { val } => {
@@ -181,9 +182,8 @@ impl TypecheckEnv {
             }
 
             // more todo on Action type
-            Expr::Action { assns , inserts} => {
-                assns.iter().for_each(|assn| self.typecheck_assn(assn));
-                inserts.iter().for_each(|insert| self.typecheck_insert(insert));
+            Expr::Action(stmts) => {
+                self.typecheck_action(stmts);
 
                 Action
             }
@@ -209,34 +209,12 @@ impl TypecheckEnv {
                 }
                 Type::Table(schema)    
             }
-            Expr::TableColumn { table_name, column_name } => {
-                let found_table = self.var_context.get(table_name);
-                match found_table {
-                    Some(Type::Table(fields)) => {
-                        let found_column = fields.iter().find(|field| &field.name == column_name);
-                        match found_column {
-                            Some(field) => match field.type_ {
-                                DataType::Bool => Type::Bool,
-                                DataType::Number => Type::Int,
-                                DataType::String => Type::String,
-                            },
-                            None => panic!("Column {} not found in table {}", column_name, table_name),
-                        }
-                    }
-                    _ => panic!("Table {} for TableColumn not found or not a table type", table_name),
-                }
-            }
             Expr::Table {schema, records } => Table(schema.to_vec()),
-            Expr::Fold { table_column, operation, identity } => {
-                let column_type = self.infer_expr(table_column);
+            Expr::Fold { table_name, column_name, operation, identity } => {
+                let column_type = self.get_column_type(table_name, column_name);
                 let func_type = self.infer_expr(operation);
                 let accum_type = self.infer_expr(identity);
 
-                if let Expr::TableColumn { .. } = table_column.as_ref() {
-                    self.infer_expr(table_column);
-                } else {         
-                    panic!("First argument should be iterator (column)");
-                }
                 match func_type {
                     Type::Fun(params, ret_type) => {
                         if !self.unify(&accum_type, &*ret_type) {
@@ -252,6 +230,24 @@ impl TypecheckEnv {
                 }
                 self.find(&accum_type)
             }
+        }
+    }
+
+fn get_column_type(&mut self, table_name: &String, column_name: &String) -> Type {
+        let found_table = self.var_context.get(table_name);
+        match found_table {
+            Some(Type::Table(fields)) => {
+                let found_column = fields.iter().find(|field| &field.name == column_name);
+                match found_column {
+                    Some(field) => match field.type_ {
+                        DataType::Bool => Type::Bool,
+                        DataType::Number => Type::Int,
+                        DataType::String => Type::String,
+                    },
+                    None => panic!("Column {} not found in table {}", column_name, table_name),
+                }
+            }
+            _ => panic!("Table {} for TableColumn not found or not a table type", table_name),
         }
     }
 }

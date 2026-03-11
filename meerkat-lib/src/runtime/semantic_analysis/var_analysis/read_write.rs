@@ -1,9 +1,10 @@
+use core::panic;
 use std::{
     collections::{HashMap, HashSet},
     hash::Hash,
 };
 
-use crate::ast::{Assn, Expr};
+use crate::ast::{Expr};
 
 impl Expr {
     /// return free variables in expr wrt var_binded, used for
@@ -58,21 +59,11 @@ impl Expr {
                 free_vars
             }
 
-            // x in FV(r) => x in FV(action { ..., l = r, ...}) and x not in reactive_names
-            /* it's trying to model:
-            1. def f = action{ x = y + z } has no dependencies in dependency graph,
-               since we handle actions separately rather than propagating values of
-               y, z to  f
-            2. def f = fn y, z => action { x = y + z } to correctly evaluate say,
-               f(1,2) to action { x = 3 }.
-            */
-            Expr::Action { assns, .. } => {
+            Expr::Action(stmts, .. ) => {
                 let mut free_vars = HashSet::new();
-                for assn in assns {
-                    // dest should never be free, we do not allow such pattern
-                    // fn x => action { x = ... }
-                    // since each var action should be declared before in the service
-                    free_vars.extend(assn.src.free_var(reactive_names, var_binded));
+                for stmt in stmts {
+                    // TODO: implement me
+                    panic!("free_var for statments is not implemented yet");
                 }
 
                 // we exclude reactive names from free_vars in action
@@ -83,12 +74,8 @@ impl Expr {
                 free_vars.insert(table_name.clone());
                 free_vars
             }
-            Expr::TableColumn { table_name, .. } => {
-                HashSet::from([table_name.to_string()])
-            }
-            Expr::Fold { table_column, operation, identity } => {
+            Expr::Fold { operation, identity, ..} => {
                 let mut free_vars = HashSet::new();
-                free_vars.extend(table_column.free_var(reactive_names, var_binded));
                 free_vars.extend(operation.free_var(reactive_names, var_binded));
                 free_vars.extend(identity.free_var(reactive_names, var_binded));
                 
@@ -97,7 +84,7 @@ impl Expr {
         }
     }
 }
-
+/*
 /// Calculate direct read set
 /// used for lock acquisition
 pub fn calc_read_sets(assns: &Vec<Assn>, reactive_names: &HashSet<String>) -> HashSet<String> {
@@ -118,3 +105,4 @@ pub fn calc_write_set(assns: &Vec<Assn>) -> HashSet<String> {
     }
     writes
 }
+*/

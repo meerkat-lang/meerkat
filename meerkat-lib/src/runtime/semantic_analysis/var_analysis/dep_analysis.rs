@@ -5,7 +5,7 @@ use crate::ast;
 use super::DependAnalysis;
 
 impl DependAnalysis {
-    pub fn new(ast: &ast::Service) -> DependAnalysis {
+    pub fn new(decls: &Vec<ast::Decl>) -> DependAnalysis {
         let mut vars: HashSet<String> = HashSet::new();
         let mut defs: HashSet<String> = HashSet::new();
         let mut reactive_names = HashSet::new();
@@ -13,7 +13,7 @@ impl DependAnalysis {
 
         let mut dep_graph: HashMap<String, HashSet<String>> = HashMap::new();
 
-        for decl in ast.decls.iter() {
+        for decl in decls.iter() {
             match decl {
                 ast::Decl::VarDecl { name, .. } => {
                     vars.insert(name.clone());

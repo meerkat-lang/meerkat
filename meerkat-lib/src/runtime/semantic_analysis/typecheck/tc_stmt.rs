@@ -1,4 +1,4 @@
-use crate::ast::{Assn, DataType, Decl, Insert, Expr, Field};
+use crate::ast::{ActionStmt, DataType, Decl, Expr, Field};
 
 use std::collections::HashSet;
 use super::TypecheckEnv;
@@ -7,7 +7,6 @@ use crate::static_analysis::typecheck::Type;
 impl TypecheckEnv {
     pub fn typecheck_decl(&mut self, decl: &Decl) {
         match decl {
-            Decl::Import { srv_name } => todo!(),
             Decl::VarDecl { name, val } => {
                 let typ = self.infer_expr(&val);
                 self.name_context.insert(name.clone(), typ);
@@ -28,7 +27,7 @@ impl TypecheckEnv {
         }
     }
 
-    pub fn typecheck_assn(&mut self, assn: &Assn) {
+    /*pub fn typecheck_assn(&mut self, assn: &Assn) {
         let dest_typ = self
             .name_context
             .get(&assn.dest)
@@ -95,7 +94,7 @@ impl TypecheckEnv {
                 }
             }
         }
-    }
+    }*/
 }
 
 // todo: assign checking

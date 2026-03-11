@@ -1,21 +1,22 @@
 use super::{Type, TypecheckEnv};
 use crate::ast::*;
 impl TypecheckEnv {
-    pub fn typecheck_test(&mut self, test: &Test) {
-        for command in test.commands.iter() {
+    pub fn typecheck_action(&mut self, commands: &Vec<ActionStmt>) {
+        for command in commands.iter() {
             match command {
-                ReplCmd::Do(expr) => {
+                ActionStmt::Do(expr) => {
                     let typ = self.infer_expr(expr);
                     if !self.unify(&typ, &Type::Action) {
                         panic!("do requires action expression");
                     }
                 }
-                ReplCmd::Assert(expr) => {
+                ActionStmt::Assert(expr) => {
                     let typ = self.infer_expr(expr);
                     if !self.unify(&typ, &Type::Bool) {
                         panic!("Assert statement requires bool expression");
                     }
                 }
+                _ => panic!("not implemented")
             }
         }
     }

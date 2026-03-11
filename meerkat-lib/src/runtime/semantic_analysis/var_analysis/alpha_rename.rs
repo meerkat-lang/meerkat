@@ -1,6 +1,7 @@
+use core::panic;
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::Expr;
+use crate::ast::{Expr, ActionStmt};
 
 impl Expr {
     /// alpha renaming of expression e
@@ -49,17 +50,14 @@ impl Expr {
                 }
             }
 
-            Expr::Action { assns, inserts} => {
-                for assn in assns {
+            Expr::Action(stmts) => {
+                for stmt in stmts {
                     // dest should never be renamed, not influenced by capture
                     // let dest = &mut assn.dest;
                     // if !var_binded.contains(dest) && renames.contains_key(dest){
                     //     *dest = renames.get(dest).unwrap().clone();
                     // }
-                    assn.src.alpha_rename(var_binded, renames);
-                }
-                for insert in inserts {
-                    insert.row.alpha_rename(var_binded, renames);       // since rows can contain variables
+                    stmt.alpha_rename(var_binded, renames);
                 }
             }
             Expr::Select { where_clause, .. } => {
@@ -70,13 +68,23 @@ impl Expr {
                     record.alpha_rename(var_binded, renames);
                 }
             }
-            Expr::TableColumn { .. } => {},
-            Expr::Fold { table_column, operation, identity } => {
-                table_column.alpha_rename(var_binded, renames);
+            Expr::Fold { table_name, column_name, operation, identity } => {
                 operation.alpha_rename(var_binded, renames);
                 identity.alpha_rename(var_binded, renames);
             },
         
         }
+    }
+}
+
+impl ActionStmt {
+    pub fn alpha_rename(
+        &mut self,
+        var_binded: &HashSet<String>,
+        renames: &HashMap<String, String>,
+    ) {
+        // TODO: Implement alpha renaming for ActionStmt based on its structure
+        // This is a placeholder - adjust based on ActionStmt's actual fields
+        panic!("alpha_rename for ActionStmt is not implemented yet");
     }
 }

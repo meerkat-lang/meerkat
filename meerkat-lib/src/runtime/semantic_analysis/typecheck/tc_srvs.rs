@@ -1,11 +1,11 @@
-use crate::ast::Service;
+use crate::ast::Decl;
 
 use super::TypecheckEnv;
 
 impl TypecheckEnv {
-    pub fn typecheck_service(&mut self, srvs: &Service) {
-        for stmt in srvs.decls.iter() {
-            self.typecheck_decl(stmt);
+    pub fn typecheck_service(&mut self, decls: &Vec<Decl>) {
+        for decl in decls {
+            self.typecheck_decl(decl);
         }
     }
 }

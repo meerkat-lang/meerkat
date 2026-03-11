@@ -23,15 +23,31 @@ pub enum BinOp {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Assn {
-    pub dest: String,
-    pub src: Expr,
+pub enum ActionStmt {
+    Let {
+        name: String,
+        expr: Expr,
+    },
+    Do(Expr),
+    Assert(Expr),
+    Assign {
+        var: String,
+        expr: Expr,
+    },
+    Insert {
+        row: Expr,
+        table_name: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Insert {                    // insert {id: 1, ..}
-    pub row: Expr,                     // each row is a vector
-    pub table_name: String,
+pub enum Stmt {
+    ActionStmt(ActionStmt),
+    Update { service: String, decls: Vec<Decl> },
+    Connect { path: String, addr: String },
+    Import { path: String, service: String },
+    Service { name: String, decls: Vec<Decl> },
+    Test { service: String, stmts: Vec<ActionStmt> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -50,6 +66,10 @@ pub enum Value {
         body: Box<Expr>,
         env: Vec<(String, Value)>,
     },
+    ActionClosure {
+        stmts: Vec<ActionStmt>,
+        env: Vec<(String, Value)>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -64,7 +84,7 @@ pub enum Expr {
     Tuple {
         val: Vec<Expr>
     },
-    KeyVal {
+    KeyVal {    // TODO: replace with a Record type (different from Tuple) that is a list of key value pairs
         key: String,
         value: Box<Expr>,
     },
@@ -94,15 +114,7 @@ pub enum Expr {
     },
 
     /// Action
-    Action {
-        assns: Vec<Assn>,
-        inserts: Vec<Insert>,
-    },
-
-    TableColumn { // table1.id for example will be treated as an expression and evaluated separately
-        table_name: String,
-        column_name: String,
-    },
+    Action(Vec<ActionStmt>),
 
     Select {
         table_name: String,
@@ -110,7 +122,7 @@ pub enum Expr {
         where_clause: Box<Expr>,
     },
 
-    Table {
+    Table { // TODO: remove this, we should just have Records and Tuples
         schema: Vec<Field>,
         records: Vec<Expr>,
         /*How do records differ from rows?
@@ -119,7 +131,8 @@ pub enum Expr {
          */
     },
     Fold {
-        table_column: Box<Expr>,
+        table_name: String,
+        column_name: String,
         operation: Box<Expr>,
         identity: Box<Expr>,
     }
@@ -127,9 +140,6 @@ pub enum Expr {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Decl {
-    Import {
-        srv_name: String,
-    },
     VarDecl {
         name: String,
         val: Expr,
@@ -156,40 +166,6 @@ pub enum DataType {
     String,
     Number,
     Bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Service {
-    pub name: String,
-    pub decls: Vec<Decl>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Test {
-    pub name: String,
-    pub commands: Vec<ReplCmd>, // commands here refer to dos and asserts
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Prog {
-    pub services: Vec<Service>,
-    pub tests: Vec<Test>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum ReplCmd {
-    Do(Expr),
-    Assert(Expr),
-    // service related commands
-    // Service(Service),
-    // Open(String),
-    // Close,
-}
-
-impl Default for Expr {
-    fn default() -> Self {
-        Expr::Literal { val: Value::Number { val: 0 } }
-    }
 }
 
 impl Display for UnOp {
@@ -225,6 +201,8 @@ impl Display for Value {
             Value::String { val } => write!(f, "\"{}\"", val),
             Value::Closure { params, body, env } =>
                 write!(f, "fn({})[{:?}]{{{}}}", params.join(","), env, body),
+            Value::ActionClosure { stmts, env } =>
+                write!(f, "action[{:?}]{{{:?}}}", env, stmts),  
         }
     }
 }
@@ -249,14 +227,12 @@ impl Display for Expr {
                     func,
                     args.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
                 ),
-            Expr::Action { assns, inserts } =>
+            Expr::Action(stmts) =>
                 write!(
                     f,
                     "Action({:?})",
-                    assns.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+                    stmts.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
                 ),
-            Expr::TableColumn { table_name, column_name } =>
-                write!(f, "{}.{}", table_name, column_name),
             Expr::Select { table_name, column_names, where_clause } => write!(f, "{}", where_clause),
             Expr::Table {records , ..} => {
                 write!(f, "[",)?;
@@ -287,24 +263,29 @@ impl Display for Expr {
     }
 }
 
-impl Display for Assn {
+impl Display for ActionStmt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} = {}", self.dest, self.src)
+        match self {
+            ActionStmt::Let { name, expr } => write!(f, "let {} = {}", name, expr),
+            ActionStmt::Do(expr) => write!(f, "do {}", expr),
+            ActionStmt::Assert(expr) => write!(f, "assert {}", expr),
+            ActionStmt::Assign { var, expr } => write!(f, "{} = {}", var, expr),
+            ActionStmt::Insert { row, table_name } => write!(f, "insert into {} {}", table_name, row),
+        }
     }
 }
 
 impl Display for Decl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Decl::Import { srv_name } => todo!(),
-            Decl::VarDecl { name, val } => { write!(f, "var {} = {}", name, val) }
+            Decl::VarDecl { name, val } => { write!(f, "var {} = {}", name, val) },
             Decl::DefDecl { name, val, is_pub } => {
                 if *is_pub {
                     write!(f, "pub def {} = {}", name, val)
                 } else {
                     write!(f, "def {} = {}", name, val)
                 }
-            }
+            },
             Decl::TableDecl { name, fields } => { write!(f, "table {} created", name) }
         }
     }

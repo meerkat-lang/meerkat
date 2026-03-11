@@ -7,7 +7,7 @@
 // Grammar 
 grammar<'input>;
 
-use crate::ast::{ReplCmd, Prog, Service, Decl, Assn, Expr, UnOp, BinOp, Test, DataType, Field, Insert, Value};
+use crate::ast::{Stmt, ActionStmt, Decl, Expr, UnOp, BinOp, DataType, Field, Value};
 use lalrpop_util::ParseError;
 use crate::runtime::parser::lex::Token;
 
@@ -74,59 +74,37 @@ extern {
     }
 }
 
-pub Prog: Prog = {
-    <services: Services> <tests: Tests> => Prog { services, tests }
+pub Prog: Vec<Stmt> = {
+    <stmts: Stmts> => stmts
 }   
 
-Service: Service = {
+Stmts: Vec<Stmt> = Stmt*;
+
+Stmt: Stmt = {
     "service" <i:Ident> "{" <ds:Decls> "}" => {
-        Service { name: i, decls: ds }
+        Stmt::Service { name: i, decls: ds }
+    },
+    "@test" "(" <i:Ident> ")" "{" <astmts: ActionStmts> "}" => {
+        Stmt::Test { service: i, stmts: astmts }
     },
 }
 
-Services: Vec<Service> = {
-    => vec![],
-    <mut v:Services> <s:Service> => {
-        v.push(s);
-        v
-    }
-}
+ActionStmts: Vec<ActionStmt> = ActionStmt*;
 
-Test: Test = {
-    "@test" "(" <i:Ident> ")" "{" <cms: ReplCmds> "}" => {
-        Test { name: i, commands: cms }
-    },
-}
-
-Tests: Vec<Test> = {
-    => vec![],
-    <mut v:Tests> <t:Test> => {
-        v.push(t);
-        v
-    }
-}
-
-ReplCmd: ReplCmd = {
+ActionStmt: ActionStmt = {
     "do" <e: Expr> ";" => {
-        ReplCmd::Do(e)
+        ActionStmt::Do(e)
     },
     "assert" "(" <e:Expr> ")" ";" => {
-        ReplCmd::Assert(e)
+        ActionStmt::Assert(e)
     },
-}
-
-ReplCmds: Vec<ReplCmd> = {
-    => vec![],
-    <mut v:ReplCmds> <c:ReplCmd> => {
-        v.push(c);
-        v
-    }
+    "insert"  <e: Expr> "into" <t: Ident> => {
+        ActionStmt::Insert {row: e, table_name: t}
+    },
+    <i:Ident> "=" <e:Expr> ";" => ActionStmt::Assign { var: i, expr: e }
 }
 
 Decl: Decl = {
-    "import" <i:Ident> ";" => {
-        Decl::Import { srv_name: i }
-    },
     "var" <i:Ident> "=" <e:Expr> ";" => {
         Decl::VarDecl { name: i, val: e }
     },
@@ -155,27 +133,6 @@ DataType: DataType = {
     "number" => DataType::Number,
     "string" => DataType::String,
     "bool" => DataType::Bool,
-}
-
-
-Insert: Insert = {
-    "insert"  <e: Expr> "into" <t: Ident> => {
-        Insert {row: e, table_name: t}
-    }
-}
-
-Inserts: Vec<Insert> = Insert*;
-
-Assn: Assn = {
-    <i:Ident> "=" <e:Expr> ";" => Assn { dest: i, src: e }
-}
-
-Assns: Vec<Assn> = {
-    => vec![],
-    <mut v:Assns> <a:Assn> => {
-        v.push(a);
-        v
-    }
 }
 
 Params: Vec<String> = {
@@ -213,17 +170,7 @@ SubExpr: Expr = {
     <expr:SubExpr> "(" <args:Args> ")" => 
         Expr::Call { func: Box::new(expr), args },
 
-    
-
-    "action" "{" <assns: Assns><inserts: Inserts> "}" => Expr::Action { assns, inserts },
-     <t:Ident> "." <c:Ident> => {
-        Expr::TableColumn {
-            table_name: t,
-            column_name: c
-        }
-    },
-    
-    
+    "action" "{" <stmts: ActionStmts> "}" => Expr::Action(stmts),
 }
 
 Expr: Expr = {
@@ -341,9 +288,10 @@ Expr: Expr = {
         },
         where_clause: Box::new(cond)
     },
-    "fold" "(" <tc:Expr> "," <op:Expr> "," <id:Expr> ")" => 
+    "fold" "(" <tn:Ident> "." <cn:Ident> "," <op:Expr> "," <id:Expr> ")" => 
     Expr::Fold {
-        table_column: Box::new(tc),
+        table_name: tn,
+        column_name: cn,
         operation: Box::new(op),
         identity: Box::new(id)
     }

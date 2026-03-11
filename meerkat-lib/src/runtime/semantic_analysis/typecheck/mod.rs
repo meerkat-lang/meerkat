@@ -12,7 +12,7 @@ mod utils;
 
 use std::{collections::HashMap, fmt::Display};
 
-use crate::ast::{Prog, DataType, Field};
+use crate::ast::{DataType, Field, Stmt};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
@@ -27,7 +27,6 @@ pub enum Type {
 
     TypVar(String),
     Table(Vec<Field>),
-    Row,
 }
 
 /// Type Scheme represents polymorphic types,
@@ -66,7 +65,6 @@ impl Display for Type {
             }
             Type::TypVar(name) => write!(f, "{}", name),
             Type::Table( schema) => write!(f, "table {:?}", schema),
-            Type::Row => write!(f, "row")
         }
     }
 }
@@ -93,25 +91,30 @@ impl Display for TypecheckEnv {
     }
 }
 
-pub fn typecheck_prog(prog: &Prog) {
+pub fn typecheck_prog(prog: &Vec<Stmt>) {
     // each service has its own type environment
     let mut srv_to_type_env = HashMap::new();
 
-    for srvs in prog.services.iter() {
-        let mut typ_env = TypecheckEnv::new();
-        typ_env.typecheck_service(srvs);
-        print!("service: {:?}\n {}", srvs.name, typ_env);
+    for stmt in prog.iter() {
+        match stmt {
+            Stmt::Service { name, decls } => {
+                let mut typ_env = TypecheckEnv::new();
+                typ_env.typecheck_service(decls);
+                print!("service: {:?}\n {}", name, typ_env);
 
-        srv_to_type_env.insert(srvs.name.clone(), typ_env);
+                srv_to_type_env.insert(name.clone(), typ_env);
+            }
+            Stmt::Test { service, stmts } => {
+                // test should only contain def decl and action stmt, so we can directly typecheck it in the service's type environment
+                let typ_env = srv_to_type_env
+                    .get_mut(service)
+                    .expect(&format!(
+                        "Test: test instantiate a non-existing service {:?}",
+                        service
+                    )).typecheck_action(stmts);
+            }
+            _ => panic!("not implemented")
+        }
     }
 
-    for test in prog.tests.iter() {
-        srv_to_type_env
-            .get_mut(&test.name)
-            .expect(&format!(
-                "Test: test instantiate a non-existing service {:?}",
-                test.name
-            ))
-            .typecheck_test(test);
-    }
 }

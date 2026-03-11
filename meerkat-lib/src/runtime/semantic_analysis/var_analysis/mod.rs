@@ -53,16 +53,75 @@ impl Display for DependAnalysis {
     }
 }
 
-pub fn calc_dep_srv(ast: &ast::Service) -> DependAnalysis {
-    let mut da = DependAnalysis::new(ast);
+pub fn calc_dep_srv(decls: &Vec<ast::Decl>) -> DependAnalysis {
+    let mut da = DependAnalysis::new(decls);
     da.calc_dep_vars();
     //println!("{}", da);
     da
 }
 
-pub fn calc_dep_prog(ast: &ast::Prog) {
-    for srv in ast.services.iter() {
-        let da = calc_dep_srv(srv);
-        println!("{}", da);
+// enumerate services and call calc_dep_srv on each one
+pub fn calc_dep_prog(stmts: &Vec<ast::Stmt>) {
+    for stmt in stmts.iter() {
+        match stmt {
+            ast::Stmt::Service { decls, .. } | ast::Stmt::Update { decls, .. } => {
+                let _ = calc_dep_srv(decls);
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::{Decl, Expr, Stmt, Value};
+
+    #[test]
+    fn test_calc_dep_prog_service() {
+        let stmts = vec![Stmt::Service {
+            name: "s".to_string(),
+            decls: vec![
+                Decl::VarDecl {
+                    name: "x".to_string(),
+                    val: Expr::Literal {
+                        val: Value::Number { val: 1 },
+                    },
+                },
+                Decl::DefDecl {
+                    name: "y".to_string(),
+                    val: Expr::Variable {
+                        ident: "x".to_string(),
+                    },
+                    is_pub: false,
+                },
+            ],
+        }];
+
+        calc_dep_prog(&stmts);
+    }
+
+    #[test]
+    fn test_calc_dep_prog_update_service() {
+        let stmts = vec![Stmt::Update {
+            service: "s".to_string(),
+            decls: vec![
+                Decl::VarDecl {
+                    name: "x".to_string(),
+                    val: Expr::Literal {
+                        val: Value::Number { val: 2 },
+                    },
+                },
+                Decl::DefDecl {
+                    name: "y".to_string(),
+                    val: Expr::Variable {
+                        ident: "x".to_string(),
+                    },
+                    is_pub: true,
+                },
+            ],
+        }];
+
+        calc_dep_prog(&stmts);
     }
 }

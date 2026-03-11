@@ -9,9 +9,10 @@ pub mod meerkat {
 
 pub mod parser {
     use logos::Logos;
-    use crate::ast::Prog;
+
+    use crate::ast::Stmt;
     
-    pub fn parse_string(input: &str) -> Result<Prog, String> {
+    pub fn parse_string(input: &str) -> Result<Vec<Stmt>, String> {
         let lex_stream = super::lex::Token::lexer(input)
             .spanned()
             .map(|(t, span)| (span.start, t, span.end));
@@ -21,7 +22,7 @@ pub mod parser {
             .map_err(|e| format!("Parse error: {:?}", e))
     }
     
-    pub fn parse_file(filename: &str) -> Result<Prog, String> {
+    pub fn parse_file(filename: &str) -> Result<Vec<Stmt>, String> {
         let content = std::fs::read_to_string(filename)
             .map_err(|e| format!("Failed to read file: {}", e))?;
         parse_string(&content)

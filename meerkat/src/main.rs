@@ -139,8 +139,7 @@ async fn run_server(prog: Vec<Stmt>, remote_url_map: std::collections::HashMap<S
                                     let wrapped_val = if member.starts_with('$') {
                                         val
                                     } else {
-                                        let local_svc = manager.services.keys().next().cloned().unwrap_or_default();
-                                        manager.wrap_value(val, &local_svc)
+                                        manager.wrap_value(val, &service)
                                     };
                                     MeerkatMessage::LookupResponse {
                                         request_id,

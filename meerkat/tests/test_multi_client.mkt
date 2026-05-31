@@ -1,0 +1,21 @@
+import s_multi_1
+import s_multi_2
+
+service s_client {
+    pub def c1 = s_multi_1.get_closure(5);
+    pub def c2 = s_multi_2.get_closure(10);
+    
+    pub def x_val = s_multi_1.get_x;
+    pub def y_val = s_multi_2.get_y;
+}
+
+@test(s_client) {
+    assert(x_val == 10);
+    assert(y_val == 20);
+    
+    do c1;
+    assert(x_val == 15);
+    
+    do c2;
+    assert(y_val == 30);
+}

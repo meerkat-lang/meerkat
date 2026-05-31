@@ -10,3 +10,9 @@ s2: meerkat/tests/test_client.mkt: 9002: s1
 
 # 3. Downstream consumer/test runner, importing s2
 s3: meerkat/tests/s3.mkt: client: s2
+
+# 4. Multi-service backend server (regression test for HashMap non-determinism)
+s_multi: meerkat/tests/s_multi.mkt: 9003:
+
+# 5. Client for multi-service backend server testing
+test_multi: meerkat/tests/test_multi_client.mkt: client: s_multi_1, s_multi_2

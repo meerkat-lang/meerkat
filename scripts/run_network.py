@@ -169,9 +169,12 @@ def main():
                 if os.path.exists(log_file_path):
                     with open(log_file_path, "r") as lf:
                         content = lf.read()
-                        match = re.search(r"Service URL:\s+(\S+)", content)
-                        if match:
-                            svc_url = match.group(1)
+                        matches = re.findall(r"Service URL:\s+(\S+)", content)
+                        if matches:
+                            for url in matches:
+                                svc_name = url.split('/')[-1]
+                                service_urls[svc_name] = url
+                            svc_url = matches[0]
                             url_found = True
                             break
 

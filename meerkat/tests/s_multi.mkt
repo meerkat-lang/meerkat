@@ -1,0 +1,11 @@
+service s_multi_1 {
+    var x = 10;
+    pub def get_closure = fn n => action { x = x + n; };
+    pub def get_x = x;
+}
+
+service s_multi_2 {
+    var y = 20;
+    pub def get_closure = fn n => action { y = y + n; };
+    pub def get_y = y;
+}

@@ -136,14 +136,9 @@ async fn run_server(prog: Vec<Stmt>, remote_url_map: std::collections::HashMap<S
                             let result = manager.lookup(&member, &service, "").await;
                             let response = match result {
                                 Ok(val) => {
-                                    let wrapped_val = if member.starts_with('$') {
-                                        val
-                                    } else {
-                                        manager.wrap_value(val, &service)
-                                    };
                                     MeerkatMessage::LookupResponse {
                                         request_id,
-                                        value: serde_json::to_string(&wrapped_val).unwrap_or_default(),
+                                        value: serde_json::to_string(&val).unwrap_or_default(),
                                     }
                                 }
                                 Err(e) => MeerkatMessage::LookupError {

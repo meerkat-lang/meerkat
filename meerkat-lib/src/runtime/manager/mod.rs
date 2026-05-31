@@ -24,8 +24,6 @@ pub struct Manager {
     pub network: Option<NetworkActor>,
     /// Pending reply channels keyed by request_id
     pub pending_replies: HashMap<u64, oneshot::Sender<MeerkatMessage>>,
-    /// Used to enumerate hidden bindings in proxy closures.
-    pub next_proxy_id: u64,
 }
 
 impl Manager {
@@ -35,7 +33,6 @@ impl Manager {
             remote_services: HashMap::new(),
             network: None,
             pending_replies: HashMap::new(),
-            next_proxy_id: 1,
         }
     }
 
@@ -59,6 +56,7 @@ impl Manager {
             match decl {
                 Decl::VarDecl { name: var_name, val } => {
                     let value = eval(&val, &env, &mut EvalContext { manager: self, service_name: &svc_name }).await?;
+                    let value = wrap_value(value, &svc_name);
                     env.push((var_name.clone(), value.clone()));
                     if let Some(s) = self.services.get_mut(&svc_name) {
                         s.vars.insert(var_name, VarState::new(value));
@@ -66,6 +64,7 @@ impl Manager {
                 }
                 Decl::DefDecl { name: def_name, val, .. } => {
                     let value = eval(&val, &env, &mut EvalContext { manager: self, service_name: &svc_name }).await?;
+                    let value = wrap_value(value, &svc_name);
                     env.push((def_name.clone(), value.clone()));
                     if let Some(s) = self.services.get_mut(&svc_name) {
                         s.vars.insert(def_name.clone(), VarState::new(value));
@@ -102,7 +101,8 @@ impl Manager {
                 .get(service_name)
                 .map(|s| s.vars.iter().map(|(k, v)| (k.clone(), v.value.clone())).collect())
                 .unwrap_or_default();
-            return eval(&expr, &env, &mut EvalContext { manager: self, service_name }).await;
+            let value = eval(&expr, &env, &mut EvalContext { manager: self, service_name }).await?;
+            return Ok(wrap_value(value, service_name));
         }
 
         // Otherwise return stored var value
@@ -138,63 +138,12 @@ impl Manager {
             MeerkatMessage::LookupResponse { value, .. } => {
                 let val: Value = serde_json::from_str(&value)
                     .map_err(|e| EvalError::NetworkError(e.to_string()))?;
-                Ok(val)
+                Ok(wrap_value(val, target_node))
             }
             MeerkatMessage::LookupError { error, .. } => {
                 Err(EvalError::LookupError(error))
             }
             _ => Err(EvalError::NetworkError("Unexpected reply to lookup request".to_string())),
-        }
-    }
-
-    pub fn wrap_value(&mut self, value: Value, current_service: &str) -> Value {
-        let is_remote = match &value {
-            Value::ActionClosure { service_name, .. } | Value::Closure { service_name, .. } => {
-                service_name != current_service
-            }
-            _ => false,
-        };
-
-        if !is_remote {
-            return value;
-        }
-
-        let var_name = format!("$x{}", self.next_proxy_id);
-        self.next_proxy_id += 1;
-
-        match value {
-            Value::ActionClosure { stmts, env, service_name } => {
-                let original_action = Value::ActionClosure { stmts, env, service_name };
-                if let Some(service) = self.services.get_mut(current_service) {
-                    service.vars.insert(var_name.clone(), crate::runtime::txn::VarState::new(original_action));
-                }
-                Value::ActionClosure {
-                    stmts: vec![ActionStmt::Do(Expr::Variable { ident: var_name.clone() })],
-                    env: vec![],
-                    service_name: current_service.to_string(),
-                }
-            }
-            Value::Closure { params, body, env, service_name } => {
-                let original_closure = Value::Closure {
-                    params: params.clone(),
-                    body: body.clone(),
-                    env: env.clone(),
-                    service_name,
-                };
-                if let Some(service) = self.services.get_mut(current_service) {
-                    service.vars.insert(var_name.clone(), crate::runtime::txn::VarState::new(original_closure));
-                }
-                Value::Closure {
-                    params: params.clone(),
-                    body: Box::new(Expr::Call {
-                        func: Box::new(Expr::Variable { ident: var_name.clone() }),
-                        args: params.iter().map(|p| Expr::Variable { ident: p.clone() }).collect(),
-                    }),
-                    env: vec![],
-                    service_name: current_service.to_string(),
-                }
-            }
-            other => other,
         }
     }
 
@@ -247,6 +196,7 @@ impl Manager {
                         .unwrap_or_default();
 
                     let value = eval(&expr, &env, &mut EvalContext { manager: self, service_name }).await?;
+                    let value = wrap_value(value, service_name);
 
                     if let Some(service) = self.services.get_mut(service_name) {
                         if let Some(var_state) = service.vars.get_mut(&def_name) {
@@ -671,5 +621,139 @@ mod tests {
         manager.assign("foo", "x", Value::Number { val: 5 }).await.unwrap();
         let result = manager.lookup("f", "foo", "").await.unwrap();
         assert_eq!(result, Value::Number { val: 15 });
+    }
+
+    /// Verify that `propagate` wraps remote closures after re-evaluation.
+    ///
+    /// Setup: service "origin" has `var x` and `pub def act = action { x = x + 1; }`.
+    ///        service "gateway" has `var flag = 0` and
+    ///        `def delegated = if flag == 1 then origin.act else action {}`.
+    ///
+    /// When flag is changed to 1, `propagate` re-evaluates `delegated`.
+    /// The resulting ActionClosure must be wrapped so its service_name is
+    /// "gateway", not "origin".
+    #[tokio::test]
+    async fn test_propagate_wraps_remote_closure() {
+        let mut manager = Manager::new();
+
+        // -- origin service: var x = 0; pub def act = action { x = x + 1; };
+        let origin_decls = vec![
+            Decl::VarDecl {
+                name: "x".to_string(),
+                val: Expr::Literal { val: Value::Number { val: 0 } },
+            },
+            Decl::DefDecl {
+                name: "act".to_string(),
+                val: Expr::Action(vec![
+                    ActionStmt::Assign {
+                        var: "x".to_string(),
+                        expr: Expr::Binop {
+                            op: crate::ast::BinOp::Add,
+                            expr1: Box::new(Expr::Variable { ident: "x".to_string() }),
+                            expr2: Box::new(Expr::Literal { val: Value::Number { val: 1 } }),
+                        },
+                    },
+                ]),
+                is_pub: true,
+            },
+        ];
+        manager.create_service("origin".to_string(), origin_decls).await.unwrap();
+
+        // -- gateway service: var flag = 0; def delegated = if flag == 1 then <origin's act> else action {};
+        //
+        // We simulate the "remote import" by directly inserting the origin
+        // action closure as a literal in the def expression, which is what
+        // the evaluator would produce for a MemberAccess on a remote service.
+        let origin_act = manager.lookup("act", "origin", "").await.unwrap();
+
+        let gateway_decls = vec![
+            Decl::VarDecl {
+                name: "flag".to_string(),
+                val: Expr::Literal { val: Value::Number { val: 0 } },
+            },
+            Decl::DefDecl {
+                name: "delegated".to_string(),
+                val: Expr::If {
+                    cond: Box::new(Expr::Binop {
+                        op: crate::ast::BinOp::Eq,
+                        expr1: Box::new(Expr::Variable { ident: "flag".to_string() }),
+                        expr2: Box::new(Expr::Literal { val: Value::Number { val: 1 } }),
+                    }),
+                    expr1: Box::new(Expr::Literal { val: origin_act }),
+                    expr2: Box::new(Expr::Action(vec![])),
+                },
+                is_pub: true,
+            },
+        ];
+        manager.create_service("gateway".to_string(), gateway_decls).await.unwrap();
+
+        // Initially flag=0, so delegated is the empty action (local)
+        let initial = manager.lookup("delegated", "gateway", "").await.unwrap();
+        match &initial {
+            Value::ActionClosure { service_name, .. } => {
+                assert_eq!(service_name, "gateway", "empty action should be homed to gateway");
+            }
+            other => panic!("expected ActionClosure, got {:?}", other),
+        }
+
+        // Change flag to 1 — propagate re-evaluates delegated
+        manager.assign("gateway", "flag", Value::Number { val: 1 }).await.unwrap();
+
+        let updated = manager.lookup("delegated", "gateway", "").await.unwrap();
+        match &updated {
+            Value::ActionClosure { service_name, .. } => {
+                assert_eq!(
+                    service_name, "gateway",
+                    "after propagation the remote action closure must be wrapped and homed to gateway, \
+                     but got service_name='{}'", service_name
+                );
+            }
+            other => panic!("expected ActionClosure, got {:?}", other),
+        }
+    }
+}
+
+/// Wrap a remote closure/action so it is homed to `current_service`.
+/// The original value is embedded as an `Expr::Literal` inside a new
+/// closure whose `service_name` is `current_service`.
+fn wrap_value(value: Value, current_service: &str) -> Value {
+    let is_remote = match &value {
+        Value::ActionClosure { service_name, .. } | Value::Closure { service_name, .. } => {
+            service_name != current_service
+        }
+        _ => false,
+    };
+
+    if !is_remote {
+        return value;
+    }
+
+    match value {
+        Value::ActionClosure { stmts, env, service_name } => {
+            let original_action = Value::ActionClosure { stmts, env, service_name };
+            Value::ActionClosure {
+                stmts: vec![ActionStmt::Do(Expr::Literal { val: original_action })],
+                env: vec![],
+                service_name: current_service.to_string(),
+            }
+        }
+        Value::Closure { params, body, env, service_name } => {
+            let original_closure = Value::Closure {
+                params: params.clone(),
+                body: body.clone(),
+                env: env.clone(),
+                service_name,
+            };
+            Value::Closure {
+                params: params.clone(),
+                body: Box::new(Expr::Call {
+                    func: Box::new(Expr::Literal { val: original_closure }),
+                    args: params.iter().map(|p| Expr::Variable { ident: p.clone() }).collect(),
+                }),
+                env: vec![],
+                service_name: current_service.to_string(),
+            }
+        }
+        other => other,
     }
 }

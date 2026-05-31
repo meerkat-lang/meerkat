@@ -22,6 +22,7 @@ import subprocess
 import signal
 import re
 import shutil
+import atexit
 
 # Enable loopback-only local bindings by default
 os.environ["MEERKAT_LOCAL"] = "1"
@@ -29,7 +30,10 @@ os.environ["MEERKAT_LOCAL"] = "1"
 LOG_DIR = os.path.join("tmp", "logs")
 processes = []
 
-def cleanup(sig=None, frame=None):
+def cleanup_processes():
+    global processes
+    if not processes:
+        return
     print("\nShutting down all Meerkat nodes...")
     for node_name, proc in processes:
         if proc.poll() is None:
@@ -41,8 +45,14 @@ def cleanup(sig=None, frame=None):
                 proc.kill()
             except Exception:
                 pass
+    processes = []
     print("Cleanup complete.")
+
+def cleanup(sig=None, frame=None):
     sys.exit(0)
+
+# Register atexit handler to ensure processes are always killed
+atexit.register(cleanup_processes)
 
 # Register signal handlers for clean exits
 signal.signal(signal.SIGINT, cleanup)
@@ -119,7 +129,7 @@ def main():
         if port.lower() == "client":
             # Client Node (runs in foreground)
             print(f"[{node_name}] Starting client node running '{file_path}'...")
-            cmd = ["cargo", "run", "--", "-f", file_path] + import_flags
+            cmd = ["./target/debug/meerkat", "-f", file_path] + import_flags
             print(f"Executing: {' '.join(cmd)}")
             print("---------------------------------------------------")
             
@@ -134,7 +144,7 @@ def main():
         else:
             # Server Node (runs in background)
             print(f"[{node_name}] Starting server node on port {port} running '{file_path}'...")
-            cmd = ["cargo", "run", "--", "-s", "-f", file_path, "-p", port] + import_flags
+            cmd = ["./target/debug/meerkat", "-s", "-f", file_path, "-p", port] + import_flags
             
             log_file = open(log_file_path, "w")
             proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, text=True)

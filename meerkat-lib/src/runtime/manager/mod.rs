@@ -74,10 +74,15 @@ impl Manager {
         Ok(())
     }
 
-    pub async fn lookup(&mut self, ident: &str, service_name: &str) -> Result<Value, EvalError> {
+    pub async fn lookup(&mut self, ident: &str, service_name: &str, current_context: &str) -> Result<Value, EvalError> {
         // Check if service is remote
         if self.remote_services.contains_key(service_name) {
             return self.remote_lookup(service_name, ident).await;
+        }
+
+        // If it's an unknown service, but we are inside a closure from a remote service, proxy it!
+        if current_context != "" && current_context != service_name && self.remote_services.contains_key(current_context) {
+            return self.proxy_remote_lookup(current_context, service_name, ident).await;
         }
 
         // If it's a def, re-evaluate from stored expression for freshness
@@ -99,7 +104,96 @@ impl Manager {
                 return Ok(var_state.value.clone());
             }
         }
+        if let Some(service) = self.services.get(service_name) {
+            println!("DEBUG: Lookup failed for {} in {}. Available vars: {:?}", ident, service_name, service.vars.keys());
+        } else {
+            println!("DEBUG: Lookup failed for {} in {}. Service not found locally.", ident, service_name);
+        }
         Err(EvalError::LookupError(format!("Variable '{}' not found in service '{}'", ident, service_name)))
+    }
+
+    pub async fn proxy_remote_lookup(&mut self, target_node: &str, target_service: &str, member: &str) -> Result<Value, EvalError> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+        let addr = self.remote_addr(target_node)?;
+        let request_id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+        let reply_to = self.local_reply_addr().await;
+
+        let msg = MeerkatMessage::LookupRequest {
+            request_id,
+            service: target_service.to_string(),
+            member: member.to_string(),
+            reply_to,
+        };
+
+        let reply = self.send_and_await_reply(
+            addr, msg, request_id,
+            format!("Timeout waiting for remote lookup of {}.{}", target_service, member),
+        ).await?;
+
+        match reply {
+            MeerkatMessage::LookupResponse { value, .. } => {
+                let val: Value = serde_json::from_str(&value)
+                    .map_err(|e| EvalError::NetworkError(e.to_string()))?;
+                Ok(val)
+            }
+            MeerkatMessage::LookupError { error, .. } => {
+                Err(EvalError::LookupError(error))
+            }
+            _ => Err(EvalError::NetworkError("Unexpected reply to lookup request".to_string())),
+        }
+    }
+
+    pub fn wrap_value(&mut self, value: Value, current_service: &str, next_id: &mut u64) -> Value {
+        let is_remote = match &value {
+            Value::ActionClosure { service_name, .. } | Value::Closure { service_name, .. } => {
+                service_name != current_service
+            }
+            _ => false,
+        };
+
+        if !is_remote {
+            return value;
+        }
+
+        let var_name = format!("$x{}", *next_id);
+        *next_id += 1;
+
+        match value {
+            Value::ActionClosure { stmts, env, service_name } => {
+                let original_action = Value::ActionClosure { stmts, env, service_name };
+                if let Some(service) = self.services.get_mut(current_service) {
+                    service.vars.insert(var_name.clone(), crate::runtime::txn::VarState::new(original_action));
+                }
+                Value::ActionClosure {
+                    stmts: vec![ActionStmt::Do(Expr::Variable { ident: var_name.clone() })],
+                    env: vec![],
+                    service_name: current_service.to_string(),
+                }
+            }
+            Value::Closure { params, body, env, service_name } => {
+                let original_closure = Value::Closure {
+                    params: params.clone(),
+                    body: body.clone(),
+                    env: env.clone(),
+                    service_name,
+                };
+                if let Some(service) = self.services.get_mut(current_service) {
+                    service.vars.insert(var_name.clone(), crate::runtime::txn::VarState::new(original_closure));
+                }
+                Value::Closure {
+                    params: params.clone(),
+                    body: Box::new(Expr::Call {
+                        func: Box::new(Expr::Variable { ident: var_name.clone() }),
+                        args: params.iter().map(|p| Expr::Variable { ident: p.clone() }).collect(),
+                    }),
+                    env: vec![],
+                    service_name: current_service.to_string(),
+                }
+            }
+            other => other,
+        }
     }
 
     pub async fn assign(&mut self, service_name: &str, var: &str, value: Value) -> Result<(), EvalError> {
@@ -271,6 +365,9 @@ impl Manager {
 
     /// Get the local machine's outbound IP address (non-loopback)
     pub fn get_public_ip() -> String {
+        if std::env::var("MEERKAT_LOCAL").is_ok() {
+            return "127.0.0.1".to_string();
+        }
         use std::net::UdpSocket;
         UdpSocket::bind("0.0.0.0:0")
             .and_then(|s| { s.connect("8.8.8.8:80")?; s.local_addr() })
@@ -508,7 +605,7 @@ mod tests {
             },
         ];
         manager.create_service("foo".to_string(), decls).await.unwrap();
-        let result = manager.lookup("x", "foo").await.unwrap();
+        let result = manager.lookup("x", "foo", "").await.unwrap();
         assert_eq!(result, Value::Number { val: 1 });
     }
 
@@ -531,7 +628,7 @@ mod tests {
             },
         ];
         manager.create_service("foo".to_string(), decls).await.unwrap();
-        let result = manager.lookup("f", "foo").await.unwrap();
+        let result = manager.lookup("f", "foo", "").await.unwrap();
         assert_eq!(result, Value::Number { val: 5 });
     }
 
@@ -539,7 +636,7 @@ mod tests {
     async fn test_lookup_missing_var_returns_error() {
         let mut manager = Manager::new();
         manager.create_service("foo".to_string(), vec![]).await.unwrap();
-        let result = manager.lookup("nonexistent", "foo").await;
+        let result = manager.lookup("nonexistent", "foo", "").await;
         assert!(result.is_err());
     }
 
@@ -565,12 +662,12 @@ mod tests {
         manager.create_service("foo".to_string(), decls).await.unwrap();
 
         // f should be 11 initially
-        let result = manager.lookup("f", "foo").await.unwrap();
+        let result = manager.lookup("f", "foo", "").await.unwrap();
         assert_eq!(result, Value::Number { val: 11 });
 
         // update x to 5, f should become 15
         manager.assign("foo", "x", Value::Number { val: 5 }).await.unwrap();
-        let result = manager.lookup("f", "foo").await.unwrap();
+        let result = manager.lookup("f", "foo", "").await.unwrap();
         assert_eq!(result, Value::Number { val: 15 });
     }
 }

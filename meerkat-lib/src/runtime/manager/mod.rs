@@ -24,6 +24,8 @@ pub struct Manager {
     pub network: Option<NetworkActor>,
     /// Pending reply channels keyed by request_id
     pub pending_replies: HashMap<u64, oneshot::Sender<MeerkatMessage>>,
+    /// Used to enumerate hidden bindings in proxy closures.
+    pub next_proxy_id: u64,
 }
 
 impl Manager {
@@ -33,6 +35,7 @@ impl Manager {
             remote_services: HashMap::new(),
             network: None,
             pending_replies: HashMap::new(),
+            next_proxy_id: 1,
         }
     }
 
@@ -41,28 +44,33 @@ impl Manager {
     {
         let dep = calc_dep_srv(&decls);
 
-        let mut service = Service {
+        let service = Service {
             name: name.clone(),
             vars: HashMap::new(),
             defs: HashMap::new(),
             dep,
         };
+        self.services.insert(name.clone(), service);
 
         let mut env: Vec<(String, Value)> = vec![];
         let svc_name = name.clone();
 
         for decl in decls {
             match decl {
-                Decl::VarDecl { name, val } => {
+                Decl::VarDecl { name: var_name, val } => {
                     let value = eval(&val, &env, &mut EvalContext { manager: self, service_name: &svc_name }).await?;
-                    env.push((name.clone(), value.clone()));
-                    service.vars.insert(name, VarState::new(value));
+                    env.push((var_name.clone(), value.clone()));
+                    if let Some(s) = self.services.get_mut(&svc_name) {
+                        s.vars.insert(var_name, VarState::new(value));
+                    }
                 }
-                Decl::DefDecl { name, val, .. } => {
+                Decl::DefDecl { name: def_name, val, .. } => {
                     let value = eval(&val, &env, &mut EvalContext { manager: self, service_name: &svc_name }).await?;
-                    env.push((name.clone(), value.clone()));
-                    service.vars.insert(name.clone(), VarState::new(value));
-                    service.defs.insert(name, val);  // store original expr
+                    env.push((def_name.clone(), value.clone()));
+                    if let Some(s) = self.services.get_mut(&svc_name) {
+                        s.vars.insert(def_name.clone(), VarState::new(value));
+                        s.defs.insert(def_name, val);  // store original expr
+                    }
                 }
                 Decl::TableDecl { .. } => {
                     return Err(EvalError::NotImplemented);
@@ -70,7 +78,6 @@ impl Manager {
             }
         }
 
-        self.services.insert(name.clone(), service);
         Ok(())
     }
 
@@ -80,7 +87,7 @@ impl Manager {
             return self.remote_lookup(service_name, ident).await;
         }
 
-        // If it's an unknown service, but we are inside a closure from a remote service, proxy it!
+        // If it's an unknown service, but we are inside a closure from a remote service, proxy it.
         if current_context != "" && current_context != service_name && self.remote_services.contains_key(current_context) {
             return self.proxy_remote_lookup(current_context, service_name, ident).await;
         }
@@ -103,11 +110,6 @@ impl Manager {
             if let Some(var_state) = service.vars.get(ident) {
                 return Ok(var_state.value.clone());
             }
-        }
-        if let Some(service) = self.services.get(service_name) {
-            println!("DEBUG: Lookup failed for {} in {}. Available vars: {:?}", ident, service_name, service.vars.keys());
-        } else {
-            println!("DEBUG: Lookup failed for {} in {}. Service not found locally.", ident, service_name);
         }
         Err(EvalError::LookupError(format!("Variable '{}' not found in service '{}'", ident, service_name)))
     }
@@ -145,7 +147,7 @@ impl Manager {
         }
     }
 
-    pub fn wrap_value(&mut self, value: Value, current_service: &str, next_id: &mut u64) -> Value {
+    pub fn wrap_value(&mut self, value: Value, current_service: &str) -> Value {
         let is_remote = match &value {
             Value::ActionClosure { service_name, .. } | Value::Closure { service_name, .. } => {
                 service_name != current_service
@@ -157,8 +159,8 @@ impl Manager {
             return value;
         }
 
-        let var_name = format!("$x{}", *next_id);
-        *next_id += 1;
+        let var_name = format!("$x{}", self.next_proxy_id);
+        self.next_proxy_id += 1;
 
         match value {
             Value::ActionClosure { stmts, env, service_name } => {

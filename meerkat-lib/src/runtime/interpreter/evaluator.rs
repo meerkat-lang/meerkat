@@ -68,7 +68,7 @@ pub async fn eval(
                     return Ok(var_val.clone());
                 }
             }
-            ctx.manager.lookup(ident, ctx.service_name).await
+            ctx.manager.lookup(ident, ctx.service_name, "").await
         }
 
         Expr::Binop { op, expr1, expr2 } => {
@@ -149,7 +149,7 @@ pub async fn eval(
 
         Expr::MemberAccess { service, member } => {
             // Manager figures out whether service is local or remote
-            ctx.manager.lookup(member, service).await
+            ctx.manager.lookup(member, service, ctx.service_name).await
         }
         _ => Err(EvalError::NotImplemented),
     }

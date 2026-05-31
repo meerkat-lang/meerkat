@@ -48,8 +48,10 @@ def cleanup_processes():
     processes = []
     print("Cleanup complete.")
 
-def cleanup(sig=None, frame=None):
-    sys.exit(0)
+def cleanup(sig=None, frame=None, exit_code=0):
+    if isinstance(sig, int):
+        sys.exit(128 + sig)
+    sys.exit(exit_code)
 
 # Register atexit handler to ensure processes are always killed
 atexit.register(cleanup_processes)
@@ -120,7 +122,7 @@ def main():
                 
                 if not resolved_url:
                     print(f"Error: Node '{node_name}' imports '{imp}', but '{imp}' has not been started yet.")
-                    cleanup()
+                    cleanup(exit_code=1)
 
                 import_flags.extend(["-i", resolved_url])
 
@@ -162,7 +164,7 @@ def main():
                     log_file.close()
                     with open(log_file_path, "r") as lf:
                         print(lf.read())
-                    cleanup()
+                    cleanup(exit_code=1)
 
                 if os.path.exists(log_file_path):
                     with open(log_file_path, "r") as lf:
@@ -178,7 +180,7 @@ def main():
                 log_file.close()
                 with open(log_file_path, "r") as lf:
                     print(lf.read())
-                cleanup()
+                cleanup(exit_code=1)
 
             log_file.close()
             service_urls[node_name] = svc_url

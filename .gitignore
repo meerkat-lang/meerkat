@@ -25,3 +25,5 @@ target
 
 #!src/utils/debug/ 
 
+# Temporary folders
+tmp/

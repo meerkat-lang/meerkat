@@ -1,0 +1,12 @@
+# Meerkat Network Orchestration Manifest
+# Format: node_name:file_path:port:imports
+# Use 'client' as the port for client-only nodes.
+
+# 1. Base backend server
+s1: meerkat/tests/s1.mkt: 9001:
+
+# 2. Intermediate gateway server, importing s1
+s2: meerkat/tests/test_client.mkt: 9002: s1
+
+# 3. Downstream consumer/test runner, importing s2
+s3: meerkat/tests/s3.mkt: client: s2

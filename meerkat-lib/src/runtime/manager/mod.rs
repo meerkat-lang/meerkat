@@ -26,6 +26,51 @@ pub struct Manager {
     pub pending_replies: HashMap<u64, oneshot::Sender<MeerkatMessage>>,
 }
 
+/// Wrap a remote closure/action so it is homed to `current_service`.
+/// The original value is embedded as an `Expr::Literal` inside a new
+/// closure whose `service_name` is `current_service`.
+fn wrap_value(value: Value, current_service: &str) -> Value {
+    let is_remote = match &value {
+        Value::ActionClosure { service_name, .. } | Value::Closure { service_name, .. } => {
+            service_name != current_service
+        }
+        _ => false,
+    };
+
+    if !is_remote {
+        return value;
+    }
+
+    match value {
+        Value::ActionClosure { stmts, env, service_name } => {
+            let original_action = Value::ActionClosure { stmts, env, service_name };
+            Value::ActionClosure {
+                stmts: vec![ActionStmt::Do(Expr::Literal { val: original_action })],
+                env: vec![],
+                service_name: current_service.to_string(),
+            }
+        }
+        Value::Closure { params, body, env, service_name } => {
+            let original_closure = Value::Closure {
+                params: params.clone(),
+                body: body.clone(),
+                env: env.clone(),
+                service_name,
+            };
+            Value::Closure {
+                params: params.clone(),
+                body: Box::new(Expr::Call {
+                    func: Box::new(Expr::Literal { val: original_closure }),
+                    args: params.iter().map(|p| Expr::Variable { ident: p.clone() }).collect(),
+                }),
+                env: vec![],
+                service_name: current_service.to_string(),
+            }
+        }
+        other => other,
+    }
+}
+
 impl Manager {
     pub fn new() -> Self {
         Manager {
@@ -710,50 +755,5 @@ mod tests {
             }
             other => panic!("expected ActionClosure, got {:?}", other),
         }
-    }
-}
-
-/// Wrap a remote closure/action so it is homed to `current_service`.
-/// The original value is embedded as an `Expr::Literal` inside a new
-/// closure whose `service_name` is `current_service`.
-fn wrap_value(value: Value, current_service: &str) -> Value {
-    let is_remote = match &value {
-        Value::ActionClosure { service_name, .. } | Value::Closure { service_name, .. } => {
-            service_name != current_service
-        }
-        _ => false,
-    };
-
-    if !is_remote {
-        return value;
-    }
-
-    match value {
-        Value::ActionClosure { stmts, env, service_name } => {
-            let original_action = Value::ActionClosure { stmts, env, service_name };
-            Value::ActionClosure {
-                stmts: vec![ActionStmt::Do(Expr::Literal { val: original_action })],
-                env: vec![],
-                service_name: current_service.to_string(),
-            }
-        }
-        Value::Closure { params, body, env, service_name } => {
-            let original_closure = Value::Closure {
-                params: params.clone(),
-                body: body.clone(),
-                env: env.clone(),
-                service_name,
-            };
-            Value::Closure {
-                params: params.clone(),
-                body: Box::new(Expr::Call {
-                    func: Box::new(Expr::Literal { val: original_closure }),
-                    args: params.iter().map(|p| Expr::Variable { ident: p.clone() }).collect(),
-                }),
-                env: vec![],
-                service_name: current_service.to_string(),
-            }
-        }
-        other => other,
     }
 }

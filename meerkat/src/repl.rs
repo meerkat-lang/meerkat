@@ -6,6 +6,9 @@ use meerkat_lib::runtime::parser::parser::{parse_file, parse_repl};
 use meerkat_lib::runtime::parser::ReplParseResult;
 use meerkat_lib::runtime::Manager;
 
+use rustyline::error::ReadlineError;
+use rustyline::DefaultEditor;
+
 const PROMPT: &str = "meerkat> ";
 const PROMPT_CONT: &str = "       > ";
 
@@ -53,14 +56,12 @@ pub async fn run_repl(
     mut manager: Manager,
     remote_url_map: std::collections::HashMap<String, String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stdin = io::stdin();
-    let is_tty = stdin.is_terminal();
+    let mut reader = DefaultEditor::new()?;
+    reader.load_history("meerkat_history.txt");
 
-    if is_tty {
-        println!("Meerkat REPL  (Ctrl-D to exit)");
-        println!("Enter service definitions, @test blocks, statements, or expressions.");
-        println!();
-    }
+    println!("Meerkat REPL  (Ctrl-D to exit)");
+    println!("Enter service definitions, @test blocks, statements, or expressions.");
+    println!();
 
     if !remote_url_map.is_empty() {
         let mut n = meerkat_lib::net::NetworkActor::new(meerkat_lib::net::types::NodeType::Server)
@@ -82,22 +83,18 @@ pub async fn run_repl(
 
     let mut buffer = String::new();
     let mut continuation = false;
-    let mut lines = stdin.lock().lines();
 
     loop {
-        if is_tty {
-            if continuation {
-                print!("{}", PROMPT_CONT);
-            } else {
-                print!("{}", PROMPT);
-            }
-            io::stdout().flush()?;
-        }
+        let readline = if continuation {
+            reader.readline(PROMPT_CONT)
+        } else {
+            reader.readline(PROMPT)
+        };
 
-        let line = match lines.next() {
-            Some(Ok(l)) => l,
-            Some(Err(e)) => return Err(e.into()),
-            None => break,
+        let line = match readline {
+            Ok(l) => l,
+            Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => break,
+            Err(e) => return Err(e.into()),
         };
 
         buffer.push_str(&line);
@@ -144,9 +141,6 @@ pub async fn run_repl(
         }
     }
 
-    if is_tty {
-        println!();
-    }
     Ok(())
 }
 

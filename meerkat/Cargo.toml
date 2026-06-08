@@ -10,3 +10,4 @@ tokio = { version = "1", features = ["sync", "macros", "io-util", "rt", "time"] 
 log = "0.4"
 env_logger = "0.10"
 serde_json = "1"
+rustyline = "18.0.0"

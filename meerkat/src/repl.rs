@@ -94,7 +94,12 @@ pub async fn run_repl(
             Ok(l) => {
                 reader.add_history_entry(l.as_str())?; l 
             }
-            Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => break,
+            Err(ReadlineError::Interrupted) => {
+                buffer.clear();
+                continuation = false;
+                continue;
+            }
+            Err(ReadlineError::Eof) => break,
             Err(e) => return Err(e.into()),
         };
 

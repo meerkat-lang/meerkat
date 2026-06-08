@@ -117,6 +117,7 @@ pub async fn run_repl(
                 continuation = true;
             }
             ReplParseResult::Error(msg) => {
+                reader.add_history_entry(buffer.trim_end())?;
                 eprintln!("Parse error: {}", msg);
                 buffer.clear();
                 continuation = false;

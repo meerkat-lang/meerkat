@@ -91,9 +91,7 @@ pub async fn run_repl(
         };
 
         let line = match readline {
-            Ok(l) => {
-                reader.add_history_entry(l.as_str())?; l 
-            }
+            Ok(l) => l,
             Err(ReadlineError::Interrupted) => {
                 buffer.clear();
                 continuation = false;
@@ -124,6 +122,7 @@ pub async fn run_repl(
                 continuation = false;
             }
             ReplParseResult::Complete(stmts) => {
+                reader.add_history_entry(buffer.trim_end())?;
                 for stmt in stmts {
                     match exec_stmt(
                         stmt,
@@ -146,7 +145,9 @@ pub async fn run_repl(
             }
         }
     }
-    let _ = reader.save_history("meerkat_history.txt");
+    if let Err(e) = reader.save_history("meerkat_history.txt") {
+        eprintln!("Warning: failed to save history: {}", e);
+    }
     Ok(())
 }
 

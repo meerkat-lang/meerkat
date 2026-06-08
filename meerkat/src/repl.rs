@@ -1,4 +1,3 @@
-use std::io::{self, BufRead, IsTerminal, Write};
 
 use meerkat_lib::runtime::ast::{Expr, Stmt, Value};
 use meerkat_lib::runtime::interpreter::{eval, execute, EvalContext, ExecuteEffect};
@@ -57,7 +56,7 @@ pub async fn run_repl(
     remote_url_map: std::collections::HashMap<String, String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut reader = DefaultEditor::new()?;
-    reader.load_history("meerkat_history.txt");
+    let _ = reader.load_history("meerkat_history.txt");
 
     println!("Meerkat REPL  (Ctrl-D to exit)");
     println!("Enter service definitions, @test blocks, statements, or expressions.");
@@ -92,7 +91,9 @@ pub async fn run_repl(
         };
 
         let line = match readline {
-            Ok(l) => l,
+            Ok(l) => {
+                reader.add_history_entry(l.as_str())?; l 
+            }
             Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => break,
             Err(e) => return Err(e.into()),
         };
@@ -140,7 +141,7 @@ pub async fn run_repl(
             }
         }
     }
-
+    let _ = reader.save_history("meerkat_history.txt");
     Ok(())
 }
 

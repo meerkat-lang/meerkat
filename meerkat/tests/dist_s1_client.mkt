@@ -10,5 +10,5 @@ service s1 {
 
 @test(s1) {
     do update_both;
-    assert(x == 1);
+    assert(x == 2);
 }

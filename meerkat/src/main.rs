@@ -48,6 +48,10 @@ struct Args {
     /// Emit AST to `stdout`
     #[arg(long = "ast", default_value_t = false)]
     ast: bool,
+
+    /// Launch interactive REPL after executing input file (default: false)
+    #[arg(short = 'j', long = "interactive", default_value_t = false)]
+    interactive: bool,
 }
 
 #[tokio::main]
@@ -103,7 +107,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
             if args.server {
                 run_server(prog, remote_url_map, args.port, args.local, interner).await
             } else {
-                run_client(prog, file, remote_url_map, args.local, interner).await
+                run_client(prog, file, remote_url_map, args.local, interner, args.interactive).await
             }
         }
         None => {
@@ -535,6 +539,7 @@ async fn run_client(
     remote_url_map: std::collections::HashMap<String, String>,
     local: bool,
     interner: Interner,
+    interactive: bool,
 ) -> Result<(), Box<dyn Error>> {
     let mut manager = Manager::new(interner);
     manager.local = local;
@@ -635,5 +640,10 @@ async fn run_client(
         }
     }
 
-    Ok(())
+    if interactive {
+        println!("Entering interactive REPL mode. Type 'exit' or Ctrl+D to quit.");
+        repl::run_repl(manager, remote_url_map).await
+    } else {
+        Ok(())
+    }
 }

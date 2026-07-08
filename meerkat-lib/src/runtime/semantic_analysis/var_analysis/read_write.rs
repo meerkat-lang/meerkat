@@ -3,6 +3,32 @@ use crate::runtime::interner::Symbol;
 use std::collections::HashSet;
 
 impl Expr {
+    fn free_vars_in_action_stmt(
+        stmt: &ActionStmt,
+        reactive_names: &HashSet<Symbol>,
+        var_binded: &HashSet<Symbol>,
+    ) -> (HashSet<Symbol>, HashSet<Symbol>) {
+        let free_vars = match stmt {
+            ActionStmt::Assign { name: _, expr } => expr.free_var(reactive_names, var_binded),
+            ActionStmt::Do(expr) => expr.free_var(reactive_names, var_binded),
+            ActionStmt::Assert(expr, _) => expr.free_var(reactive_names, var_binded),
+            ActionStmt::Let {
+                name: _,
+                ty: _,
+                expr,
+            } => expr.free_var(reactive_names, var_binded),
+            ActionStmt::Expr(expr) => expr.free_var(reactive_names, var_binded),
+            ActionStmt::Insert { row, .. } => row.free_var(reactive_names, var_binded),
+        };
+
+        let mut new_binds = var_binded.clone();
+        if let ActionStmt::Let { name, .. } = stmt {
+            new_binds.insert(*name);
+        }
+
+        (free_vars, new_binds)
+    }
+
     /// Collect every cross-service reference `(service, member)` appearing
     /// anywhere in this expression. Counterpart to `free_var`, which drops
     /// `MemberAccess`; issue #24 needs these to know which remote members a
@@ -151,31 +177,12 @@ impl Expr {
             }
             Expr::Action(stmts) => {
                 let mut free_vars = HashSet::new();
+                let mut action_binds = var_binded.clone();
                 for stmt in stmts {
-                    match stmt {
-                        ActionStmt::Assign { name: _, expr } => {
-                            free_vars.extend(expr.free_var(reactive_names, var_binded));
-                        }
-                        ActionStmt::Do(expr) => {
-                            free_vars.extend(expr.free_var(reactive_names, var_binded));
-                        }
-                        ActionStmt::Assert(expr, _) => {
-                            free_vars.extend(expr.free_var(reactive_names, var_binded));
-                        }
-                        ActionStmt::Let {
-                            name: _,
-                            ty: _,
-                            expr,
-                        } => {
-                            free_vars.extend(expr.free_var(reactive_names, var_binded));
-                        }
-                        ActionStmt::Expr(expr) => {
-                            free_vars.extend(expr.free_var(reactive_names, var_binded));
-                        }
-                        ActionStmt::Insert { row, .. } => {
-                            free_vars.extend(row.free_var(reactive_names, var_binded));
-                        }
-                    }
+                    let (stmt_free_vars, new_binds) =
+                        Self::free_vars_in_action_stmt(stmt, reactive_names, &action_binds);
+                    free_vars.extend(stmt_free_vars);
+                    action_binds = new_binds;
                 }
                 free_vars.difference(reactive_names).cloned().collect()
             }
@@ -208,7 +215,7 @@ impl Expr {
 
 #[cfg(test)]
 mod html_dep_tests {
-    use crate::ast::Expr;
+    use crate::ast::{ActionStmt, Expr, Value};
     use crate::runtime::html::HtmlTemplateBuilder;
     use crate::runtime::interner::Interner;
     use std::collections::HashSet;
@@ -252,5 +259,32 @@ mod html_dep_tests {
             "html interpolation must surface cross-service dep: {:?}",
             deps
         );
+    }
+
+    #[test]
+    fn test_action_free_var_threads_let_bindings() {
+        let mut interner = Interner::new();
+        let outer = interner.insert("outer");
+        let x = interner.insert("x");
+        let y = interner.insert("y");
+        let expr = Expr::Action(vec![
+            ActionStmt::Let {
+                name: x,
+                ty: None,
+                expr: Expr::Variable { name: outer },
+            },
+            ActionStmt::Let {
+                name: y,
+                ty: None,
+                expr: Expr::Variable { name: x },
+            },
+            ActionStmt::Expr(Expr::Variable { name: y }),
+            ActionStmt::Expr(Expr::Literal {
+                val: Value::Int { val: 1 },
+            }),
+        ]);
+
+        let free = expr.free_var(&HashSet::new(), &HashSet::new());
+        assert_eq!(free, HashSet::from([outer]));
     }
 }

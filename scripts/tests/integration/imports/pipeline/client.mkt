@@ -1,0 +1,10 @@
+import A
+import B
+import C
+import D
+
+service PipelineClient {}
+
+@test(PipelineClient) {
+    assert(A.place_order == 105);
+}

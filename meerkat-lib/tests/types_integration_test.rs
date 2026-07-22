@@ -8,7 +8,7 @@ fn check_program(input: &str) -> Result<(), String> {
     let prog = parse_string(input, &mut node.interner)
         .map_err(|e| format!("Parse error: {}", e))
         .expect("Test program input must be syntactically valid.");
-    node.check(&prog).map_err(|e| e.to_string())
+    node.run_static_checks(&prog).map_err(|e| e.to_string())
 }
 
 /// Verify that basic primitive types check correctly
@@ -902,4 +902,69 @@ fn test_integration_watch_ill_typed() {
         watch 1 + \"hello\";
     ";
     assert!(check_program(input).is_err())
+}
+
+/// Verify that member type inference across imported service boundaries
+/// correctly infers types without requiring annotations
+#[test]
+fn test_cross_service_member_type_inference() {
+    let input = "
+        import s1
+        service s1 {
+            pub def val = 42;
+        }
+        service s2 {
+            pub def get_val = fn () => s1.val + 1;
+        }
+    ";
+    assert!(check_program(input).is_ok());
+}
+
+/// Verify that type mismatches referencing imported service members
+/// are rejected statically
+#[test]
+fn test_cross_service_type_mismatch_errors() {
+    let input = "
+        import s1
+        service s1 {
+            pub def text = \"hello\";
+        }
+        service s2 {
+            pub def num: int = s1.text;
+        }
+    ";
+    assert!(check_program(input).is_err());
+}
+
+/// Verify that mutual cyclic member access across imported services
+/// produces a static type error (`CannotInferType`)
+#[test]
+fn test_cross_service_member_cycle_errors() {
+    let input = "
+        import s1
+        import s2
+        service s1 {
+            pub def a = s2.b;
+        }
+        service s2 {
+            pub def b = s1.a;
+        }
+    ";
+    assert!(check_program(input).is_err());
+}
+
+/// Verify that @test blocks for imported services strictly type check
+/// assertions against inferred member types
+#[test]
+fn test_test_block_type_checks_imported_member() {
+    let input = "
+        import s1
+        service s1 {
+            pub def count = 10;
+        }
+        @test(s1) {
+            assert(count == \"not_an_int\");
+        }
+    ";
+    assert!(check_program(input).is_err());
 }

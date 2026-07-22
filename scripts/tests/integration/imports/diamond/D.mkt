@@ -1,0 +1,4 @@
+service D {
+    var active_users = 100;
+    pub def get_active = active_users;
+}

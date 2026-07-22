@@ -1,0 +1,281 @@
+//! This module implements the imports state machine for resolving
+//! and fetching import dependencies from local disk or network peers.
+//! This is designed to support any kind of event system with `tokio`.
+
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::time::Instant;
+
+use crate::error::{Error, Result};
+use crate::net::types::MeerkatMessage;
+use crate::net::{Address, MessageId, NetworkCommand};
+use crate::runtime::ast::Stmt;
+use crate::runtime::interner::{Interner, Symbol};
+use crate::runtime::parser;
+
+/// Request tracking info for optimistic retries
+#[derive(Debug)]
+pub struct PendingRequest {
+    /// Name of the service being requested
+    pub service_name: String,
+    /// Target network URL of the peer
+    pub target_url: String,
+    /// Instant when the initial request was sent
+    pub start_time: Instant,
+}
+
+/// Tuple representing a pending import command, target service name, and URL
+pub type ImportCommand = (NetworkCommand, String, String);
+
+/// State machine for resolving module import dependencies
+pub struct Imports<'a> {
+    interner: &'a mut Interner,
+    visited_services: HashSet<Symbol>,
+    pending_network: HashMap<MessageId, PendingRequest>,
+    pending_services: HashSet<String>,
+    remote_url_map: HashMap<String, String>,
+    accumulated_ast: Vec<Stmt>,
+    request_counter: u64,
+    my_addr: String,
+}
+
+impl<'a> Imports<'a> {
+    /// Create a new Imports state machine and process base AST
+    ///
+    /// Args:
+    ///   `interner` (`&'a mut Interner`): Process interner reference
+    ///   `remote_url_map` (`HashMap<String, String>`): Service URL map
+    ///   `base_ast` (`&[Stmt]`): Root file parsed statements
+    ///   `base_dir` (`&Path`): Directory containing local files
+    ///   `my_addr` (`&str`): Canonical listening address of this node
+    ///
+    /// Returns:
+    ///   `Result<(Self, Vec<ImportCommand>)>`: Initialized
+    ///   state machine and initial network fetch commands
+    ///
+    /// Errors:
+    ///   `Error`: If local import reading or parsing fails
+    pub fn new(
+        interner: &'a mut Interner,
+        remote_url_map: HashMap<String, String>,
+        base_ast: &[Stmt],
+        base_dir: &Path,
+        my_addr: &str,
+    ) -> Result<(Self, Vec<ImportCommand>)> {
+        let mut visited_services = HashSet::new();
+
+        // Register local services in visited set to prevent loops
+        for stmt in base_ast {
+            if let Stmt::Service { name, .. } = stmt {
+                visited_services.insert(*name);
+            }
+        }
+
+        let mut imports = Imports {
+            interner,
+            visited_services,
+            pending_network: HashMap::new(),
+            pending_services: HashSet::new(),
+            remote_url_map,
+            accumulated_ast: Vec::new(),
+            request_counter: 0,
+            my_addr: my_addr.to_string(),
+        };
+
+        let mut initial_cmds = Vec::new();
+        let imports_in_base: Vec<Symbol> = base_ast
+            .iter()
+            .filter_map(|stmt| match stmt {
+                Stmt::Import { service_name, .. } => Some(*service_name),
+                Stmt::Service { .. } => None,
+                Stmt::ActionStmt(_) => None,
+                Stmt::Update { .. } => None,
+                Stmt::Connect { .. } => None,
+                Stmt::Test { .. } => None,
+                Stmt::Watch { .. } => None,
+            })
+            .collect();
+
+        for sym in imports_in_base {
+            let cmds = imports.resolve_import(sym, base_dir)?;
+            initial_cmds.extend(cmds);
+        }
+
+        Ok((imports, initial_cmds))
+    }
+
+    /// Register a sent network command message ID for retry tracking
+    ///
+    /// Args:
+    ///   `msg_id` (`MessageId`): Message ID returned by network actor
+    ///   `service_name` (`String`): Service name requested
+    ///   `target_url` (`String`): Peer target URL
+    pub fn register_sent_command(
+        &mut self,
+        msg_id: MessageId,
+        service_name: String,
+        target_url: String,
+    ) {
+        self.pending_network.insert(
+            msg_id,
+            PendingRequest {
+                service_name,
+                target_url,
+                start_time: Instant::now(),
+            },
+        );
+    }
+
+    /// Process incoming source code for a service
+    ///
+    /// Args:
+    ///   `source` (`&str`): Raw source text received
+    ///   `service_name` (`&str`): Name of the service received
+    ///   `base_dir` (`&Path`): Directory for local imports
+    ///
+    /// Returns:
+    ///   `Result<Vec<ImportCommand>>`: Fetch commands
+    ///
+    /// Errors:
+    ///   `Error`: If source parsing or local disk reading fails
+    pub fn on_recv_source(
+        &mut self,
+        source: &str,
+        service_name: &str,
+        base_dir: &Path,
+    ) -> Result<Vec<ImportCommand>> {
+        self.pending_services.remove(service_name);
+
+        let parsed_stmts = parser::parse_string(source, self.interner)
+            .map_err(|e| Error::Message(e.to_string()))?;
+
+        // Mark all services in received file as visited
+        for stmt in &parsed_stmts {
+            if let Stmt::Service { name, .. } = stmt {
+                self.visited_services.insert(*name);
+            }
+        }
+
+        self.accumulated_ast.extend(parsed_stmts.clone());
+
+        let mut new_cmds = Vec::new();
+        for stmt in &parsed_stmts {
+            match stmt {
+                Stmt::Import {
+                    service_name: sym, ..
+                } => {
+                    let cmds = self.resolve_import(*sym, base_dir)?;
+                    new_cmds.extend(cmds);
+                }
+                Stmt::Service { .. } => {}
+                Stmt::ActionStmt(_) => {}
+                Stmt::Update { .. } => {}
+                Stmt::Connect { .. } => {}
+                Stmt::Test { .. } => {}
+                Stmt::Watch { .. } => {}
+            }
+        }
+
+        Ok(new_cmds)
+    }
+
+    /// Handle network message send failure with optimistic retry logic
+    ///
+    /// Args:
+    ///   `failed_msg_id` (`MessageId`): Message ID that failed
+    ///
+    /// Returns:
+    ///   `Result<Option<ImportCommand>>`: Retry command
+    ///
+    /// Errors:
+    ///   `Error`: If timeout limit has been exceeded
+    pub fn on_send_failure(&mut self, failed_msg_id: MessageId) -> Result<Option<ImportCommand>> {
+        let pending = match self.pending_network.remove(&failed_msg_id) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        let elapsed = pending.start_time.elapsed().as_secs();
+        if elapsed >= 10 {
+            return Err(Error::Message(format!(
+                "Import fetch timed out for service '{}' after {}s",
+                pending.service_name, elapsed
+            )));
+        }
+
+        self.request_counter = self.request_counter.wrapping_add(1);
+        let req_id = self.request_counter;
+        let path = format!("{}.mkt", pending.service_name);
+        let msg = MeerkatMessage::ServiceCodeRequest {
+            request_id: req_id,
+            path,
+            reply_to: self.my_addr.clone(),
+        };
+        let cmd = NetworkCommand::SendMessage {
+            addr: Address::new(pending.target_url.as_str()),
+            msg,
+        };
+
+        Ok(Some((cmd, pending.service_name, pending.target_url)))
+    }
+
+    /// Check if all pending import dependencies are resolved
+    ///
+    /// Returns:
+    ///   `bool`: True if no pending services remain
+    pub fn is_done(&self) -> bool {
+        self.pending_services.is_empty()
+    }
+
+    /// Consumes the Imports state machine and returns resolved AST
+    ///
+    /// Returns:
+    ///   `Vec<Stmt>`: Concatenated AST of all imported services
+    pub fn finalize(self) -> Vec<Stmt> {
+        self.accumulated_ast
+    }
+
+    /// Private helper to resolve a single import symbol
+    fn resolve_import(
+        &mut self,
+        service_sym: Symbol,
+        base_dir: &Path,
+    ) -> Result<Vec<ImportCommand>> {
+        if self.visited_services.contains(&service_sym) {
+            return Ok(Vec::new());
+        }
+
+        self.visited_services.insert(service_sym);
+        let service_name = self.interner.get(service_sym).to_string();
+
+        if !self.my_addr.is_empty() {
+            if let Some(target_url) = self.remote_url_map.get(&service_name).cloned() {
+                self.pending_services.insert(service_name.clone());
+                self.request_counter = self.request_counter.wrapping_add(1);
+                let req_id = self.request_counter;
+                let path = format!("{}.mkt", service_name);
+                let msg = MeerkatMessage::ServiceCodeRequest {
+                    request_id: req_id,
+                    path,
+                    reply_to: self.my_addr.clone(),
+                };
+                let cmd = NetworkCommand::SendMessage {
+                    addr: Address::new(target_url.as_str()),
+                    msg,
+                };
+                return Ok(vec![(cmd, service_name, target_url)]);
+            }
+        }
+
+        // Local disk resolution fallback
+        let file_path = base_dir.join(format!("{}.mkt", service_name));
+        let source = std::fs::read_to_string(&file_path).map_err(|e| {
+            Error::Message(format!(
+                "Failed to read local import file '{:?}': {}",
+                file_path, e
+            ))
+        })?;
+
+        self.on_recv_source(&source, &service_name, base_dir)
+    }
+}

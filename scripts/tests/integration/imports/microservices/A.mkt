@@ -1,0 +1,8 @@
+import B
+import C
+
+service A {
+    var order_count = 5;
+    pub def get_order_count = order_count;
+    pub def place_order = (order_count + B.get_summary) + C.get_item_count;
+}

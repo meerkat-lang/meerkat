@@ -1,0 +1,22 @@
+{
+  "settings": {
+    "startup_timeout": 45.0,
+    "monitor_poll_interval": 0.25,
+    "terminate_timeout": 5.0
+  },
+  "nodes": [
+    {
+      "alias": "server_b",
+      "type": "server",
+      "file": "scripts/tests/integration/imports/mixed_imports/server_b.mkt",
+      "port": 9300
+    },
+    {
+      "alias": "mixed_client",
+      "type": "client",
+      "file": "scripts/tests/integration/imports/mixed_imports/client.mkt",
+      "timeout": 30,
+      "imports": ["server_b.server_b"]
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+import C
+
+service B {
+    var user_count = 10;
+    pub def get_user_count = user_count;
+    pub def get_summary = user_count + C.get_item_count;
+}

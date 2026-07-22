@@ -1,0 +1,6 @@
+import B
+import C
+
+service A {
+    pub def get_dashboard = B.get_analytics + C.get_notifications;
+}

@@ -48,7 +48,6 @@ use crate::runtime::ast::{ActionStmt, BinOp, Decl, Expr, Stmt, UnOp, Value};
 use crate::runtime::interner::Symbol;
 use crate::runtime::tt::types::{Param, ServiceType, TupleType, Type};
 use crate::runtime::Env;
-use std::collections::HashSet;
 
 /// Validate the structural depth of a type representation
 ///
@@ -124,9 +123,6 @@ pub struct Context<'a, 'b> {
     program: &'a [Stmt],
     /// Type environments for services that are declared locally in this program
     local_services: &'b mut Env<'a, ServiceType<'a>>,
-    /// Names of services brought in via `import` statements; their member
-    /// types are unknown at compile time and are skipped by the checker
-    import_services: HashSet<Symbol>,
     checking_stack: Vec<(Symbol, Symbol)>,
     current_service: Option<Symbol>,
 }
@@ -147,7 +143,6 @@ impl<'a, 'b> Context<'a, 'b> {
             depth: 0,
             program,
             local_services,
-            import_services: HashSet::new(),
             checking_stack: Vec::new(),
             current_service: None,
         }
@@ -181,21 +176,15 @@ impl<'a, 'b> Context<'a, 'b> {
     /// Returns:
     ///     `Result<(), Error>`: Ok on success
     pub fn check_all(&mut self) -> Result<(), Error> {
-        // First pass: register all locally-declared service names so that
-        // forward-reference lookups within `type_of_member` can find them,
-        // and collect all imported service names so that cross-service member
-        // accesses can be skipped rather than hard-errored
+        // First pass: register all service names (local and imported) so that
+        // forward-reference lookups within `type_of_member` can find them.
+        // Both local and imported Stmt::Service nodes are present in the
+        // unified AST passed from Node::static_checks.
         for stmt in self.program {
-            match stmt {
-                Stmt::Service { name, .. } => {
-                    if self.local_services.find(*name).is_none() {
-                        self.local_services.bind(*name, ServiceType::default());
-                    }
+            if let Stmt::Service { name, .. } = stmt {
+                if self.local_services.find(*name).is_none() {
+                    self.local_services.bind(*name, ServiceType::default());
                 }
-                Stmt::Import { service_name, .. } => {
-                    self.import_services.insert(*service_name);
-                }
-                _ => {}
             }
         }
 
@@ -229,15 +218,7 @@ impl<'a, 'b> Context<'a, 'b> {
                          checks as not yet implemented"
                     );
                 }
-                Stmt::Import { .. } => {
-                    // TODO(Issue #156): Implement static checks
-                    // (deferred per Issue #34)
-                    println!(
-                        "warning: tt/check: ignoring 'import' \
-                         checks as not yet implemented"
-                    );
-                }
-                Stmt::Connect { .. } | Stmt::Service { .. } => {}
+                Stmt::Connect { .. } | Stmt::Service { .. } | Stmt::Import { .. } => {}
             }
         }
 
@@ -287,17 +268,9 @@ impl<'a, 'b> Context<'a, 'b> {
             }
         }
 
-        // If the service was brought in via `import`, its declarations are
-        // not present in this compilation unit and cannot be type-checked.
-        // Emit a warning and treat the member as `Unit` (unchecked) so that
-        // the program is not prevented from running
-        if self.import_services.contains(&service_name) {
-            println!(
-                "warning: tt/check: skipping member type check for \
-                 imported service (type unknown at compile time)"
-            );
-            return Ok(Type::UnresolvedService(service_name));
-        }
+        // No cached entry: walk the program to find and type the member.
+        // Both local and imported service declarations are present in
+        // `self.program` (unified_ast), so we use the normal path for all.
 
         let key = (service_name, member_name);
         if self.checking_stack.contains(&key) {

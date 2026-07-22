@@ -901,22 +901,35 @@ fn test_lambda_annotations_in_checking_mode() {
 }
 
 /// Verify that a local service referencing a member of an imported service
-/// does not produce a type error. The type checker cannot know the member
-/// types of remote services, so it must skip the check and allow the
-/// program to proceed to runtime
+/// is fully type-checked when the unified AST contains the imported service's
+/// declarations (as produced by on_node_startup before static_checks).
 #[test]
-fn test_import_member_access_is_skipped() {
+fn test_import_member_access_resolves_with_unified_ast() {
     let mut interner = Interner::new();
     let remote_svc = interner.insert("na");
     let local_svc = interner.insert("nb");
     let remote_member = interner.insert("get_x");
     let local_val = interner.insert("val");
 
-    // Program: `import na` then `service nb { pub def val = na.get_x; }`
+    // Program simulating unified_ast:
+    //   import na           <- marks na as imported
+    //   service na { pub def get_x = 42; }   <- from fetched source
+    //   service nb { pub def val = na.get_x; }
     let program = vec![
         Stmt::Import {
             path: "na".to_string(),
             service_name: remote_svc,
+        },
+        Stmt::Service {
+            name: remote_svc,
+            decls: vec![Decl::DefDecl {
+                name: remote_member,
+                ty: None,
+                is_pub: true,
+                val: Expr::Literal {
+                    val: Value::Int { val: 42 },
+                },
+            }],
         },
         Stmt::Service {
             name: local_svc,

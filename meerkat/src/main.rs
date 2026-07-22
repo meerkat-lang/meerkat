@@ -177,7 +177,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
 
             // Perform static validation checks on the parsed program
             // statements before executing or starting the server
-            node.check(&prog)
+            node.run_static_checks_for_file(file, &remote_url_map)
                 .map_err(|e| format!("Static check error: {}", e))?;
 
             // This mode must appear before `server` args check in
@@ -190,7 +190,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                 return Ok(());
             }
 
-            let interner = node.interner;
+            let interner = node.interner.clone();
 
             if args.server {
                 run_server(

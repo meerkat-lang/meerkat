@@ -1,0 +1,5 @@
+import C
+
+service B {
+    pub def calc_bill = C.calc_discount + 15;
+}

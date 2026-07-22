@@ -1,0 +1,9 @@
+import A
+import B
+
+service ActionClient {}
+
+@test(ActionClient) {
+    assert(B.get_stock == 100);
+    assert(A.get_remote_stock == 100);
+}

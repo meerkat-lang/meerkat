@@ -1,0 +1,5 @@
+import D
+
+service C {
+    pub def calc_discount = 100 - D.calc_tax;
+}

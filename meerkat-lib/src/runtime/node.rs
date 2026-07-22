@@ -165,7 +165,6 @@ impl<'a> Node<'a> {
             }
 
             while !imports.is_done() {
-                tokio::task::yield_now().await;
                 if let Some(event) = net.try_recv_event() {
                     match event {
                         NetworkEvent::MessageReceived { peer, msg } => match msg {
@@ -219,6 +218,8 @@ impl<'a> Node<'a> {
                             buffered_events.push(event);
                         }
                     }
+                } else {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
             }
         }

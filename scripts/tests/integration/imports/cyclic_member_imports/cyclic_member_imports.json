@@ -6,17 +6,24 @@
   },
   "nodes": [
     {
+      "alias": "server_b",
+      "type": "server",
+      "file": "scripts/tests/integration/imports/cyclic_member_imports/server_b.mkt",
+      "port": 9371
+    },
+    {
       "alias": "server_a",
       "type": "server",
       "file": "scripts/tests/integration/imports/cyclic_member_imports/server_a.mkt",
-      "port": 9370
+      "port": 9370,
+      "imports": ["server_b.server_b"]
     },
     {
       "alias": "cyclic_client",
       "type": "client",
       "file": "scripts/tests/integration/imports/cyclic_member_imports/client.mkt",
       "timeout": 30,
-      "imports": ["server_a.server_a"]
+      "imports": ["server_a.server_a", "server_b.server_b"]
     }
   ]
 }

@@ -46,17 +46,17 @@ MANIFESTS = [
     (
         "rejection_imports",
         "scripts/tests/integration/imports/rejection_imports/rejection_imports.json",
-        True,
+        "Unknown identifier",
     ),
     (
         "circular_imports",
         "scripts/tests/integration/imports/circular_imports/circular_imports.json",
-        True,
+        "Circular dependency detected",
     ),
     (
         "cyclic_member_imports",
         "scripts/tests/integration/imports/cyclic_member_imports/cyclic_member_imports.json",
-        True,
+        "dependency cycle detected",
     ),
 ]
 
@@ -67,7 +67,7 @@ def run_mkn(name, manifest, expect_fail=False):
     Args:
         name (str): Short name of the test case.
         manifest (str): Path to the JSON manifest file.
-        expect_fail (bool): True if non-zero exit code is expected.
+        expect_fail (bool): True or string if non-zero exit code is expected.
 
     Returns:
         bool: True if the test met expectation, False otherwise.
@@ -79,13 +79,24 @@ def run_mkn(name, manifest, expect_fail=False):
         text=True,
     )
     failed = res.returncode != 0
-    if failed != expect_fail:
+    if failed != bool(expect_fail):
         print("FAILED")
         if res.stdout is not None and len(res.stdout) > 0:
             print(res.stdout, end="")
         if res.stderr is not None and len(res.stderr) > 0:
             print(res.stderr, end="")
         return False
+
+    if isinstance(expect_fail, str):
+        output = (res.stdout or "") + (res.stderr or "")
+        if expect_fail.lower() not in output.lower():
+            print(f"FAILED (expected error containing '{expect_fail}')")
+            if res.stdout is not None and len(res.stdout) > 0:
+                print(res.stdout, end="")
+            if res.stderr is not None and len(res.stderr) > 0:
+                print(res.stderr, end="")
+            return False
+
     print("ok")
     return True
 

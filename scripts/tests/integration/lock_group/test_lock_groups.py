@@ -27,15 +27,16 @@ MANIFESTS = [
 ]
 
 
-def run_mkn(name, manifest):
+def run_mkn(name, manifest, expect_fail=False):
     """Run a single MKN test manifest.
 
     Args:
         name (str): Short name of the test case.
         manifest (str): Path to the JSON manifest file.
+        expect_fail (bool): True or string if non-zero exit code is expected.
 
     Returns:
-        bool: True if the test passed, False otherwise.
+        bool: True if the test met expectation, False otherwise.
     """
     print(f"test {name} ... ", end="", flush=True)
     res = subprocess.run(
@@ -43,13 +44,25 @@ def run_mkn(name, manifest):
         capture_output=True,
         text=True,
     )
-    if res.returncode != 0:
+    failed = res.returncode != 0
+    if failed != bool(expect_fail):
         print("FAILED")
         if res.stdout is not None and len(res.stdout) > 0:
             print(res.stdout, end="")
         if res.stderr is not None and len(res.stderr) > 0:
             print(res.stderr, end="")
         return False
+
+    if isinstance(expect_fail, str):
+        output = (res.stdout or "") + (res.stderr or "")
+        if expect_fail.lower() not in output.lower():
+            print(f"FAILED (expected error containing '{expect_fail}')")
+            if res.stdout is not None and len(res.stdout) > 0:
+                print(res.stdout, end="")
+            if res.stderr is not None and len(res.stderr) > 0:
+                print(res.stderr, end="")
+            return False
+
     print("ok")
     return True
 

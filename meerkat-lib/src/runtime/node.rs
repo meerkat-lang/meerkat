@@ -64,6 +64,40 @@ impl<'a> Node<'a> {
             .map_err(|e| Error::Message(e.to_string()))
     }
 
+    /// Sends `cmd` over `net` and registers resulting message ID with `imports`
+    ///
+    /// Args:
+    ///   `net` (`&mut NetworkActor`): Active network actor
+    ///   `imports` (`&mut Imports`): Import tracker instance
+    ///   `cmd` (`NetworkCommand`): Command to send
+    ///   `service_name` (`String`): Target service name
+    ///   `target_url` (`String`): Target service multiaddress
+    ///
+    /// Returns:
+    ///   `Result<()>`: Ok if message sent and registered, or error
+    ///
+    /// Errors:
+    ///   `Error`: If sending fails or reply is unexpected
+    async fn send_and_register(
+        net: &mut NetworkActor,
+        imports: &mut Imports<'_>,
+        cmd: NetworkCommand,
+        service_name: String,
+        target_url: String,
+    ) -> Result<()> {
+        let reply = net.handle_command(cmd).await;
+        match reply {
+            NetworkReply::MessageSent { msg_id } => {
+                imports.register_sent_command(msg_id, service_name, target_url);
+                Ok(())
+            }
+            NetworkReply::Failure(e) => Err(Error::Message(format!("Send failed: {}", e))),
+            NetworkReply::ListenSuccess { .. } | NetworkReply::LocalAddresses { .. } => Err(
+                Error::Message("Unexpected reply from SendMessage command".to_string()),
+            ),
+        }
+    }
+
     /// Orchestrates the network boot sequence and resolves imports
     ///
     /// Args:
@@ -99,8 +133,18 @@ impl<'a> Node<'a> {
                 addr: Address::new("/ip4/127.0.0.1/tcp/0"),
             };
             let reply = net.handle_command(listen_cmd).await;
-            if let NetworkReply::ListenSuccess { addr } = reply {
-                my_addr = format!("{}/p2p/{}", addr.0, peer_id);
+            match reply {
+                NetworkReply::ListenSuccess { addr } => {
+                    my_addr = format!("{}/p2p/{}", addr.0, peer_id);
+                }
+                NetworkReply::Failure(e) => {
+                    return Err(Error::Message(format!("Failed to listen: {}", e)));
+                }
+                NetworkReply::MessageSent { .. } | NetworkReply::LocalAddresses { .. } => {
+                    return Err(Error::Message(
+                        "Unexpected reply from Listen command".to_string(),
+                    ));
+                }
             }
             opt_net = Some(net);
         }
@@ -117,10 +161,7 @@ impl<'a> Node<'a> {
 
         if let Some(net) = opt_net.as_mut() {
             for (cmd, service_name, target_url) in initial_cmds {
-                let reply = net.handle_command(cmd).await;
-                if let NetworkReply::MessageSent { msg_id } = reply {
-                    imports.register_sent_command(msg_id, service_name, target_url);
-                }
+                Self::send_and_register(net, &mut imports, cmd, service_name, target_url).await?;
             }
 
             while !imports.is_done() {
@@ -133,10 +174,8 @@ impl<'a> Node<'a> {
                                 let new_cmds =
                                     imports.on_recv_source(&source, service_name, base_dir)?;
                                 for (cmd, s_name, t_url) in new_cmds {
-                                    let rep = net.handle_command(cmd).await;
-                                    if let NetworkReply::MessageSent { msg_id } = rep {
-                                        imports.register_sent_command(msg_id, s_name, t_url);
-                                    }
+                                    Self::send_and_register(net, &mut imports, cmd, s_name, t_url)
+                                        .await?;
                                 }
                             }
                             MeerkatMessage::ServiceCodeRequest {
@@ -172,10 +211,8 @@ impl<'a> Node<'a> {
                         NetworkEvent::SendFailed { msg_id, error: _ } => {
                             if let Some((cmd, s_name, t_url)) = imports.on_send_failure(msg_id)? {
                                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                                let rep = net.handle_command(cmd).await;
-                                if let NetworkReply::MessageSent { msg_id: new_id } = rep {
-                                    imports.register_sent_command(new_id, s_name, t_url);
-                                }
+                                Self::send_and_register(net, &mut imports, cmd, s_name, t_url)
+                                    .await?;
                             }
                         }
                         NetworkEvent::PeerConnected { peer: _ } => {

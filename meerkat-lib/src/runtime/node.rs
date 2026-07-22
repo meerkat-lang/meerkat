@@ -168,7 +168,7 @@ impl<'a> Node<'a> {
                 tokio::task::yield_now().await;
                 if let Some(event) = net.try_recv_event() {
                     match event {
-                        NetworkEvent::MessageReceived { peer: _, msg } => match msg {
+                        NetworkEvent::MessageReceived { peer, msg } => match msg {
                             MeerkatMessage::ServiceCodeResponse { source, path, .. } => {
                                 let service_name = path.strip_suffix(".mkt").unwrap_or(&path);
                                 let new_cmds =
@@ -202,10 +202,7 @@ impl<'a> Node<'a> {
                                 )));
                             }
                             _ => {
-                                buffered_events.push(NetworkEvent::MessageReceived {
-                                    peer: String::new(),
-                                    msg,
-                                });
+                                buffered_events.push(NetworkEvent::MessageReceived { peer, msg });
                             }
                         },
                         NetworkEvent::SendFailed { msg_id, error: _ } => {

@@ -973,3 +973,63 @@ fn test_codec_request_validation() {
     assert!(codec::validate_lookup_request("invalid-service!", "member").is_err());
     assert!(codec::validate_action_request("invalid-service!").is_err());
 }
+
+/// Verify that on_node_startup preserves the remote peer ID string on buffered MessageReceived events
+#[tokio::test(flavor = "multi_thread")]
+async fn test_on_node_startup_preserves_buffered_peer_id() {
+    use meerkat_lib::runtime::node::Node;
+    use std::collections::HashMap;
+
+    let mut node = Node::new();
+
+    let dir = unique_test_dir("node_startup_peer_id");
+    let file_path = dir.join("test.mkt");
+    std::fs::write(&file_path, "service LocalSvc { pub def val = 1; }").unwrap();
+
+    let remote_map = HashMap::new();
+    let file_str = file_path.to_str().unwrap();
+
+    let identity = libp2p::identity::Keypair::generate_ed25519();
+    let (opt_net, _buffered_events, _) = node
+        .on_node_startup(file_str, remote_map, Some(identity))
+        .await
+        .expect("on_node_startup succeeds");
+
+    assert!(opt_net.is_some());
+    let mut server = opt_net.unwrap();
+
+    let server_peer_id = server.local_peer_id();
+    let addrs_reply = server
+        .handle_command(NetworkCommand::GetLocalAddresses)
+        .await;
+    let server_addr = match addrs_reply {
+        NetworkReply::LocalAddresses { addrs } => addrs[0].clone(),
+        other => panic!("Expected LocalAddresses, got {:?}", other),
+    };
+
+    let full_addr = Address::new(format!("{}/p2p/{}", server_addr.0, server_peer_id));
+
+    let mut client = NetworkActor::new(NodeType::Server).await.unwrap();
+    let client_peer_id = client.local_peer_id().to_string();
+
+    let _ = client
+        .handle_command(NetworkCommand::SendMessage {
+            addr: full_addr,
+            msg: MeerkatMessage::Ping {
+                content: "ping_test".to_string(),
+            },
+        })
+        .await;
+
+    let mut recvd_peer = String::new();
+    for _ in 0..50 {
+        sleep(Duration::from_millis(100)).await;
+        if let Ok(NetworkEvent::MessageReceived { peer, .. }) = server.event_rx.try_recv() {
+            recvd_peer = peer;
+            break;
+        }
+    }
+
+    assert!(!recvd_peer.is_empty(), "Peer ID should not be empty");
+    assert_eq!(recvd_peer, client_peer_id);
+}

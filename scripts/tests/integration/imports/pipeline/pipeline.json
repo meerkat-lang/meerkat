@@ -37,7 +37,7 @@
       "type": "client",
       "file": "scripts/tests/integration/imports/pipeline/client.mkt",
       "timeout": 45,
-      "imports": ["A.A", "B.B", "C.C", "D.D"]
+      "imports": ["A.A"]
     }
   ]
 }

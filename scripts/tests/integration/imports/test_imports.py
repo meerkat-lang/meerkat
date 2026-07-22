@@ -48,6 +48,16 @@ MANIFESTS = [
         "scripts/tests/integration/imports/rejection_imports/rejection_imports.json",
         True,
     ),
+    (
+        "circular_imports",
+        "scripts/tests/integration/imports/circular_imports/circular_imports.json",
+        True,
+    ),
+    (
+        "cyclic_member_imports",
+        "scripts/tests/integration/imports/cyclic_member_imports/cyclic_member_imports.json",
+        True,
+    ),
 ]
 
 

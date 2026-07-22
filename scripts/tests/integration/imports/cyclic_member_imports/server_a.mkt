@@ -1,0 +1,3 @@
+service server_a {
+    pub def val_a = cyclic_client.val_b;
+}

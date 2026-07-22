@@ -1,0 +1,4 @@
+import server_a
+service cyclic_client {
+    pub def val_b = server_a.val_a;
+}

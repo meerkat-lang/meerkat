@@ -90,28 +90,36 @@ pub enum Error {
     DepthLimitExceeded,
     InvalidTupleArity,
     NotAFunction,
+    DependencyCycle { service: Symbol, member: Symbol },
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::UnboundVariable(s) => {
-                write!(f, "Unbound variable: {:?}", s)
+                write!(f, "unbound variable: {:?}", s)
             }
             Error::TypeMismatch { expected, found } => {
-                write!(f, "Type mismatch: expected {}, found {}", expected, found)
+                write!(f, "type mismatch: expected {}, found {}.", expected, found)
             }
             Error::CannotInferType => {
-                write!(f, "Cannot infer type")
+                write!(f, "cannot infer type.")
             }
             Error::DepthLimitExceeded => {
-                write!(f, "Depth limit exceeded")
+                write!(f, "depth limit exceeded.")
             }
             Error::InvalidTupleArity => {
-                write!(f, "Invalid tuple arity")
+                write!(f, "invalid tuple arity.")
             }
             Error::NotAFunction => {
-                write!(f, "Not a function")
+                write!(f, "not a function.")
+            }
+            Error::DependencyCycle { service, member } => {
+                write!(
+                    f,
+                    "dependency cycle detected at service '{:?}', member '{:?}'.",
+                    service, member
+                )
             }
         }
     }
@@ -258,7 +266,7 @@ impl<'a, 'b> Context<'a, 'b> {
     ///     Result<Type, Error>: The type of the member
     ///
     /// Raises:
-    ///     Error::CannotInferType: On cyclic dependencies
+    ///     Error::DependencyCycle: On cyclic member dependencies
     ///     Error::UnboundVariable: If member is not found
     fn type_of_member(&mut self, service_name: Symbol, member_name: Symbol) -> Result<Type, Error> {
         // Fast path: member type already cached from a prior check
@@ -274,7 +282,10 @@ impl<'a, 'b> Context<'a, 'b> {
 
         let key = (service_name, member_name);
         if self.checking_stack.contains(&key) {
-            return Err(Error::CannotInferType);
+            return Err(Error::DependencyCycle {
+                service: service_name,
+                member: member_name,
+            });
         }
         self.checking_stack.push(key);
 

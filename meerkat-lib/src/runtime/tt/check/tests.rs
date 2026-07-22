@@ -169,11 +169,11 @@ fn test_function_calls() {
 fn test_error_display() {
     assert_eq!(
         Error::DepthLimitExceeded.to_string(),
-        "Depth limit exceeded"
+        "depth limit exceeded."
     );
-    assert_eq!(Error::CannotInferType.to_string(), "Cannot infer type");
-    assert_eq!(Error::InvalidTupleArity.to_string(), "Invalid tuple arity");
-    assert_eq!(Error::NotAFunction.to_string(), "Not a function");
+    assert_eq!(Error::CannotInferType.to_string(), "cannot infer type.");
+    assert_eq!(Error::InvalidTupleArity.to_string(), "invalid tuple arity.");
+    assert_eq!(Error::NotAFunction.to_string(), "not a function.");
 }
 
 /// Verify deeply nested type structures fail depth checking
@@ -498,7 +498,13 @@ fn test_circular_dependency() {
         ],
     }];
     let res = check(&program, &mut classes);
-    assert_eq!(res, Err(Error::CannotInferType))
+    assert_eq!(
+        res,
+        Err(Error::DependencyCycle {
+            service: name_s,
+            member: name_a
+        })
+    )
 }
 
 /// Verify member access across different services

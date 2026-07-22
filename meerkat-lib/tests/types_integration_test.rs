@@ -42,7 +42,7 @@ fn test_integration_primitive_mismatch() {
     let res = check_program(input);
     assert!(res.is_err());
     let err = res.expect_err("Type checking must fail.");
-    assert!(err.contains("Type check error"))
+    assert!(err.contains("type check error"));
 }
 
 /// Verify annotated function parameters and return types

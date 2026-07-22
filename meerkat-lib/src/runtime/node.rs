@@ -297,8 +297,51 @@ impl<'a> Node<'a> {
         })?;
 
         let mut local_services = Env::new(None);
-        tt::check(&self.unified_ast, &mut local_services)
-            .map_err(|e| Error::Message(format!("Type check error: {}", e)))
+        tt::check(&self.unified_ast, &mut local_services).map_err(|e| self.format_tt_error(e))
+    }
+
+    /// Format a type checking error into a user-facing error message,
+    /// resolving interned symbol identifiers to string representations
+    ///
+    /// Args:
+    ///     `err` (`tt::check::Error`): The type checking error to format
+    ///
+    /// Returns:
+    ///     `Error`: The formatted Error::Message
+    fn format_tt_error(&self, err: tt::check::Error) -> Error {
+        match err {
+            tt::check::Error::DependencyCycle { service, member } => {
+                let service_str = self.interner.get(service);
+                let member_str = self.interner.get(member);
+                Error::Message(format!(
+                    "type check error: dependency cycle detected at service '{}', member '{}'.",
+                    service_str, member_str
+                ))
+            }
+            tt::check::Error::UnboundVariable(s) => {
+                let var_str = self.interner.get(s);
+                Error::Message(format!(
+                    "type check error: unbound variable: '{}'.",
+                    var_str
+                ))
+            }
+            tt::check::Error::TypeMismatch { expected, found } => Error::Message(format!(
+                "type check error: type mismatch: expected {}, found {}.",
+                expected, found
+            )),
+            tt::check::Error::CannotInferType => {
+                Error::Message("type check error: cannot infer type.".to_string())
+            }
+            tt::check::Error::DepthLimitExceeded => {
+                Error::Message("type check error: depth limit exceeded.".to_string())
+            }
+            tt::check::Error::InvalidTupleArity => {
+                Error::Message("type check error: invalid tuple arity.".to_string())
+            }
+            tt::check::Error::NotAFunction => {
+                Error::Message("type check error: not a function.".to_string())
+            }
+        }
     }
 
     /// Perform static analysis checks on external program statements
@@ -376,8 +419,7 @@ impl<'a> Node<'a> {
             nameres::Error::DepthLimit => Error::Message(e.to_string()),
         })?;
 
-        tt::check(program, &mut self.local_services)
-            .map_err(|e| Error::Message(format!("Type check error: {}", e)))
+        tt::check(program, &mut self.local_services).map_err(|e| self.format_tt_error(e))
     }
 
     /// Start the runtime manager consuming this Node

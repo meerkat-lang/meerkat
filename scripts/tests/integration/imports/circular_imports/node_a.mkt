@@ -1,0 +1,3 @@
+service node_a {
+    var val_a = 1;
+}

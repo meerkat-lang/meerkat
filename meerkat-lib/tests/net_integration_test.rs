@@ -1033,3 +1033,80 @@ async fn test_on_node_startup_preserves_buffered_peer_id() {
     assert!(!recvd_peer.is_empty(), "Peer ID should not be empty");
     assert_eq!(recvd_peer, client_peer_id);
 }
+
+/// Verify that run_static_checks_with_imports fetches remote service
+/// dependencies over libp2p network and executes static checks
+#[tokio::test(flavor = "multi_thread")]
+async fn test_static_checks_remote_imports() {
+    use meerkat_lib::runtime::node::Node;
+    use std::collections::HashMap;
+
+    let dir_remote = unique_test_dir("remote_svc_dir");
+    let remote_file = dir_remote.join("RemoteSvc.mkt");
+    std::fs::write(
+        &remote_file,
+        "service RemoteSvc {\n    pub def val = 42;\n}",
+    )
+    .unwrap();
+
+    let mut server = NetworkActor::new(NodeType::Server).await.unwrap();
+    let reply = server
+        .handle_command(NetworkCommand::Listen {
+            addr: Address::new("/ip4/127.0.0.1/tcp/0"),
+        })
+        .await;
+
+    let server_addr = match reply {
+        NetworkReply::ListenSuccess { addr } => addr,
+        other => panic!("Expected ListenSuccess, got {:?}", other),
+    };
+
+    let server_peer_id = server.local_peer_id();
+    let full_addr = format!("{}/p2p/{}", server_addr.0, server_peer_id);
+
+    let served_dir = dir_remote.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Ok(NetworkEvent::MessageReceived {
+                msg:
+                    MeerkatMessage::ServiceCodeRequest {
+                        request_id,
+                        path,
+                        reply_to,
+                    },
+                ..
+            }) = server.event_rx.try_recv()
+            {
+                let response = codec::serve_service_code(request_id, path, &reply_to, &served_dir);
+                server
+                    .handle_command(NetworkCommand::SendMessage {
+                        addr: Address::new(&reply_to),
+                        msg: response,
+                    })
+                    .await;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    });
+
+    let dir_local = unique_test_dir("local_svc_dir");
+    let main_file = dir_local.join("main.mkt");
+    std::fs::write(
+        &main_file,
+        "import RemoteSvc\nservice MainSvc {\n    pub def res = RemoteSvc.val;\n}",
+    )
+    .unwrap();
+
+    let mut remote_url_map = HashMap::new();
+    remote_url_map.insert("RemoteSvc".to_string(), full_addr);
+
+    let mut node = Node::new();
+    let file_str = main_file.to_str().unwrap();
+
+    let res = node
+        .resolve_imports(file_str, remote_url_map)
+        .await
+        .expect("resolve_imports failed")
+        .static_checks();
+    assert!(res.is_ok(), "static_checks failed: {:?}", res);
+}

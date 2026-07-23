@@ -177,7 +177,10 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
 
             // Perform static validation checks on the parsed program
             // statements before executing or starting the server
-            node.run_static_checks_for_file(file, &remote_url_map)
+            node.resolve_imports(file, remote_url_map.clone())
+                .await
+                .map_err(|e| format!("Import error: {}", e))?
+                .static_checks()
                 .map_err(|e| format!("Static check error: {}", e))?;
 
             // This mode must appear before `server` args check in

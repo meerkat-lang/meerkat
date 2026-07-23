@@ -106,6 +106,174 @@ impl<'a> Node<'a> {
     ///   `remote_url_map` (`HashMap<String, String>`): Remote URLs
     ///   `identity` (`Option<Keypair>`): Optional network identity
     ///
+    /// Initialize a server network actor listening on IP loopback
+    ///
+    /// Args:
+    ///   `identity` (`Option<Keypair>`): Keypair for stable Peer ID
+    ///
+    /// Returns:
+    ///   `Result<(NetworkActor, String)>`: Active actor and multiaddress
+    ///
+    /// Errors:
+    ///   `Error`: If network creation or listener command fails
+    /// Initialize a server network actor listening on IP loopback
+    ///
+    /// Args:
+    ///   `identity` (`Option<Keypair>`): Keypair for stable Peer ID
+    ///
+    /// Returns:
+    ///   `Result<(NetworkActor, String)>`: Active actor and multiaddress
+    ///
+    /// Errors:
+    ///   `Error`: If network creation or listener command fails
+    async fn init_network(&mut self, identity: Option<Keypair>) -> Result<(NetworkActor, String)> {
+        let mut net = NetworkActor::new_with_identity(NodeType::Server, identity)
+            .await
+            .map_err(|e| Error::Message(e.to_string()))?;
+
+        let peer_id = net.local_peer_id();
+        let listen_cmd = NetworkCommand::Listen {
+            addr: Address::new("/ip4/127.0.0.1/tcp/0"),
+        };
+        let reply = net.handle_command(listen_cmd).await;
+        let my_addr = match reply {
+            NetworkReply::ListenSuccess { addr } => format!("{}/p2p/{}", addr.0, peer_id),
+            NetworkReply::Failure(e) => {
+                return Err(Error::Message(format!("Failed to listen: {}", e)));
+            }
+            NetworkReply::MessageSent { .. } | NetworkReply::LocalAddresses { .. } => {
+                return Err(Error::Message(
+                    "Unexpected reply from Listen command".to_string(),
+                ));
+            }
+        };
+
+        Ok((net, my_addr))
+    }
+
+    /// Resolve local disk service imports into AST statements
+    ///
+    /// Args:
+    ///   `base_ast` (`&[Stmt]`): Root program statements
+    ///   `base_dir` (`&Path`): Directory containing local files
+    ///
+    /// Returns:
+    ///   `Result<Vec<Stmt>>`: Imported AST statements
+    ///
+    /// Errors:
+    ///   `Error`: If local file reading or parsing fails
+    fn resolve_local_imports(&mut self, base_ast: &[Stmt], base_dir: &Path) -> Result<Vec<Stmt>> {
+        let (imports, _) =
+            Imports::new(&mut self.interner, HashMap::new(), base_ast, base_dir, "")?;
+        Ok(imports.finalize())
+    }
+
+    /// Drive P2P network import resolution loop over an active network actor
+    ///
+    /// Args:
+    ///   `base_ast` (`&[Stmt]`): Root program statements
+    ///   `base_dir` (`&Path`): Directory containing local files
+    ///   `remote_url_map` (`HashMap<String, String>`): Service URL map
+    ///   `my_addr` (`&str`): Canonical listening multiaddress
+    ///   `net` (`&mut NetworkActor`): Active network actor
+    ///
+    /// Returns:
+    ///   `Result<(Vec<Stmt>, Vec<NetworkEvent>)>`: Imported statements and events
+    ///
+    /// Errors:
+    ///   `Error`: If network fetching or parsing fails
+    async fn fetch_network_imports(
+        &mut self,
+        base_ast: &[Stmt],
+        base_dir: &Path,
+        remote_url_map: HashMap<String, String>,
+        my_addr: &str,
+        net: &mut NetworkActor,
+    ) -> Result<(Vec<Stmt>, Vec<NetworkEvent>)> {
+        let (mut imports, initial_cmds) = Imports::new(
+            &mut self.interner,
+            remote_url_map,
+            base_ast,
+            base_dir,
+            my_addr,
+        )?;
+
+        let mut buffered_events = Vec::new();
+
+        for (cmd, service_name, target_url) in initial_cmds {
+            Self::send_and_register(net, &mut imports, cmd, service_name, target_url).await?;
+        }
+
+        while !imports.is_done() {
+            if let Some(event) = net.try_recv_event() {
+                match event {
+                    NetworkEvent::MessageReceived { peer, msg } => match msg {
+                        MeerkatMessage::ServiceCodeResponse { source, path, .. } => {
+                            let service_name = path.strip_suffix(".mkt").unwrap_or(&path);
+                            let new_cmds =
+                                imports.on_recv_source(&source, service_name, base_dir)?;
+                            for (cmd, s_name, t_url) in new_cmds {
+                                Self::send_and_register(net, &mut imports, cmd, s_name, t_url)
+                                    .await?;
+                            }
+                        }
+                        MeerkatMessage::ServiceCodeRequest {
+                            request_id,
+                            path,
+                            reply_to,
+                        } => {
+                            let response =
+                                codec::serve_service_code(request_id, path, &reply_to, base_dir);
+                            net.handle_command(NetworkCommand::SendMessage {
+                                addr: Address::new(&reply_to),
+                                msg: response,
+                            })
+                            .await;
+                        }
+                        MeerkatMessage::ServiceCodeError {
+                            request_id: _,
+                            error,
+                        } => {
+                            return Err(Error::Message(format!(
+                                "Remote peer returned service error: {}",
+                                error
+                            )));
+                        }
+                        _ => {
+                            buffered_events.push(NetworkEvent::MessageReceived { peer, msg });
+                        }
+                    },
+                    NetworkEvent::SendFailed { msg_id, error: _ } => {
+                        if let Some((cmd, s_name, t_url)) = imports.on_send_failure(msg_id)? {
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                IMPORT_RETRY_DELAY_MS,
+                            ))
+                            .await;
+                            Self::send_and_register(net, &mut imports, cmd, s_name, t_url).await?;
+                        }
+                    }
+                    NetworkEvent::PeerConnected { peer: _ } => {
+                        buffered_events.push(event);
+                    }
+                    NetworkEvent::PeerDisconnected { peer: _ } => {
+                        buffered_events.push(event);
+                    }
+                }
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(IMPORT_POLL_INTERVAL_MS)).await;
+            }
+        }
+
+        Ok((imports.finalize(), buffered_events))
+    }
+
+    /// Orchestrates the network boot sequence and resolves imports
+    ///
+    /// Args:
+    ///   `file` (`&str`): Root program `.mkt` file path
+    ///   `remote_url_map` (`HashMap<String, String>`): Remote URLs
+    ///   `identity` (`Option<Keypair>`): Optional network identity
+    ///
     /// Returns:
     ///   `Result<(Option<NetworkActor>, Vec<NetworkEvent>, Vec<Stmt>)>`:
     ///   Tuple of network actor, buffered events, and local program
@@ -113,7 +281,7 @@ impl<'a> Node<'a> {
     /// Errors:
     ///   `Error`: If dependency fetching or static checks fail
     pub async fn on_node_startup(
-        &'a mut self,
+        &mut self,
         file: &str,
         remote_url_map: HashMap<String, String>,
         identity: Option<Keypair>,
@@ -122,120 +290,60 @@ impl<'a> Node<'a> {
         let base_dir = Path::new(file).parent().unwrap_or_else(|| Path::new("."));
 
         let mut opt_net = None;
-        let mut my_addr = String::new();
-
-        if (!remote_url_map.is_empty()) || (identity.is_some()) {
-            let mut net = NetworkActor::new_with_identity(NodeType::Server, identity)
-                .await
-                .map_err(|e| Error::Message(e.to_string()))?;
-
-            let peer_id = net.local_peer_id();
-            let listen_cmd = NetworkCommand::Listen {
-                addr: Address::new("/ip4/127.0.0.1/tcp/0"),
-            };
-            let reply = net.handle_command(listen_cmd).await;
-            match reply {
-                NetworkReply::ListenSuccess { addr } => {
-                    my_addr = format!("{}/p2p/{}", addr.0, peer_id);
-                }
-                NetworkReply::Failure(e) => {
-                    return Err(Error::Message(format!("Failed to listen: {}", e)));
-                }
-                NetworkReply::MessageSent { .. } | NetworkReply::LocalAddresses { .. } => {
-                    return Err(Error::Message(
-                        "Unexpected reply from Listen command".to_string(),
-                    ));
-                }
-            }
-            opt_net = Some(net);
-        }
-
-        let (mut imports, initial_cmds) = Imports::new(
-            &mut self.interner,
-            remote_url_map,
-            &local_prog,
-            base_dir,
-            &my_addr,
-        )?;
-
         let mut buffered_events = Vec::new();
 
-        if let Some(net) = opt_net.as_mut() {
-            for (cmd, service_name, target_url) in initial_cmds {
-                Self::send_and_register(net, &mut imports, cmd, service_name, target_url).await?;
-            }
+        let imported_ast = if (!remote_url_map.is_empty()) || (identity.is_some()) {
+            let (mut net, my_addr) = self.init_network(identity).await?;
+            let (stmts, events) = self
+                .fetch_network_imports(&local_prog, base_dir, remote_url_map, &my_addr, &mut net)
+                .await?;
+            opt_net = Some(net);
+            buffered_events = events;
+            stmts
+        } else {
+            self.resolve_local_imports(&local_prog, base_dir)?
+        };
 
-            while !imports.is_done() {
-                if let Some(event) = net.try_recv_event() {
-                    match event {
-                        NetworkEvent::MessageReceived { peer, msg } => match msg {
-                            MeerkatMessage::ServiceCodeResponse { source, path, .. } => {
-                                let service_name = path.strip_suffix(".mkt").unwrap_or(&path);
-                                let new_cmds =
-                                    imports.on_recv_source(&source, service_name, base_dir)?;
-                                for (cmd, s_name, t_url) in new_cmds {
-                                    Self::send_and_register(net, &mut imports, cmd, s_name, t_url)
-                                        .await?;
-                                }
-                            }
-                            MeerkatMessage::ServiceCodeRequest {
-                                request_id,
-                                path,
-                                reply_to,
-                            } => {
-                                let response = codec::serve_service_code(
-                                    request_id, path, &reply_to, base_dir,
-                                );
-                                net.handle_command(NetworkCommand::SendMessage {
-                                    addr: Address::new(&reply_to),
-                                    msg: response,
-                                })
-                                .await;
-                            }
-                            MeerkatMessage::ServiceCodeError {
-                                request_id: _,
-                                error,
-                            } => {
-                                return Err(Error::Message(format!(
-                                    "Remote peer returned service error: {}",
-                                    error
-                                )));
-                            }
-                            _ => {
-                                buffered_events.push(NetworkEvent::MessageReceived { peer, msg });
-                            }
-                        },
-                        NetworkEvent::SendFailed { msg_id, error: _ } => {
-                            if let Some((cmd, s_name, t_url)) = imports.on_send_failure(msg_id)? {
-                                tokio::time::sleep(std::time::Duration::from_millis(
-                                    IMPORT_RETRY_DELAY_MS,
-                                ))
-                                .await;
-                                Self::send_and_register(net, &mut imports, cmd, s_name, t_url)
-                                    .await?;
-                            }
-                        }
-                        NetworkEvent::PeerConnected { peer: _ } => {
-                            buffered_events.push(event);
-                        }
-                        NetworkEvent::PeerDisconnected { peer: _ } => {
-                            buffered_events.push(event);
-                        }
-                    }
-                } else {
-                    tokio::time::sleep(std::time::Duration::from_millis(IMPORT_POLL_INTERVAL_MS))
-                        .await;
-                }
-            }
-        }
-
-        let import_ast = imports.finalize();
         self.unified_ast = local_prog.clone();
-        self.unified_ast.extend(import_ast);
+        self.unified_ast.extend(imported_ast);
 
         self.static_checks()?;
 
         Ok((opt_net, buffered_events, local_prog))
+    }
+
+    /// Resolve local disk and remote P2P dependencies into unified AST
+    ///
+    /// Args:
+    ///   `file` (`&str`): Root program entrypoint path
+    ///   `remote_url_map` (`HashMap<String, String>`): Service map
+    ///
+    /// Returns:
+    ///   `Result<&mut Self>`: Reference to Self for method chaining
+    ///
+    /// Errors:
+    ///   `Error`: If local reading or P2P import fetching fails
+    pub async fn resolve_imports(
+        &mut self,
+        file: &str,
+        remote_url_map: HashMap<String, String>,
+    ) -> Result<&mut Self> {
+        let local_prog = self.load_file(file)?;
+        let base_dir = Path::new(file).parent().unwrap_or_else(|| Path::new("."));
+
+        let imported_ast = if remote_url_map.is_empty() {
+            self.resolve_local_imports(&local_prog, base_dir)?
+        } else {
+            let (mut net, my_addr) = self.init_network(None).await?;
+            let (stmts, _events) = self
+                .fetch_network_imports(&local_prog, base_dir, remote_url_map, &my_addr, &mut net)
+                .await?;
+            stmts
+        };
+
+        self.unified_ast = local_prog;
+        self.unified_ast.extend(imported_ast);
+        Ok(self)
     }
 
     /// Print Service URLs for all hosted services
@@ -394,11 +502,11 @@ impl<'a> Node<'a> {
     ///
     /// Errors:
     ///   `Error`: If name resolution or type checking fails
-    /// Perform static analysis checks on a root program file, resolving
-    /// local disk imports into unified_ast prior to running checks
+    /// Perform static analysis checks on a root program entrypoint,
+    /// resolving local disk and remote P2P imports prior to checks
     ///
     /// Args:
-    ///   `file` (`&str`): Root program file path
+    ///   `file` (`&str`): Root program entrypoint path
     ///   `remote_url_map` (`&HashMap<String, String>`): Service map
     ///
     /// Returns:
@@ -406,24 +514,15 @@ impl<'a> Node<'a> {
     ///
     /// Errors:
     ///   `Error`: If parsing, import resolution, or static checks fail
-    pub fn run_static_checks_for_file(
+    pub async fn run_static_checks_with_imports(
         &mut self,
         file: &str,
         remote_url_map: &HashMap<String, String>,
     ) -> Result<()> {
-        let local_prog = self.load_file(file)?;
-        let base_dir = Path::new(file).parent().unwrap_or_else(|| Path::new("."));
-        let (imports, _) = Imports::new(
-            &mut self.interner,
-            remote_url_map.clone(),
-            &local_prog,
-            base_dir,
-            "",
-        )?;
-        let imported_ast = imports.finalize();
-        self.unified_ast = local_prog;
-        self.unified_ast.extend(imported_ast);
-        self.static_checks()
+        let _ = self
+            .on_node_startup(file, remote_url_map.clone(), None)
+            .await?;
+        Ok(())
     }
 
     pub fn run_static_checks(&mut self, program: &'a [Stmt]) -> Result<()> {

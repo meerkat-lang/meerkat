@@ -216,10 +216,20 @@ fn test_imports_pending_cleanup() {
     let msg2 = MessageId(102);
 
     // Register initial request
-    imports.register_sent_command(msg1, "B".to_string(), "/ip4/127.0.0.1/tcp/9000".to_string());
+    imports.register_sent_command(
+        msg1,
+        "B".to_string(),
+        "/ip4/127.0.0.1/tcp/9000".to_string(),
+        0,
+    );
 
     // Register retry request for same service; msg1 should be pruned
-    imports.register_sent_command(msg2, "B".to_string(), "/ip4/127.0.0.1/tcp/9000".to_string());
+    imports.register_sent_command(
+        msg2,
+        "B".to_string(),
+        "/ip4/127.0.0.1/tcp/9000".to_string(),
+        1,
+    );
 
     // Receive source for B; should remove pending entries for B
     let remote_source = "service B {\n    pub def count = 100;\n}";

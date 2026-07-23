@@ -1,0 +1,57 @@
+{
+  "settings": {
+    "startup_timeout": 60.0,
+    "monitor_poll_interval": 0.25,
+    "terminate_timeout": 5.0
+  },
+  "nodes": [
+    {
+      "alias": "N1",
+      "type": "server",
+      "file": "scripts/tests/integration/imports/dense_mesh/N1.mkt",
+      "port": 9410
+    },
+    {
+      "alias": "N2",
+      "type": "server",
+      "file": "scripts/tests/integration/imports/dense_mesh/N2.mkt",
+      "port": 9420,
+      "imports": ["N1.N1"]
+    },
+    {
+      "alias": "N3",
+      "type": "server",
+      "file": "scripts/tests/integration/imports/dense_mesh/N3.mkt",
+      "port": 9430,
+      "imports": ["N1.N1", "N2.N2"]
+    },
+    {
+      "alias": "N4",
+      "type": "server",
+      "file": "scripts/tests/integration/imports/dense_mesh/N4.mkt",
+      "port": 9440,
+      "imports": ["N1.N1", "N2.N2", "N3.N3"]
+    },
+    {
+      "alias": "N5",
+      "type": "server",
+      "file": "scripts/tests/integration/imports/dense_mesh/N5.mkt",
+      "port": 9450,
+      "imports": ["N1.N1", "N2.N2", "N3.N3", "N4.N4"]
+    },
+    {
+      "alias": "N6",
+      "type": "server",
+      "file": "scripts/tests/integration/imports/dense_mesh/N6.mkt",
+      "port": 9460,
+      "imports": ["N1.N1", "N2.N2", "N3.N3", "N4.N4", "N5.N5"]
+    },
+    {
+      "alias": "dense_mesh_client",
+      "type": "client",
+      "file": "scripts/tests/integration/imports/dense_mesh/client.mkt",
+      "timeout": 45,
+      "imports": ["N1.N1", "N2.N2", "N3.N3", "N4.N4", "N5.N5", "N6.N6"]
+    }
+  ]
+}

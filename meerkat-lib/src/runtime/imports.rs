@@ -11,7 +11,7 @@ use crate::net::types::MeerkatMessage;
 use crate::net::{Address, MessageId, NetworkCommand};
 use crate::runtime::ast::Stmt;
 use crate::runtime::interner::{Interner, Symbol};
-use crate::runtime::limits::MAX_IMPORT_TIMEOUT_SECS;
+use crate::runtime::limits::{INDIVIDUAL_IMPORT_TIMEOUT_SECS, MAX_IMPORT_RETRIES};
 use crate::runtime::parser;
 
 /// Request tracking info for optimistic retries
@@ -21,12 +21,15 @@ pub struct PendingRequest {
     pub service_name: String,
     /// Target network URL of the peer
     pub target_url: String,
-    /// Instant when the initial request was sent
+    /// Instant when the request was sent
     pub start_time: Instant,
+    /// Number of retry attempts made so far
+    pub retry_count: u8,
 }
 
-/// Tuple representing a pending import command, target service name, and URL
-pub type ImportCommand = (NetworkCommand, String, String);
+/// Tuple representing a pending import command, target service name,
+/// URL, and retry attempt count
+pub type ImportCommand = (NetworkCommand, String, String, u8);
 
 /// State machine for resolving module import dependencies
 pub struct Imports<'a> {
@@ -34,7 +37,6 @@ pub struct Imports<'a> {
     visited_services: HashSet<Symbol>,
     pending_network: HashMap<MessageId, PendingRequest>,
     pending_services: HashSet<String>,
-    service_start_times: HashMap<String, Instant>,
     remote_url_map: HashMap<String, String>,
     accumulated_ast: Vec<Stmt>,
     request_counter: u64,
@@ -78,7 +80,6 @@ impl<'a> Imports<'a> {
             visited_services,
             pending_network: HashMap::new(),
             pending_services: HashSet::new(),
-            service_start_times: HashMap::new(),
             remote_url_map,
             accumulated_ast: Vec::new(),
             request_counter: 0,
@@ -113,18 +114,14 @@ impl<'a> Imports<'a> {
     ///   `msg_id` (`MessageId`): Message ID returned by network actor
     ///   `service_name` (`String`): Service name requested
     ///   `target_url` (`String`): Peer target URL
+    ///   `retry_count` (`u8`): Current retry attempt count
     pub fn register_sent_command(
         &mut self,
         msg_id: MessageId,
         service_name: String,
         target_url: String,
+        retry_count: u8,
     ) {
-        // Retain initial start time across retries for cumulative timeout
-        let start_time = *self
-            .service_start_times
-            .entry(service_name.clone())
-            .or_insert_with(Instant::now);
-
         // Remove prior pending entries for the same service to prevent leaks
         self.pending_network
             .retain(|_, req| req.service_name != service_name);
@@ -134,7 +131,8 @@ impl<'a> Imports<'a> {
             PendingRequest {
                 service_name,
                 target_url,
-                start_time,
+                start_time: Instant::now(),
+                retry_count,
             },
         );
 
@@ -166,7 +164,6 @@ impl<'a> Imports<'a> {
         base_dir: &Path,
     ) -> Result<Vec<ImportCommand>> {
         self.pending_services.remove(service_name);
-        self.service_start_times.remove(service_name);
         self.pending_network
             .retain(|_, req| req.service_name != service_name);
 
@@ -212,7 +209,7 @@ impl<'a> Imports<'a> {
     ///   `Result<Option<ImportCommand>>`: Retry command
     ///
     /// Errors:
-    ///   `Error`: If timeout limit has been exceeded
+    ///   `Error`: If retry limit has been exceeded
     pub fn on_send_failure(&mut self, failed_msg_id: MessageId) -> Result<Option<ImportCommand>> {
         let pending = match self.pending_network.remove(&failed_msg_id) {
             Some(p) => p,
@@ -224,11 +221,11 @@ impl<'a> Imports<'a> {
             return Ok(None);
         }
 
-        let elapsed = pending.start_time.elapsed().as_secs();
-        if elapsed >= MAX_IMPORT_TIMEOUT_SECS {
+        let new_retry_count = pending.retry_count + 1;
+        if new_retry_count > MAX_IMPORT_RETRIES {
             return Err(Error::Message(format!(
-                "Import fetch timed out for service '{}' after {}s",
-                pending.service_name, elapsed
+                "Import fetch failed for service '{}' after {} retries",
+                pending.service_name, MAX_IMPORT_RETRIES
             )));
         }
 
@@ -245,7 +242,52 @@ impl<'a> Imports<'a> {
             msg,
         };
 
-        Ok(Some((cmd, pending.service_name, pending.target_url)))
+        Ok(Some((
+            cmd,
+            pending.service_name,
+            pending.target_url,
+            new_retry_count,
+        )))
+    }
+
+    /// Poll for pending requests that have timed out and need retrying
+    ///
+    /// Returns:
+    ///   `Result<Vec<ImportCommand>>`: Retry commands for timed out requests
+    ///
+    /// Errors:
+    ///   `Error`: If retry limit has been exceeded for any request
+    pub fn poll_timeouts(&mut self) -> Result<Vec<ImportCommand>> {
+        let mut to_retry = Vec::new();
+        let mut failed_service = None;
+
+        for (msg_id, pending) in &self.pending_network {
+            let elapsed = pending.start_time.elapsed().as_secs();
+            if elapsed >= INDIVIDUAL_IMPORT_TIMEOUT_SECS {
+                let next_retry = pending.retry_count + 1;
+                if next_retry > MAX_IMPORT_RETRIES {
+                    failed_service = Some((pending.service_name.clone(), MAX_IMPORT_RETRIES));
+                    break;
+                }
+                to_retry.push(*msg_id);
+            }
+        }
+
+        if let Some((svc, max_retries)) = failed_service {
+            return Err(Error::Message(format!(
+                "Import fetch failed for service '{}' after {} retries",
+                svc, max_retries
+            )));
+        }
+
+        let mut retry_cmds = Vec::new();
+        for msg_id in to_retry {
+            if let Some(cmd) = self.on_send_failure(msg_id)? {
+                retry_cmds.push(cmd);
+            }
+        }
+
+        Ok(retry_cmds)
     }
 
     /// Check if all pending import dependencies are resolved
@@ -254,6 +296,10 @@ impl<'a> Imports<'a> {
     ///   `bool`: True if no pending services remain
     pub fn is_done(&self) -> bool {
         self.pending_services.is_empty()
+    }
+
+    pub fn get_pending_services(&self) -> Vec<String> {
+        self.pending_services.iter().cloned().collect()
     }
 
     /// Consumes the Imports state machine and returns resolved AST
@@ -292,7 +338,7 @@ impl<'a> Imports<'a> {
                     addr: Address::new(target_url.as_str()),
                     msg,
                 };
-                return Ok(vec![(cmd, service_name, target_url)]);
+                return Ok(vec![(cmd, service_name, target_url, 0)]);
             }
         }
 

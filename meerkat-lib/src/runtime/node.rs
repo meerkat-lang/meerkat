@@ -20,9 +20,7 @@ use crate::net::{
 use crate::runtime::ast::Stmt;
 use crate::runtime::imports::Imports;
 use crate::runtime::interner::Interner;
-use crate::runtime::limits::{
-    IMPORT_POLL_INTERVAL_MS, IMPORT_RETRY_DELAY_MS, MAX_IMPORT_TIMEOUT_SECS,
-};
+use crate::runtime::limits::{IMPORT_POLL_INTERVAL_MS, IMPORT_RETRY_DELAY_MS};
 use crate::runtime::tt::types::ServiceType;
 use crate::runtime::{nameres, tt, Env, Manager};
 
@@ -116,11 +114,12 @@ impl<'a> Node<'a> {
         cmd: NetworkCommand,
         service_name: String,
         target_url: String,
+        retry_count: u8,
     ) -> Result<()> {
         match cmd {
             NetworkCommand::SendMessage { addr, msg } => {
                 let msg_id = Self::send_message(net, addr, msg).await?;
-                imports.register_sent_command(msg_id, service_name, target_url);
+                imports.register_sent_command(msg_id, service_name, target_url, retry_count);
                 Ok(())
             }
             _ => Err(Error::Message(
@@ -230,19 +229,19 @@ impl<'a> Node<'a> {
 
         let mut buffered_events = Vec::new();
 
-        for (cmd, service_name, target_url) in initial_cmds {
-            Self::send_and_register(net, &mut imports, cmd, service_name, target_url).await?;
+        for (cmd, service_name, target_url, retry_count) in initial_cmds {
+            Self::send_and_register(
+                net,
+                &mut imports,
+                cmd,
+                service_name,
+                target_url,
+                retry_count,
+            )
+            .await?;
         }
 
-        let start_time = std::time::Instant::now();
-
         while !imports.is_done() {
-            if start_time.elapsed().as_secs() >= MAX_IMPORT_TIMEOUT_SECS {
-                return Err(Error::Message(format!(
-                    "Import resolution timed out after {}s",
-                    MAX_IMPORT_TIMEOUT_SECS
-                )));
-            }
             if let Some(event) = net.try_recv_event() {
                 match event {
                     NetworkEvent::MessageReceived { peer, msg } => match msg {
@@ -250,9 +249,16 @@ impl<'a> Node<'a> {
                             let service_name = path.strip_suffix(".mkt").unwrap_or(&path);
                             let new_cmds =
                                 imports.on_recv_source(&source, service_name, base_dir)?;
-                            for (cmd, s_name, t_url) in new_cmds {
-                                Self::send_and_register(net, &mut imports, cmd, s_name, t_url)
-                                    .await?;
+                            for (cmd, s_name, t_url, retry) in new_cmds {
+                                Self::send_and_register(
+                                    net,
+                                    &mut imports,
+                                    cmd,
+                                    s_name,
+                                    t_url,
+                                    retry,
+                                )
+                                .await?;
                             }
                         }
                         MeerkatMessage::ServiceCodeRequest {
@@ -278,12 +284,15 @@ impl<'a> Node<'a> {
                         }
                     },
                     NetworkEvent::SendFailed { msg_id, error: _ } => {
-                        if let Some((cmd, s_name, t_url)) = imports.on_send_failure(msg_id)? {
+                        if let Some((cmd, s_name, t_url, retry)) =
+                            imports.on_send_failure(msg_id)?
+                        {
                             tokio::time::sleep(std::time::Duration::from_millis(
                                 IMPORT_RETRY_DELAY_MS,
                             ))
                             .await;
-                            Self::send_and_register(net, &mut imports, cmd, s_name, t_url).await?;
+                            Self::send_and_register(net, &mut imports, cmd, s_name, t_url, retry)
+                                .await?;
                         }
                     }
                     NetworkEvent::PeerConnected { peer: _ } => {
@@ -294,6 +303,10 @@ impl<'a> Node<'a> {
                     }
                 }
             } else {
+                let retry_cmds = imports.poll_timeouts()?;
+                for (cmd, s_name, t_url, retry) in retry_cmds {
+                    Self::send_and_register(net, &mut imports, cmd, s_name, t_url, retry).await?;
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(IMPORT_POLL_INTERVAL_MS)).await;
             }
         }

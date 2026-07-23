@@ -452,7 +452,13 @@ impl NetworkActor {
         };
 
         if swarm.is_connected(&peer_id) {
-            Self::send_to_peer(control, peer_id, msg_id, msg, event_tx).await;
+            let mut control_clone = control.clone();
+            let event_tx_clone = event_tx.clone();
+            // Spawn stream negotiation in a background task to prevent blocking the
+            // NetworkActor event loop during high-contention requests.
+            spawn_event_loop(async move {
+                Self::send_to_peer(&mut control_clone, peer_id, msg_id, msg, &event_tx_clone).await;
+            });
         } else {
             // Track if we are already dialing this `peer_id` inside `pending_sends` to prevent duplicate dials
             let is_dialing = pending_sends.contains_key(&peer_id);
@@ -462,8 +468,13 @@ impl NetworkActor {
                 .push((msg_id, msg));
 
             if !is_dialing {
-                // Call `swarm.dial` for the target peer since no active dial request exists
-                if let Err(e) = swarm.dial(multiaddr) {
+                // Call `swarm.dial` with explicit DialOpts to inject the `peer_id`.
+                // If the dial fails asynchronously, this guarantees the OutgoingConnectionError
+                // will include the peer_id so we can clean up `pending_sends` and emit SendFailed.
+                let dial_opts = libp2p::swarm::dial_opts::DialOpts::peer_id(peer_id)
+                    .addresses(vec![multiaddr])
+                    .build();
+                if let Err(e) = swarm.dial(dial_opts) {
                     let _ = event_tx.send(NetworkEvent::SendFailed {
                         msg_id,
                         error: SendError::ProtocolError(format!("Dial failed: {:?}", e)),
@@ -614,10 +625,23 @@ impl NetworkActor {
                     }
                 }
 
-                // Send any queued messages in `pending_sends` waiting for connection establishment
+                // Send any queued messages in `pending_sends` waiting for connection establishment.
+                // Each message is multiplexed concurrently in its own background task to avoid
+                // blocking the event loop on stream negotiation.
                 if let Some(messages) = pending_sends.remove(&peer_id) {
                     for (msg_id, msg) in messages {
-                        Self::send_to_peer(control, peer_id, msg_id, msg, event_tx).await;
+                        let mut control_clone = control.clone();
+                        let event_tx_clone = event_tx.clone();
+                        spawn_event_loop(async move {
+                            Self::send_to_peer(
+                                &mut control_clone,
+                                peer_id,
+                                msg_id,
+                                msg,
+                                &event_tx_clone,
+                            )
+                            .await;
+                        });
                     }
                 }
             }

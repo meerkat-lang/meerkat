@@ -488,6 +488,7 @@ def integration_tests():
         ("microservices_dag",         make_mkn_test(f"{IDIR}/imports/microservices/microservices.json")),
         ("transitive_pipeline",       make_mkn_test(f"{IDIR}/imports/pipeline/pipeline.json")),
         ("diamond_topology",          make_mkn_test(f"{IDIR}/imports/diamond/diamond.json")),
+        ("dense_mesh",                make_mkn_test(f"{IDIR}/imports/dense_mesh/dense_mesh.json")),
         ("action_cross_node",         make_mkn_test(f"{IDIR}/imports/action/action.json")),
         ("file_imports",              make_mkn_test(f"{IDIR}/imports/file_imports/file_imports.json")),
         ("mixed_imports",             make_mkn_test(f"{IDIR}/imports/mixed_imports/mixed_imports.json")),

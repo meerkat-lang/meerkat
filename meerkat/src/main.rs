@@ -885,7 +885,7 @@ async fn run_server(
                 } => {
                     let response = codec::serve_service_code(
                         request_id,
-                        path,
+                        path.clone(),
                         &reply_to,
                         &served_base_dir,
                     );

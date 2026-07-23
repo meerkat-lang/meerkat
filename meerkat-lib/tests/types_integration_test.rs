@@ -937,7 +937,7 @@ fn test_cross_service_type_mismatch_errors() {
 }
 
 /// Verify that mutual cyclic member access across imported services
-/// produces a static type error (`CannotInferType`)
+/// produces a static type error (`DependencyCycle`)
 #[test]
 fn test_cross_service_member_cycle_errors() {
     let input = "

@@ -186,3 +186,51 @@ fn test_imports_network_cycle_static_check_rejection() {
     let err_msg = res.expect_err("expected static check error").to_string();
     assert!(err_msg.contains("dependency cycle detected"));
 }
+
+/// Test that pending network entries are pruned on retry and when
+/// source code is received, and stale send failures are ignored
+#[test]
+fn test_imports_pending_cleanup() {
+    use meerkat_lib::net::MessageId;
+
+    let mut interner = Interner::new();
+    let sym_b = interner.insert("B");
+    let base_ast = vec![Stmt::Import {
+        path: "B.mkt".to_string(),
+        service_name: sym_b,
+    }];
+
+    let mut remote_map = HashMap::new();
+    remote_map.insert("B".to_string(), "/ip4/127.0.0.1/tcp/9000".to_string());
+
+    let (mut imports, _initial_cmds) = Imports::new(
+        &mut interner,
+        remote_map,
+        &base_ast,
+        Path::new(""),
+        "/ip4/127.0.0.1/tcp/8000/p2p/peer_a",
+    )
+    .expect("Imports::new success");
+
+    let msg1 = MessageId(101);
+    let msg2 = MessageId(102);
+
+    // Register initial request
+    imports.register_sent_command(msg1, "B".to_string(), "/ip4/127.0.0.1/tcp/9000".to_string());
+
+    // Register retry request for same service; msg1 should be pruned
+    imports.register_sent_command(msg2, "B".to_string(), "/ip4/127.0.0.1/tcp/9000".to_string());
+
+    // Receive source for B; should remove pending entries for B
+    let remote_source = "service B {\n    pub def count = 100;\n}";
+    let _ = imports
+        .on_recv_source(remote_source, "B", Path::new(""))
+        .expect("on_recv_source success");
+
+    // Stale failure notifications for completed service yield None
+    let retry1 = imports.on_send_failure(msg1).expect("on_send_failure ok");
+    assert!(retry1.is_none());
+
+    let retry2 = imports.on_send_failure(msg2).expect("on_send_failure ok");
+    assert!(retry2.is_none());
+}

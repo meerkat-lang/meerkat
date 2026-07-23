@@ -11,6 +11,7 @@ use crate::net::types::MeerkatMessage;
 use crate::net::{Address, MessageId, NetworkCommand};
 use crate::runtime::ast::Stmt;
 use crate::runtime::interner::{Interner, Symbol};
+use crate::runtime::limits::MAX_IMPORT_TIMEOUT_SECS;
 use crate::runtime::parser;
 
 /// Request tracking info for optimistic retries
@@ -33,6 +34,7 @@ pub struct Imports<'a> {
     visited_services: HashSet<Symbol>,
     pending_network: HashMap<MessageId, PendingRequest>,
     pending_services: HashSet<String>,
+    service_start_times: HashMap<String, Instant>,
     remote_url_map: HashMap<String, String>,
     accumulated_ast: Vec<Stmt>,
     request_counter: u64,
@@ -76,6 +78,7 @@ impl<'a> Imports<'a> {
             visited_services,
             pending_network: HashMap::new(),
             pending_services: HashSet::new(),
+            service_start_times: HashMap::new(),
             remote_url_map,
             accumulated_ast: Vec::new(),
             request_counter: 0,
@@ -116,14 +119,32 @@ impl<'a> Imports<'a> {
         service_name: String,
         target_url: String,
     ) {
+        // Retain initial start time across retries for cumulative timeout
+        let start_time = *self
+            .service_start_times
+            .entry(service_name.clone())
+            .or_insert_with(Instant::now);
+
+        // Remove prior pending entries for the same service to prevent leaks
+        self.pending_network
+            .retain(|_, req| req.service_name != service_name);
+
         self.pending_network.insert(
             msg_id,
             PendingRequest {
                 service_name,
                 target_url,
-                start_time: Instant::now(),
+                start_time,
             },
         );
+
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(
+                self.pending_network.contains_key(&msg_id),
+                "pending_network must contain newly registered message ID"
+            );
+        }
     }
 
     /// Process incoming source code for a service
@@ -145,6 +166,9 @@ impl<'a> Imports<'a> {
         base_dir: &Path,
     ) -> Result<Vec<ImportCommand>> {
         self.pending_services.remove(service_name);
+        self.service_start_times.remove(service_name);
+        self.pending_network
+            .retain(|_, req| req.service_name != service_name);
 
         let parsed_stmts = parser::parse_string(source, self.interner)
             .map_err(|e| Error::Message(e.to_string()))?;
@@ -195,8 +219,13 @@ impl<'a> Imports<'a> {
             None => return Ok(None),
         };
 
+        // If service is no longer pending (already resolved), ignore retry
+        if !self.pending_services.contains(&pending.service_name) {
+            return Ok(None);
+        }
+
         let elapsed = pending.start_time.elapsed().as_secs();
-        if elapsed >= 10 {
+        if elapsed >= MAX_IMPORT_TIMEOUT_SECS {
             return Err(Error::Message(format!(
                 "Import fetch timed out for service '{}' after {}s",
                 pending.service_name, elapsed

@@ -20,6 +20,7 @@ use crate::net::{
 use crate::runtime::ast::Stmt;
 use crate::runtime::imports::Imports;
 use crate::runtime::interner::Interner;
+use crate::runtime::limits::{IMPORT_POLL_INTERVAL_MS, IMPORT_RETRY_DELAY_MS};
 use crate::runtime::tt::types::ServiceType;
 use crate::runtime::{nameres, tt, Env, Manager};
 
@@ -206,7 +207,10 @@ impl<'a> Node<'a> {
                         },
                         NetworkEvent::SendFailed { msg_id, error: _ } => {
                             if let Some((cmd, s_name, t_url)) = imports.on_send_failure(msg_id)? {
-                                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    IMPORT_RETRY_DELAY_MS,
+                                ))
+                                .await;
                                 Self::send_and_register(net, &mut imports, cmd, s_name, t_url)
                                     .await?;
                             }
@@ -219,7 +223,8 @@ impl<'a> Node<'a> {
                         }
                     }
                 } else {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(IMPORT_POLL_INTERVAL_MS))
+                        .await;
                 }
             }
         }

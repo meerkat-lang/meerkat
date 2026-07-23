@@ -1,0 +1,16 @@
+// #153: demonstrates triggering an action from the client.
+//
+// This file is expected to FAIL until the client-action design is
+// implemented: `onclick` is not recognised as an event attribute, and an
+// Html value cannot currently carry an action closure.
+//
+// Run the server with s1.mkt, then load this file in the browser client.
+// Clicking the button should run s1.inc_x on the server, which increments x,
+// recomputes s1.y, and pushes an update back so that z re-renders.
+
+import s1
+
+service counter_ui {
+    pub def z = s1.y * 2;
+    pub def html = (<div><p>z = {z}</p><button onclick={s1.inc_x}>increment</button></div>);
+}

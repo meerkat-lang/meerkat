@@ -1181,7 +1181,8 @@ mod tests {
         assert!(resolver.resolve_program(&program, &mut env).is_ok());
     }
 
-    /// Verify testing an imported service is ignored with warning
+    /// Verify testing an imported service resolves when its
+    /// `Stmt::Service` is present in the unified AST
     #[test]
     fn test_unit_test_block_imported_service_resolves() {
         let mut interner = Interner::new();

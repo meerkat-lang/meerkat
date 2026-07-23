@@ -220,16 +220,41 @@ def make_validation_test(filename, expected_error):
     return test
 
 
+def test_empty_expect_fail():
+    """Verify that make_mkn_test rejects empty string expect_fail.
+
+    Returns:
+        bool: True if AssertionError was raised with expected message.
+    """
+    try:
+        make_mkn_test("dummy.json", expect_fail="")
+    except AssertionError as err:
+        if "expect_fail string must not be empty" in str(err):
+            return True
+        print(f"\nFAIL: unexpected AssertionError message: {err}")
+        return False
+    print(
+        "\nFAIL: expected AssertionError for expect_fail='' "
+        "but none was raised."
+    )
+    return False
+
+
 def unit_tests():
     """Return the full list of unit test (name, callable) pairs.
 
     Returns:
         list[tuple[str, callable]]: Unit test pairs.
     """
-    return [
+    tests = [
         (name, make_validation_test(filename, expected_error))
         for name, filename, expected_error in VALIDATION_CASES
     ]
+    tests.append((
+        "empty_expect_fail",
+        test_empty_expect_fail,
+    ))
+    return tests
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +284,10 @@ def make_mkn_test(manifest, expect_fail=False):
     assert expect_fail is not True, (
         "expect_fail=True is ambiguous; pass the expected error substring instead"
     )
+    if isinstance(expect_fail, str):
+        assert len(expect_fail) > 0, (
+            "expect_fail string must not be empty"
+        )
 
     def test():
         if not os.path.isfile(manifest):
@@ -548,4 +577,5 @@ def main():
     sys.exit(0 if total_failed == 0 else 1)
 
 
-main()
+if __name__ == "__main__":
+    main()

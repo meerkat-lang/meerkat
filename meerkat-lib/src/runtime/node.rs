@@ -352,11 +352,42 @@ impl<'a> Node<'a> {
         file: &str,
         remote_url_map: HashMap<String, String>,
     ) -> Result<&mut Self> {
+        self.resolve_imports_with_net(file, remote_url_map, None, None)
+            .await
+    }
+
+    /// Resolve local disk and remote P2P dependencies into unified AST with
+    /// an optional pre-initialized network actor
+    ///
+    /// Args:
+    ///   `file` (`&str`): Root program entrypoint path
+    ///   `remote_url_map` (`HashMap<String, String>`): Service map
+    ///   `provided_net` (`Option<&mut NetworkActor>`): Optional network actor
+    ///   `provided_addr` (`Option<&str>`): Optional bound multiaddress
+    ///
+    /// Returns:
+    ///   `Result<&mut Self>`: Reference to Self for method chaining
+    ///
+    /// Errors:
+    ///   `Error`: If local reading or P2P import fetching fails
+    pub async fn resolve_imports_with_net(
+        &mut self,
+        file: &str,
+        remote_url_map: HashMap<String, String>,
+        provided_net: Option<&mut NetworkActor>,
+        provided_addr: Option<&str>,
+    ) -> Result<&mut Self> {
+        debug_assert!(!file.is_empty(), "file path must not be empty");
         let local_prog = self.load_file(file)?;
         let base_dir = Path::new(file).parent().unwrap_or_else(|| Path::new("."));
 
         let imported_ast = if remote_url_map.is_empty() {
             self.resolve_local_imports(&local_prog, base_dir)?
+        } else if let (Some(net), Some(addr)) = (provided_net, provided_addr) {
+            let (stmts, _events) = self
+                .fetch_network_imports(&local_prog, base_dir, remote_url_map, addr, net)
+                .await?;
+            stmts
         } else {
             let (mut net, my_addr) = self.init_network(None).await?;
             let (stmts, _events) = self

@@ -417,11 +417,26 @@ impl NetworkActor {
         let multiaddr = match addr.0.parse::<Multiaddr>() {
             Ok(m) => m,
             Err(_) => {
-                let _ = event_tx.send(NetworkEvent::SendFailed {
-                    msg_id,
-                    error: SendError::UnreachableAddress(addr),
-                });
-                return;
+                let mut parsed = None;
+                if let Some(pos) = addr.0.rfind("/p2p/") {
+                    let after_p2p = &addr.0[pos + 5..];
+                    if let Some(slash_idx) = after_p2p.find('/') {
+                        let trimmed = &addr.0[..pos + 5 + slash_idx];
+                        if let Ok(m) = trimmed.parse::<Multiaddr>() {
+                            parsed = Some(m);
+                        }
+                    }
+                }
+                match parsed {
+                    Some(m) => m,
+                    None => {
+                        let _ = event_tx.send(NetworkEvent::SendFailed {
+                            msg_id,
+                            error: SendError::UnreachableAddress(addr),
+                        });
+                        return;
+                    }
+                }
             }
         };
 

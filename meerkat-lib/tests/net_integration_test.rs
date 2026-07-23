@@ -126,7 +126,7 @@ async fn test_multiple_messages() {
     let mut client = NetworkActor::new(NodeType::Server).await.unwrap();
 
     for i in 0..5 {
-        client
+        let _ = client
             .handle_command(NetworkCommand::SendMessage {
                 addr: full_addr.clone(),
                 msg: MeerkatMessage::Ping {
@@ -181,7 +181,7 @@ async fn test_mock_send_and_receive() {
     println!("Mock server address: {}", server_addr.0);
 
     // Send from client to server
-    client
+    let _ = client
         .handle_command(NetworkCommand::SendMessage {
             addr: server_addr,
             msg: MeerkatMessage::Ping {
@@ -224,7 +224,7 @@ async fn test_mock_multiple_messages() {
     };
 
     for i in 0..5 {
-        client
+        let _ = client
             .handle_command(NetworkCommand::SendMessage {
                 addr: server_addr.clone(),
                 msg: MeerkatMessage::Ping {
@@ -249,7 +249,7 @@ async fn test_mock_multiple_messages() {
 async fn test_mock_unreachable_address() {
     let mut client = MockNetwork::new();
 
-    client
+    let _ = client
         .handle_command(NetworkCommand::SendMessage {
             addr: Address::new("/ip4/127.0.0.1/tcp/9000/p2p/nonexistent-peer"),
             msg: MeerkatMessage::Ping {
@@ -273,7 +273,7 @@ async fn test_mock_unreachable_address() {
 // ── NetworkLayer trait tests ──────────────────────────────────────────────────
 
 async fn send_ping_via_trait<N: meerkat_lib::net::NetworkLayer>(sender: &mut N, addr: Address) {
-    sender
+    let _ = sender
         .handle_command(NetworkCommand::SendMessage {
             addr,
             msg: MeerkatMessage::Ping {
@@ -424,7 +424,7 @@ async fn test_circuit_relay() {
     // Retry send with a hard 10-second timeout (5 attempts x 10 polls x 100ms)
     let received = tokio::time::timeout(Duration::from_secs(10), async {
         for attempt in 0..5usize {
-            client1
+            let _ = client1
                 .handle_command(NetworkCommand::SendMessage {
                     addr: client2_circuit_addr.clone(),
                     msg: MeerkatMessage::Ping {
@@ -475,7 +475,7 @@ async fn test_circuit_relay() {
         "{}/p2p-circuit/p2p/12D3KooW8Zr3nQ7mL4xK9vJ2pY6sF1gT5hR",
         relay_full_addr.0,
     ));
-    client1
+    let _ = client1
         .handle_command(NetworkCommand::SendMessage {
             addr: fake_peer,
             msg: MeerkatMessage::Ping {
@@ -565,7 +565,7 @@ async fn test_service_code_request_roundtrip() {
     let served_source = "service counter { pub var count = 0; }\nservice other { var z = 1; }";
     std::fs::write(served_dir.join("counter.mkt"), served_source).unwrap();
 
-    client
+    let _ = client
         .handle_command(NetworkCommand::SendMessage {
             addr: server_addr,
             msg: MeerkatMessage::ServiceCodeRequest {
@@ -597,7 +597,7 @@ async fn test_service_code_request_roundtrip() {
     // resolve the path against the base dir, read the file).
     let response = serve_service_code(request_id, path, &reply_to, &served_dir);
 
-    server
+    let _ = server
         .handle_command(NetworkCommand::SendMessage {
             addr: Address::new(&reply_to),
             msg: response,
@@ -655,7 +655,7 @@ async fn test_service_code_request_rejects_oversized_path() {
 
     let oversized_path = "a".repeat(MAX_NET_REQUEST_STRING_LENGTH + 1);
 
-    client
+    let _ = client
         .handle_command(NetworkCommand::SendMessage {
             addr: server_addr,
             msg: MeerkatMessage::ServiceCodeRequest {
@@ -689,7 +689,7 @@ async fn test_service_code_request_rejects_oversized_path() {
     let response = serve_service_code(request_id, path, &reply_to, &served_dir);
     let _ = std::fs::remove_dir_all(&served_dir);
 
-    server
+    let _ = server
         .handle_command(NetworkCommand::SendMessage {
             addr: Address::new(&reply_to),
             msg: response,
@@ -761,7 +761,7 @@ async fn test_lock_request_roundtrip() {
     );
 
     // Send LockRequest from client to server
-    client
+    let _ = client
         .handle_command(NetworkCommand::SendMessage {
             addr: server_addr.clone(),
             msg: MeerkatMessage::LockRequest {
@@ -799,7 +799,7 @@ async fn test_lock_request_roundtrip() {
     assert_eq!(reply_to, client_addr.0);
 
     // Server sends LockResponse back to client
-    server
+    let _ = server
         .handle_command(NetworkCommand::SendMessage {
             addr: Address::new(&reply_to),
             msg: MeerkatMessage::LockResponse {
@@ -879,7 +879,7 @@ async fn test_lock_request_invalid_identifier_rejected_over_network() {
     );
 
     // Send LockRequest from client to server
-    client
+    let _ = client
         .handle_command(NetworkCommand::SendMessage {
             addr: server_addr.clone(),
             msg: MeerkatMessage::LockRequest {
@@ -921,7 +921,7 @@ async fn test_lock_request_invalid_identifier_rejected_over_network() {
             .map(|e| e.to_string()),
     };
 
-    server
+    let _ = server
         .handle_command(NetworkCommand::SendMessage {
             addr: Address::new(&reply_to),
             msg: response,
@@ -1078,7 +1078,7 @@ async fn test_static_checks_remote_imports() {
             }) = server.event_rx.try_recv()
             {
                 let response = codec::serve_service_code(request_id, path, &reply_to, &served_dir);
-                server
+                let _ = server
                     .handle_command(NetworkCommand::SendMessage {
                         addr: Address::new(&reply_to),
                         msg: response,
@@ -1109,4 +1109,22 @@ async fn test_static_checks_remote_imports() {
         .expect("resolve_imports failed")
         .static_checks();
     assert!(res.is_ok(), "static_checks failed: {:?}", res);
+}
+
+/// Verify that receiving NetworkReply::Failure during command execution returns an error.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_service_code_send_fail() {
+    let mut net = NetworkActor::new(NodeType::Server).await.unwrap();
+
+    let reply = net
+        .handle_command(NetworkCommand::ListenViaRelay {
+            relay_addr: Address::new("/ip4/127.0.0.1/tcp/0"),
+        })
+        .await;
+
+    assert!(
+        matches!(reply, NetworkReply::Failure(_)),
+        "Expected NetworkReply::Failure for ListenViaRelay without relay, got {:?}",
+        reply
+    );
 }

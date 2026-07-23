@@ -16,6 +16,7 @@ pub enum NetworkCommand {
 
 /// Reply from Network Actor - single unified enum
 #[derive(Debug, Reply)]
+#[must_use = "network replies contain execution/delivery status and must be handled"]
 pub enum NetworkReply {
     MessageSent { msg_id: MessageId },
     ListenSuccess { addr: Address },

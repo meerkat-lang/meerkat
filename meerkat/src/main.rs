@@ -70,6 +70,24 @@ fn load_or_create_identity(
     }
 }
 
+/// Helper to send a message over net actor and log if message sending fails
+///
+/// Args:
+///   `net` (`&mut NetworkActor`): Active network actor
+///   `reply_to` (`&str`): Target multiaddress string
+///   `msg` (`MeerkatMessage`): Message payload to send
+async fn send_net_msg(net: &mut NetworkActor, reply_to: &str, msg: MeerkatMessage) {
+    let reply = net
+        .handle_command(NetworkCommand::SendMessage {
+            addr: Address::new(reply_to),
+            msg,
+        })
+        .await;
+    if let NetworkReply::Failure(e) = reply {
+        log::warn!("Failed to send network message to {}: {}", reply_to, e);
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Args {
@@ -264,11 +282,7 @@ async fn run_and_reply_or_park(manager: &mut Manager, parked: ParkedRequest) {
                         error: other.err().map(|e| e.to_string()),
                     };
                     if let Some(net) = manager.network.as_mut() {
-                        net.handle_command(NetworkCommand::SendMessage {
-                            addr: Address::new(&reply_to),
-                            msg: response,
-                        })
-                        .await;
+                        send_net_msg(net, &reply_to, response).await;
                     }
                 }
             }
@@ -308,11 +322,7 @@ async fn run_and_reply_or_park(manager: &mut Manager, parked: ParkedRequest) {
                         },
                     };
                     if let Some(net) = manager.network.as_mut() {
-                        net.handle_command(NetworkCommand::SendMessage {
-                            addr: Address::new(&reply_to),
-                            msg: response,
-                        })
-                        .await;
+                        send_net_msg(net, &reply_to, response).await;
                     }
                 }
                 Err(e) => {
@@ -321,11 +331,7 @@ async fn run_and_reply_or_park(manager: &mut Manager, parked: ParkedRequest) {
                         error: e.to_string(),
                     };
                     if let Some(net) = manager.network.as_mut() {
-                        net.handle_command(NetworkCommand::SendMessage {
-                            addr: Address::new(&reply_to),
-                            msg: response,
-                        })
-                        .await;
+                        send_net_msg(net, &reply_to, response).await;
                     }
                 }
             }
@@ -367,11 +373,7 @@ async fn run_and_reply_or_park(manager: &mut Manager, parked: ParkedRequest) {
                         error: other.err().map(|e| e.to_string()),
                     };
                     if let Some(net) = manager.network.as_mut() {
-                        net.handle_command(NetworkCommand::SendMessage {
-                            addr: Address::new(&reply_to),
-                            msg: response,
-                        })
-                        .await;
+                        send_net_msg(net, &reply_to, response).await;
                     }
                 }
             }
@@ -514,11 +516,7 @@ async fn run_server(
         if last_keepalive.elapsed() >= std::time::Duration::from_secs(5) {
             for (request_id, reply_to) in manager.parked_keepalive_targets() {
                 if let Some(net) = manager.network.as_mut() {
-                    net.handle_command(NetworkCommand::SendMessage {
-                        addr: Address::new(&reply_to),
-                        msg: MeerkatMessage::WaitParked { request_id },
-                    })
-                    .await;
+                    send_net_msg(net, &reply_to, MeerkatMessage::WaitParked { request_id }).await;
                 }
             }
             last_keepalive = tokio::time::Instant::now();
@@ -539,11 +537,7 @@ async fn run_server(
                             error: e.to_string(),
                         };
                         if let Some(net) = manager.network.as_mut() {
-                            net.handle_command(NetworkCommand::SendMessage {
-                                addr: Address::new(&reply_to),
-                                msg: response,
-                            })
-                            .await;
+                            send_net_msg(net, &reply_to, response).await;
                         }
                         continue;
                     }
@@ -584,11 +578,7 @@ async fn run_server(
                                 },
                             };
                             if let Some(net) = manager.network.as_mut() {
-                                net.handle_command(NetworkCommand::SendMessage {
-                                    addr: Address::new(&reply_to),
-                                    msg: response,
-                                })
-                                .await;
+                                send_net_msg(net, &reply_to, response).await;
                             }
                         }
                     }
@@ -608,11 +598,7 @@ async fn run_server(
                             error: Some(e.to_string()),
                         };
                         if let Some(net) = manager.network.as_mut() {
-                            net.handle_command(NetworkCommand::SendMessage {
-                                addr: Address::new(&reply_to),
-                                msg: response,
-                            })
-                            .await;
+                            send_net_msg(net, &reply_to, response).await;
                         }
                         continue;
                     }
@@ -650,11 +636,7 @@ async fn run_server(
                             error: error_msg,
                         };
                         if let Some(net) = manager.network.as_mut() {
-                            net.handle_command(NetworkCommand::SendMessage {
-                                addr: Address::new(&reply_to),
-                                msg: response,
-                            })
-                            .await;
+                            send_net_msg(net, &reply_to, response).await;
                         }
                         continue;
                     }
@@ -686,11 +668,7 @@ async fn run_server(
                                 error: result.err().map(|e| e.to_string()),
                             };
                             if let Some(net) = manager.network.as_mut() {
-                                net.handle_command(NetworkCommand::SendMessage {
-                                    addr: Address::new(&reply_to),
-                                    msg: response,
-                                })
-                                .await;
+                                send_net_msg(net, &reply_to, response).await;
                             }
                         }
                     }
@@ -711,11 +689,7 @@ async fn run_server(
                         error: result.err().map(|e| e.to_string()),
                     };
                     if let Some(net) = manager.network.as_mut() {
-                        net.handle_command(NetworkCommand::SendMessage {
-                            addr: Address::new(&reply_to),
-                            msg: response,
-                        })
-                        .await;
+                        send_net_msg(net, &reply_to, response).await;
                     }
                     // Wake transactions that were waiting on locks this
                     // commit just released.
@@ -731,10 +705,11 @@ async fn run_server(
                     // do not later wake for an abandoned transaction.
                     manager.purge_parked_txn(&txn_id);
                     if let Some(net) = manager.network.as_mut() {
-                        net.handle_command(NetworkCommand::SendMessage {
-                            addr: Address::new(&reply_to),
-                            msg: MeerkatMessage::AbortResponse { request_id },
-                        })
+                        send_net_msg(
+                            net,
+                            &reply_to,
+                            MeerkatMessage::AbortResponse { request_id },
+                        )
                         .await;
                     }
                     // Wake transactions that were waiting on locks this
@@ -760,11 +735,7 @@ async fn run_server(
                             error: Some(e.to_string()),
                         };
                         if let Some(net) = manager.network.as_mut() {
-                            net.handle_command(NetworkCommand::SendMessage {
-                                addr: Address::new(&reply_to),
-                                msg: response,
-                            })
-                            .await;
+                            send_net_msg(net, &reply_to, response).await;
                         }
                         continue;
                     }
@@ -855,11 +826,7 @@ async fn run_server(
                         &served_base_dir,
                     );
                     if let Some(net) = manager.network.as_mut() {
-                        net.handle_command(NetworkCommand::SendMessage {
-                            addr: Address::new(&reply_to),
-                            msg: response,
-                        })
-                        .await;
+                        send_net_msg(net, &reply_to, response).await;
                     }
                 }
                 MeerkatMessage::Ping { .. }

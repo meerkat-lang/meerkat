@@ -15,7 +15,7 @@ use crate::error::{Error, Result};
 use crate::net::network_layer::NetworkLayer;
 use crate::net::types::MeerkatMessage;
 use crate::net::{
-    codec, Address, NetworkActor, NetworkCommand, NetworkEvent, NetworkReply, NodeType,
+    codec, Address, MessageId, NetworkActor, NetworkCommand, NetworkEvent, NetworkReply, NodeType,
 };
 use crate::runtime::ast::Stmt;
 use crate::runtime::imports::Imports;
@@ -65,6 +65,35 @@ impl<'a> Node<'a> {
             .map_err(|e| Error::Message(e.to_string()))
     }
 
+    /// Sends a message to target address and checks returned NetworkReply
+    ///
+    /// Args:
+    ///   `net` (`&mut NetworkActor`): Active network actor
+    ///   `addr` (`Address`): Target multiaddress
+    ///   `msg` (`MeerkatMessage`): Message payload to send
+    ///
+    /// Returns:
+    ///   `Result<MessageId>`: Assigned message ID if sent successfully
+    ///
+    /// Errors:
+    ///   `Error`: If network sending fails or reply is unexpected
+    async fn send_message(
+        net: &mut NetworkActor,
+        addr: Address,
+        msg: MeerkatMessage,
+    ) -> Result<MessageId> {
+        let reply = net
+            .handle_command(NetworkCommand::SendMessage { addr, msg })
+            .await;
+        match reply {
+            NetworkReply::MessageSent { msg_id } => Ok(msg_id),
+            NetworkReply::Failure(e) => Err(Error::Message(format!("Send failed: {}", e))),
+            NetworkReply::ListenSuccess { .. } | NetworkReply::LocalAddresses { .. } => Err(
+                Error::Message("Unexpected reply from SendMessage command".to_string()),
+            ),
+        }
+    }
+
     /// Sends `cmd` over `net` and registers resulting message ID with `imports`
     ///
     /// Args:
@@ -86,16 +115,15 @@ impl<'a> Node<'a> {
         service_name: String,
         target_url: String,
     ) -> Result<()> {
-        let reply = net.handle_command(cmd).await;
-        match reply {
-            NetworkReply::MessageSent { msg_id } => {
+        match cmd {
+            NetworkCommand::SendMessage { addr, msg } => {
+                let msg_id = Self::send_message(net, addr, msg).await?;
                 imports.register_sent_command(msg_id, service_name, target_url);
                 Ok(())
             }
-            NetworkReply::Failure(e) => Err(Error::Message(format!("Send failed: {}", e))),
-            NetworkReply::ListenSuccess { .. } | NetworkReply::LocalAddresses { .. } => Err(
-                Error::Message("Unexpected reply from SendMessage command".to_string()),
-            ),
+            _ => Err(Error::Message(
+                "Unexpected non-SendMessage command for import registration".to_string(),
+            )),
         }
     }
 
@@ -224,11 +252,7 @@ impl<'a> Node<'a> {
                         } => {
                             let response =
                                 codec::serve_service_code(request_id, path, &reply_to, base_dir);
-                            net.handle_command(NetworkCommand::SendMessage {
-                                addr: Address::new(&reply_to),
-                                msg: response,
-                            })
-                            .await;
+                            Self::send_message(net, Address::new(&reply_to), response).await?;
                         }
                         MeerkatMessage::ServiceCodeError {
                             request_id: _,

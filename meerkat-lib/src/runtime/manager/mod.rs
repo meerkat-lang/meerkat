@@ -693,8 +693,15 @@ impl Manager {
     /// #24: fire-and-forget send (no reply awaited).
     async fn send_oneway(&mut self, addr: Address, msg: MeerkatMessage) {
         if let Some(net) = self.network.as_mut() {
-            net.handle_command(NetworkCommand::SendMessage { addr, msg })
+            let reply = net
+                .handle_command(NetworkCommand::SendMessage {
+                    addr: addr.clone(),
+                    msg,
+                })
                 .await;
+            if let NetworkReply::Failure(e) = reply {
+                log::warn!("send_oneway to {} failed: {}", addr.0, e);
+            }
         }
     }
 
@@ -998,8 +1005,15 @@ impl Manager {
         let net = self.network.as_mut().ok_or_else(|| {
             EvalError::LocalDispatchFailed("No network layer available".to_string())
         })?;
-        net.handle_command(NetworkCommand::SendMessage { addr, msg })
+        let reply = net
+            .handle_command(NetworkCommand::SendMessage {
+                addr: addr.clone(),
+                msg,
+            })
             .await;
+        if let NetworkReply::Failure(e) = reply {
+            log::warn!("Failed to dispatch request to {}: {}", addr.0, e);
+        }
 
         // Register oneshot channel for this request
         let (tx, mut rx) = oneshot::channel::<MeerkatMessage>();

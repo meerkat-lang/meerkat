@@ -244,3 +244,59 @@ fn test_imports_pending_cleanup() {
     let retry2 = imports.on_send_failure(msg2).expect("on_send_failure ok");
     assert!(retry2.is_none());
 }
+
+/// Verify that `decode_source_response` validates paths and enforces source
+/// length limits, returning `Error::LimitExceeded` for invalid inputs
+#[test]
+fn test_decode_source_response_validation() {
+    use meerkat_lib::net::codec::decode_source_response;
+    use meerkat_lib::runtime::limits::MAX_NET_REQUEST_SOURCE_LENGTH;
+
+    // Valid path and source
+    let valid_res = decode_source_response("B.mkt", "service B {}");
+    assert_eq!(valid_res.expect("valid source response"), "B");
+
+    // Valid path without .mkt extension
+    let valid_no_ext = decode_source_response("B", "service B {}");
+    assert_eq!(
+        valid_no_ext.expect("valid source response without ext"),
+        "B"
+    );
+
+    // Invalid path containing path traversal
+    let invalid_path = decode_source_response("../B.mkt", "service B {}");
+    assert!(invalid_path.is_err());
+
+    // Invalid path with bad characters
+    let bad_chars = decode_source_response("B-invalid#.mkt", "service B {}");
+    assert!(bad_chars.is_err());
+
+    // Oversized source payload
+    let oversized_source = "a".repeat(MAX_NET_REQUEST_SOURCE_LENGTH + 1);
+    let oversized_res = decode_source_response("B.mkt", &oversized_source);
+    assert!(oversized_res.is_err());
+}
+
+/// Verify that `on_recv_source` rejects imports exceeding the maximum
+/// allowed service count limit with `Error::LimitExceeded`
+#[test]
+fn test_imports_max_imported_services_limit() {
+    use meerkat_lib::runtime::limits::MAX_IMPORTED_SERVICES;
+
+    let mut interner = Interner::new();
+    let base_ast = Vec::new();
+
+    let (mut imports, _initial_cmds) =
+        Imports::new(&mut interner, HashMap::new(), &base_ast, Path::new(""), "")
+            .expect("Imports::new success");
+
+    // Populate visited_services up to the limit
+    for i in 0..MAX_IMPORTED_SERVICES {
+        let src = format!("service S{} {{}}", i);
+        let _ = imports.on_recv_source(&src, &format!("S{}", i), Path::new(""));
+    }
+
+    // Exceeding the limit should return Error::LimitExceeded
+    let res = imports.on_recv_source("service Overflow {}", "Overflow", Path::new(""));
+    assert!(res.is_err());
+}

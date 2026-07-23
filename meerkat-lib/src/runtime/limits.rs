@@ -28,3 +28,9 @@ pub const IMPORT_RETRY_DELAY_MS: u64 = 200;
 
 /// Polling interval in milliseconds for network import event loop
 pub const IMPORT_POLL_INTERVAL_MS: u64 = 10;
+
+/// Maximum length of source code received over network in bytes
+pub const MAX_NET_REQUEST_SOURCE_LENGTH: usize = 1_048_576;
+
+/// Maximum number of services allowed to be imported
+pub const MAX_IMPORTED_SERVICES: usize = 256;

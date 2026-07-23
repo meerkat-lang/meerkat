@@ -11,7 +11,9 @@ use crate::net::types::MeerkatMessage;
 use crate::net::{Address, MessageId, NetworkCommand};
 use crate::runtime::ast::Stmt;
 use crate::runtime::interner::{Interner, Symbol};
-use crate::runtime::limits::{INDIVIDUAL_IMPORT_TIMEOUT_SECS, MAX_IMPORT_RETRIES};
+use crate::runtime::limits::{
+    INDIVIDUAL_IMPORT_TIMEOUT_SECS, MAX_IMPORTED_SERVICES, MAX_IMPORT_RETRIES,
+};
 use crate::runtime::parser;
 
 /// Request tracking info for optimistic retries
@@ -163,6 +165,22 @@ impl<'a> Imports<'a> {
         service_name: &str,
         base_dir: &Path,
     ) -> Result<Vec<ImportCommand>> {
+        if self.visited_services.len() >= MAX_IMPORTED_SERVICES {
+            return Err(Error::LimitExceeded(format!(
+                "imported service count exceeds maximum limit of {}",
+                MAX_IMPORTED_SERVICES
+            )));
+        }
+
+        if !self.pending_services.contains(service_name) {
+            // Log unsolicited response rather than failing, which aids testing
+            // and speculative pushes
+            println!(
+                "Received response for service '{}' not in pending set",
+                service_name
+            );
+        }
+
         self.pending_services.remove(service_name);
         self.pending_network
             .retain(|_, req| req.service_name != service_name);

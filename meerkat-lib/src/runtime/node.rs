@@ -246,9 +246,9 @@ impl<'a> Node<'a> {
                 match event {
                     NetworkEvent::MessageReceived { peer, msg } => match msg {
                         MeerkatMessage::ServiceCodeResponse { source, path, .. } => {
-                            let service_name = path.strip_suffix(".mkt").unwrap_or(&path);
+                            let service_name = codec::decode_source_response(&path, &source)?;
                             let new_cmds =
-                                imports.on_recv_source(&source, service_name, base_dir)?;
+                                imports.on_recv_source(&source, &service_name, base_dir)?;
                             for (cmd, s_name, t_url, retry) in new_cmds {
                                 Self::send_and_register(
                                     net,

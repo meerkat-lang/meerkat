@@ -478,8 +478,7 @@ impl<'a> Node<'a> {
                     Some(ctx) => {
                         let ctx_str = self.interner.get(ctx);
                         format!(
-                            "Unknown identifier '{}' (expected {}) \
-               in service '{}'",
+                            "Unknown identifier '{}' (expected {}) in service '{}'",
                             name_str, expected, ctx_str
                         )
                     }
@@ -490,8 +489,7 @@ impl<'a> Node<'a> {
             nameres::Error::ForwardReference(name) => {
                 let name_str = self.interner.get(name);
                 let msg = format!(
-                    "Invalid forward reference to \
-           uninitialized value '{}'",
+                    "Invalid forward reference to uninitialized value '{}'",
                     name_str
                 );
                 Error::Message(msg)
@@ -592,8 +590,7 @@ impl<'a> Node<'a> {
                     Some(ctx) => {
                         let ctx_str = self.interner.get(ctx);
                         format!(
-                            "Unknown identifier '{}' (expected {}) \
-               in service '{}'",
+                            "Unknown identifier '{}' (expected {}) in service '{}'",
                             name_str, expected, ctx_str
                         )
                     }
@@ -604,8 +601,7 @@ impl<'a> Node<'a> {
             nameres::Error::ForwardReference(name) => {
                 let name_str = self.interner.get(name);
                 let msg = format!(
-                    "Invalid forward reference to \
-           uninitialized value '{}'",
+                    "Invalid forward reference to uninitialized value '{}'",
                     name_str
                 );
                 Error::Message(msg)

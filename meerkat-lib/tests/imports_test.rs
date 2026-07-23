@@ -231,6 +231,10 @@ fn test_imports_pending_cleanup() {
         1,
     );
 
+    // Assert that msg1 was pruned by registering msg2
+    let retry1 = imports.on_send_failure(msg1).expect("on_send_failure ok");
+    assert!(retry1.is_none());
+
     // Receive source for B; should remove pending entries for B
     let remote_source = "service B {\n    pub def count = 100;\n}";
     let _ = imports
@@ -238,9 +242,6 @@ fn test_imports_pending_cleanup() {
         .expect("on_recv_source success");
 
     // Stale failure notifications for completed service yield None
-    let retry1 = imports.on_send_failure(msg1).expect("on_send_failure ok");
-    assert!(retry1.is_none());
-
     let retry2 = imports.on_send_failure(msg2).expect("on_send_failure ok");
     assert!(retry2.is_none());
 }

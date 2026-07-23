@@ -180,6 +180,8 @@ pub enum Token<'a> {
     Dot,
 
     // Reserved Keywords
+    #[token("update")]
+    UPDATE_KW,
     #[token("service")]
     SERVICE,
     #[token("@test")]

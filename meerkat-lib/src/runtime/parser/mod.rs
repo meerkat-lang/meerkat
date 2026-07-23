@@ -253,6 +253,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_parse_update_block() {
+        use crate::ast::Stmt;
+        let mut interner = Interner::new();
+        let input = "update MyService { var x = 5; }";
+        let res = parse_string(input, &mut interner);
+        assert!(res.is_ok(), "Failed to parse update block: {:?}", res);
+        let ast = res.unwrap();
+        assert_eq!(ast.len(), 1);
+        match &ast[0] {
+            Stmt::Update {
+                service_name,
+                decls,
+            } => {
+                assert_eq!(interner.get(*service_name), "MyService");
+                assert_eq!(decls.len(), 1);
+            }
+            _ => panic!("Expected Stmt::Update"),
+        }
+    }
+
     /// Verify that parsing an assertion exceeding length
     /// limit fails
     #[test]

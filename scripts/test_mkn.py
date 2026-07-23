@@ -5,7 +5,7 @@ Runs in two phases mirroring cargo test output:
   2. Integration  - full orchestration tests (spawns real nodes)
 
 Run from workspace root:
-    python3 scripts/test_mkn.py
+    python3 scripts/test_mkn.py [filters ...] [--exact]
 """
 
 import subprocess
@@ -16,6 +16,7 @@ import sys
 import os
 import signal
 import time
+from argparse import ArgumentParser
 
 
 # ---------------------------------------------------------------------------
@@ -550,24 +551,78 @@ def _validate_no_duplicate_names(label, tests):
 
 
 def main():
-    """Run unit tests then integration tests and report overall result."""
+    """Run unit tests then integration tests and report overall result.
+
+    Parses command-line arguments to allow substring or exact matching
+    filters on test names, mirroring `cargo test` behavior
+    """
     _validate_unit_fixtures()
+
+    parser = ArgumentParser(
+        description=(
+            "Run MKN unit and integration test suite with filtering"
+        )
+    )
+    parser.add_argument(
+        "filters",
+        nargs="*",
+        help="Optional filters for test names",
+    )
+    parser.add_argument(
+        "--exact",
+        action="store_true",
+        help="Require exact test name matching",
+    )
+    args = parser.parse_args()
+
+    assert isinstance(args.filters, list), (
+        "args.filters must be a list"
+    )
+    assert isinstance(args.exact, bool), (
+        "args.exact must be a boolean"
+    )
 
     utests = unit_tests()
     itests = integration_tests()
     _validate_no_duplicate_names("unit tests", utests)
     _validate_no_duplicate_names("integration tests", itests)
 
+    if len(args.filters) > 0:
+        if args.exact == True:
+            utests = [
+                (name, fn)
+                for name, fn in utests
+                if name in args.filters
+            ]
+            itests = [
+                (name, fn)
+                for name, fn in itests
+                if name in args.filters
+            ]
+        else:
+            utests = [
+                (name, fn)
+                for name, fn in utests
+                if any(f in name for f in args.filters)
+            ]
+            itests = [
+                (name, fn)
+                for name, fn in itests
+                if any(f in name for f in args.filters)
+            ]
+
     total_passed = 0
     total_failed = 0
 
-    p, f = run_suite("unit tests", utests)
-    total_passed += p
-    total_failed += f
+    if len(utests) > 0:
+        p, f = run_suite("unit tests", utests)
+        total_passed += p
+        total_failed += f
 
-    p, f = run_suite("integration tests", itests)
-    total_passed += p
-    total_failed += f
+    if len(itests) > 0:
+        p, f = run_suite("integration tests", itests)
+        total_passed += p
+        total_failed += f
 
     overall = "ok" if total_failed == 0 else "FAILED"
     print(

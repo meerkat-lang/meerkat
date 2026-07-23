@@ -20,7 +20,9 @@ use crate::net::{
 use crate::runtime::ast::Stmt;
 use crate::runtime::imports::Imports;
 use crate::runtime::interner::Interner;
-use crate::runtime::limits::{IMPORT_POLL_INTERVAL_MS, IMPORT_RETRY_DELAY_MS};
+use crate::runtime::limits::{
+    IMPORT_POLL_INTERVAL_MS, IMPORT_RETRY_DELAY_MS, MAX_IMPORT_TIMEOUT_SECS,
+};
 use crate::runtime::tt::types::ServiceType;
 use crate::runtime::{nameres, tt, Env, Manager};
 
@@ -232,7 +234,15 @@ impl<'a> Node<'a> {
             Self::send_and_register(net, &mut imports, cmd, service_name, target_url).await?;
         }
 
+        let start_time = std::time::Instant::now();
+
         while !imports.is_done() {
+            if start_time.elapsed().as_secs() >= MAX_IMPORT_TIMEOUT_SECS {
+                return Err(Error::Message(format!(
+                    "Import resolution timed out after {}s",
+                    MAX_IMPORT_TIMEOUT_SECS
+                )));
+            }
             if let Some(event) = net.try_recv_event() {
                 match event {
                     NetworkEvent::MessageReceived { peer, msg } => match msg {

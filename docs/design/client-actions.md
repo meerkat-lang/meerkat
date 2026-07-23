@@ -78,6 +78,9 @@ ordinary action path.  If it names another node, it is sent there through
 `remote_action`.  The captured environment and service identity supply the
 execution context, so no new capture or scoping rules are required.
 
+What the page actually holds for a handler, and therefore what a click sends
+back, is left open below; see the section on the browser trust boundary.
+
 Any state the action changes propagates through the existing reactive
 machinery.  In the example above, clicking the button increments `x` on the
 server, which recomputes `s1.y`, which pushes an update to the subscribed
@@ -98,10 +101,46 @@ instead of splicing strings together.
 
 The `Html` module was written with this in mind.  Its documentation states that
 the representation is private precisely so that it can change later, and names a
-structured tree as the anticipated direction.  The change also addresses a
-concern raised during review of the web client: with a tree, dynamically
-computed values are inserted as data rather than as markup, so they cannot be
-interpreted as HTML.
+structured tree as the anticipated direction.
+
+A tree alone does not make rendering safe.  If the renderer walks the tree and
+concatenates it back into a string, the current injection risk is preserved.
+The design therefore requires that rendering go through DOM APIs that treat
+values as data: interpolated text is set as text content, ordinary attributes
+are set as attribute values, and neither is parsed as markup.  Under that rule a
+dynamically computed value cannot introduce elements or event handlers,
+regardless of what it contains.
+
+If a service ever needs to emit markup that should be parsed as HTML, that has
+to be a distinct and explicitly named construct rather than the default
+behaviour of interpolation, so that the trusted case is visible in the source.
+
+## Handlers and the browser trust boundary
+
+Sending an action to another node currently means sending its statements and
+captured environment, and every node that receives them is another Meerkat
+process.  Binding a handler into a page changes that: the receiving side is a
+browser, and whatever it holds can be inspected and altered before it is sent
+back.  If a click returns the statements it was given, a client could return
+different ones, and the server would execute them.
+
+This is a variant of a problem the system already has -- a peer supplying its
+own return route is tracked in #118 -- but the browser makes it sharper, because
+the handler is handed out deliberately rather than merely accepted on arrival.
+It is also not answered by the earlier decision that a browser client trusts the
+server it loaded its code from: that decision runs in the other direction.
+
+An alternative is for the handler in the page to be an opaque reference rather
+than the action itself.  The node that renders the markup keeps the closure and
+gives the page an identifier for it; a click sends the identifier back, and the
+owning node resolves it to the closure it issued and runs that.  Nothing
+executable crosses the boundary, and the page cannot name an action it was never
+given.  The cost is that identifiers have to be issued, scoped to a particular
+page's session, and eventually discarded.
+
+This design does not settle the question, but no implementation should begin
+until it is settled, because the answer determines what an event attribute
+evaluates to on the client side.
 
 ## Extending to other inputs
 

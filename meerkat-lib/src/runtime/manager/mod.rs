@@ -1013,6 +1013,7 @@ impl Manager {
             .await;
         if let NetworkReply::Failure(e) = reply {
             log::warn!("Failed to dispatch request to {}: {}", addr.0, e);
+            return Err(EvalError::LocalDispatchFailed(e));
         }
 
         // Register oneshot channel for this request

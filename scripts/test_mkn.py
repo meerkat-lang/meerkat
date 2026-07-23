@@ -589,7 +589,7 @@ def main():
     _validate_no_duplicate_names("integration tests", itests)
 
     if len(args.filters) > 0:
-        if args.exact == True:
+        if args.exact:
             utests = [
                 (name, fn)
                 for name, fn in utests

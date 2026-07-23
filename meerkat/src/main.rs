@@ -72,6 +72,12 @@ fn load_or_create_identity(
 
 /// Helper to send a message over net actor and log if message sending fails
 ///
+/// TODO(GitHub Issue #174): The current routing implementation relies
+/// on payload-provided `reply_to` fields, which lack transport-layer
+/// authentication context. Moving forward, it may be beneficial to
+/// align the trust boundary by utilizing authenticated transport
+/// identities.
+///
 /// Args:
 ///   `net` (`&mut NetworkActor`): Active network actor
 ///   `reply_to` (`&str`): Target multiaddress string

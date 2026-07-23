@@ -950,7 +950,8 @@ fn test_cross_service_member_cycle_errors() {
             pub def b = s1.a;
         }
     ";
-    assert!(check_program(input).is_err());
+    let err_msg = check_program(input).expect_err("expected type error");
+    assert!(err_msg.contains("dependency cycle detected"));
 }
 
 /// Verify that @test blocks for imported services strictly type check

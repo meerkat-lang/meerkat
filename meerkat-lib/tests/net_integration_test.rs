@@ -974,9 +974,9 @@ fn test_codec_request_validation() {
     assert!(codec::validate_action_request("invalid-service!").is_err());
 }
 
-/// Verify that on_node_startup preserves the remote peer ID string on buffered MessageReceived events
+/// Verify that the network actor preserves the remote peer ID string on incoming MessageReceived events
 #[tokio::test(flavor = "multi_thread")]
-async fn test_on_node_startup_preserves_buffered_peer_id() {
+async fn test_network_actor_preserves_peer_id_on_message_received() {
     use meerkat_lib::runtime::node::Node;
     use std::collections::HashMap;
 
@@ -990,7 +990,7 @@ async fn test_on_node_startup_preserves_buffered_peer_id() {
     let file_str = file_path.to_str().unwrap();
 
     let identity = libp2p::identity::Keypair::generate_ed25519();
-    let (opt_net, _buffered_events, _) = node
+    let (opt_net, _, _) = node
         .on_node_startup(file_str, remote_map, Some(identity))
         .await
         .expect("on_node_startup succeeds");
@@ -1111,9 +1111,9 @@ async fn test_static_checks_remote_imports() {
     assert!(res.is_ok(), "static_checks failed: {:?}", res);
 }
 
-/// Verify that receiving NetworkReply::Failure during command execution returns an error.
+/// Verify that ListenViaRelay returns NetworkReply::Failure when given an invalid relay address.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_service_code_send_fail() {
+async fn test_listen_via_relay_invalid_address_fails() {
     let mut net = NetworkActor::new(NodeType::Server).await.unwrap();
 
     let reply = net

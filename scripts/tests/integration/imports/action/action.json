@@ -1,0 +1,29 @@
+{
+  "settings": {
+    "startup_timeout": 60.0,
+    "monitor_poll_interval": 0.25,
+    "terminate_timeout": 5.0
+  },
+  "nodes": [
+    {
+      "alias": "B",
+      "type": "server",
+      "file": "scripts/tests/integration/imports/action/B.mkt",
+      "port": 9240
+    },
+    {
+      "alias": "A",
+      "type": "server",
+      "file": "scripts/tests/integration/imports/action/A.mkt",
+      "port": 9250,
+      "imports": ["B.B"]
+    },
+    {
+      "alias": "action_client",
+      "type": "client",
+      "file": "scripts/tests/integration/imports/action/client.mkt",
+      "timeout": 45,
+      "imports": ["A.A", "B.B"]
+    }
+  ]
+}

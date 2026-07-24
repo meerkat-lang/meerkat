@@ -4,19 +4,19 @@ Runs in two phases mirroring cargo test output:
   1. Unit tests   - manifest validation checks (no live nodes)
   2. Integration  - full orchestration tests (spawns real nodes)
 
-Finally delegates to the lock_group integration suite for transitive
-locking tests.
-
 Run from workspace root:
-    python3 scripts/test_mkn.py
+    python3 scripts/test_mkn.py [filters ...] [--exact]
 """
 
 import subprocess
+import contextlib
+import io
 import json
 import sys
 import os
 import signal
 import time
+from argparse import ArgumentParser
 
 
 # ---------------------------------------------------------------------------
@@ -68,9 +68,7 @@ def run_cmd(args, timeout=30):
                 pass
 
         stdout, _ = proc.communicate()
-        if isinstance(stdout, bytes):
-            stdout = stdout.decode(errors="replace")
-        elif stdout is None:
+        if stdout is None:
             stdout = ""
         return -1, stdout
 
@@ -82,7 +80,9 @@ def run_cmd(args, timeout=30):
 def run_suite(suite_name, tests):
     """Run a list of (name, callable) tests and report cargo-style output.
 
-    Each callable must return True on pass, False on fail.
+    Each callable must return True on pass, False on fail. Failure
+    output is collected and printed at the end of the suite in a
+    `failures:` block, mirroring cargo test output.
 
     Args:
         suite_name (str): Human-readable label for this suite.
@@ -96,32 +96,53 @@ def run_suite(suite_name, tests):
     print(f"running {len(tests)} tests")
 
     passed = 0
-    failed = 0
+    failed_names = []
+    failure_outputs = {}
     start = time.monotonic()
 
     for name, fn in tests:
         print(f"test {name} ... ", end="", flush=True)
+        buf = io.StringIO()
         try:
-            ok = fn()
+            with contextlib.redirect_stdout(buf):
+                ok = fn()
         except Exception as exc:
-            print(f"FAILED\nerror: {exc}")
             ok = False
+            print(f"panicked at: {exc}", file=buf)
         if ok:
             print("ok")
             passed += 1
         else:
-            failed += 1
+            print("FAILED")
+            failed_names.append(name)
+            failure_outputs[name] = buf.getvalue()
 
     elapsed = time.monotonic() - start
-    status = "ok" if failed == 0 else "FAILED"
+
+    if failed_names:
+        print()
+        print("failures:")
+        for name in failed_names:
+            output = failure_outputs[name].strip()
+            if output:
+                print()
+                print(f"---- {name} stdout ----")
+                print(output)
+        print()
+        print("failures:")
+        for name in failed_names:
+            print(f"    {name}")
+
+    status = "ok" if not failed_names else "FAILED"
     print()
     print(
         f"test result: {status}. "
-        f"{passed} passed; {failed} failed; "
+        f"{passed} passed; {len(failed_names)} failed; "
+        f"0 ignored; 0 measured; 0 filtered out; "
         f"finished in {elapsed:.2f}s"
     )
     print()
-    return passed, failed
+    return passed, len(failed_names)
 
 
 # ---------------------------------------------------------------------------
@@ -200,46 +221,106 @@ def make_validation_test(filename, expected_error):
     return test
 
 
-def build_unit_tests():
-    """Build the full list of unit test (name, callable) pairs.
+def test_empty_expect_fail():
+    """Verify that make_mkn_test rejects empty string expect_fail.
+
+    Returns:
+        bool: True if AssertionError was raised with expected message.
+    """
+    try:
+        make_mkn_test("dummy.json", expect_fail="")
+    except AssertionError as err:
+        if "expect_fail string must not be empty" in str(err):
+            return True
+        print(f"\nFAIL: unexpected AssertionError message: {err}")
+        return False
+    print(
+        "\nFAIL: expected AssertionError for expect_fail='' "
+        "but none was raised."
+    )
+    return False
+
+
+def unit_tests():
+    """Return the full list of unit test (name, callable) pairs.
 
     Returns:
         list[tuple[str, callable]]: Unit test pairs.
     """
-    return [
+    tests = [
         (name, make_validation_test(filename, expected_error))
         for name, filename, expected_error in VALIDATION_CASES
     ]
+    tests.append((
+        "empty_expect_fail",
+        test_empty_expect_fail,
+    ))
+    return tests
 
 
 # ---------------------------------------------------------------------------
 # Integration tests — full orchestration (spawns real nodes)
 # ---------------------------------------------------------------------------
 
-def test_mkn_basic_topology():
-    """Verify a basic two-node server/client topology completes cleanly.
+def make_mkn_test(manifest, expect_fail=False):
+    """Return a zero-argument callable for a single MKN manifest test.
+
+    Runs `mkn.py` against `manifest` and asserts the exit code and,
+    when `expect_fail` is a non-empty string, that the error substring
+    appears in the combined process output.
+
+    Args:
+        manifest (str): Workspace-relative path to the MKN manifest.
+        expect_fail (bool | str): `False` for tests that must pass.
+            A non-empty string for tests expected to fail with that
+            substring present in the output. Must not be `True`.
 
     Returns:
-        bool: True if the test passed.
+        callable: Test function returning True on pass, False on fail.
     """
-    code, output = run_cmd(
-        [sys.executable, MKN,
-         f"{MKN_DIR}/test_mkn_basic.json"],
-        timeout=90,
+    assert isinstance(expect_fail, (bool, str)), (
+        f"expect_fail must be False or a non-empty string, "
+        f"got {type(expect_fail).__name__!r}: {expect_fail!r}"
     )
-    if code != 0:
-        print(
-            f"\nFAIL: basic topology exited {code}. "
-            f"Output:\n{output.strip()}"
+    assert expect_fail is not True, (
+        "expect_fail=True is ambiguous; pass the expected error substring instead"
+    )
+    if isinstance(expect_fail, str):
+        assert len(expect_fail) > 0, (
+            "expect_fail string must not be empty"
         )
-        return False
-    if "All services online." not in output:
-        print(
-            "\nFAIL: 'All services online.' not found in output.\n"
-            + output.strip()
+
+    def test():
+        if not os.path.isfile(manifest):
+            print(f"\nFAIL: manifest not found: {manifest}")
+            return False
+        code, output = run_cmd(
+            [sys.executable, MKN, manifest],
+            timeout=90,
         )
-        return False
-    return True
+        if code == -1:
+            print(
+                f"\nFAIL: test timed out after 90s."
+                f"\n{output.strip()}"
+            )
+            return False
+        failed = code != 0
+        if failed != bool(expect_fail):
+            print(
+                f"\nFAIL: exit code {code} "
+                f"(expected {'non-zero' if expect_fail else 'zero'})."
+                f"\n{output.strip()}"
+            )
+            return False
+        if isinstance(expect_fail, str):
+            if expect_fail.lower() not in output.lower():
+                print(
+                    f"\nFAIL: expected '{expect_fail}' in output."
+                    f"\n{output.strip()}"
+                )
+                return False
+        return True
+    return test
 
 
 def test_mkn_namespace_split():
@@ -390,78 +471,160 @@ def test_mkn_missing_service():
     return True
 
 
-def build_integration_tests():
-    """Build the list of mkn integration test (name, callable) pairs.
+def integration_tests():
+    """Return the full list of integration test (name, callable) pairs.
 
     Returns:
         list[tuple[str, callable]]: Integration test pairs.
     """
+    IDIR = "scripts/tests/integration"
     return [
-        ("mkn_basic_topology", test_mkn_basic_topology),
-        ("mkn_namespace_split", test_mkn_namespace_split),
-        ("mkn_client_timeout_slow", test_mkn_client_timeout_slow),
-        ("mkn_client_timeout_exec", test_mkn_client_timeout_exec),
-        ("mkn_missing_service", test_mkn_missing_service),
+        # --- bespoke orchestration tests ---
+        ("mkn_namespace_split",       test_mkn_namespace_split),
+        ("mkn_client_timeout_slow",   test_mkn_client_timeout_slow),
+        ("mkn_client_timeout_exec",   test_mkn_client_timeout_exec),
+        ("mkn_missing_service",       test_mkn_missing_service),
+        # --- import integration tests ---
+        ("microservices_dag",         make_mkn_test(f"{IDIR}/imports/microservices/microservices.json")),
+        ("transitive_pipeline",       make_mkn_test(f"{IDIR}/imports/pipeline/pipeline.json")),
+        ("diamond_topology",          make_mkn_test(f"{IDIR}/imports/diamond/diamond.json")),
+        ("dense_mesh",                make_mkn_test(f"{IDIR}/imports/dense_mesh/dense_mesh.json")),
+        ("action_cross_node",         make_mkn_test(f"{IDIR}/imports/action/action.json")),
+        ("file_imports",              make_mkn_test(f"{IDIR}/imports/file_imports/file_imports.json")),
+        ("mixed_imports",             make_mkn_test(f"{IDIR}/imports/mixed_imports/mixed_imports.json")),
+        ("rejection_imports",         make_mkn_test(f"{IDIR}/imports/rejection_imports/rejection_imports.json",
+                                                    expect_fail="Unknown identifier")),
+        ("circular_imports",          make_mkn_test(f"{IDIR}/imports/circular_imports/circular_imports.json",
+                                                    expect_fail="Circular dependency detected")),
+        ("cyclic_member_imports",     make_mkn_test(f"{IDIR}/imports/cyclic_member_imports/cyclic_member_imports.json",
+                                                    expect_fail="dependency cycle detected")),
+        # --- lock group integration tests ---
+        ("cascade_lock_success",      make_mkn_test(f"{IDIR}/lock_group/success.json")),
+        ("cascade_abort_wait_die",    make_mkn_test(f"{IDIR}/lock_group/abort.json")),
+        ("cascade_lock_wait",         make_mkn_test(f"{IDIR}/lock_group/wait.json")),
     ]
-
-
-# ---------------------------------------------------------------------------
-# Lock group integration suite (external runner)
-# ---------------------------------------------------------------------------
-
-LOCK_GROUP_RUNNER = (
-    "scripts/tests/integration/lock_group/test_lock_groups.py"
-)
-
-
-def run_lock_group_suite():
-    """Delegate to the lock group integration suite runner.
-
-    Spawns `LOCK_GROUP_RUNNER` as a subprocess so its cargo-style
-    output is streamed directly to stdout with a 90-second timeout
-
-    Returns:
-        `bool`: `True` if the suite passed and did not time out
-    """
-    try:
-        result = subprocess.run(
-            [sys.executable, LOCK_GROUP_RUNNER],
-            timeout=90,
-        )
-        return result.returncode == 0
-    except subprocess.TimeoutExpired:
-        print(
-            "\nFAIL: lock group suite timed out (90s)",
-            file=sys.stderr,
-        )
-        return False
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _validate_unit_fixtures():
+    """Assert every VALIDATION_CASES fixture file exists on disk.
+
+    Raises:
+        SystemExit: If any fixture file is missing.
+    """
+    missing = [
+        f"{MKN_DIR}/{filename}"
+        for _, filename, _ in VALIDATION_CASES
+        if not os.path.isfile(f"{MKN_DIR}/{filename}")
+    ]
+    if missing:
+        print("FAIL: missing unit test fixture files:", file=sys.stderr)
+        for path in missing:
+            print(f"  {path}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _validate_no_duplicate_names(label, tests):
+    """Assert all test names in `tests` are unique.
+
+    Args:
+        label (str): Suite label for error messages.
+        tests (list[tuple[str, callable]]): Test list to validate.
+
+    Raises:
+        SystemExit: If any duplicate names are found.
+    """
+    seen = set()
+    duplicates = []
+    for name, _ in tests:
+        if name in seen:
+            duplicates.append(name)
+        seen.add(name)
+    if duplicates:
+        print(
+            f"FAIL: duplicate test names in {label}: {duplicates}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def main():
-    """Run unit tests, then integration tests, then lock group suite."""
+    """Run unit tests then integration tests and report overall result.
+
+    Parses command-line arguments to allow substring or exact matching
+    filters on test names, mirroring `cargo test` behavior
+    """
+    _validate_unit_fixtures()
+
+    parser = ArgumentParser(
+        description=(
+            "Run MKN unit and integration test suite with filtering"
+        )
+    )
+    parser.add_argument(
+        "filters",
+        nargs="*",
+        help="Optional filters for test names",
+    )
+    parser.add_argument(
+        "--exact",
+        action="store_true",
+        help="Require exact test name matching",
+    )
+    args = parser.parse_args()
+
+    assert isinstance(args.filters, list), (
+        "args.filters must be a list"
+    )
+    assert isinstance(args.exact, bool), (
+        "args.exact must be a boolean"
+    )
+
+    utests = unit_tests()
+    itests = integration_tests()
+    _validate_no_duplicate_names("unit tests", utests)
+    _validate_no_duplicate_names("integration tests", itests)
+
+    if len(args.filters) > 0:
+        if args.exact:
+            utests = [
+                (name, fn)
+                for name, fn in utests
+                if name in args.filters
+            ]
+            itests = [
+                (name, fn)
+                for name, fn in itests
+                if name in args.filters
+            ]
+        else:
+            utests = [
+                (name, fn)
+                for name, fn in utests
+                if any(f in name for f in args.filters)
+            ]
+            itests = [
+                (name, fn)
+                for name, fn in itests
+                if any(f in name for f in args.filters)
+            ]
+
     total_passed = 0
     total_failed = 0
 
-    # Phase 1: unit tests
-    p, f = run_suite("unit tests", build_unit_tests())
-    total_passed += p
-    total_failed += f
+    if len(utests) > 0:
+        p, f = run_suite("unit tests", utests)
+        total_passed += p
+        total_failed += f
 
-    # Phase 2: mkn integration tests
-    p, f = run_suite("integration tests", build_integration_tests())
-    total_passed += p
-    total_failed += f
+    if len(itests) > 0:
+        p, f = run_suite("integration tests", itests)
+        total_passed += p
+        total_failed += f
 
-    # Phase 3: lock group integration suite
-    lock_ok = run_lock_group_suite()
-    if not lock_ok:
-        total_failed += 1
-
-    # Final summary
     overall = "ok" if total_failed == 0 else "FAILED"
     print(
         f"overall test result: {overall}. "
@@ -470,4 +633,5 @@ def main():
     sys.exit(0 if total_failed == 0 else 1)
 
 
-main()
+if __name__ == "__main__":
+    main()

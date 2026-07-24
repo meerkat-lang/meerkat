@@ -12,7 +12,8 @@ use crate::net::types::{LockGroup, MeerkatMessage};
 use crate::runtime::ast::{ActionStmt, BinOp, Expr, Field, TableType, UnOp, Value};
 use crate::runtime::interner::{Interner, Symbol};
 use crate::runtime::limits::{
-    MAX_IDENTIFIER_LENGTH, MAX_NET_REQUEST_STRING_LENGTH, MAX_STRING_LITERAL_LENGTH, MAX_TYPE_DEPTH,
+    MAX_IDENTIFIER_LENGTH, MAX_NET_REQUEST_SOURCE_LENGTH, MAX_NET_REQUEST_STRING_LENGTH,
+    MAX_STRING_LITERAL_LENGTH, MAX_TYPE_DEPTH,
 };
 use crate::runtime::tt::{Param, ServiceType, TupleType, Type};
 use std::collections::HashMap;
@@ -68,6 +69,30 @@ pub fn validate_service_code_request(path: &str, reply_to: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Validate incoming `ServiceCodeResponse` source and path, returning the
+/// validated service name
+///
+/// Args:
+///     `path` (`&str`): Requested file path
+///     `source` (`&str`): Received source code
+///
+/// Returns:
+///     `Result<String>`: Validated service name
+///
+/// Raises:
+///     `Error::LimitExceeded`: If `source` length exceeds limit or `path` is invalid
+pub fn decode_source_response(path: &str, source: &str) -> Result<String> {
+    if source.len() > MAX_NET_REQUEST_SOURCE_LENGTH {
+        return Err(Error::LimitExceeded(format!(
+            "source size exceeds maximum length of {} bytes",
+            MAX_NET_REQUEST_SOURCE_LENGTH
+        )));
+    }
+    let service_name = path.strip_suffix(".mkt").unwrap_or(path);
+    validate_identifier(service_name)?;
+    Ok(service_name.to_string())
 }
 
 /// Validate identifier fields of a `LookupRequest` message arriving over

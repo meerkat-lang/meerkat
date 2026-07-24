@@ -1,0 +1,3 @@
+service local_disk_c {
+    pub def local_val = 100;
+}

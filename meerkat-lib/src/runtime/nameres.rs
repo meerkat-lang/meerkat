@@ -1,21 +1,12 @@
-//! Static name resolution analysis for the Meerkat language compiler
+//! Static name resolution analysis for the Meerkat language
 //!
 //! This module resolves and validates variable usages in abstract
-//! syntax trees, failing defensively if an unbound symbol is accessed
-//!
-//! In accordance with `Issue #34`, the compiler is currently restricted
-//! to local file checks without full multi-file import resolution
-//! Several features have not yet been fully introduced to the system
-//! Rather than raising errors and blocking development, checks for
-//! these operations are deferred and emit warnings to indicate they
-//! are under active development
-//!
-//! Note that variables referring to table types are still resolved to
-//! register their declarations in the environment
+//! syntax trees, failing defensively if an unbound symbol is accessed.
+//! When called with a unified AST (local + all imported service source),
+//! cross-service member accesses and @test blocks are fully resolved.
 //!
 //! The currently skipped operations are listed below
 //! - Service `update` statements
-//! - Service `import` declarations
 //! - `TableDecl` declarations
 //! - `Insert` statements
 //! - `Select` expressions
@@ -303,11 +294,11 @@ impl<'a> Resolver<'a> {
                     Some(decls) => decls,
                     None => {
                         self.current_context = prev_context;
-                        println!(
-                            "warning: nameres: ignoring 'import' \
-                             checks as not yet implemented"
-                        );
-                        return Ok(());
+                        return Err(Error::UnknownIdentifier {
+                            name: *service_name,
+                            expected: ExpectedSort::Service,
+                            context_name: self.current_context,
+                        });
                     }
                 };
                 for decl in *decls {
@@ -1190,25 +1181,37 @@ mod tests {
         assert!(resolver.resolve_program(&program, &mut env).is_ok());
     }
 
-    /// Verify testing an imported service is ignored with warning
+    /// Verify testing an imported service resolves when its
+    /// `Stmt::Service` is present in the unified AST
     #[test]
-    fn test_unit_test_block_imported_logs_warning() {
+    fn test_unit_test_block_imported_service_resolves() {
         let mut interner = Interner::new();
         let s = interner.insert("s");
         let x = interner.insert("x");
 
-        // Representing `@test(s) { x; }`
+        // Simulates unified_ast: the imported service's Stmt::Service is
+        // present alongside the @test block, as produced by on_node_startup.
+        // Representing:
+        //   service s { var x = 0; }
+        //   @test(s) { x; }
+        let service_stmt = Stmt::Service {
+            name: s,
+            decls: vec![Decl::VarDecl {
+                name: x,
+                ty: None,
+                val: Expr::Literal {
+                    val: Value::Int { val: 0 },
+                },
+            }],
+        };
         let test_stmt = Stmt::Test {
             service_name: s,
             stmts: vec![ActionStmt::Expr(Expr::Variable { name: x })],
         };
 
         let mut env = Env::new(None);
-        // Bind service in `env` (simulating import)
-        env.bind(s, Binding::Value);
-
         let mut resolver = Resolver::new();
-        let program = vec![test_stmt];
+        let program = vec![service_stmt, test_stmt];
 
         let result = resolver.resolve_program(&program, &mut env);
         assert!(result.is_ok());

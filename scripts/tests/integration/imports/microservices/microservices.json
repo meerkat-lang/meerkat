@@ -1,0 +1,36 @@
+{
+  "settings": {
+    "startup_timeout": 60.0,
+    "monitor_poll_interval": 0.25,
+    "terminate_timeout": 5.0
+  },
+  "nodes": [
+    {
+      "alias": "C",
+      "type": "server",
+      "file": "scripts/tests/integration/imports/microservices/C.mkt",
+      "port": 9130
+    },
+    {
+      "alias": "B",
+      "type": "server",
+      "file": "scripts/tests/integration/imports/microservices/B.mkt",
+      "port": 9140,
+      "imports": ["C.C"]
+    },
+    {
+      "alias": "A",
+      "type": "server",
+      "file": "scripts/tests/integration/imports/microservices/A.mkt",
+      "port": 9150,
+      "imports": ["B.B", "C.C"]
+    },
+    {
+      "alias": "import_client",
+      "type": "client",
+      "file": "scripts/tests/integration/imports/microservices/client.mkt",
+      "timeout": 45,
+      "imports": ["A.A", "B.B", "C.C"]
+    }
+  ]
+}

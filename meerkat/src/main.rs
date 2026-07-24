@@ -70,6 +70,30 @@ fn load_or_create_identity(
     }
 }
 
+/// Helper to send a message over net actor and log if message sending fails
+///
+/// TODO(GitHub Issue #174): The current routing implementation relies
+/// on payload-provided `reply_to` fields, which lack transport-layer
+/// authentication context. Moving forward, it may be beneficial to
+/// align the trust boundary by utilizing authenticated transport
+/// identities.
+///
+/// Args:
+///   `net` (`&mut NetworkActor`): Active network actor
+///   `reply_to` (`&str`): Target multiaddress string
+///   `msg` (`MeerkatMessage`): Message payload to send
+async fn send_net_msg(net: &mut NetworkActor, reply_to: &str, msg: MeerkatMessage) {
+    let reply = net
+        .handle_command(NetworkCommand::SendMessage {
+            addr: Address::new(reply_to),
+            msg,
+        })
+        .await;
+    if let NetworkReply::Failure(e) = reply {
+        log::warn!("Failed to send network message to {}: {}", reply_to, e);
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Args {
@@ -175,10 +199,52 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                 printer.print_program(&prog);
             }
 
+            let mut opt_server_net: Option<NetworkActor> = None;
+            let mut opt_server_addr: Option<String> = None;
+
+            if args.server {
+                let identity_keypair = match args.identity.as_ref() {
+                    Some(path) => Some(load_or_create_identity(path)?),
+                    None => None,
+                };
+                let mut net =
+                    NetworkActor::new_with_identity(NodeType::Server, identity_keypair).await?;
+                let listen_ip = if args.local { "127.0.0.1" } else { "0.0.0.0" };
+                let listen_addr = Address::new(format!("/ip4/{}/tcp/{}", listen_ip, args.port));
+                let reply = net
+                    .handle_command(NetworkCommand::Listen { addr: listen_addr })
+                    .await;
+                let actual_addr = listen_success_addr(reply)?;
+
+                let dummy_manager = Manager::new(node.interner.clone());
+                let node_ip = if args.local {
+                    "127.0.0.1".to_string()
+                } else {
+                    dummy_manager.get_node_ip()
+                };
+                let peer_id = net.local_peer_id();
+                let actual_addr_str = actual_addr
+                    .0
+                    .replace("0.0.0.0", &node_ip)
+                    .replace("127.0.0.1", &node_ip);
+                let full_addr = format!("{}/p2p/{}", actual_addr_str, peer_id);
+
+                opt_server_net = Some(net);
+                opt_server_addr = Some(full_addr);
+            }
+
             // Perform static validation checks on the parsed program
             // statements before executing or starting the server
-            node.check(&prog)
-                .map_err(|e| format!("Static check error: {}", e))?;
+            node.resolve_imports_with_net(
+                file,
+                remote_url_map.clone(),
+                opt_server_net.as_mut(),
+                opt_server_addr.as_deref(),
+            )
+            .await
+            .map_err(|e| format!("Import error: {}", e))?
+            .static_checks()
+            .map_err(|e| format!("Static check error: {}", e))?;
 
             // This mode must appear before `server` args check in
             // order to properly stop execution. Logic for static
@@ -190,9 +256,14 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                 return Ok(());
             }
 
-            let interner = node.interner;
+            let interner = node.interner.clone();
 
             if args.server {
+                let server_net = opt_server_net
+                    .expect("Server network should be initialized when args.server is true");
+                let server_addr = opt_server_addr
+                    .expect("Server address should be initialized when args.server is true");
+
                 run_server(
                     prog,
                     file,
@@ -204,6 +275,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                         identity: args.identity,
                     },
                     interner,
+                    Some((server_net, server_addr)),
                 )
                 .await
             } else {
@@ -261,11 +333,7 @@ async fn run_and_reply_or_park(manager: &mut Manager, parked: ParkedRequest) {
                         error: other.err().map(|e| e.to_string()),
                     };
                     if let Some(net) = manager.network.as_mut() {
-                        net.handle_command(NetworkCommand::SendMessage {
-                            addr: Address::new(&reply_to),
-                            msg: response,
-                        })
-                        .await;
+                        send_net_msg(net, &reply_to, response).await;
                     }
                 }
             }
@@ -305,11 +373,7 @@ async fn run_and_reply_or_park(manager: &mut Manager, parked: ParkedRequest) {
                         },
                     };
                     if let Some(net) = manager.network.as_mut() {
-                        net.handle_command(NetworkCommand::SendMessage {
-                            addr: Address::new(&reply_to),
-                            msg: response,
-                        })
-                        .await;
+                        send_net_msg(net, &reply_to, response).await;
                     }
                 }
                 Err(e) => {
@@ -318,11 +382,7 @@ async fn run_and_reply_or_park(manager: &mut Manager, parked: ParkedRequest) {
                         error: e.to_string(),
                     };
                     if let Some(net) = manager.network.as_mut() {
-                        net.handle_command(NetworkCommand::SendMessage {
-                            addr: Address::new(&reply_to),
-                            msg: response,
-                        })
-                        .await;
+                        send_net_msg(net, &reply_to, response).await;
                     }
                 }
             }
@@ -364,11 +424,7 @@ async fn run_and_reply_or_park(manager: &mut Manager, parked: ParkedRequest) {
                         error: other.err().map(|e| e.to_string()),
                     };
                     if let Some(net) = manager.network.as_mut() {
-                        net.handle_command(NetworkCommand::SendMessage {
-                            addr: Address::new(&reply_to),
-                            msg: response,
-                        })
-                        .await;
+                        send_net_msg(net, &reply_to, response).await;
                     }
                 }
             }
@@ -409,6 +465,7 @@ async fn run_server(
     remote_url_map: std::collections::HashMap<String, String>,
     config: ServerConfig,
     interner: Interner,
+    pre_init: Option<(NetworkActor, String)>,
 ) -> Result<(), Box<dyn Error>> {
     // #39: the directory the server was started from is the root for serving
     // `.mkt` files: a ServiceCodeRequest names a file by path, which is
@@ -417,31 +474,43 @@ async fn run_server(
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .to_path_buf();
-    // #151: when an identity file is configured, load (or create) a
-    // persistent keypair so the Peer ID is stable across restarts.
-    let identity_keypair = match config.identity {
-        Some(path) => Some(load_or_create_identity(&path)?),
-        None => None,
-    };
-    let mut net = NetworkActor::new_with_identity(NodeType::Server, identity_keypair).await?;
+
     let mut manager = Manager::new(interner);
     manager.local = config.local;
 
+    let (mut net, full_addr) = match pre_init {
+        Some(pair) => pair,
+        None => {
+            // #151: when an identity file is configured, load (or create) a
+            // persistent keypair so the Peer ID is stable across restarts.
+            let identity_keypair = match config.identity {
+                Some(ref path) => Some(load_or_create_identity(path)?),
+                None => None,
+            };
+            let mut net =
+                NetworkActor::new_with_identity(NodeType::Server, identity_keypair).await?;
+            let node_ip = manager.get_node_ip();
+            let listen_ip = if config.local { "127.0.0.1" } else { "0.0.0.0" };
+            let listen_addr = Address::new(format!("/ip4/{}/tcp/{}", listen_ip, config.port));
+            let reply = net
+                .handle_command(NetworkCommand::Listen { addr: listen_addr })
+                .await;
+            let actual_addr = listen_success_addr(reply)?;
+
+            let peer_id = net.local_peer_id();
+            // Replace loopback/unspecified with actual node IP
+            let actual_addr_str = actual_addr
+                .0
+                .replace("0.0.0.0", &node_ip)
+                .replace("127.0.0.1", &node_ip);
+            let full_addr = format!("{}/p2p/{}", actual_addr_str, peer_id);
+            (net, full_addr)
+        }
+    };
+
     let node_ip = manager.get_node_ip();
     let listen_ip = if config.local { "127.0.0.1" } else { "0.0.0.0" };
-    let listen_addr = Address::new(format!("/ip4/{}/tcp/{}", listen_ip, config.port));
-    let reply = net
-        .handle_command(NetworkCommand::Listen { addr: listen_addr })
-        .await;
-    let actual_addr = listen_success_addr(reply)?;
-
     let peer_id = net.local_peer_id();
-    // Replace loopback/unspecified with actual node IP
-    let actual_addr_str = actual_addr
-        .0
-        .replace("0.0.0.0", &node_ip)
-        .replace("127.0.0.1", &node_ip);
-    let full_addr = format!("{}/p2p/{}", actual_addr_str, peer_id);
     println!("Server listening at: {}", full_addr);
 
     // #39: browser (wasm) clients can only speak WebSocket, so listen on a
@@ -511,11 +580,7 @@ async fn run_server(
         if last_keepalive.elapsed() >= std::time::Duration::from_secs(5) {
             for (request_id, reply_to) in manager.parked_keepalive_targets() {
                 if let Some(net) = manager.network.as_mut() {
-                    net.handle_command(NetworkCommand::SendMessage {
-                        addr: Address::new(&reply_to),
-                        msg: MeerkatMessage::WaitParked { request_id },
-                    })
-                    .await;
+                    send_net_msg(net, &reply_to, MeerkatMessage::WaitParked { request_id }).await;
                 }
             }
             last_keepalive = tokio::time::Instant::now();
@@ -536,11 +601,7 @@ async fn run_server(
                             error: e.to_string(),
                         };
                         if let Some(net) = manager.network.as_mut() {
-                            net.handle_command(NetworkCommand::SendMessage {
-                                addr: Address::new(&reply_to),
-                                msg: response,
-                            })
-                            .await;
+                            send_net_msg(net, &reply_to, response).await;
                         }
                         continue;
                     }
@@ -581,11 +642,7 @@ async fn run_server(
                                 },
                             };
                             if let Some(net) = manager.network.as_mut() {
-                                net.handle_command(NetworkCommand::SendMessage {
-                                    addr: Address::new(&reply_to),
-                                    msg: response,
-                                })
-                                .await;
+                                send_net_msg(net, &reply_to, response).await;
                             }
                         }
                     }
@@ -605,11 +662,7 @@ async fn run_server(
                             error: Some(e.to_string()),
                         };
                         if let Some(net) = manager.network.as_mut() {
-                            net.handle_command(NetworkCommand::SendMessage {
-                                addr: Address::new(&reply_to),
-                                msg: response,
-                            })
-                            .await;
+                            send_net_msg(net, &reply_to, response).await;
                         }
                         continue;
                     }
@@ -647,11 +700,7 @@ async fn run_server(
                             error: error_msg,
                         };
                         if let Some(net) = manager.network.as_mut() {
-                            net.handle_command(NetworkCommand::SendMessage {
-                                addr: Address::new(&reply_to),
-                                msg: response,
-                            })
-                            .await;
+                            send_net_msg(net, &reply_to, response).await;
                         }
                         continue;
                     }
@@ -683,11 +732,7 @@ async fn run_server(
                                 error: result.err().map(|e| e.to_string()),
                             };
                             if let Some(net) = manager.network.as_mut() {
-                                net.handle_command(NetworkCommand::SendMessage {
-                                    addr: Address::new(&reply_to),
-                                    msg: response,
-                                })
-                                .await;
+                                send_net_msg(net, &reply_to, response).await;
                             }
                         }
                     }
@@ -708,11 +753,7 @@ async fn run_server(
                         error: result.err().map(|e| e.to_string()),
                     };
                     if let Some(net) = manager.network.as_mut() {
-                        net.handle_command(NetworkCommand::SendMessage {
-                            addr: Address::new(&reply_to),
-                            msg: response,
-                        })
-                        .await;
+                        send_net_msg(net, &reply_to, response).await;
                     }
                     // Wake transactions that were waiting on locks this
                     // commit just released.
@@ -728,10 +769,11 @@ async fn run_server(
                     // do not later wake for an abandoned transaction.
                     manager.purge_parked_txn(&txn_id);
                     if let Some(net) = manager.network.as_mut() {
-                        net.handle_command(NetworkCommand::SendMessage {
-                            addr: Address::new(&reply_to),
-                            msg: MeerkatMessage::AbortResponse { request_id },
-                        })
+                        send_net_msg(
+                            net,
+                            &reply_to,
+                            MeerkatMessage::AbortResponse { request_id },
+                        )
                         .await;
                     }
                     // Wake transactions that were waiting on locks this
@@ -757,11 +799,7 @@ async fn run_server(
                             error: Some(e.to_string()),
                         };
                         if let Some(net) = manager.network.as_mut() {
-                            net.handle_command(NetworkCommand::SendMessage {
-                                addr: Address::new(&reply_to),
-                                msg: response,
-                            })
-                            .await;
+                            send_net_msg(net, &reply_to, response).await;
                         }
                         continue;
                     }
@@ -847,16 +885,12 @@ async fn run_server(
                 } => {
                     let response = codec::serve_service_code(
                         request_id,
-                        path,
+                        path.clone(),
                         &reply_to,
                         &served_base_dir,
                     );
                     if let Some(net) = manager.network.as_mut() {
-                        net.handle_command(NetworkCommand::SendMessage {
-                            addr: Address::new(&reply_to),
-                            msg: response,
-                        })
-                        .await;
+                        send_net_msg(net, &reply_to, response).await;
                     }
                 }
                 MeerkatMessage::Ping { .. }

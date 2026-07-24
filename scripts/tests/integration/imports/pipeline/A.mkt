@@ -1,0 +1,5 @@
+import B
+
+service A {
+    pub def place_order = B.calc_bill;
+}

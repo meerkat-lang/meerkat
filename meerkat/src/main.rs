@@ -910,6 +910,8 @@ async fn run_server(
                 // #39: code responses are client-bound replies, not seen at the server.
                 | MeerkatMessage::ServiceCodeResponse { .. }
                 | MeerkatMessage::ServiceCodeError { .. }
+                | MeerkatMessage::UpdateServiceRequest { .. }
+                | MeerkatMessage::UpdateServiceResponse { .. }
                 | MeerkatMessage::WaitParked { .. } => {}
             }
         }

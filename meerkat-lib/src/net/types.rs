@@ -236,6 +236,21 @@ pub enum MeerkatMessage {
         success: bool,
         error: Option<String>,
     },
+
+    /// Request to perform a live code update on a service
+    UpdateServiceRequest {
+        request_id: u64,
+        service_name: String,
+        source: String,
+    },
+
+    /// Response indicating success or failure of a service update
+    UpdateServiceResponse {
+        request_id: u64,
+        /// `None` indicates success, while `Some(error_message)` describes
+        /// the failure reason
+        error: Option<String>,
+    },
 }
 
 /// Errors that can occur when sending messages

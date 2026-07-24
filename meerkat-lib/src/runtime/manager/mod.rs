@@ -994,6 +994,9 @@ impl Manager {
                             MeerkatMessage::ServiceCodeError { request_id, .. } => {
                                 Some(*request_id)
                             }
+                            MeerkatMessage::UpdateServiceResponse { request_id, .. } => {
+                                Some(*request_id)
+                            }
                             MeerkatMessage::Ping { .. }
                             | MeerkatMessage::Pong { .. }
                             | MeerkatMessage::Announce { .. }
@@ -1007,6 +1010,7 @@ impl Manager {
                             | MeerkatMessage::RequestUpdates { .. }
                             // #39: an incoming code request is handled server-side, not a reply.
                             | MeerkatMessage::ServiceCodeRequest { .. }
+                            | MeerkatMessage::UpdateServiceRequest { .. }
                             | MeerkatMessage::Update { .. } => None,
                         };
                         if let Some(request_id) = rid {
@@ -1371,6 +1375,8 @@ impl Manager {
             | MeerkatMessage::ServiceCodeRequest { .. }
             | MeerkatMessage::ServiceCodeResponse { .. }
             | MeerkatMessage::ServiceCodeError { .. }
+            | MeerkatMessage::UpdateServiceRequest { .. }
+            | MeerkatMessage::UpdateServiceResponse { .. }
             | MeerkatMessage::WaitParked { .. } => Err(EvalError::LocalDispatchFailed(
                 "Unexpected reply to lookup request".to_string(),
             )),
@@ -1511,6 +1517,8 @@ impl Manager {
             | MeerkatMessage::ServiceCodeRequest { .. }
             | MeerkatMessage::ServiceCodeResponse { .. }
             | MeerkatMessage::ServiceCodeError { .. }
+            | MeerkatMessage::UpdateServiceRequest { .. }
+            | MeerkatMessage::UpdateServiceResponse { .. }
             | MeerkatMessage::WaitParked { .. } => Err(EvalError::LocalDispatchFailed(
                 "Unexpected reply to action request".to_string(),
             )),
@@ -2339,6 +2347,8 @@ impl Manager {
             | MeerkatMessage::ServiceCodeRequest { .. }
             | MeerkatMessage::ServiceCodeResponse { .. }
             | MeerkatMessage::ServiceCodeError { .. }
+            | MeerkatMessage::UpdateServiceRequest { .. }
+            | MeerkatMessage::UpdateServiceResponse { .. }
             | MeerkatMessage::WaitParked { .. } => Err(EvalError::LocalDispatchFailed(
                 "Unexpected reply to commit".to_string(),
             )),

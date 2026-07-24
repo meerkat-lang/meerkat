@@ -95,6 +95,37 @@ pub fn decode_source_response(path: &str, source: &str) -> Result<String> {
     Ok(service_name.to_string())
 }
 
+/// Validate and decode an `UpdateServiceRequest` arriving over the wire
+///
+/// Enforces zero-trust identifier and payload size limits
+///
+/// Args:
+///     `service_name` (`&str`): Name of the service to update
+///     `source` (`&str`): Source code payload
+///     `interner` (`&mut Interner`): Interner for symbol creation
+///
+/// Returns:
+///     `Result<(Symbol, String)>`: Validated interned service symbol
+///     and source string
+///
+/// Raises:
+///     `Error::LimitExceeded`: If identifier is invalid or source exceeds
+///     max length
+pub fn decode_update_service_request(
+    service_name: &str,
+    source: &str,
+    interner: &mut Interner,
+) -> Result<(Symbol, String)> {
+    validate_identifier(service_name)?;
+    if source.len() > MAX_NET_REQUEST_SOURCE_LENGTH {
+        return Err(Error::LimitExceeded(format!(
+            "source size exceeds maximum length of {} bytes",
+            MAX_NET_REQUEST_SOURCE_LENGTH
+        )));
+    }
+    Ok((interner.insert(service_name), source.to_string()))
+}
+
 /// Validate identifier fields of a `LookupRequest` message arriving over
 /// the wire
 ///
@@ -2078,5 +2109,34 @@ mod service_code_tests {
             },
         );
         assert!(validate_lock_request(&invalid_read_map).is_err());
+    }
+
+    /// Verify that `decode_update_service_request` validates service identifiers
+    /// and enforces maximum source length limits
+    #[test]
+    fn test_decode_update_service_request() {
+        let mut interner = Interner::new();
+
+        let valid_res = decode_update_service_request(
+            "MyService",
+            "update MyService { var x = 1; }",
+            &mut interner,
+        );
+        assert!(valid_res.is_ok());
+        let (sym, src) = valid_res.unwrap();
+        assert_eq!(interner.get(sym), "MyService");
+        assert_eq!(src, "update MyService { var x = 1; }");
+
+        let invalid_svc = decode_update_service_request(
+            "invalid-service!",
+            "update invalid-service! {}",
+            &mut interner,
+        );
+        assert!(invalid_svc.is_err());
+
+        let oversized_source = "a".repeat(MAX_NET_REQUEST_SOURCE_LENGTH + 1);
+        let oversized_res =
+            decode_update_service_request("MyService", &oversized_source, &mut interner);
+        assert!(oversized_res.is_err());
     }
 }

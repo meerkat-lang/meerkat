@@ -142,6 +142,7 @@ pub struct Thunk<'a> {
 /// it remains in the codebase while being deprecated for static checks
 pub struct Resolver<'a> {
     local_services: HashMap<Symbol, &'a [Decl]>,
+    service_scopes: HashMap<Symbol, HashSet<Symbol>>,
     current_context: Option<Symbol>,
     thunks: Vec<Thunk<'a>>,
     currently_evaluating: HashSet<Symbol>,
@@ -162,6 +163,7 @@ impl<'a> Resolver<'a> {
     pub fn new() -> Self {
         Self {
             local_services: HashMap::new(),
+            service_scopes: HashMap::new(),
             current_context: None,
             thunks: Vec::new(),
             currently_evaluating: HashSet::new(),
@@ -365,6 +367,9 @@ impl<'a> Resolver<'a> {
                     };
                     self.resolve_expr(val, env, 0)?;
                     env.bind(*name, info);
+                    if let Some(ctx) = self.current_context {
+                        self.service_scopes.entry(ctx).or_default().insert(*name);
+                    }
                 }
                 Decl::DefDecl {
                     name,
@@ -385,6 +390,9 @@ impl<'a> Resolver<'a> {
                     };
                     self.resolve_expr(val, env, 0)?;
                     env.bind(*name, info);
+                    if let Some(ctx) = self.current_context {
+                        self.service_scopes.entry(ctx).or_default().insert(*name);
+                    }
                 }
                 Decl::TableDecl { name, fields: _ } => {
                     println!(
@@ -392,6 +400,9 @@ impl<'a> Resolver<'a> {
                          checks as not yet implemented"
                     );
                     env.bind(*name, Binding::Value);
+                    if let Some(ctx) = self.current_context {
+                        self.service_scopes.entry(ctx).or_default().insert(*name);
+                    }
                 }
             }
         }
@@ -458,7 +469,12 @@ impl<'a> Resolver<'a> {
                         });
 
                     if is_local_member {
-                        if !self.in_deferred_phase {
+                        let is_initialized = self
+                            .current_context
+                            .and_then(|ctx| self.service_scopes.get(&ctx))
+                            .is_some_and(|scope| scope.contains(name));
+
+                        if !is_initialized {
                             return Err(Error::ForwardReference(*name));
                         }
                     } else {
@@ -589,7 +605,12 @@ impl<'a> Resolver<'a> {
                         });
 
                     if is_local_member {
-                        if self.in_deferred_phase {
+                        let is_initialized = self
+                            .current_context
+                            .and_then(|ctx| self.service_scopes.get(&ctx))
+                            .is_some_and(|scope| scope.contains(name));
+
+                        if is_initialized {
                             return Ok(());
                         } else {
                             return Err(Error::ForwardReference(*name));

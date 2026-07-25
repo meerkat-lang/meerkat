@@ -981,3 +981,61 @@ fn test_transitive_import_member_access() {
     let res = resolve(&stmts);
     assert!(res.is_ok());
 }
+
+/// Verify delayed forward reference succeeds if variable is
+/// initialized before closure invocation
+#[test]
+fn test_integration_delayed_fwd_ok() {
+    let mut interner = Interner::new();
+    let input = "
+        service s {
+            def f = fn () => x;
+            var x = 5;
+            var y = f();
+        }
+    ";
+    let parse_result = parse_string(input, &mut interner);
+    assert!(parse_result.is_ok());
+    let stmts = parse_result.unwrap();
+    let res = resolve(&stmts);
+    assert!(res.is_ok());
+}
+
+/// Verify delayed forward reference fails if closure is invoked
+/// before target variable is initialized
+#[test]
+fn test_integration_delayed_fwd_err() {
+    let mut interner = Interner::new();
+    let input = "
+        service s {
+            def f = fn () => x;
+            var y = f();
+            var x = 5;
+        }
+    ";
+    let parse_result = parse_string(input, &mut interner);
+    assert!(parse_result.is_ok());
+    let stmts = parse_result.unwrap();
+    let res = resolve(&stmts);
+    let x = interner.insert("x");
+    assert_eq!(res, Err(Error::ForwardReference(x)));
+}
+
+/// Verify delayed action forward reference succeeds when executed
+/// after target variable initialization
+#[test]
+fn test_integration_action_fwd_ok() {
+    let mut interner = Interner::new();
+    let input = "
+        service s {
+            def act = action { let a = x; };
+            var x = 10;
+            pub def run = action { do act; };
+        }
+    ";
+    let parse_result = parse_string(input, &mut interner);
+    assert!(parse_result.is_ok());
+    let stmts = parse_result.unwrap();
+    let res = resolve(&stmts);
+    assert!(res.is_ok());
+}

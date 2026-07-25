@@ -218,7 +218,7 @@ impl<'a, 'b> Context<'a, 'b> {
                     let mut local_env = Env::new(None);
                     self.infer(expr, &mut local_env, 1)?;
                 }
-                Stmt::Update { .. } => {
+                Stmt::Atomic { .. } | Stmt::Update { .. } => {
                     // TODO(Issue #156): Implement static checks
                     // (deferred per Issue #34)
                     println!(

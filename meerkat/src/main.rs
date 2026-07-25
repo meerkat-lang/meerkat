@@ -985,6 +985,18 @@ async fn run_client(
                     .map_err(|e| format!("Update error: {}", e))?;
                 println!("Service '{}' updated", manager.interner.get(service_name));
             }
+            Stmt::Atomic { updates } => {
+                if !updates.is_empty() {
+                    let mut txn = meerkat_lib::runtime::update::Transaction::new(updates.clone());
+                    txn.poll(&mut manager)
+                        .await
+                        .map_err(|e| format!("Atomic update error: {}", e))?;
+                    println!(
+                        "Atomic update transaction completed ({} updates)",
+                        updates.len()
+                    );
+                }
+            }
             &Stmt::Test {
                 service_name,
                 ref stmts,

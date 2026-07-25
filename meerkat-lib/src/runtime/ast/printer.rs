@@ -75,6 +75,12 @@ impl<'a> AstPrinter<'a> {
                 println!("ActionStmt:");
                 self.print_action_stmt(action, indent + 1);
             }
+            Stmt::Atomic { updates } => {
+                println!("Atomic:");
+                for update in updates {
+                    self.print_stmt(update, indent + 1);
+                }
+            }
             Stmt::Update {
                 service_name,
                 decls,

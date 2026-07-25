@@ -195,6 +195,7 @@ impl<'a> Resolver<'a> {
                     env.bind(*service_name, Binding::Value);
                 }
                 Stmt::ActionStmt(_)
+                | Stmt::Atomic { .. }
                 | Stmt::Update { .. }
                 | Stmt::Connect { .. }
                 | Stmt::Test { .. }
@@ -252,6 +253,12 @@ impl<'a> Resolver<'a> {
     ) -> Result<(), Error> {
         match stmt {
             Stmt::ActionStmt(action) => self.resolve_action_stmt(action, env, 0),
+            Stmt::Atomic { updates } => {
+                for u in updates {
+                    self.resolve_stmt(u, env)?;
+                }
+                Ok(())
+            }
             Stmt::Update { .. } => {
                 println!(
                     "warning: nameres: ignoring 'update' \

@@ -60,6 +60,9 @@ pub enum ActionStmt {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Stmt {
     ActionStmt(ActionStmt),
+    Atomic {
+        updates: Vec<Stmt>,
+    },
     Update {
         service_name: Symbol,
         decls: Vec<Decl>,

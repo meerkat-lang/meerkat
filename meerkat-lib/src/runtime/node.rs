@@ -494,6 +494,18 @@ impl<'a> Node<'a> {
                         .map_err(|e| Error::Message(format!("Update error: {}", e)))?;
                     println!("Service '{}' updated", manager.interner.get(*service_name));
                 }
+                Stmt::Atomic { updates } => {
+                    if !updates.is_empty() {
+                        let mut txn = crate::runtime::update::Transaction::new(updates.clone());
+                        txn.poll(&mut manager)
+                            .await
+                            .map_err(|e| Error::Message(format!("Atomic update error: {}", e)))?;
+                        println!(
+                            "Atomic update transaction completed ({} updates)",
+                            updates.len()
+                        );
+                    }
+                }
                 Stmt::Import { .. }
                 | Stmt::Test { .. }
                 | Stmt::ActionStmt(_)

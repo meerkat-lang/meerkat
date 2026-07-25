@@ -16,6 +16,7 @@ extern {
     type Error = String;
 
     enum Token<'input> {
+        "atomic" => Token::ATOMIC_KW,
         "update" => Token::UPDATE_KW,
         "service" => Token::SERVICE,
         "@test" => Token::TEST_KW,
@@ -85,9 +86,16 @@ pub Prog: Vec<Stmt> = {
 
 Stmts: Vec<Stmt> = Stmt*;
 
-Stmt: Stmt = {
+UpdateStmt: Stmt = {
     "update" <i:Ident> "{" <ds:Decls> "}" => {
         Stmt::Update { service_name: i, decls: ds }
+    },
+}
+
+Stmt: Stmt = {
+    <u: UpdateStmt> => u,
+    "atomic" "{" <us: UpdateStmt*> "}" => {
+        Stmt::Atomic { updates: us }
     },
     "service" <i:Ident> "{" <ds:Decls> "}" => {
         Stmt::Service { name: i, decls: ds }

@@ -513,3 +513,67 @@ async fn test_update_multiple_new_fields_and_reactive_defs_success() {
     let sum_val = manager.lookup(sum_sym, s1_sym, None).await.unwrap();
     assert_eq!(sum_val, Value::Int { val: 30 });
 }
+
+/// Verify that an atomic block containing updates for multiple services
+/// applies all updates atomically
+#[tokio::test]
+async fn test_atomic_block_multiple_services_update() {
+    let mut interner = Interner::new();
+    let initial_code = "
+        service s1 {
+            var x = 10;
+        }
+        service s2 {
+            var y = 20;
+        }
+    ";
+    let initial_ast = parse_string(initial_code, &mut interner).expect("initial parse failed");
+    let mut node = Node::new();
+    node.interner = interner.clone();
+    node.unified_ast = initial_ast;
+    node.static_checks().expect("static checks failed");
+
+    let local_ast = node.unified_ast.clone();
+    let mut manager = node
+        .on_manager_startup(true, None, HashMap::new(), &local_ast)
+        .await
+        .expect("manager startup failed");
+
+    let atomic_code = "
+        atomic {
+            update s1 {
+                var x = 100;
+            }
+            update s2 {
+                var y = 200;
+            }
+        }
+    ";
+    let ast = parse_string(atomic_code, &mut manager.interner).expect("atomic parse failed");
+    assert_eq!(ast.len(), 1);
+
+    if let meerkat_lib::runtime::ast::Stmt::Atomic { updates } = &ast[0] {
+        let mut txn = Transaction::new(updates.clone());
+        let poll_res = txn.poll(&mut manager).await;
+        assert!(poll_res.is_ok(), "poll error: {:?}", poll_res);
+    } else {
+        panic!("expected Stmt::Atomic");
+    }
+
+    let s1_sym = manager.interner.insert("s1");
+    let s2_sym = manager.interner.insert("s2");
+    let x_sym = manager.interner.insert("x");
+    let y_sym = manager.interner.insert("y");
+
+    let s1 = manager.services.get(&s1_sym).expect("service s1 missing");
+    assert_eq!(
+        s1.vars.get(&x_sym).expect("var x missing").value,
+        Value::Int { val: 100 }
+    );
+
+    let s2 = manager.services.get(&s2_sym).expect("service s2 missing");
+    assert_eq!(
+        s2.vars.get(&y_sym).expect("var y missing").value,
+        Value::Int { val: 200 }
+    );
+}

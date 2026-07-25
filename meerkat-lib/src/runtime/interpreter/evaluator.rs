@@ -159,7 +159,7 @@ pub async fn eval(
                     _ => {}
                 }
             }
-            match (op, val1, val2) {
+            match (op, &val1, &val2) {
                 (BinOp::Add, Value::Int { val: v1 }, Value::Int { val: v2 }) => {
                     Ok(Value::Int { val: v1 + v2 })
                 }
@@ -170,13 +170,8 @@ pub async fn eval(
                     Ok(Value::Int { val: v1 * v2 })
                 }
                 (BinOp::Div, Value::Int { val: v1 }, Value::Int { val: v2 }) => {
-                    // NOTE: Division by zero and division overflow (i32::MIN / -1) are the only
-                    // integer arithmetic operations that panic in Rust release mode.
-                    // If a modulo (%) operator is ever implemented in the future, it must
-                    // also include these identical bounds checks (x % 0 and i32::MIN % -1)
-                    // to prevent panics.
-                    let val = v1.checked_div(v2).ok_or_else(|| {
-                        EvalError::RuntimeError(if v2 == 0 {
+                    let val = v1.checked_div(*v2).ok_or_else(|| {
+                        EvalError::RuntimeError(if *v2 == 0 {
                             "Division by zero".to_string()
                         } else {
                             "Integer overflow".to_string()
@@ -187,6 +182,12 @@ pub async fn eval(
                 (BinOp::Eq, Value::Int { val: v1 }, Value::Int { val: v2 }) => {
                     Ok(Value::Bool { val: v1 == v2 })
                 }
+                (BinOp::Eq, Value::Bool { val: v1 }, Value::Bool { val: v2 }) => {
+                    Ok(Value::Bool { val: v1 == v2 })
+                }
+                (BinOp::Eq, Value::String { val: v1 }, Value::String { val: v2 }) => {
+                    Ok(Value::Bool { val: v1 == v2 })
+                }
                 (BinOp::Lt, Value::Int { val: v1 }, Value::Int { val: v2 }) => {
                     Ok(Value::Bool { val: v1 < v2 })
                 }
@@ -194,14 +195,15 @@ pub async fn eval(
                     Ok(Value::Bool { val: v1 > v2 })
                 }
                 (BinOp::And, Value::Bool { val: v1 }, Value::Bool { val: v2 }) => {
-                    Ok(Value::Bool { val: v1 && v2 })
+                    Ok(Value::Bool { val: *v1 && *v2 })
                 }
                 (BinOp::Or, Value::Bool { val: v1 }, Value::Bool { val: v2 }) => {
-                    Ok(Value::Bool { val: v1 || v2 })
+                    Ok(Value::Bool { val: *v1 || *v2 })
                 }
-                _ => Err(EvalError::TypeError(
-                    "Type error in binary operation".to_string(),
-                )),
+                _ => Err(EvalError::TypeError(format!(
+                    "Type error in binary operation: {:?} on {:?} and {:?}",
+                    op, val1, val2
+                ))),
             }
         }
 

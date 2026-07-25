@@ -1,6 +1,8 @@
-use super::ast::{ActionStmt, Decl, Expr, Value};
+use super::ast::{ActionStmt, Decl, Expr, Stmt, Value};
+use super::env::Env;
 use super::interpreter::{eval, execute, EvalContext, EvalError, ExecuteEffect};
 use super::semantic_analysis::var_analysis::{calc_dep_srv, DependAnalysis};
+use super::tt::types::ServiceType;
 use crate::net::network_layer::NetworkLayer;
 use crate::net::{
     codec, Address, LockGroup, MeerkatMessage, NetworkActor, NetworkCommand, NetworkEvent,
@@ -105,6 +107,10 @@ pub struct Manager {
     /// #24: reply address for each remote listener, keyed by the listener's
     /// ServiceNetId, so the owner can route Updates back to it.
     pub listener_addrs: HashMap<ServiceNetId, String>,
+    /// Global unified AST of all services running on this manager
+    pub unified_ast: Vec<Stmt>,
+    /// Global local services type environment
+    pub local_services: Env<'static, ServiceType<'static>>,
 }
 
 impl Manager {
@@ -122,6 +128,8 @@ impl Manager {
             interner,
             reactive_cache: None,
             listener_addrs: HashMap::new(),
+            unified_ast: Vec::new(),
+            local_services: Env::new(None),
         }
     }
 
@@ -248,6 +256,10 @@ impl Manager {
         // evaluating any declarations, so action closures built during
         // initialization are stamped with the correct `ServiceNetId`
         // instead of `service_net_id_for_name`'s bare-name fallback
+        self.unified_ast.push(Stmt::Service {
+            name,
+            decls: decls.clone(),
+        });
         self.services.insert(
             name,
             Service {
@@ -1620,9 +1632,11 @@ impl Manager {
                 }
             }
         }
-        let var_state = service.vars.get_mut(&var).ok_or_else(|| {
-            EvalError::VarNotFound(format!("Variable '{}' not found", self.interner.get(var)))
-        })?;
+        let var_state = service.vars.entry(var).or_insert_with(|| VarState {
+            value: Value::Int { val: 0 },
+            lock: crate::runtime::txn::VarLock::Unlocked,
+            latest_write_txn: None,
+        });
         if var_state.lock.try_write(txn_id) {
             Ok(())
         } else {
@@ -1778,6 +1792,12 @@ impl Manager {
     }
 
     /// Release all locks held by `txn_id` on the given variables (and service locks)
+    /// Release all locks (both member and service level) held by a transaction
+    pub fn release_all_locks(&mut self, txn: &Transaction) {
+        let keys = self.all_locked_keys(txn);
+        self.release_locks(&keys, &txn.id);
+    }
+
     fn release_locks(&mut self, locked: &HashSet<WaitKey>, txn_id: &TxnId) {
         for key in locked {
             match key {
@@ -1996,7 +2016,7 @@ impl Manager {
     }
 
     /// Attempt to acquire a whole-service lock on a service
-    fn acquire_service_lock(
+    pub fn acquire_service_lock(
         &mut self,
         service_name: Symbol,
         txn_id: &TxnId,
@@ -2135,7 +2155,7 @@ impl Manager {
     /// Raises:
     ///     EvalError::WaitOn: If a lock must wait.
     ///     EvalError::LocalDispatchFailed: If a remote lock fails/times out.
-    async fn acquire_lock_group_internal(
+    pub(crate) async fn acquire_lock_group_internal(
         &mut self,
         txn: &mut Transaction,
         services: &HashMap<String, LockGroup>,
@@ -2156,6 +2176,9 @@ impl Manager {
 
         for (svc_name_str, group) in services {
             let svc_sym = self.interner.insert(svc_name_str);
+            if group.service_level_lock {
+                continue;
+            }
             for r in &group.reads {
                 let var_sym = self.interner.insert(r);
                 queue.push((svc_sym, var_sym, false));

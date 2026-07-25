@@ -460,6 +460,12 @@ impl<'a> Node<'a> {
         let mut manager = Manager::new(self.interner);
         manager.local = local;
         manager.network = network;
+        manager.unified_ast = self.unified_ast.clone();
+        manager.local_services = unsafe {
+            std::mem::transmute::<Env<'_, ServiceType<'_>>, Env<'static, ServiceType<'static>>>(
+                self.local_services,
+            )
+        };
 
         for (svc_name, url) in &remote_url_map {
             let svc_sym = manager.interner.insert(svc_name);
@@ -470,12 +476,29 @@ impl<'a> Node<'a> {
         }
 
         for stmt in local_ast {
-            if let Stmt::Service { name, decls } = stmt {
-                manager
-                    .create_service(*name, decls.clone())
-                    .await
-                    .map_err(|e| Error::Message(format!("Service error: {}", e)))?;
-                println!("Service '{}' loaded", manager.interner.get(*name));
+            match stmt {
+                Stmt::Service { name, decls } => {
+                    manager
+                        .create_service(*name, decls.clone())
+                        .await
+                        .map_err(|e| Error::Message(format!("Service error: {}", e)))?;
+                    println!("Service '{}' loaded", manager.interner.get(*name));
+                }
+                Stmt::Update {
+                    service_name,
+                    decls: _,
+                } => {
+                    let mut txn = crate::runtime::update::Transaction::new(vec![stmt.clone()]);
+                    txn.poll(&mut manager)
+                        .await
+                        .map_err(|e| Error::Message(format!("Update error: {}", e)))?;
+                    println!("Service '{}' updated", manager.interner.get(*service_name));
+                }
+                Stmt::Import { .. }
+                | Stmt::Test { .. }
+                | Stmt::ActionStmt(_)
+                | Stmt::Connect { .. }
+                | Stmt::Watch { .. } => {}
             }
         }
 
@@ -521,7 +544,13 @@ impl<'a> Node<'a> {
         })?;
 
         let mut local_services = Env::new(None);
-        tt::check(&self.unified_ast, &mut local_services).map_err(|e| self.format_tt_error(e))
+        tt::check(&self.unified_ast, &mut local_services).map_err(|e| self.format_tt_error(e))?;
+        self.local_services = unsafe {
+            std::mem::transmute::<Env<'_, ServiceType<'_>>, Env<'a, ServiceType<'a>>>(
+                local_services,
+            )
+        };
+        Ok(())
     }
 
     /// Format a type checking error into a user-facing error message,

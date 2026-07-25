@@ -974,6 +974,17 @@ async fn run_client(
                     .map_err(|e| format!("Service error: {}", e))?;
                 println!("Service '{}' loaded", manager.interner.get(name));
             }
+            &Stmt::Update {
+                service_name,
+                ref decls,
+            } => {
+                let _ = decls;
+                let mut txn = meerkat_lib::runtime::update::Transaction::new(vec![stmt.clone()]);
+                txn.poll(&mut manager)
+                    .await
+                    .map_err(|e| format!("Update error: {}", e))?;
+                println!("Service '{}' updated", manager.interner.get(service_name));
+            }
             &Stmt::Test {
                 service_name,
                 ref stmts,
@@ -1025,8 +1036,7 @@ async fn run_client(
                     }
                 }
             }
-            &Stmt::ActionStmt(_) => {}
-            &Stmt::Update { .. } | &Stmt::Connect { .. } | &Stmt::Watch { .. } => {}
+            &Stmt::ActionStmt(_) | &Stmt::Connect { .. } | &Stmt::Watch { .. } => {}
         }
     }
 

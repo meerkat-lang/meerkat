@@ -17,6 +17,7 @@ pub mod parser;
 pub mod semantic_analysis;
 pub mod tt;
 pub mod txn;
+pub mod update;
 
 pub use env::Env;
 pub use html::Html;

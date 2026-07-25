@@ -1,8 +1,9 @@
-// test_nameres_thunks.mkt
+// test_nameres_lexical.mkt
 //
-// This test file contains reproductions for name resolution of thunks
-// and suspended computations, showing what should fail and what should
-// pass. The failing cases must be commented out to run the valid cases
+// This test file verifies pure lexical block-level name resolution.
+// Under the redesigned static architecture, nameres verifies that all
+// referenced identifiers exist in scope (regardless of declaration order),
+// delegating execution-order dependency analysis to a separate pass.
 
 // Example 1: Direct IIFE (Closure)
 // Expected behavior: FAILS static check due to immediate forward reference 'x'

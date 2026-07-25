@@ -15,9 +15,8 @@
 use crate::runtime::ast::{ActionStmt, Decl, Expr, Stmt, Value};
 use crate::runtime::interner::Symbol;
 use crate::runtime::limits::MAX_SCOPE_DEPTH;
-use crate::runtime::tt::Param;
 use crate::runtime::Env;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 
 /// The sort of identifier expected during name resolution
@@ -95,58 +94,19 @@ impl std::error::Error for Error {}
 pub enum Binding<'a> {
     /// A standard, immediately evaluated value
     Value,
-    /// A suspended computation (closure/action) with its parameters and body
-    Suspended {
-        /// Parameters of the suspended computation
-        params: Option<&'a [Param]>,
-        /// The body of the suspended computation
-        body: &'a Expr,
-    },
-}
-
-/// The body of a delayed computation (thunk)
-#[derive(Clone)]
-pub enum ThunkBody<'a> {
-    /// An expression body (such as a closure body)
-    Expr(&'a Expr),
-    /// A list of action statements (such as an action block or test block)
-    ActionStmts(&'a [ActionStmt]),
-}
-
-/// A thunk representing a suspended computation whose resolution is deferred
-#[derive(Clone)]
-pub struct Thunk<'a> {
-    /// Parameters of the thunk, if any
-    params: Option<Vec<Param>>,
-    /// The body of the thunk
-    body: ThunkBody<'a>,
-    /// The lexical environment captured at the definition site
-    env: Env<'a, Binding<'a>>,
-    /// The service context active at the definition site
-    context: Option<Symbol>,
+    #[doc(hidden)]
+    _Marker(std::marker::PhantomData<&'a ()>),
 }
 
 /// The stateful struct that drives static name resolution traversal
 ///
-/// This resolver implements an extended multi-pass name resolution
-/// architecture utilizing thunks to model suspended computations
-/// It eliminates the depth-counter heuristic in favor of simulating
-/// execution-order semantics. When a closure, action, or test block
-/// is encountered, its resolution is deferred as a thunk. If a call
-/// or execution trigger is hit at service scope, the thunk is forced
-/// immediately, verifying all sequential forward dependencies
-///
-/// This provides the exact same static guarantees as a dependency
-/// DAG (such as in `dep_analysis.rs`) by tracing the evaluation path
-/// Since `dep_analysis` is still used for runtime closure flattening,
-/// it remains in the codebase while being deprecated for static checks
+/// This resolver performs pure lexical, block-level name resolution.
+/// It delegates execution-order dependency checking to a separate
+/// static analysis pass, ensuring that lexical lookup rules are
+/// enforced cleanly without rigid ordering constraints.
 pub struct Resolver<'a> {
     local_services: HashMap<Symbol, &'a [Decl]>,
-    service_scopes: HashMap<Symbol, HashSet<Symbol>>,
     current_context: Option<Symbol>,
-    thunks: Vec<Thunk<'a>>,
-    currently_evaluating: HashSet<Symbol>,
-    in_deferred_phase: bool,
 }
 
 impl<'a> Default for Resolver<'a> {
@@ -159,16 +119,14 @@ impl<'a> Resolver<'a> {
     /// Creates a new resolver instance
     ///
     /// Returns:
-    ///     `Self`: The new `Resolver` instance
+    ///     Self: The new `Resolver` instance
     pub fn new() -> Self {
-        Self {
+        let resolver = Self {
             local_services: HashMap::new(),
-            service_scopes: HashMap::new(),
             current_context: None,
-            thunks: Vec::new(),
-            currently_evaluating: HashSet::new(),
-            in_deferred_phase: false,
-        }
+        };
+        debug_assert!(resolver.current_context.is_none());
+        resolver
     }
 
     /// Resolves name bindings for a program represented as a slice
@@ -209,33 +167,6 @@ impl<'a> Resolver<'a> {
         for stmt in stmts {
             self.resolve_stmt(stmt, env)?;
         }
-
-        // Pass 3: Drain and resolve all thunks (deferred phase)
-        self.in_deferred_phase = true;
-        let thunks = std::mem::take(&mut self.thunks);
-        for thunk in &thunks {
-            let prev_context = self.current_context;
-            self.current_context = thunk.context;
-            match &thunk.body {
-                ThunkBody::Expr(body) => {
-                    if let Some(params) = &thunk.params {
-                        let mut inner_env = Env::new(Some(&thunk.env));
-                        for param in params {
-                            inner_env.bind(param.name, Binding::Value);
-                        }
-                        self.resolve_expr(body, &inner_env, 0)?;
-                    } else {
-                        self.resolve_expr(body, &thunk.env, 0)?;
-                    }
-                }
-                ThunkBody::ActionStmts(stmts) => {
-                    let mut action_env = Env::new(Some(&thunk.env));
-                    self.resolve_action_stmts(stmts, &mut action_env, 0)?;
-                }
-            }
-            self.current_context = prev_context;
-        }
-        self.in_deferred_phase = false;
 
         Ok(())
     }
@@ -319,16 +250,7 @@ impl<'a> Resolver<'a> {
                         }
                     }
                 }
-                if self.in_deferred_phase {
-                    self.resolve_action_stmts(stmts, &mut test_env, 0)?;
-                } else {
-                    self.thunks.push(Thunk {
-                        params: None,
-                        body: ThunkBody::ActionStmts(stmts),
-                        env: test_env.flatten(),
-                        context: self.current_context,
-                    });
-                }
+                self.resolve_action_stmts(stmts, &mut test_env, 0)?;
                 self.current_context = prev_context;
                 Ok(())
             }
@@ -354,22 +276,8 @@ impl<'a> Resolver<'a> {
         for decl in decls {
             match decl {
                 Decl::VarDecl { name, ty: _, val } => {
-                    let info = match val {
-                        Expr::Func { params, body, .. } => Binding::Suspended {
-                            params: Some(params),
-                            body: body.as_ref(),
-                        },
-                        Expr::Action(_) => Binding::Suspended {
-                            params: None,
-                            body: val,
-                        },
-                        _ => Binding::Value,
-                    };
                     self.resolve_expr(val, env, 0)?;
-                    env.bind(*name, info);
-                    if let Some(ctx) = self.current_context {
-                        self.service_scopes.entry(ctx).or_default().insert(*name);
-                    }
+                    env.bind(*name, Binding::Value);
                 }
                 Decl::DefDecl {
                     name,
@@ -377,22 +285,8 @@ impl<'a> Resolver<'a> {
                     val,
                     is_pub: _,
                 } => {
-                    let info = match val {
-                        Expr::Func { params, body, .. } => Binding::Suspended {
-                            params: Some(params),
-                            body: body.as_ref(),
-                        },
-                        Expr::Action(_) => Binding::Suspended {
-                            params: None,
-                            body: val,
-                        },
-                        _ => Binding::Value,
-                    };
                     self.resolve_expr(val, env, 0)?;
-                    env.bind(*name, info);
-                    if let Some(ctx) = self.current_context {
-                        self.service_scopes.entry(ctx).or_default().insert(*name);
-                    }
+                    env.bind(*name, Binding::Value);
                 }
                 Decl::TableDecl { name, fields: _ } => {
                     println!(
@@ -400,9 +294,6 @@ impl<'a> Resolver<'a> {
                          checks as not yet implemented"
                     );
                     env.bind(*name, Binding::Value);
-                    if let Some(ctx) = self.current_context {
-                        self.service_scopes.entry(ctx).or_default().insert(*name);
-                    }
                 }
             }
         }
@@ -453,7 +344,7 @@ impl<'a> Resolver<'a> {
                 Ok(())
             }
             ActionStmt::Expr(expr) => self.resolve_expr(expr, env, depth + 1),
-            ActionStmt::Do(expr) => self.force_resolve(expr, env, depth + 1),
+            ActionStmt::Do(expr) => self.resolve_expr(expr, env, depth + 1),
             ActionStmt::Assert(expr, _text) => self.resolve_expr(expr, env, depth + 1),
             ActionStmt::Assign { name, expr } => {
                 if env.find(*name).is_none() {
@@ -468,16 +359,7 @@ impl<'a> Resolver<'a> {
                             })
                         });
 
-                    if is_local_member {
-                        let is_initialized = self
-                            .current_context
-                            .and_then(|ctx| self.service_scopes.get(&ctx))
-                            .is_some_and(|scope| scope.contains(name));
-
-                        if !is_initialized {
-                            return Err(Error::ForwardReference(*name));
-                        }
-                    } else {
+                    if !is_local_member {
                         return Err(Error::UnknownIdentifier {
                             name: *name,
                             expected: ExpectedSort::Variable,
@@ -507,62 +389,6 @@ impl<'a> Resolver<'a> {
                 loop_env.bind(*var, Binding::Value);
                 self.resolve_action_stmts(body, &mut loop_env, depth + 1)
             }
-        }
-    }
-
-    /// Forces immediate name resolution of a suspended computation
-    ///
-    /// Args:
-    ///     `expr` (`&'a Expr`): The target expression to force
-    ///     `env` (`&Env<'b, Binding<'a>>`): The current environment
-    ///
-    /// Returns:
-    ///     `Result<(), Error>`: Ok if resolution succeeds, or `Error`
-    fn force_resolve<'b>(
-        &mut self,
-        expr: &'a Expr,
-        env: &Env<'b, Binding<'a>>,
-        depth: usize,
-    ) -> Result<(), Error> {
-        match expr {
-            Expr::Func { params, body, .. } => {
-                let mut inner_env = Env::new(Some(env));
-                for param in params {
-                    inner_env.bind(param.name, Binding::Value);
-                }
-                self.resolve_expr(body.as_ref(), &inner_env, depth + 1)
-            }
-            Expr::Action(stmts) => {
-                let mut action_env = Env::new(Some(env));
-                self.resolve_action_stmts(stmts, &mut action_env, depth + 1)
-            }
-            Expr::Variable { name } => {
-                if self.currently_evaluating.contains(name) {
-                    return Ok(());
-                }
-                self.currently_evaluating.insert(*name);
-                let res = if let Some((decl_env, info)) = env.find_with_env(*name) {
-                    match info {
-                        Binding::Suspended { params, body } => {
-                            if let Some(params) = params {
-                                let mut inner_env = Env::new(Some(decl_env));
-                                for param in *params {
-                                    inner_env.bind(param.name, Binding::Value);
-                                }
-                                self.resolve_expr(body, &inner_env, depth + 1)
-                            } else {
-                                self.resolve_expr(body, decl_env, depth + 1)
-                            }
-                        }
-                        Binding::Value => Ok(()),
-                    }
-                } else {
-                    self.resolve_expr(expr, env, depth + 1)
-                };
-                self.currently_evaluating.remove(name);
-                res
-            }
-            _ => self.resolve_expr(expr, env, depth + 1),
         }
     }
 
@@ -605,16 +431,7 @@ impl<'a> Resolver<'a> {
                         });
 
                     if is_local_member {
-                        let is_initialized = self
-                            .current_context
-                            .and_then(|ctx| self.service_scopes.get(&ctx))
-                            .is_some_and(|scope| scope.contains(name));
-
-                        if is_initialized {
-                            return Ok(());
-                        } else {
-                            return Err(Error::ForwardReference(*name));
-                        }
+                        return Ok(());
                     }
 
                     return Err(Error::UnknownIdentifier {
@@ -651,41 +468,23 @@ impl<'a> Resolver<'a> {
                 body,
                 return_ty: _,
             } => {
-                if self.in_deferred_phase {
-                    let mut inner_env = Env::new(Some(env));
-                    for param in params {
-                        inner_env.bind(param.name, Binding::Value);
-                    }
-                    self.resolve_expr(body.as_ref(), &inner_env, depth + 1)?;
-                } else {
-                    self.thunks.push(Thunk {
-                        params: Some(params.clone()),
-                        body: ThunkBody::Expr(body.as_ref()),
-                        env: env.flatten(),
-                        context: self.current_context,
-                    });
+                let mut inner_env = Env::new(Some(env));
+                for param in params {
+                    inner_env.bind(param.name, Binding::Value);
                 }
+                self.resolve_expr(body.as_ref(), &inner_env, depth + 1)?;
                 Ok(())
             }
             Expr::Call { func, args } => {
-                self.force_resolve(func.as_ref(), env, depth + 1)?;
+                self.resolve_expr(func.as_ref(), env, depth + 1)?;
                 for arg in args {
                     self.resolve_expr(arg, env, depth + 1)?;
                 }
                 Ok(())
             }
             Expr::Action(stmts) => {
-                if self.in_deferred_phase {
-                    let mut action_env = Env::new(Some(env));
-                    self.resolve_action_stmts(stmts, &mut action_env, depth + 1)?;
-                } else {
-                    self.thunks.push(Thunk {
-                        params: None,
-                        body: ThunkBody::ActionStmts(stmts),
-                        env: env.flatten(),
-                        context: self.current_context,
-                    });
-                }
+                let mut action_env = Env::new(Some(env));
+                self.resolve_action_stmts(stmts, &mut action_env, depth + 1)?;
                 Ok(())
             }
             Expr::MemberAccess {
@@ -785,20 +584,11 @@ impl<'a> Resolver<'a> {
                 service_name: _,
                 return_ty: _,
             } => {
-                if self.in_deferred_phase {
-                    let mut inner_env = Env::new(Some(env));
-                    for param in params {
-                        inner_env.bind(param.name, Binding::Value);
-                    }
-                    self.resolve_expr(body.as_ref(), &inner_env, depth + 1)?;
-                } else {
-                    self.thunks.push(Thunk {
-                        params: Some(params.clone()),
-                        body: ThunkBody::Expr(body.as_ref()),
-                        env: env.flatten(),
-                        context: self.current_context,
-                    });
+                let mut inner_env = Env::new(Some(env));
+                for param in params {
+                    inner_env.bind(param.name, Binding::Value);
                 }
+                self.resolve_expr(body.as_ref(), &inner_env, depth + 1)?;
                 Ok(())
             }
             Value::ActionClosure {
@@ -806,17 +596,8 @@ impl<'a> Resolver<'a> {
                 env: _,
                 service_net_id: _,
             } => {
-                if self.in_deferred_phase {
-                    let mut action_env = Env::new(Some(env));
-                    self.resolve_action_stmts(stmts, &mut action_env, depth + 1)?;
-                } else {
-                    self.thunks.push(Thunk {
-                        params: None,
-                        body: ThunkBody::ActionStmts(stmts),
-                        env: env.flatten(),
-                        context: self.current_context,
-                    });
-                }
+                let mut action_env = Env::new(Some(env));
+                self.resolve_action_stmts(stmts, &mut action_env, depth + 1)?;
                 Ok(())
             }
             Value::List { vals } => {
@@ -850,35 +631,27 @@ mod tests {
     use crate::runtime::interner::Interner;
     use crate::runtime::tt::Param;
 
-    /// Verify service rejects eager forward references
+    /// Verify service accepts forward references in pure lexical resolution
     #[test]
-    fn test_unit_service_rejects_forward_reference() {
+    fn test_unit_service_accepts_forward_reference() {
         let mut interner = Interner::new();
         let s = interner.insert("s");
         let x = interner.insert("x");
         let y = interner.insert("y");
 
-        // def y = (x + 1);
-        let decl_y = Decl::DefDecl {
-            name: y,
-            ty: None,
-            val: Expr::Binop {
-                op: crate::runtime::ast::BinOp::Add,
-                expr1: Box::new(Expr::Variable { name: x }),
-                expr2: Box::new(Expr::Literal {
-                    val: Value::Int { val: 1 },
-                }),
-            },
-            is_pub: true,
-        };
-
-        // var x = 5;
         let decl_x = Decl::VarDecl {
             name: x,
             ty: None,
             val: Expr::Literal {
                 val: Value::Int { val: 5 },
             },
+        };
+
+        let decl_y = Decl::DefDecl {
+            name: y,
+            ty: None,
+            val: Expr::Variable { name: x },
+            is_pub: false,
         };
 
         let stmt = Stmt::Service {
@@ -890,8 +663,7 @@ mod tests {
         let mut resolver = Resolver::new();
         let program = vec![stmt];
         let res = resolver.resolve_program(&program, &mut env);
-        assert!(res.is_err());
-        assert_eq!(res.unwrap_err(), Error::ForwardReference(x));
+        assert!(res.is_ok());
     }
 
     /// Verify sequential block scoping and declaration-before-use

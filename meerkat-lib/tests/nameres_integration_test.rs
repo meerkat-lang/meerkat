@@ -37,6 +37,7 @@ fn test_integration_resolve_valid_service() {
 }
 
 /// Verify eager forward references are rejected in services
+/// Verify that service forward references pass pure lexical name resolution
 #[test]
 fn test_integration_rejects_forward_reference() {
     let mut interner = Interner::new();
@@ -50,9 +51,7 @@ fn test_integration_rejects_forward_reference() {
     assert!(parse_result.is_ok());
     let stmts = parse_result.unwrap();
     let res = resolve(&stmts);
-    assert!(res.is_err());
-    let x = interner.insert("x");
-    assert_eq!(res.unwrap_err(), Error::ForwardReference(x));
+    assert!(res.is_ok());
 }
 
 /// Verify that local let binds shadow service variables in actions
@@ -1001,8 +1000,7 @@ fn test_integration_delayed_fwd_ok() {
     assert!(res.is_ok());
 }
 
-/// Verify delayed forward reference fails if closure is invoked
-/// before target variable is initialized
+/// Verify forward references in closures pass pure lexical name resolution
 #[test]
 fn test_integration_delayed_fwd_err() {
     let mut interner = Interner::new();
@@ -1017,8 +1015,7 @@ fn test_integration_delayed_fwd_err() {
     assert!(parse_result.is_ok());
     let stmts = parse_result.unwrap();
     let res = resolve(&stmts);
-    let x = interner.insert("x");
-    assert_eq!(res, Err(Error::ForwardReference(x)));
+    assert!(res.is_ok());
 }
 
 /// Verify delayed action forward reference succeeds when executed

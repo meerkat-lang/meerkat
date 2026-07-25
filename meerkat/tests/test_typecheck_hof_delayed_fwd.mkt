@@ -1,0 +1,7 @@
+service s {
+    var b = 0;
+    var c = 0;
+    def app: (int -> int) -> (int -> int) = fn f => fn x => f(x + b);
+    def d = app(fn x => x + a)(c); 
+    var a = 0;
+}

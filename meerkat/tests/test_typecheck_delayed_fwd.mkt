@@ -1,0 +1,4 @@
+service s {
+    def f = fn () => a; 
+    var a = 0;
+}

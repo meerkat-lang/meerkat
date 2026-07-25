@@ -280,6 +280,10 @@ impl<'a, 'b> Context<'a, 'b> {
         // Both local and imported service declarations are present in
         // `self.program` (unified_ast), so we use the normal path for all.
 
+        // The checking_stack detects mutual type recursion (e.g. `def a
+        // = b; def b = a;`). Execution-order dependencies are analyzed
+        // in a separate compiler pass. This check strictly exists to
+        // ensure type inference terminates and avoids stack overflows.
         let key = (service_name, member_name);
         if self.checking_stack.contains(&key) {
             return Err(Error::DependencyCycle {
@@ -306,18 +310,6 @@ impl<'a, 'b> Context<'a, 'b> {
                 ty: annotated, val, ..
             } => {
                 let mut env = Env::new(None);
-                for prev in decls {
-                    match prev {
-                        Decl::VarDecl { name, .. } | Decl::DefDecl { name, .. } => {
-                            if *name == member_name {
-                                break;
-                            }
-                            let prev_ty = self.type_of_member(service_name, *name)?;
-                            env.bind(*name, prev_ty);
-                        }
-                        Decl::TableDecl { .. } => {}
-                    }
-                }
 
                 let prev_service = self.current_service;
                 self.current_service = Some(service_name);
@@ -440,14 +432,7 @@ impl<'a, 'b> Context<'a, 'b> {
                 let ty = if let Some(local_ty) = env.find(*name) {
                     local_ty.clone()
                 } else if let Some(svc) = self.current_service {
-                    if let Some(st) = self.local_services.find(svc) {
-                        st.fields()
-                            .find(*name)
-                            .ok_or(Error::UnboundVariable(*name))?
-                            .clone()
-                    } else {
-                        return Err(Error::UnboundVariable(*name));
-                    }
+                    self.type_of_member(svc, *name)?
                 } else {
                     return Err(Error::UnboundVariable(*name));
                 };

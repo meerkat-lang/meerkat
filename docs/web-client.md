@@ -145,9 +145,10 @@ as well and is tracked in issue #154.
 A page is a view and cannot yet send anything back.  A design for triggering
 actions from the client is under discussion in issue #153.
 
-Interpolated values are rendered into markup as text, which is safe only while
-the server is trusted.  Making the HTML representation a structured tree, so
-that computed values are inserted as data, is part of that design.
+Interpolated values are formatted via the runtime `Display` implementation and
+inserted directly into the rendered markup (no HTML escaping), so this is safe
+only while the server is trusted.  Making the HTML representation a structured tree,
+so that computed values are inserted as data, is part of that design.
 
 Reply destinations in network messages are supplied by the sender and are not
 yet bound to an authenticated identity; this is tracked in issue #118.

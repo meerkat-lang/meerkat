@@ -541,3 +541,91 @@ impl Display for Decl {
         }
     }
 }
+
+/// Apply a sequence of service update statements to a base AST
+///
+/// Produces a new AST where target `Stmt::Service` declarations are updated
+/// in-place with new or modified declarations, and `Stmt::Update` and
+/// `Stmt::Atomic` nodes are removed from the top level
+///
+/// Args:
+///     `base_ast` (`&[Stmt]`): The original AST statements
+///     `updates` (`&[Stmt]`): The update statements to apply
+///
+/// Returns:
+///     `Result<Vec<Stmt>, Symbol>`: The updated AST or the missing service Symbol
+///
+/// Raises:
+///     `Symbol`: If a target service for an update is not found
+pub fn apply_updates_to_ast(base_ast: &[Stmt], updates: &[Stmt]) -> Result<Vec<Stmt>, Symbol> {
+    let mut patched_ast: Vec<Stmt> = base_ast
+        .iter()
+        .filter(|stmt| !matches!(stmt, Stmt::Update { .. } | Stmt::Atomic { .. }))
+        .cloned()
+        .collect();
+
+    for stmt in updates {
+        let (updated_svc_name, updated_decls) = match stmt {
+            Stmt::Service { name, decls } => (name, decls),
+            Stmt::Update {
+                service_name: name,
+                decls,
+            } => (name, decls),
+            Stmt::Atomic {
+                updates: inner_updates,
+            } => {
+                patched_ast = apply_updates_to_ast(&patched_ast, inner_updates)?;
+                continue;
+            }
+            Stmt::Connect { .. }
+            | Stmt::Import { .. }
+            | Stmt::Test { .. }
+            | Stmt::ActionStmt(_)
+            | Stmt::Watch { .. } => continue,
+        };
+
+        let mut found_service = false;
+        for existing_stmt in &mut patched_ast {
+            if let Stmt::Service {
+                name: existing_svc_name,
+                decls: existing_decls,
+            } = existing_stmt
+            {
+                if *existing_svc_name == *updated_svc_name {
+                    found_service = true;
+                    for up_decl in updated_decls {
+                        let up_name = match up_decl {
+                            Decl::VarDecl { name: n, .. }
+                            | Decl::DefDecl { name: n, .. }
+                            | Decl::TableDecl { name: n, .. } => *n,
+                        };
+
+                        let mut matched_existing = false;
+                        for ex_decl in existing_decls.iter_mut() {
+                            let ex_name = match ex_decl {
+                                Decl::VarDecl { name: n, .. }
+                                | Decl::DefDecl { name: n, .. }
+                                | Decl::TableDecl { name: n, .. } => *n,
+                            };
+                            if ex_name == up_name {
+                                *ex_decl = up_decl.clone();
+                                matched_existing = true;
+                                break;
+                            }
+                        }
+
+                        if !matched_existing {
+                            existing_decls.push(up_decl.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        if !found_service {
+            return Err(*updated_svc_name);
+        }
+    }
+
+    Ok(patched_ast)
+}

@@ -17,7 +17,7 @@ use crate::net::types::MeerkatMessage;
 use crate::net::{
     codec, Address, MessageId, NetworkActor, NetworkCommand, NetworkEvent, NetworkReply, NodeType,
 };
-use crate::runtime::ast::Stmt;
+use crate::runtime::ast::{apply_updates_to_ast, Stmt};
 use crate::runtime::graphs::analysis::compute_dependencies;
 use crate::runtime::imports::Imports;
 use crate::runtime::interner::Interner;
@@ -522,11 +522,72 @@ impl<'a> Node<'a> {
     ///
     /// Returns:
     ///   `Result<()>`: Ok if checks pass, or error
+    /// Perform static analysis checks on unified service declarations
+    ///
+    /// Validates both the pre-update static schema and any post-update AST
+    /// synthesized from service update declarations
+    ///
+    /// Returns:
+    ///   `Result<()>`: Ok if checks pass, or error
     ///
     /// Errors:
     ///   `Error`: If name resolution or type checking fails
     pub fn static_checks(&mut self) -> Result<()> {
-        nameres::resolve(&self.unified_ast).map_err(|e| match e {
+        nameres::resolve(&self.unified_ast).map_err(|e| self.format_nameres_error(e))?;
+
+        let mut local_services = Env::new(None);
+        tt::check(&self.unified_ast, &mut local_services).map_err(|e| self.format_tt_error(e))?;
+        self.local_services = unsafe {
+            std::mem::transmute::<Env<'_, ServiceType<'_>>, Env<'a, ServiceType<'a>>>(
+                local_services,
+            )
+        };
+
+        compute_dependencies(&self.unified_ast)
+            .map_err(|e| Error::Message(e.format_with_interner(&self.interner)))?;
+
+        let mut update_stmts = Vec::new();
+        for stmt in &self.unified_ast {
+            match stmt {
+                Stmt::Update { .. } => {
+                    update_stmts.push(stmt.clone());
+                }
+                Stmt::Atomic { updates } => {
+                    for u in updates {
+                        update_stmts.push(u.clone());
+                    }
+                }
+                Stmt::Connect { .. }
+                | Stmt::Service { .. }
+                | Stmt::Import { .. }
+                | Stmt::Test { .. }
+                | Stmt::ActionStmt(_)
+                | Stmt::Watch { .. } => {}
+            }
+        }
+
+        if !update_stmts.is_empty() {
+            let post_update_ast = apply_updates_to_ast(&self.unified_ast, &update_stmts)
+                .map_err(|sym| self.format_tt_error(tt::check::Error::UnboundVariable(sym)))?;
+
+            nameres::resolve(&post_update_ast).map_err(|e| self.format_nameres_error(e))?;
+
+            compute_dependencies(&post_update_ast)
+                .map_err(|e| Error::Message(e.format_with_interner(&self.interner)))?;
+        }
+
+        Ok(())
+    }
+
+    /// Format a name resolution error into a user-facing error message
+    ///
+    /// Args:
+    ///     `err` (`nameres::Error`): The name resolution error to format
+    ///
+    /// Returns:
+    ///     `Error`: The formatted Error::Message
+    fn format_nameres_error(&self, err: nameres::Error) -> Error {
+        match err {
             nameres::Error::UnknownIdentifier {
                 name,
                 expected,
@@ -553,21 +614,8 @@ impl<'a> Node<'a> {
                 );
                 Error::Message(msg)
             }
-            nameres::Error::DepthLimit => Error::Message(e.to_string()),
-        })?;
-
-        let mut local_services = Env::new(None);
-        tt::check(&self.unified_ast, &mut local_services).map_err(|e| self.format_tt_error(e))?;
-        self.local_services = unsafe {
-            std::mem::transmute::<Env<'_, ServiceType<'_>>, Env<'a, ServiceType<'a>>>(
-                local_services,
-            )
-        };
-
-        compute_dependencies(&self.unified_ast)
-            .map_err(|e| Error::Message(e.format_with_interner(&self.interner)))?;
-
-        Ok(())
+            nameres::Error::DepthLimit => Error::Message(err.to_string()),
+        }
     }
 
     /// Format a type checking error into a user-facing error message,

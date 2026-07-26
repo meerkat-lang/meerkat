@@ -6,7 +6,7 @@
 //! applies updates atomically once fully evaluated.
 
 use crate::net::LockGroup;
-use crate::runtime::ast::{Decl, Stmt, Value};
+use crate::runtime::ast::{apply_updates_to_ast, Decl, Stmt, Value};
 use crate::runtime::env::Env;
 use crate::runtime::graphs::{analysis::compute_dependencies, ServiceGraphs};
 use crate::runtime::interner::Symbol;
@@ -151,73 +151,15 @@ impl<'a> Transaction<'a> {
 
                 self.lock_txn = Some(txn);
                 self.state = TransactionState::LocksAcquired;
-                self.ast = manager.unified_ast.clone();
-
-                for stmt in &self.updates {
-                    let (updated_svc_name, updated_decls) = match stmt {
-                        Stmt::Service { name, decls } => (name, decls),
-                        Stmt::Update {
-                            service_name: name,
-                            decls,
-                        } => (name, decls),
-                        _ => continue,
-                    };
-                    let mut found_service = false;
-                    for existing_stmt in &mut self.ast {
-                        if let Stmt::Service {
-                            name: existing_svc_name,
-                            decls: existing_decls,
-                        } = existing_stmt
-                        {
-                            if *existing_svc_name == *updated_svc_name {
-                                found_service = true;
-                                for up_decl in updated_decls {
-                                    let up_name = match up_decl {
-                                        Decl::VarDecl { name: n, .. }
-                                        | Decl::DefDecl { name: n, .. } => *n,
-                                        Decl::TableDecl { .. } => {
-                                            self.release_lock_txn(manager);
-                                            return Err(EvalError::NotImplemented);
-                                        }
-                                    };
-
-                                    let mut matched_existing = false;
-                                    for ex_decl in existing_decls.iter_mut() {
-                                        let ex_name = match ex_decl {
-                                            Decl::VarDecl { name: n, .. }
-                                            | Decl::DefDecl { name: n, .. } => *n,
-                                            Decl::TableDecl { .. } => {
-                                                self.release_lock_txn(manager);
-                                                return Err(EvalError::NotImplemented);
-                                            }
-                                        };
-                                        if ex_name == up_name {
-                                            *ex_decl = up_decl.clone();
-                                            matched_existing = true;
-                                            break;
-                                        }
-                                    }
-
-                                    if !matched_existing {
-                                        if matches!(up_decl, Decl::VarDecl { .. }) {
-                                            let insert_pos = existing_decls
-                                                .iter()
-                                                .position(|d| matches!(d, Decl::DefDecl { .. }))
-                                                .unwrap_or(existing_decls.len());
-                                            existing_decls.insert(insert_pos, up_decl.clone());
-                                        } else {
-                                            existing_decls.push(up_decl.clone());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if !found_service {
+                match apply_updates_to_ast(&manager.unified_ast, &self.updates) {
+                    Ok(patched) => self.ast = patched,
+                    Err(sym) => {
                         self.release_lock_txn(manager);
-                        return Err(EvalError::RuntimeError(
-                            "Target service for update not found".to_string(),
-                        ));
+                        let name_str = manager.interner.get(sym);
+                        return Err(EvalError::RuntimeError(format!(
+                            "Target service '{}' for update not found",
+                            name_str
+                        )));
                     }
                 }
 

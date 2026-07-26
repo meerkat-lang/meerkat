@@ -315,7 +315,17 @@ impl<'a, 'b> Context<'a, 'b> {
                 self.current_service = Some(service_name);
                 let res = if let Some(expected) = annotated {
                     check_type(expected, 1)?;
-                    self.check_expr(val, expected, &mut env)?;
+                    if let Some(mut st) = self.local_services.remove(service_name) {
+                        let _ = st.add_field(member_name, expected.clone());
+                        self.local_services.bind(service_name, st);
+                    }
+                    if let Err(e) = self.check_expr(val, expected, &mut env) {
+                        if let Some(mut st) = self.local_services.remove(service_name) {
+                            st.remove_field(member_name);
+                            self.local_services.bind(service_name, st);
+                        }
+                        return Err(e);
+                    }
                     expected.clone()
                 } else {
                     self.infer(val, &mut env, 1)?

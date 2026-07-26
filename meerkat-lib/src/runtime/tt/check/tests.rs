@@ -655,7 +655,8 @@ fn test_function_parameter_mismatches() {
             },
         }],
     }];
-    assert!(check(&p2, &mut classes).is_err());
+    let mut classes2 = Env::new(None);
+    assert!(check(&p2, &mut classes2).is_err());
 }
 
 /// Verify function call arguments and function types are validated

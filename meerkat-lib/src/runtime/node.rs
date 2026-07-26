@@ -18,6 +18,7 @@ use crate::net::{
     codec, Address, MessageId, NetworkActor, NetworkCommand, NetworkEvent, NetworkReply, NodeType,
 };
 use crate::runtime::ast::Stmt;
+use crate::runtime::graphs::analysis::compute_dependencies;
 use crate::runtime::imports::Imports;
 use crate::runtime::interner::Interner;
 use crate::runtime::limits::{IMPORT_POLL_INTERVAL_MS, IMPORT_RETRY_DELAY_MS};
@@ -562,6 +563,9 @@ impl<'a> Node<'a> {
                 local_services,
             )
         };
+
+        compute_dependencies(&self.unified_ast)?;
+
         Ok(())
     }
 
@@ -673,7 +677,11 @@ impl<'a> Node<'a> {
             nameres::Error::DepthLimit => Error::Message(e.to_string()),
         })?;
 
-        tt::check(program, &mut self.local_services).map_err(|e| self.format_tt_error(e))
+        tt::check(program, &mut self.local_services).map_err(|e| self.format_tt_error(e))?;
+
+        crate::runtime::graphs::analysis::compute_dependencies(program)?;
+
+        Ok(())
     }
 
     /// Start the runtime manager consuming this Node

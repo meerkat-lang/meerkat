@@ -5,6 +5,7 @@
 
 pub mod ast;
 pub mod env;
+pub mod graphs;
 pub mod html;
 pub mod imports;
 pub mod interner;
@@ -14,7 +15,6 @@ pub mod manager;
 pub mod nameres;
 pub mod node;
 pub mod parser;
-pub mod semantic_analysis;
 pub mod tt;
 pub mod txn;
 pub mod update;

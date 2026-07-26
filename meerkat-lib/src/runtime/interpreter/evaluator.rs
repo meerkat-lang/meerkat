@@ -1,4 +1,5 @@
 use crate::ast::{BinOp, Expr, UnOp, Value};
+use crate::runtime::graphs::free_var::free_var;
 use crate::runtime::interner::Symbol;
 use crate::runtime::txn::{Transaction, WaitKey};
 use crate::runtime::Manager;
@@ -235,7 +236,7 @@ pub async fn eval(
             return_ty,
         } => {
             let var_binded: HashSet<Symbol> = params.iter().map(|p| p.name).collect();
-            let free_vars = body.free_var(&HashSet::new(), &var_binded);
+            let free_vars = free_var(body, &var_binded);
             let captured_env: Vec<(Symbol, Value)> = env
                 .iter()
                 .filter(|(name, _)| {
@@ -264,10 +265,7 @@ pub async fn eval(
             // Service `vars` or `defs` are looked up fresh via the
             // `manager` at execution time
             let action_expr = Expr::Action(stmts.clone());
-            let free_vars = action_expr.free_var(
-                &std::collections::HashSet::new(),
-                &std::collections::HashSet::new(),
-            );
+            let free_vars = free_var(&action_expr, &HashSet::new());
             let captured_env: Vec<(Symbol, Value)> = env
                 .iter()
                 .filter(|(name, _)| {

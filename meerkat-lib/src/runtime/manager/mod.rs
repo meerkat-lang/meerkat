@@ -1,7 +1,7 @@
 use super::ast::{ActionStmt, Decl, Expr, Stmt, Value};
 use super::env::Env;
+use super::graphs::{analysis::analyze_dependencies, free_var::cross_service_deps, ServiceGraphs};
 use super::interpreter::{eval, execute, EvalContext, EvalError, ExecuteEffect};
-use super::semantic_analysis::var_analysis::{calc_dep_srv, DependAnalysis};
 use super::tt::types::ServiceType;
 use crate::net::network_layer::NetworkLayer;
 use crate::net::{
@@ -22,7 +22,7 @@ pub struct Service {
     /// Per-variable state: value, lock, and latest write transaction in one place
     pub vars: HashMap<Symbol, VarState>,
     pub defs: HashMap<Symbol, Expr>, // original def expressions for re-evaluation
-    pub dep: DependAnalysis,         // dependency graph + topo order
+    pub graphs: ServiceGraphs,       // dependency graph container
     /// #24: who depends on each member: member -> {(listener service id, def)}.
     pub listeners: HashMap<Symbol, HashSet<(ServiceNetId, Symbol)>>,
     /// #24: cached values of each def's cross-service deps:
@@ -249,7 +249,8 @@ impl Manager {
         name: Symbol,
         decls: Vec<Decl>,
     ) -> Result<(), EvalError> {
-        let dep = calc_dep_srv(&decls);
+        let graphs =
+            analyze_dependencies(&decls).map_err(|e| EvalError::VarNotFound(e.to_string()))?;
 
         let id = self.compute_service_net_id(name);
         // Register the service (with its real `ServiceNetId`) before
@@ -267,7 +268,7 @@ impl Manager {
                 name,
                 vars: HashMap::new(),
                 defs: HashMap::new(),
-                dep,
+                graphs,
                 listeners: HashMap::new(),
                 dep_cache: HashMap::new(),
                 service_lock: None,
@@ -359,57 +360,80 @@ impl Manager {
                 }
             }
 
-            // #24: now that init succeeded, register listener edges so a change to
-            // a member notifies the defs that depend on it. Same-service deps come
-            // from dep_graph; cross-service deps come from each def's MemberAccess refs, where a local
-            // owner is wired in-process and a remote owner is subscribed over the
-            // wire. Only runs on the success path: a rolled-back service must not
-            // register listeners.
-            // #98: also skip when a participant commit failed -- that service is
-            // about to be rolled back below, so it must not wire up listeners.
+            // #24: now that init succeeded, register listener edges so
+            // a change to a member notifies the defs that depend on it
+            // Same-service deps come from `reactive_graph`;
+            // cross-service deps come from each `def`'s `cross_deps`
+            // references, where a local owner is wired in-process and
+            // a remote owner is subscribed over the wire. Only runs on
+            // the success path: a rolled-back service must not
+            // register listeners
+            // #98: also skip when a participant commit failed -- that
+            // service is about to be rolled back below, so it must not
+            // wire up listeners
             if commit_error.is_none() {
                 if let Some(s) = self.services.get(&svc_name) {
                     let this_id = s.id.clone();
-                    let mut edges: Vec<(Symbol, Symbol, Symbol)> = Vec::new();
-                    for (def_name, deps) in &s.dep.dep_graph {
-                        if s.defs.contains_key(def_name) {
-                            for dep_member in deps {
-                                edges.push((svc_name, *dep_member, *def_name));
-                            }
+                    let mut edges: Vec<(Symbol, Symbol, Symbol)> =
+                        Vec::new();
+                    for (dep_member, listener_def) in
+                        s.graphs.reactive_edges()
+                    {
+                        if s.defs.contains_key(&listener_def) {
+                            edges.push((
+                                svc_name,
+                                dep_member,
+                                listener_def,
+                            ));
                         }
                     }
-                    // #24: cross-service deps, derived from each stored def
-                    // expression (dep_remote removed: these are just the keys of
-                    // dep_cache, recomputed here from the def's MemberAccess refs).
-                    for (def_name, expr) in &s.defs {
-                        for (owner, member) in expr.cross_service_deps() {
-                            edges.push((owner, member, *def_name));
+                    // #24: cross-service deps, derived from each stored
+                    // `def` expression (`dep_remote` removed: these
+                    // are just the keys of `dep_cache`, recomputed
+                    // here from `cross_deps`)
+                    for (def_name, cross_set) in &s.graphs.cross_deps {
+                        for (owner, member) in cross_set {
+                            edges.push((*owner, *member, *def_name));
                         }
                     }
                     for (owner, member, listener_def) in edges {
                         if self.services.contains_key(&owner) {
-                            if let Some(owner_svc) = self.services.get_mut(&owner) {
+                            if let Some(owner_svc) =
+                                self.services.get_mut(&owner)
+                            {
                                 owner_svc
                                     .listeners
                                     .entry(member)
                                     .or_default()
-                                    .insert((this_id.clone(), listener_def));
+                                    .insert((
+                                        this_id.clone(),
+                                        listener_def,
+                                    ));
                             }
                         } else {
-                            // remote owner: subscribe over the wire so future changes push.
-                            self.subscribe_remote(owner, member, this_id.clone(), listener_def)
-                                .await;
+                            // remote owner: subscribe over the wire
+                            // so future changes push
+                            self.subscribe_remote(
+                                owner,
+                                member,
+                                this_id.clone(),
+                                listener_def,
+                            )
+                            .await;
                         }
                     }
                 }
-            } // end: commit_error.is_none()
+            }
 
-            // #98: a participant failed to commit after prepare. Roll the local
-            // service back rather than leaving it half-committed but live: abort
-            // participants and remove the service, mirroring the init-failure
-            // path. The captured error is returned below.
+            // #98: a participant failed to commit after prepare. Roll
+            // the local service back rather than leaving it
+            // half-committed but live: abort participants and remove the
+            // service, mirroring the init-failure path. The captured
+            // error is returned below
             if commit_error.is_some() {
-                for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
+                for addr in
+                    txn.participants.iter().cloned().collect::<Vec<_>>()
+                {
                     self.send_abort(addr, &txn.id).await;
                 }
                 self.services.remove(&svc_name);
@@ -2219,15 +2243,14 @@ impl Manager {
                 if visited.insert((svc_sym, mem_sym)) {
                     if let Some(service) = self.services.get(&svc_sym) {
                         // Transitive local dependencies
-                        if let Some(deps) = service.dep.dep_transitive.get(&mem_sym) {
-                            for dep_sym in deps {
-                                queue.push((svc_sym, *dep_sym, false));
-                            }
+                        let deps = service.graphs.transitive_dependencies_of(mem_sym);
+                        for dep_sym in &deps {
+                            queue.push((svc_sym, *dep_sym, false));
                         }
 
                         // Cross-service dependencies
                         if let Some(expr) = service.defs.get(&mem_sym) {
-                            for (remote_svc, remote_mem) in expr.cross_service_deps() {
+                            for (remote_svc, remote_mem) in cross_service_deps(expr) {
                                 if self.remote_services.contains_key(&remote_svc) {
                                     // Track remote dependencies for a
                                     // remote service to request them
@@ -2451,7 +2474,7 @@ mod tests {
             }),
         };
         assert_eq!(
-            z_expr.cross_service_deps(),
+            cross_service_deps(&z_expr),
             std::collections::HashSet::from([(tc.s1, tc.y)])
         );
         // y = x + 1  ->  {} (no cross-service references)
@@ -2462,7 +2485,7 @@ mod tests {
                 val: Value::Int { val: 1 },
             }),
         };
-        assert!(y_expr.cross_service_deps().is_empty());
+        assert!(cross_service_deps(&y_expr).is_empty());
     }
 
     // #24: a def in s2 that reads s1.y updates eagerly when s1.x changes,

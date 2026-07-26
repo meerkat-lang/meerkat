@@ -8,11 +8,11 @@
 use crate::net::LockGroup;
 use crate::runtime::ast::{Decl, Stmt, Value};
 use crate::runtime::env::Env;
+use crate::runtime::graphs::{analysis::analyze_dependencies, ServiceGraphs};
 use crate::runtime::interner::Symbol;
 use crate::runtime::interpreter::evaluator::{eval, EvalContext, EvalError};
 use crate::runtime::manager::Manager;
 use crate::runtime::nameres;
-use crate::runtime::semantic_analysis::var_analysis::{calc_dep_srv, DependAnalysis};
 use crate::runtime::tt::check::{self as tt};
 use crate::runtime::tt::types::ServiceType;
 use crate::runtime::txn::{Transaction as LockTxn, TxnId, VarLock};
@@ -36,7 +36,7 @@ pub struct Transaction<'a> {
     ast: Vec<Stmt>,
     types: Env<'a, ServiceType<'a>>,
     values: HashMap<(Symbol, Symbol), Value>,
-    deps: HashMap<Symbol, DependAnalysis>,
+    deps: HashMap<Symbol, ServiceGraphs>,
     lock_txn: Option<LockTxn>,
 }
 
@@ -238,7 +238,8 @@ impl<'a> Transaction<'a> {
 
                 for stmt in &self.ast {
                     if let Stmt::Service { name, decls } = stmt {
-                        let dep = calc_dep_srv(decls);
+                        let dep = analyze_dependencies(decls)
+                            .map_err(|e| EvalError::RuntimeError(e.to_string()))?;
                         self.deps.insert(*name, dep);
                     }
                 }
@@ -345,7 +346,7 @@ impl<'a> Transaction<'a> {
 
         for (svc_name, dep) in std::mem::take(&mut self.deps) {
             if let Some(service) = manager.services.get_mut(&svc_name) {
-                service.dep = dep;
+                service.graphs = dep;
                 service.service_lock = None;
             }
         }

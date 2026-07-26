@@ -308,20 +308,22 @@ impl<'a> Transaction<'a> {
                         | Stmt::Test { .. }
                         | Stmt::Watch { .. } => continue,
                     };
-                    for decl in decls {
-                        match decl {
-                            Decl::VarDecl {
-                                name: decl_name, ..
-                            } => {
-                                manager.propagate(*svc_name, *decl_name).await;
+                    if manager.services.contains_key(svc_name) {
+                        for decl in decls {
+                            match decl {
+                                Decl::VarDecl {
+                                    name: decl_name, ..
+                                } => {
+                                    manager.propagate(*svc_name, *decl_name).await;
+                                }
+                                Decl::DefDecl {
+                                    name: decl_name, ..
+                                } => {
+                                    manager.recompute_def(*svc_name, *decl_name).await;
+                                    manager.propagate(*svc_name, *decl_name).await;
+                                }
+                                Decl::TableDecl { .. } => {}
                             }
-                            Decl::DefDecl {
-                                name: decl_name, ..
-                            } => {
-                                manager.recompute_def(*svc_name, *decl_name).await;
-                                manager.propagate(*svc_name, *decl_name).await;
-                            }
-                            Decl::TableDecl { .. } => {}
                         }
                     }
                     if let Some(addr) = manager.remote_services.get(svc_name).cloned() {
@@ -331,10 +333,12 @@ impl<'a> Transaction<'a> {
                             std::sync::atomic::AtomicU64::new(1);
                         let request_id =
                             NEXT_UPDATE_REQ_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let reply_to = manager.local_reply_addr().await;
                         let msg = crate::net::types::MeerkatMessage::UpdateServiceRequest {
                             request_id,
                             service_name: svc_str.clone(),
                             source,
+                            reply_to,
                         };
                         let timeout = format!(
                             "Timeout waiting for service update response for '{}'",
@@ -351,6 +355,12 @@ impl<'a> Transaction<'a> {
                         }
                     }
                 }
+                if let Some(lock_txn) = &self.lock_txn {
+                    for addr in lock_txn.participants.iter().cloned().collect::<Vec<_>>() {
+                        let _ = manager.send_commit(addr, &lock_txn.id).await;
+                    }
+                }
+                self.release_lock_txn(manager);
 
                 Ok(())
             }

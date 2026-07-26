@@ -573,8 +573,32 @@ async fn run_server(
 
     println!("Server running, press Ctrl+C to stop...");
 
+    let mut pending_updates: std::collections::VecDeque<(u64, String, String, String)> =
+        std::collections::VecDeque::new();
+
     let mut last_keepalive = tokio::time::Instant::now();
     loop {
+        // Defer pending service updates so that network events can be processed
+        // without blocking the server loop during multi-step updates
+        if let Some((request_id, source, reply_to, peer)) = pending_updates.pop_front() {
+            let parse_res = parser::parse_string(&source, &mut manager.interner);
+            let res = match parse_res {
+                Ok(stmts) => {
+                    let mut txn = meerkat_lib::runtime::update::Transaction::new(stmts);
+                    txn.poll(&mut manager).await.map_err(|e| e.to_string())
+                }
+                Err(e) => Err(e),
+            };
+            let error = res.err();
+            let response = MeerkatMessage::UpdateServiceResponse { request_id, error };
+            let target_addr = if !reply_to.is_empty() { reply_to } else { peer };
+            if !target_addr.is_empty() {
+                if let Some(net) = manager.network.as_mut() {
+                    send_net_msg(net, &target_addr, response).await;
+                }
+            }
+        }
+
         // Periodically reassure parked waiters (wait-die wait) that they are
         // still queued, so their reply timeout never fires while we hold them.
         if last_keepalive.elapsed() >= std::time::Duration::from_secs(5) {
@@ -586,8 +610,16 @@ async fn run_server(
             last_keepalive = tokio::time::Instant::now();
         }
         let event = manager.network.as_mut().and_then(|n| n.try_recv_event());
-        if let Some(NetworkEvent::MessageReceived { msg, .. }) = event {
+        if let Some(NetworkEvent::MessageReceived { msg, peer }) = event {
             match msg {
+                MeerkatMessage::UpdateServiceRequest {
+                    request_id,
+                    service_name: _,
+                    source,
+                    reply_to,
+                } => {
+                    pending_updates.push_back((request_id, source, reply_to, peer));
+                }
                 MeerkatMessage::LookupRequest {
                     request_id,
                     service,
@@ -910,7 +942,6 @@ async fn run_server(
                 // #39: code responses are client-bound replies, not seen at the server.
                 | MeerkatMessage::ServiceCodeResponse { .. }
                 | MeerkatMessage::ServiceCodeError { .. }
-                | MeerkatMessage::UpdateServiceRequest { .. }
                 | MeerkatMessage::UpdateServiceResponse { .. }
                 | MeerkatMessage::WaitParked { .. } => {}
             }
@@ -947,10 +978,13 @@ async fn run_client(
         let addr = listen_success_addr(reply)?;
         let node_ip = manager.get_node_ip();
         let peer_id = n.local_peer_id();
-        let addr_str = addr
-            .0
-            .replace("0.0.0.0", &node_ip)
-            .replace("127.0.0.1", &node_ip);
+        let addr_str = if local {
+            addr.0.clone()
+        } else {
+            addr.0
+                .replace("0.0.0.0", &node_ip)
+                .replace("127.0.0.1", &node_ip)
+        };
         local_full_addr = Some(format!("{}/p2p/{}", addr_str, peer_id));
         net = Some(n);
     }

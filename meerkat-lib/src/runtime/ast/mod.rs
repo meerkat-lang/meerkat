@@ -623,7 +623,10 @@ pub fn apply_updates_to_ast(base_ast: &[Stmt], updates: &[Stmt]) -> Result<Vec<S
         }
 
         if !found_service {
-            return Err(*updated_svc_name);
+            patched_ast.push(Stmt::Service {
+                name: *updated_svc_name,
+                decls: updated_decls.clone(),
+            });
         }
     }
 

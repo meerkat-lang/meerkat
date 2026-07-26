@@ -1022,6 +1022,7 @@ impl Manager {
                         request_id,
                         service_name,
                         source,
+                        reply_to,
                     } => {
                         let res = match codec::decode_update_service_request(
                             &service_name,
@@ -1045,8 +1046,10 @@ impl Manager {
                         };
                         let error = res.err();
                         let reply_msg = MeerkatMessage::UpdateServiceResponse { request_id, error };
-                        if !peer.is_empty() {
-                            self.send_oneway(Address::new(&peer), reply_msg).await;
+                        let target_addr = if !reply_to.is_empty() { reply_to } else { peer };
+                        if !target_addr.is_empty() {
+                            self.send_oneway(Address::new(&target_addr), reply_msg)
+                                .await;
                         }
                     }
                     MeerkatMessage::LockRequest {
@@ -1283,10 +1286,13 @@ impl Manager {
         match reply {
             NetworkReply::LocalAddresses { addrs } => {
                 if let Some(addr) = addrs.first() {
-                    let addr_str = addr
-                        .0
-                        .replace("0.0.0.0", &node_ip)
-                        .replace("127.0.0.1", &node_ip);
+                    let addr_str = if self.local {
+                        addr.0.clone()
+                    } else {
+                        addr.0
+                            .replace("0.0.0.0", &node_ip)
+                            .replace("127.0.0.1", &node_ip)
+                    };
                     format!("{}/p2p/{}", addr_str, peer_id)
                 } else {
                     String::new()
@@ -2240,13 +2246,21 @@ impl Manager {
         txn: &mut Transaction,
         services: &HashMap<String, LockGroup>,
     ) -> Result<(), EvalError> {
+        let mut remote_locks: HashMap<Symbol, LockGroup> = HashMap::new();
+
         // 1. Process service-level locks first
         for (svc_name_str, group) in services {
             let svc_sym = self.interner.insert(svc_name_str);
             if group.service_level_lock {
-                let net_id = self.service_net_id_for_name(svc_sym);
-                self.acquire_service_lock(svc_sym, &txn.id)?;
-                txn.service_locked.insert(net_id);
+                if self.services.contains_key(&svc_sym) {
+                    let net_id = self.service_net_id_for_name(svc_sym);
+                    self.acquire_service_lock(svc_sym, &txn.id)?;
+                    txn.service_locked.insert(net_id);
+                } else if self.remote_services.contains_key(&svc_sym) {
+                    remote_locks.insert(svc_sym, group.clone());
+                } else {
+                    self.acquire_service_lock(svc_sym, &txn.id)?;
+                }
             }
         }
 
@@ -2268,8 +2282,6 @@ impl Manager {
                 queue.push((svc_sym, var_sym, true));
             }
         }
-
-        let mut remote_locks: HashMap<Symbol, (HashSet<String>, HashSet<String>)> = HashMap::new();
 
         while let Some((svc_sym, mem_sym, is_write)) = queue.pop() {
             if self.services.contains_key(&svc_sym) {
@@ -2312,11 +2324,15 @@ impl Manager {
                                     // remote service to request them
                                     // as a batch later
                                     let remote_mem_str = self.interner.get(remote_mem).to_string();
-                                    remote_locks
-                                        .entry(remote_svc)
-                                        .or_insert_with(|| (HashSet::new(), HashSet::new()))
-                                        .0
-                                        .insert(remote_mem_str);
+                                    let entry =
+                                        remote_locks.entry(remote_svc).or_insert_with(|| {
+                                            LockGroup {
+                                                service_level_lock: false,
+                                                reads: HashSet::new(),
+                                                writes: HashSet::new(),
+                                            }
+                                        });
+                                    entry.reads.insert(remote_mem_str);
                                 } else {
                                     // Queue cross-service dependency
                                     // for local lock and traversal
@@ -2330,27 +2346,24 @@ impl Manager {
                 // Accumulate remote lock requirements mapped to their
                 // host node address
                 let mem_str = self.interner.get(mem_sym).to_string();
-                let entry = remote_locks
-                    .entry(svc_sym)
-                    .or_insert_with(|| (HashSet::new(), HashSet::new()));
+                let entry = remote_locks.entry(svc_sym).or_insert_with(|| LockGroup {
+                    service_level_lock: false,
+                    reads: HashSet::new(),
+                    writes: HashSet::new(),
+                });
                 if is_write {
-                    entry.1.insert(mem_str);
+                    entry.writes.insert(mem_str);
                 } else {
-                    entry.0.insert(mem_str);
+                    entry.reads.insert(mem_str);
                 }
             }
         }
 
         // 4. Build and send remote lock requests
         let mut node_requests: HashMap<Address, HashMap<String, LockGroup>> = HashMap::new();
-        for (remote_svc, (reads, writes)) in remote_locks {
+        for (remote_svc, group) in remote_locks {
             if let Ok(addr) = self.remote_addr(remote_svc) {
                 let svc_name_str = self.interner.get(remote_svc).to_string();
-                let group = LockGroup {
-                    service_level_lock: false,
-                    reads,
-                    writes,
-                };
                 node_requests
                     .entry(addr)
                     .or_default()
@@ -2401,7 +2414,11 @@ impl Manager {
     }
 
     /// Originator side: ask a participant to commit, awaiting its acknowledgement
-    async fn send_commit(&mut self, addr: Address, tid: &TxnId) -> Result<(), EvalError> {
+    pub(crate) async fn send_commit(
+        &mut self,
+        addr: Address,
+        tid: &TxnId,
+    ) -> Result<(), EvalError> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT_COMMIT_ID: AtomicU64 = AtomicU64::new(1);
         let request_id = NEXT_COMMIT_ID.fetch_add(1, Ordering::SeqCst);

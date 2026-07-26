@@ -242,6 +242,7 @@ pub enum MeerkatMessage {
         request_id: u64,
         service_name: String,
         source: String,
+        reply_to: String,
     },
 
     /// Response indicating success or failure of a service update

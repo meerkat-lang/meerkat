@@ -1,0 +1,19 @@
+{
+  "settings": {
+    "startup_timeout": 10.0,
+    "monitor_poll_interval": 0.25,
+    "terminate_timeout": 5.0
+  },
+  "nodes": [
+    {
+      "alias": "dashboard_server",
+      "type": "server",
+      "cmd": [
+        "cargo", "run", "-p", "meerkat", "--", "--local", "-s",
+        "-f", "demos/demo-2/server.mkt",
+        "-p", "9240",
+        "--identity", "demos/demo-2/dashboard.key"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+// Smart home energy manager node
+//
+// Aggregates data from solar inverter and battery to compute net grid demand
+
+import inverter
+import battery
+
+service home {
+  // Calculate solar generation state
+  pub def solar_active = inverter.generating;
+
+  // Track battery charge level
+  pub def battery_level = battery.charge_level;
+}

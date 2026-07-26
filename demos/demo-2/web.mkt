@@ -1,0 +1,10 @@
+// Single-import WebAssembly client entry point for demo-2
+//
+// Delegates HTML rendering directly to the dashboard server node
+
+import dashboard
+
+service web {
+  // Pass through evaluated html definition from dashboard server
+  pub def html = dashboard.html;
+}

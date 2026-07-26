@@ -1,0 +1,16 @@
+// Server-side stateful services hosted on port 9240 for demo-2
+
+service inverter {
+  var generating: bool = true;
+  var output_kw: int = 4;
+}
+
+service battery {
+  var charge_level: int = 85;
+  var status: string = "charging";
+}
+
+service home {
+  pub def battery_level = battery.charge_level;
+  pub def solar_active = inverter.generating;
+}

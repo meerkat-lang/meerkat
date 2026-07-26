@@ -1,0 +1,23 @@
+// Test controller node for demo-2
+//
+// Simulates an over-the-air state update changing battery and inverter states
+
+import inverter
+import battery
+
+service controller {}
+
+update battery {
+  var status: string = "discharging";
+  var charge_level: int = 35;
+}
+
+update inverter {
+  var output_kw: int = 1;
+}
+
+@test(controller) {
+  assert(battery.status == "discharging");
+  assert(battery.charge_level == 35);
+  assert(inverter.output_kw == 1);
+}

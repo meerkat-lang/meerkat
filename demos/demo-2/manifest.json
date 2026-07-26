@@ -1,0 +1,41 @@
+{
+  "settings": {
+    "startup_timeout": 10.0,
+    "monitor_poll_interval": 0.25,
+    "terminate_timeout": 5.0
+  },
+  "nodes": [
+    {
+      "alias": "inverter",
+      "type": "server",
+      "file": "demos/demo-2/inverter.mkt",
+      "port": 9210
+    },
+    {
+      "alias": "battery",
+      "type": "server",
+      "file": "demos/demo-2/battery.mkt",
+      "port": 9220
+    },
+    {
+      "alias": "home",
+      "type": "server",
+      "file": "demos/demo-2/home.mkt",
+      "port": 9230,
+      "imports": ["inverter.inverter", "battery.battery"]
+    },
+    {
+      "alias": "dashboard",
+      "type": "server",
+      "file": "demos/demo-2/dashboard.mkt",
+      "port": 9240,
+      "imports": ["inverter.inverter", "battery.battery", "home.home"]
+    },
+    {
+      "alias": "controller",
+      "type": "client",
+      "file": "demos/demo-2/controller.mkt",
+      "imports": ["inverter.inverter", "battery.battery", "home.home", "dashboard.dashboard"]
+    }
+  ]
+}

@@ -1,0 +1,31 @@
+import inverter
+import home
+
+// The controller pushes an OTA firmware update.
+// Loosely inspired by IEEE 1547 smart grids.
+// It requires exact states and kW telemetry.
+service controller {}
+
+update inverter {
+    // Upgrade to smart grid compliance states.
+    var generating: string = "grid_tied";
+    
+    // Add newly required telemetry metric.
+    var output_kw: int = 5;
+    
+    // New rule for safe export per regulations.
+    pub def safe_export = 
+        if generating == "grid_tied" 
+        then output_kw > 2 
+        else false;
+}
+
+@test(controller) {
+    // Verify inverter upgraded schema.
+    assert(inverter.generating == "grid_tied");
+    assert(inverter.output_kw == 5);
+    assert(inverter.safe_export == true);
+    
+    // Verify home adapted to new type.
+    assert(home.solar_active == "grid_tied");
+}

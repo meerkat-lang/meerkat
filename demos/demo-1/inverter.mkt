@@ -1,0 +1,6 @@
+// The inverter ships with a legacy firmware.
+// It reports a simple binary generating state.
+service inverter {
+    // Basic boolean generation status.
+    var generating: bool = true;
+}

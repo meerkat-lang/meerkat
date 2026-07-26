@@ -1,0 +1,7 @@
+import inverter
+
+// The home relies on the legacy binary status.
+service home {
+    // Home uses solar if it is generating.
+    pub def solar_active = inverter.generating;
+}

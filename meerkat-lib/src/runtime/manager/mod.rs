@@ -332,10 +332,19 @@ impl Manager {
 
         // #87: commit on success, abort and roll back on failure (pattern from
         // execute_action_with_txn).
+        // #98: a participant commit can fail after prepare (timeout, etc.).
+        // Apply local writes, then attempt every participant commit -- do not
+        // stop at the first failure, or later participants are left prepared --
+        // and remember the first error to surface once init otherwise succeeded.
+        let mut commit_error = None;
         if init_error.is_none() {
             self.apply_committed_writes(&txn).await;
             for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
-                let _ = self.send_commit(addr, &txn.id).await;
+                if let Err(e) = self.send_commit(addr, &txn.id).await {
+                    if commit_error.is_none() {
+                        commit_error = Some(e);
+                    }
+                }
             }
 
             // #24: now that init succeeded, register listener edges so a change to
@@ -390,9 +399,15 @@ impl Manager {
         let freed = self.all_locked_keys(&txn);
         self.release_locks(&freed, &txn.id);
 
+        // #98: init failure takes precedence (it already rolled back above).
+        // Otherwise, surface a participant commit failure rather than reporting
+        // success while a remote participant may hold stranded locks.
         match init_error {
             Some(e) => Err(e),
-            None => Ok(()),
+            None => match commit_error {
+                Some(e) => Err(e),
+                None => Ok(()),
+            },
         }
     }
 
@@ -3599,7 +3614,15 @@ mod tests {
             .unwrap();
 
         // Simulate another in-flight transaction holding a write lock on s1.x.
-        let ext = TxnId::new(tc.manager.node_id);
+        // #98: use an explicit low timestamp so this transaction is
+        // deterministically older than s2's internally-generated one. s2 must
+        // be the younger party that dies under wait-die; relying on the wall
+        // clock made that ordering non-deterministic.
+        let ext = crate::runtime::txn::TxnId {
+            timestamp: 1,
+            node_id: tc.manager.node_id,
+            iteration: 0,
+        };
         assert!(tc
             .manager
             .services

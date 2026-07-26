@@ -332,10 +332,19 @@ impl Manager {
 
         // #87: commit on success, abort and roll back on failure (pattern from
         // execute_action_with_txn).
+        // #98: a participant commit can fail after prepare (timeout, etc.).
+        // Apply local writes, then attempt every participant commit -- do not
+        // stop at the first failure, or later participants are left prepared --
+        // and remember the first error to surface once init otherwise succeeded.
+        let mut commit_error = None;
         if init_error.is_none() {
             self.apply_committed_writes(&txn).await;
             for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
-                let _ = self.send_commit(addr, &txn.id).await;
+                if let Err(e) = self.send_commit(addr, &txn.id).await {
+                    if commit_error.is_none() {
+                        commit_error = Some(e);
+                    }
+                }
             }
 
             // #24: now that init succeeded, register listener edges so a change to
@@ -344,39 +353,54 @@ impl Manager {
             // owner is wired in-process and a remote owner is subscribed over the
             // wire. Only runs on the success path: a rolled-back service must not
             // register listeners.
-            if let Some(s) = self.services.get(&svc_name) {
-                let this_id = s.id.clone();
-                let mut edges: Vec<(Symbol, Symbol, Symbol)> = Vec::new();
-                for (def_name, deps) in &s.dep.dep_graph {
-                    if s.defs.contains_key(def_name) {
-                        for dep_member in deps {
-                            edges.push((svc_name, *dep_member, *def_name));
+            // #98: also skip when a participant commit failed -- that service is
+            // about to be rolled back below, so it must not wire up listeners.
+            if commit_error.is_none() {
+                if let Some(s) = self.services.get(&svc_name) {
+                    let this_id = s.id.clone();
+                    let mut edges: Vec<(Symbol, Symbol, Symbol)> = Vec::new();
+                    for (def_name, deps) in &s.dep.dep_graph {
+                        if s.defs.contains_key(def_name) {
+                            for dep_member in deps {
+                                edges.push((svc_name, *dep_member, *def_name));
+                            }
+                        }
+                    }
+                    // #24: cross-service deps, derived from each stored def
+                    // expression (dep_remote removed: these are just the keys of
+                    // dep_cache, recomputed here from the def's MemberAccess refs).
+                    for (def_name, expr) in &s.defs {
+                        for (owner, member) in expr.cross_service_deps() {
+                            edges.push((owner, member, *def_name));
+                        }
+                    }
+                    for (owner, member, listener_def) in edges {
+                        if self.services.contains_key(&owner) {
+                            if let Some(owner_svc) = self.services.get_mut(&owner) {
+                                owner_svc
+                                    .listeners
+                                    .entry(member)
+                                    .or_default()
+                                    .insert((this_id.clone(), listener_def));
+                            }
+                        } else {
+                            // remote owner: subscribe over the wire so future changes push.
+                            self.subscribe_remote(owner, member, this_id.clone(), listener_def)
+                                .await;
                         }
                     }
                 }
-                // #24: cross-service deps, derived from each stored def
-                // expression (dep_remote removed: these are just the keys of
-                // dep_cache, recomputed here from the def's MemberAccess refs).
-                for (def_name, expr) in &s.defs {
-                    for (owner, member) in expr.cross_service_deps() {
-                        edges.push((owner, member, *def_name));
-                    }
+            } // end: commit_error.is_none()
+
+            // #98: a participant failed to commit after prepare. Roll the local
+            // service back rather than leaving it half-committed but live: abort
+            // participants and remove the service, mirroring the init-failure
+            // path. The captured error is returned below.
+            if commit_error.is_some() {
+                for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
+                    self.send_abort(addr, &txn.id).await;
                 }
-                for (owner, member, listener_def) in edges {
-                    if self.services.contains_key(&owner) {
-                        if let Some(owner_svc) = self.services.get_mut(&owner) {
-                            owner_svc
-                                .listeners
-                                .entry(member)
-                                .or_default()
-                                .insert((this_id.clone(), listener_def));
-                        }
-                    } else {
-                        // remote owner: subscribe over the wire so future changes push.
-                        self.subscribe_remote(owner, member, this_id.clone(), listener_def)
-                            .await;
-                    }
-                }
+                self.services.remove(&svc_name);
             }
         } else {
             // Execution failed: discard buffered writes and abort participants.
@@ -390,9 +414,15 @@ impl Manager {
         let freed = self.all_locked_keys(&txn);
         self.release_locks(&freed, &txn.id);
 
+        // #98: init failure takes precedence (it already rolled back above).
+        // Otherwise, surface a participant commit failure rather than reporting
+        // success while a remote participant may hold stranded locks.
         match init_error {
             Some(e) => Err(e),
-            None => Ok(()),
+            None => match commit_error {
+                Some(e) => Err(e),
+                None => Ok(()),
+            },
         }
     }
 
@@ -3599,7 +3629,15 @@ mod tests {
             .unwrap();
 
         // Simulate another in-flight transaction holding a write lock on s1.x.
-        let ext = TxnId::new(tc.manager.node_id);
+        // #98: use an explicit low timestamp so this transaction is
+        // deterministically older than s2's internally-generated one. s2 must
+        // be the younger party that dies under wait-die; relying on the wall
+        // clock made that ordering non-deterministic.
+        let ext = crate::runtime::txn::TxnId {
+            timestamp: 1,
+            node_id: tc.manager.node_id,
+            iteration: 0,
+        };
         assert!(tc
             .manager
             .services

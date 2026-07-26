@@ -43,22 +43,6 @@ impl std::fmt::Debug for Symbol {
     }
 }
 
-/// Implement the `Display` trait for the `Symbol` struct
-///
-/// This outputs the raw integer ID of the symbol for standard display formatting
-impl std::fmt::Display for Symbol {
-    /// Format the symbol for user display
-    ///
-    /// Args:
-    ///     `f` (`&mut std::fmt::Formatter<'_>`): The formatter target
-    ///
-    /// Returns:
-    ///     `std::fmt::Result`: The result of the formatting operation
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.id)
-    }
-}
-
 /// Implement the `Default` trait for the `Symbol` struct
 ///
 /// This enables creating an empty sentinel symbol by default
@@ -242,13 +226,6 @@ mod tests {
     fn test_interner_default() {
         let interner = Interner::default();
         assert_eq!(interner.get(Symbol::empty()), "");
-    }
-
-    /// Verify that Symbol implements Display correctly
-    #[test]
-    fn test_symbol_display_format() {
-        let symbol = Symbol { id: 100 };
-        assert_eq!(format!("{}", symbol), "100");
     }
 
     /// Verify Symbol PartialEq, Eq, and Hash properties

@@ -266,7 +266,7 @@ impl std::fmt::Display for Type {
                 Type::Func(..) => write!(f, "({}) list", t),
                 _ => write!(f, "{} list", t),
             },
-            Type::UnresolvedService(s) => write!(f, "unresolved_service({})", s),
+            Type::UnresolvedService(s) => write!(f, "unresolved_service({:?})", s),
         }
     }
 }
@@ -284,9 +284,9 @@ impl std::fmt::Display for Param {
     ///     `std::fmt::Result`: The result of the formatting operation
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Some(ty) = &self.ty {
-            write!(f, "{}: {}", self.name, ty)
+            write!(f, "{:?}: {}", self.name, ty)
         } else {
-            write!(f, "{}", self.name)
+            write!(f, "{:?}", self.name)
         }
     }
 }

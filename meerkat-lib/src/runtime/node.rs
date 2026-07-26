@@ -564,7 +564,8 @@ impl<'a> Node<'a> {
             )
         };
 
-        compute_dependencies(&self.unified_ast)?;
+        compute_dependencies(&self.unified_ast)
+            .map_err(|e| Error::Message(e.format_with_interner(&self.interner)))?;
 
         Ok(())
     }
@@ -679,7 +680,8 @@ impl<'a> Node<'a> {
 
         tt::check(program, &mut self.local_services).map_err(|e| self.format_tt_error(e))?;
 
-        crate::runtime::graphs::analysis::compute_dependencies(program)?;
+        crate::runtime::graphs::analysis::compute_dependencies(program)
+            .map_err(|e| Error::Message(e.format_with_interner(&self.interner)))?;
 
         Ok(())
     }

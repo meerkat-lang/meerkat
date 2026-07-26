@@ -38,7 +38,7 @@ impl<'a> AstPrinter<'a> {
     /// Returns:
     ///     `String`: The formatted symbol string representation
     pub fn format_symbol(&self, sym: Symbol) -> String {
-        format!("{} (\"{}\")", sym, self.interner.get(sym))
+        format!("{:?} (\"{}\")", sym, self.interner.get(sym))
     }
 
     /// Helper function to format an optional type using `Display` representation

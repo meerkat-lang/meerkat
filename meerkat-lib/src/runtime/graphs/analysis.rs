@@ -2,11 +2,57 @@
 
 use super::ServiceGraphs;
 use crate::ast::{Decl, Expr, Stmt};
-use crate::error::{Error, Result};
-use crate::runtime::interner::Symbol;
+use crate::runtime::interner::{Interner, Symbol};
 use petgraph::graphmap::DiGraphMap;
 use petgraph::visit::Dfs;
 use std::collections::{HashMap, HashSet};
+
+/// Dependency analysis errors for eager graph validation
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnalysisError {
+    /// A value was referenced eagerly before being initialized
+    EagerForwardReference(Symbol),
+}
+
+impl AnalysisError {
+    /// Format the analysis error for human-readable display using an Interner
+    ///
+    /// Args:
+    ///     `interner` (`&Interner`): The string interner instance
+    ///
+    /// Returns:
+    ///     `String`: The formatted error string representation
+    pub fn format_with_interner(&self, interner: &Interner) -> String {
+        match self {
+            AnalysisError::EagerForwardReference(sym) => {
+                let name_str = interner.get(*sym);
+                format!(
+                    "Invalid forward reference to uninitialized value '{}'",
+                    name_str
+                )
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for AnalysisError {
+    /// Format the error for basic display output
+    ///
+    /// Args:
+    ///     `f` (`&mut std::fmt::Formatter<'_>`): The formatter target
+    ///
+    /// Returns:
+    ///     `std::fmt::Result`: The result of the formatting operation
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AnalysisError::EagerForwardReference(_) => {
+                write!(f, "Invalid forward reference to uninitialized value")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AnalysisError {}
 
 /// Context parameters passed during eager dependency graph construction and validation
 struct EagerCtx<'a> {
@@ -23,11 +69,13 @@ struct EagerCtx<'a> {
 ///   `program` (`&[Stmt]`): Program AST containing service declarations
 ///
 /// Returns:
-///   `Result<Vec<ServiceGraphs>>`: Computed dependency graphs for all services
+///   `Result<Vec<ServiceGraphs>, AnalysisError>`: Computed dependency graphs for all services
 ///
-/// Errors:
-///   `Error`: If an invalid eager forward reference is detected within or across services
-pub fn compute_dependencies(program: &[Stmt]) -> Result<Vec<ServiceGraphs>> {
+/// Raises:
+///   `AnalysisError::EagerForwardReference`: If an invalid eager forward reference is detected
+pub fn compute_dependencies(
+    program: &[Stmt],
+) -> std::result::Result<Vec<ServiceGraphs>, AnalysisError> {
     let mut global_def_bodies = HashMap::new();
     let mut global_member_order = HashMap::new();
 
@@ -81,7 +129,7 @@ fn analyze_dependencies_with_ctx(
     decls: &[Decl],
     global_def_bodies: &HashMap<(Symbol, Symbol), Expr>,
     global_member_order: &HashMap<Symbol, Vec<Symbol>>,
-) -> Result<ServiceGraphs> {
+) -> std::result::Result<ServiceGraphs, AnalysisError> {
     if decls.is_empty() {
         return Ok(ServiceGraphs::new());
     }
@@ -148,7 +196,7 @@ fn validate_eager_and_build_deps(
     expr: &Expr,
     ctx: &EagerCtx<'_>,
     graphs: &mut ServiceGraphs,
-) -> Result<()> {
+) -> std::result::Result<(), AnalysisError> {
     debug_assert!(
         ctx.declared_symbols.contains(&decl_name),
         "decl_name must be in declared_symbols"
@@ -184,10 +232,7 @@ fn validate_eager_and_build_deps(
             && ctx.declared_symbols.contains(&node)
             && !ctx.initialized_symbols.contains(&node)
         {
-            return Err(Error::Message(format!(
-                "Invalid forward reference to uninitialized value '{}'",
-                node
-            )));
+            return Err(AnalysisError::EagerForwardReference(node));
         }
     }
 
@@ -200,7 +245,7 @@ fn build_eager_call_graph(
     parent_node: Symbol,
     ctx: &EagerCtx<'_>,
     eager_graph: &mut DiGraphMap<Symbol, ()>,
-) -> Result<()> {
+) -> std::result::Result<(), AnalysisError> {
     match expr {
         Expr::Call { func: _, args: _ } => {
             let mut call_chain = Vec::new();
@@ -320,7 +365,7 @@ fn check_remote_member_eager_validity(
     member_name: Symbol,
     target_body: &Expr,
     global_member_order: &HashMap<Symbol, Vec<Symbol>>,
-) -> Result<()> {
+) -> std::result::Result<(), AnalysisError> {
     if let Some(members) = global_member_order.get(&service_name) {
         let mut initialized = HashSet::new();
         for mem in members {
@@ -338,10 +383,7 @@ fn check_remote_member_eager_validity(
         let free_deps = super::free_var::free_var(body_to_check, &HashSet::new());
         for dep in free_deps {
             if members.contains(&dep) && !initialized.contains(&dep) {
-                return Err(Error::Message(format!(
-                    "Invalid forward reference to uninitialized value '{}'",
-                    dep
-                )));
+                return Err(AnalysisError::EagerForwardReference(dep));
             }
         }
     }
@@ -354,7 +396,7 @@ fn expand_eager_argument(
     parent_node: Symbol,
     ctx: &EagerCtx<'_>,
     eager_graph: &mut DiGraphMap<Symbol, ()>,
-) -> Result<()> {
+) -> std::result::Result<(), AnalysisError> {
     match arg {
         Expr::Func { body, params, .. } => {
             if !matches!(body.as_ref(), Expr::Action(..)) {

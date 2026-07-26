@@ -1,3 +1,24 @@
+// test_typecheck_hof_delayed_fwd.mkt
+//
+// PURPOSE: Verify that a higher-order function call that transitively reads an
+// uninitialized variable through its argument closure is correctly rejected by
+// the static dependency analysis pass.
+//
+// EXPECTED OUTCOME: FAILS static checks (dependency analysis detects an eager
+// forward reference to `a` which is not yet initialized when `d` is defined).
+//
+// RATIONALE: `def d = app(fn x => x + a)(c)` eagerly calls `app(...)` during
+// initialization. `app = fn f => fn x => f(x + b)`, so the call chain
+// evaluates to `(fn x => x + a)(c + b)`, which calls `x + a` with the
+// argument closed over `a`. Since `var a = 0` is declared after `d`, reading
+// `a` here is a use-before-initialization bug that must be caught.
+//
+// This is the complex HOF example from GitHub Issue #173 (PR #120 comment
+// by @neurusL). Per the issue discussion: "d has read a already by forcing
+// thunks -- this is not intended to pass name resolution."
+//
+// Makefile target: test-forward-decls (expected: exit non-zero, inverted with !)
+
 service s {
     var b = 0;
     var c = 0;

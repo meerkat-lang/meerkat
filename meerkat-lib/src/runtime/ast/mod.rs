@@ -317,7 +317,7 @@ impl Display for Value {
             } => {
                 let params_str: Vec<String> = params.iter().map(|p| p.to_string()).collect();
                 let env_str: Vec<String> =
-                    env.iter().map(|(k, v)| format!("{}: {}", k, v)).collect();
+                    env.iter().map(|(k, v)| format!("{:?}: {}", k, v)).collect();
                 if let Some(ref ty) = return_ty {
                     write!(
                         f,
@@ -337,7 +337,7 @@ impl Display for Value {
                 service_net_id,
             } => {
                 let env_str: Vec<String> =
-                    env.iter().map(|(k, v)| format!("{}: {}", k, v)).collect();
+                    env.iter().map(|(k, v)| format!("{:?}: {}", k, v)).collect();
                 write!(
                     f,
                     "action[{:?}][{}]{{{:?}}}",
@@ -376,8 +376,8 @@ impl Display for Expr {
             Expr::Literal { val } => write!(f, "{}", val),
             Expr::Html(_) => write!(f, "<html>"),
             Expr::Tuple { .. } => write!(f, "vector"),
-            Expr::KeyVal { name, value } => write!(f, "keyval: {}, {}", name, value),
-            Expr::Variable { name } => write!(f, "{}", name),
+            Expr::KeyVal { name, value } => write!(f, "keyval: {:?}, {}", name, value),
+            Expr::Variable { name } => write!(f, "{:?}", name),
             Expr::Unop { op, expr } => write!(f, "{}{}", op, expr),
             Expr::Binop { op, expr1, expr2 } => write!(f, "{} {} {}", expr1, op, expr2),
             Expr::If { cond, expr1, expr2 } => {
@@ -416,7 +416,7 @@ impl Display for Expr {
             Expr::MemberAccess {
                 service_name,
                 member_name,
-            } => write!(f, "{}.{}", service_name, member_name),
+            } => write!(f, "{:?}.{:?}", service_name, member_name),
             Expr::Select { where_clause, .. } => write!(f, "{}", where_clause),
             Expr::Table { records, .. } => {
                 write!(f, "[",)?;
@@ -475,24 +475,24 @@ impl Display for ActionStmt {
         match self {
             ActionStmt::Let { name, ty, expr } => {
                 if let Some(t) = ty {
-                    write!(f, "let {}: {} = {}", name, t, expr)
+                    write!(f, "let {:?}: {} = {}", name, t, expr)
                 } else {
-                    write!(f, "let {} = {}", name, expr)
+                    write!(f, "let {:?} = {}", name, expr)
                 }
             }
             ActionStmt::Expr(expr) => write!(f, "{}", expr),
             ActionStmt::Do(expr) => write!(f, "do {}", expr),
             ActionStmt::Assert(expr, _) => write!(f, "assert {}", expr),
-            ActionStmt::Assign { name, expr } => write!(f, "{} = {}", name, expr),
+            ActionStmt::Assign { name, expr } => write!(f, "{:?} = {}", name, expr),
             ActionStmt::Insert { row, table_name } => {
-                write!(f, "insert into {} {}", table_name, row)
+                write!(f, "insert into {:?} {}", table_name, row)
             }
             ActionStmt::For {
                 var,
                 iterable,
                 body,
             } => {
-                write!(f, "for {} in {} {{ ", var, iterable)?;
+                write!(f, "for {:?} in {} {{ ", var, iterable)?;
                 for stmt in body {
                     write!(f, "{}; ", stmt)?;
                 }
@@ -517,9 +517,9 @@ impl Display for Decl {
         match self {
             Decl::VarDecl { name, ty, val } => {
                 if let Some(t) = ty {
-                    write!(f, "var {}: {} = {}", name, t, val)
+                    write!(f, "var {:?}: {} = {}", name, t, val)
                 } else {
-                    write!(f, "var {} = {}", name, val)
+                    write!(f, "var {:?} = {}", name, val)
                 }
             }
             Decl::DefDecl {
@@ -530,13 +530,13 @@ impl Display for Decl {
             } => {
                 let prefix = if *is_pub { "pub " } else { "" };
                 if let Some(t) = ty {
-                    write!(f, "{}def {}: {} = {}", prefix, name, t, val)
+                    write!(f, "{}def {:?}: {} = {}", prefix, name, t, val)
                 } else {
-                    write!(f, "{}def {} = {}", prefix, name, val)
+                    write!(f, "{}def {:?} = {}", prefix, name, val)
                 }
             }
             Decl::TableDecl { name, .. } => {
-                write!(f, "table {} created", name)
+                write!(f, "table {:?} created", name)
             }
         }
     }

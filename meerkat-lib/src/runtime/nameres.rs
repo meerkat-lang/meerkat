@@ -65,11 +65,11 @@ impl fmt::Display for Error {
                 if let Some(ctx) = context_name {
                     write!(
                         f,
-                        "Unknown identifier '{}' (expected {}) in context '{}'",
+                        "Unknown identifier '{:?}' (expected {}) in context '{:?}'",
                         name, expected, ctx
                     )
                 } else {
-                    write!(f, "Unknown identifier '{}' (expected {})", name, expected)
+                    write!(f, "Unknown identifier '{:?}' (expected {})", name, expected)
                 }
             }
             Error::DepthLimit => {
@@ -78,7 +78,7 @@ impl fmt::Display for Error {
             Error::ForwardReference(name) => {
                 write!(
                     f,
-                    "Invalid forward reference to uninitialized value '{}'",
+                    "Invalid forward reference to uninitialized value '{:?}'",
                     name
                 )
             }

@@ -6,14 +6,15 @@ Usage:
 
 Purpose:
     Orchestrates the Smart Grid Web Dashboard demo (Demo 2).
-    1. Ensures WASM package is built.
-    2. Spawns local HTTP server on port 8000.
-    3. Launches backend Meerkat server network (server.mkt).
-    4. Polls socket until dashboard WebSocket port 9241 is accepting connections.
-    5. Opens Google Chrome directly to dashboard.mkt for WASM remote subscription.
-    6. Displays an 8-second terminal countdown timer while user views initial state.
-    7. Triggers controller.mkt over P2P network to push live OTA state updates.
-    8. Gracefully shuts down all child processes on Ctrl+C.
+    1. Cleanly terminates any stale background listeners on ports 8000, 9240, 9241.
+    2. Rebuilds WASM package if needed.
+    3. Spawns local HTTP server on port 8000.
+    4. Launches backend Meerkat server network (server.mkt).
+    5. Polls socket until dashboard WebSocket port 9241 is accepting connections.
+    6. Opens Google Chrome directly to dashboard.mkt for WASM remote subscription.
+    7. Displays an 8-second terminal countdown timer while user views initial state.
+    8. Triggers controller.mkt over P2P network to push live OTA state updates.
+    9. Gracefully shuts down all child processes on Ctrl+C.
 """
 
 import os
@@ -42,6 +43,17 @@ def cleanup():
     PROCS.clear()
     print("[demo-2] Cleanup complete.")
 
+def kill_port(port: int):
+    """Kill any process currently bound to the specified TCP port."""
+    try:
+        res = subprocess.run(["lsof", "-t", f"-iTCP:{port}", "-sTCP:LISTEN"], capture_output=True, text=True)
+        pids = res.stdout.strip().split()
+        for pid in pids:
+            if pid and pid.isdigit():
+                subprocess.run(["kill", "-9", pid], capture_output=True)
+    except Exception:
+        pass
+
 def wait_for_port(host: str, port: int, timeout: float = 40.0) -> bool:
     """Poll a TCP socket until it is accepting connections.
 
@@ -67,7 +79,12 @@ def main():
     signal.signal(signal.SIGINT, lambda sig, frame: sys.exit(0))
     signal.signal(signal.SIGTERM, lambda sig, frame: sys.exit(0))
 
-    # 1. Build WASM package if missing
+    # 1. Clean up any stale processes occupying ports 8000, 9240, 9241
+    kill_port(8000)
+    kill_port(9240)
+    kill_port(9241)
+
+    # 2. Build WASM package if missing
     pkg_dir = os.path.join("meerkat-wasm", "www", "pkg")
     if not os.path.exists(pkg_dir):
         print("[demo-2] Building WASM package...")
@@ -76,7 +93,7 @@ def main():
             print("[demo-2] Error: WASM build failed.")
             sys.exit(1)
 
-    # 2. Start HTTP server on port 8000
+    # 3. Start HTTP server on port 8000
     print("[demo-2] Starting web server at http://localhost:8000...")
     http_proc = subprocess.Popen(
         [sys.executable, "-m", "http.server", "8000"],
@@ -86,13 +103,13 @@ def main():
     )
     PROCS.append(http_proc)
 
-    # 3. Start Meerkat server network
+    # 4. Start Meerkat server network
     manifest_path = os.path.join("demos", "demo-2", "manifest-server.json")
     print(f"[demo-2] Starting Meerkat server via {manifest_path}...")
     mkn_proc = subprocess.Popen([sys.executable, "scripts/mkn.py", manifest_path])
     PROCS.append(mkn_proc)
 
-    # 4. Wait for WebSocket port 9241 to open
+    # 5. Wait for WebSocket port 9241 to open
     print("[demo-2] Waiting for dashboard WebSocket port 9241 to initialize...")
     if wait_for_port("127.0.0.1", 9241, timeout=40.0):
         print("[demo-2] Dashboard WebSocket port 9241 is online!")
@@ -106,7 +123,7 @@ def main():
         print("[demo-2] Error: Timed out waiting for port 9241.")
         sys.exit(1)
 
-    # 5. Live Countdown Sequence
+    # 6. Live Countdown Sequence
     print("\n[demo-2] ==========================================================")
     print("[demo-2] Initial dashboard loaded! Initial state: 4.0 kW solar (80%), 85% battery.")
     print("[demo-2] Watch your browser window to observe the live update!")
@@ -118,7 +135,7 @@ def main():
 
     print("\n[demo-2] Triggering live OTA update now over P2P network...")
 
-    # 6. Execute controller client update node targeting inverter and battery on port 9240
+    # 7. Execute controller client update node targeting inverter and battery on port 9240
     dashboard_peer = "12D3KooWSrbdDG8vbm4z3e1XLMzFAatPQc1VdkVDRHYG5SZbBGVk"
     controller_cmd = [
         "cargo", "run", "-p", "meerkat", "--", "--local",
@@ -132,7 +149,7 @@ def main():
     else:
         print("\n[demo-2] Warning: Controller update node exited with error code.")
 
-    # 7. Keep orchestrator running until interrupted
+    # 8. Keep orchestrator running until interrupted
     try:
         mkn_proc.wait()
     except KeyboardInterrupt:

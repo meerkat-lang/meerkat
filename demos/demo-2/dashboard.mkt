@@ -1,6 +1,6 @@
 // Interactive visual dashboard node loaded by WebAssembly client
 //
-// macOS-inspired Smart Grid Live Dashboard with thin, refined progress bars
+// macOS-inspired Smart Grid Live Dashboard with thin progress bars and industrial telemetry status indicators
 
 import inverter
 import battery
@@ -39,7 +39,7 @@ service dashboard {
 
       <div style="margin-bottom: 1.25rem; padding: 1rem; background: #f8fafc; border-radius: 12px; border: 1px solid #f1f5f9;">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.6rem; font-size: 0.85rem; font-weight: 500; color: #475569;">
-          <span>Battery Storage ({battery_status})</span>
+          <span>Battery Storage Capacity</span>
           <span style="font-weight: 600; color: #0f172a;">{battery_percent}% / 100%</span>
         </div>
         <div style="width: 100%; background: #e2e8f0; border-radius: 9999px; height: 8px; overflow: hidden;">
@@ -47,9 +47,16 @@ service dashboard {
         </div>
       </div>
 
-      <div style="padding: 0.85rem 1rem; background: #f8fafc; border-radius: 12px; border: 1px solid #f1f5f9; display: flex; justify-content: space-between; align-items: center; font-size: 0.85rem;">
-        <span style="color: #64748b; font-weight: 500;">Home Solar System</span>
-        <span style="font-weight: 600; color: #10b981; background: #ecfdf5; padding: 0.2rem 0.65rem; border-radius: 9999px; font-size: 0.75rem;">Active</span>
+      <div style="padding: 1rem; background: #f8fafc; border-radius: 12px; border: 1px solid #f1f5f9;">
+        <div style="font-size: 0.78rem; font-weight: 600; color: #64748b; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 0.6rem;">Automated Power Routing</div>
+        <div class="industrial-telemetry-panel">
+          <div class="telemetry-badge badge-solar"><span class="led-dot led-solar"></span>☀️ SOLAR</div>
+          <div class="telemetry-badge badge-battery"><span class="led-dot led-battery"></span>🔋 BATTERY BACKUP</div>
+        </div>
+        <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.85rem; margin-top: 0.5rem;">
+          <span style="color: #64748b; font-weight: 500;">Active Supply</span>
+          <span class="active-supply-text" style="font-weight: 600; color: #0f172a;"></span>
+        </div>
       </div>
     </div>
   );

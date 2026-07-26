@@ -14,6 +14,7 @@
       -webkit-font-smoothing: antialiased;
     }
     .debug-panel {
+      display: none;
       max-width: 720px;
       margin: 2rem auto;
       padding: 1.5rem;
@@ -25,28 +26,101 @@
     pre { background: #f8fafc; padding: 1rem; white-space: pre-wrap; word-break: break-all; border-radius: 6px; }
     button { padding: 0.5rem 1rem; background: #2563eb; color: white; border: none; border-radius: 6px; cursor: pointer; }
     .status-msg {
-      text-align: center;
-      padding: 4rem 1rem;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 6rem 1rem;
       color: #64748b;
-      font-size: 1.1rem;
+      font-size: 0.95rem;
       font-weight: 500;
     }
     .spinner {
-      display: inline-block;
-      width: 24px;
-      height: 24px;
-      border: 3px solid #cbd5e1;
-      border-top-color: #2563eb;
+      display: block;
+      width: 28px;
+      height: 28px;
+      border: 3px solid #e2e8f0;
+      border-top-color: #3b82f6;
       border-radius: 50%;
-      animation: spin 1s linear infinite;
-      vertical-align: middle;
-      margin-right: 10px;
+      animation: spin 0.8s linear infinite;
+      margin-bottom: 12px;
     }
     @keyframes spin {
       to { transform: rotate(360deg); }
     }
     #render-container {
       width: 100%;
+    }
+    #render {
+      opacity: 0;
+      transition: opacity 0.4s ease-in-out;
+    }
+    #render.loaded {
+      opacity: 1;
+    }
+
+    /* Balanced Industrial Telemetry Status Panel Styles */
+    .industrial-telemetry-panel {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      border-radius: 10px;
+      padding: 4px;
+      margin-bottom: 0.75rem;
+    }
+    .telemetry-badge {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      padding: 0.4rem 0.5rem;
+      border-radius: 8px;
+      transition: all 3.4s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    .telemetry-badge-active-solar {
+      background: #ffffff;
+      border: 1px solid #cbd5e1;
+      color: #b45309;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+    }
+    .telemetry-badge-active-battery {
+      background: #ffffff;
+      border: 1px solid #cbd5e1;
+      color: #334155;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+    }
+    .telemetry-badge-inactive {
+      background: transparent;
+      border: 1px solid transparent;
+      color: #94a3b8;
+      opacity: 0.45;
+    }
+    .led-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      transition: background-color 3.4s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 3.4s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    .led-dot-solar {
+      background-color: #f59e0b;
+      box-shadow: 0 0 5px rgba(245, 158, 11, 0.6);
+    }
+    .led-dot-battery {
+      background-color: #475569;
+      box-shadow: 0 0 5px rgba(71, 85, 105, 0.6);
+    }
+    .led-dot-off {
+      background-color: #cbd5e1;
+      box-shadow: none;
+    }
+    .active-supply-text {
+      transition: color 3.4s cubic-bezier(0.16, 1, 0.3, 1), opacity 3.4s cubic-bezier(0.16, 1, 0.3, 1);
     }
   </style>
 </head>
@@ -62,8 +136,9 @@
     <pre id="out">(not connected)</pre>
   </div>
 
-  <div id="status" class="status-msg" style="display: none;">
-    <span class="spinner"></span> <span id="status-text">Connecting to Meerkat service...</span>
+  <div id="status" class="status-msg">
+    <span class="spinner"></span>
+    <span id="status-text">Connecting to Smart Grid service...</span>
   </div>
 
   <div id="render-container">
@@ -78,45 +153,115 @@
     const debugForm = document.getElementById("debug-form");
     const statusEl = document.getElementById("status");
     const statusTextEl = document.getElementById("status-text");
+    const renderEl = document.getElementById("render");
 
-    // MutationObserver to animate progress bars smoothly when WASM re-renders innerHTML
-    if (!window._barWidths) window._barWidths = {};
-    const renderContainer = document.getElementById("render");
+    // Pure JavaScript 60 FPS animation state for progress bars
+    let currentSolar = 80;
+    let currentBattery = 85;
+    let animFrameId = null;
 
-    const observer = new MutationObserver(() => {
-      const fills = document.querySelectorAll('.progress-fill');
-      fills.forEach(fill => {
-        const key = fill.getAttribute('data-key');
-        const targetWidth = fill.getAttribute('data-width');
-        if (key && targetWidth) {
-          const prevWidth = window._barWidths[key] || targetWidth + '%';
-          window._barWidths[key] = targetWidth + '%';
+    function animateBarsTo(targetSolar, targetBattery) {
+      if (animFrameId) cancelAnimationFrame(animFrameId);
 
-          fill.style.width = prevWidth;
-          fill.style.transition = 'none';
+      const startSolar = currentSolar;
+      const startBattery = currentBattery;
+      const startTime = performance.now();
+      const duration = 3400; // 3.4 seconds (twice as slow)
 
-          requestAnimationFrame(() => {
-            requestAnimationFrame(() => {
-              fill.style.transition = 'width 1.2s cubic-bezier(0.16, 1, 0.3, 1), background-color 1.2s cubic-bezier(0.16, 1, 0.3, 1)';
-              fill.style.width = targetWidth + '%';
-            });
-          });
+      function step(now) {
+        const elapsed = now - startTime;
+        const p = Math.min(1, elapsed / duration);
+        // Smooth cubic ease-out curve
+        const ease = 1 - Math.pow(1 - p, 3);
+
+        currentSolar = startSolar + (targetSolar - startSolar) * ease;
+        currentBattery = startBattery + (targetBattery - startBattery) * ease;
+
+        const solarFill = document.querySelector('.progress-fill[data-key="solar"]');
+        const batteryFill = document.querySelector('.progress-fill[data-key="battery"]');
+
+        if (solarFill) solarFill.style.width = currentSolar.toFixed(1) + '%';
+        if (batteryFill) batteryFill.style.width = currentBattery.toFixed(1) + '%';
+
+        if (p < 1) {
+          animFrameId = requestAnimationFrame(step);
         }
-      });
-    });
+      }
 
-    if (renderContainer) {
-      observer.observe(renderContainer, { childList: true, subtree: true });
+      animFrameId = requestAnimationFrame(step);
     }
 
-    // Parse URL query parameters
+    const observer = new MutationObserver(() => {
+      observer.disconnect();
+
+      try {
+        let targetSolar = currentSolar;
+        let targetBattery = currentBattery;
+
+        const solarFill = document.querySelector('.progress-fill[data-key="solar"]');
+        const batteryFill = document.querySelector('.progress-fill[data-key="battery"]');
+
+        if (solarFill) {
+          const w = parseInt(solarFill.getAttribute('data-width'), 10);
+          if (!isNaN(w)) targetSolar = w;
+        }
+        if (batteryFill) {
+          const w = parseInt(batteryFill.getAttribute('data-width'), 10);
+          if (!isNaN(w)) targetBattery = w;
+        }
+
+        // Trigger smooth 60 FPS JS animation loop for both bars simultaneously
+        animateBarsTo(targetSolar, targetBattery);
+
+        // Update Telemetry Badges & LEDs
+        const isSolarActive = targetBattery > 50;
+        const panels = document.querySelectorAll('.industrial-telemetry-panel');
+        panels.forEach(panel => {
+          const solarBadge = panel.querySelector('.badge-solar');
+          const batteryBadge = panel.querySelector('.badge-battery');
+          const solarLed = panel.querySelector('.led-solar');
+          const batteryLed = panel.querySelector('.led-battery');
+          const supplyLabel = panel.parentElement ? panel.parentElement.querySelector('.active-supply-text') : null;
+
+          if (solarBadge && batteryBadge) {
+            if (isSolarActive) {
+              solarBadge.className = 'telemetry-badge badge-solar telemetry-badge-active-solar';
+              batteryBadge.className = 'telemetry-badge badge-battery telemetry-badge-inactive';
+              if (solarLed) solarLed.className = 'led-dot led-solar';
+              if (batteryLed) batteryLed.className = 'led-dot led-dot-off';
+              if (supplyLabel) supplyLabel.textContent = '☀️ Solar Generation (Grid Export)';
+            } else {
+              solarBadge.className = 'telemetry-badge badge-solar telemetry-badge-inactive';
+              batteryBadge.className = 'telemetry-badge badge-battery telemetry-badge-active-battery';
+              if (solarLed) solarLed.className = 'led-dot led-dot-off';
+              if (batteryLed) batteryLed.className = 'led-dot led-battery';
+              if (supplyLabel) supplyLabel.textContent = '⚡️ Battery Storage (Discharging)';
+            }
+          }
+        });
+
+        if (renderEl) {
+          renderEl.classList.add('loaded');
+          statusEl.style.display = "none";
+        }
+      } finally {
+        if (renderEl) {
+          observer.observe(renderEl, { childList: true });
+        }
+      }
+    });
+
+    if (renderEl) {
+      observer.observe(renderEl, { childList: true });
+    }
+
     const params = new URLSearchParams(window.location.search);
     const hasUrlParams = params.has("peer_id") || params.has("addr") || params.has("path");
 
-    if (hasUrlParams) {
-      debugForm.style.display = "none";
-      statusEl.style.display = "block";
-
+    if (!hasUrlParams) {
+      debugForm.style.display = "block";
+      statusEl.style.display = "none";
+    } else {
       const port = params.get("port") || "9241";
       if (params.has("peer_id")) {
         const peerId = params.get("peer_id");
@@ -134,16 +279,9 @@
       const addr = document.getElementById("addr").value;
       const path = document.getElementById("path").value;
 
-      if (hasUrlParams) {
-        statusTextEl.textContent = "Connecting to Meerkat server...";
-      } else {
-        out.textContent = "Connecting...";
-      }
-
       try {
         const src = await load_service(addr, path);
         out.textContent = src;
-        statusEl.style.display = "none";
       } catch (e) {
         out.textContent = "error: " + e;
         if (hasUrlParams) {

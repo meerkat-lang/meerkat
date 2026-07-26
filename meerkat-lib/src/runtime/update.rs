@@ -211,13 +211,11 @@ impl<'a> Transaction<'a> {
                 if let Err(e) = nameres::resolve(&self.ast) {
                     let msg = match &e {
                         nameres::Error::ForwardReference(sym) => {
-                            format!(
-                                "ForwardReference({} / {:?})",
-                                manager.interner.get(*sym),
-                                sym
-                            )
+                            format!("ForwardReference({})", manager.interner.get(*sym))
                         }
-                        other => format!("{:?}", other),
+                        nameres::Error::UnknownIdentifier { .. } | nameres::Error::DepthLimit => {
+                            format!("{}", e)
+                        }
                     };
                     return Err(EvalError::RuntimeError(format!(
                         "Name resolution failed on update: {}",
@@ -244,14 +242,20 @@ impl<'a> Transaction<'a> {
                     .iter()
                     .filter_map(|stmt| match stmt {
                         Stmt::Service { name, .. } => Some(*name),
-                        _ => None,
+                        Stmt::ActionStmt(_)
+                        | Stmt::Atomic { .. }
+                        | Stmt::Update { .. }
+                        | Stmt::Connect { .. }
+                        | Stmt::Import { .. }
+                        | Stmt::Test { .. }
+                        | Stmt::Watch { .. } => None,
                     })
                     .collect();
 
                 debug_assert_eq!(
                     service_stmts.len(),
                     service_graphs_vec.len(),
-                    "Service statement count must match computed service graph count"
+                    "Service statement count must match graph count"
                 );
 
                 for (name, graphs) in service_stmts.into_iter().zip(service_graphs_vec) {
@@ -267,7 +271,12 @@ impl<'a> Transaction<'a> {
                             service_name: name,
                             decls,
                         } => (name, decls),
-                        _ => continue,
+                        Stmt::ActionStmt(_)
+                        | Stmt::Atomic { .. }
+                        | Stmt::Connect { .. }
+                        | Stmt::Import { .. }
+                        | Stmt::Test { .. }
+                        | Stmt::Watch { .. } => continue,
                     };
                     for decl in decls {
                         let (var_name, expr) = match decl {
@@ -309,13 +318,50 @@ impl<'a> Transaction<'a> {
                         Stmt::Update {
                             service_name: name, ..
                         } => Some(*name),
-                        _ => None,
+                        Stmt::ActionStmt(_)
+                        | Stmt::Atomic { .. }
+                        | Stmt::Connect { .. }
+                        | Stmt::Import { .. }
+                        | Stmt::Test { .. }
+                        | Stmt::Watch { .. } => None,
                     })
                     .collect();
 
                 for updated_svc_name in updated_svc_names {
                     if let Some(dep) = self.deps.remove(&updated_svc_name) {
                         manager.update_service_graphs(updated_svc_name, dep).await;
+                    }
+                }
+
+                for stmt in &self.updates {
+                    let (svc_name, decls) = match stmt {
+                        Stmt::Service { name, decls } => (name, decls),
+                        Stmt::Update {
+                            service_name: name,
+                            decls,
+                        } => (name, decls),
+                        Stmt::ActionStmt(_)
+                        | Stmt::Atomic { .. }
+                        | Stmt::Connect { .. }
+                        | Stmt::Import { .. }
+                        | Stmt::Test { .. }
+                        | Stmt::Watch { .. } => continue,
+                    };
+                    for decl in decls {
+                        match decl {
+                            Decl::VarDecl {
+                                name: decl_name, ..
+                            } => {
+                                manager.propagate(*svc_name, *decl_name).await;
+                            }
+                            Decl::DefDecl {
+                                name: decl_name, ..
+                            } => {
+                                manager.recompute_def(*svc_name, *decl_name).await;
+                                manager.propagate(*svc_name, *decl_name).await;
+                            }
+                            Decl::TableDecl { .. } => {}
+                        }
                     }
                 }
 

@@ -632,7 +632,7 @@ impl Manager {
         Ok(())
     }
 
-    async fn propagate(&mut self, service_name: Symbol, changed_var: Symbol) {
+    pub(crate) async fn propagate(&mut self, service_name: Symbol, changed_var: Symbol) {
         // #24: event-driven reactivity over the listener graph. A change to a
         // member notifies its listeners. For each listener we resolve its
         // service id to a local service: Some means a local listener, which we
@@ -676,7 +676,7 @@ impl Manager {
     /// cache with this def's cached cross-service deps so MemberAccess resolves
     /// from cache instead of a (possibly remote) lookup. Returns whether the
     /// stored value changed.
-    async fn recompute_def(&mut self, svc: Symbol, def: Symbol) -> bool {
+    pub(crate) async fn recompute_def(&mut self, svc: Symbol, def: Symbol) -> bool {
         let expr = match self
             .services
             .get(&svc)

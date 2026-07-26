@@ -64,6 +64,16 @@ impl<'a> Transaction<'a> {
         }
     }
 
+    /// Release any locks currently held by this transaction on the manager
+    ///
+    /// Args:
+    ///     `manager` (`&mut Manager`): The active runtime manager
+    fn release_lock_txn(&self, manager: &mut Manager) {
+        if let Some(txn) = &self.lock_txn {
+            manager.release_all_locks(txn);
+        }
+    }
+
     /// Drives the transaction forward through its state machine stages
     ///
     /// Args:
@@ -166,6 +176,7 @@ impl<'a> Transaction<'a> {
                                         Decl::VarDecl { name: n, .. }
                                         | Decl::DefDecl { name: n, .. } => *n,
                                         Decl::TableDecl { .. } => {
+                                            self.release_lock_txn(manager);
                                             return Err(EvalError::NotImplemented);
                                         }
                                     };
@@ -176,6 +187,7 @@ impl<'a> Transaction<'a> {
                                             Decl::VarDecl { name: n, .. }
                                             | Decl::DefDecl { name: n, .. } => *n,
                                             Decl::TableDecl { .. } => {
+                                                self.release_lock_txn(manager);
                                                 return Err(EvalError::NotImplemented);
                                             }
                                         };
@@ -202,6 +214,7 @@ impl<'a> Transaction<'a> {
                         }
                     }
                     if !found_service {
+                        self.release_lock_txn(manager);
                         return Err(EvalError::RuntimeError(
                             "Target service for update not found".to_string(),
                         ));
@@ -209,6 +222,7 @@ impl<'a> Transaction<'a> {
                 }
 
                 if let Err(e) = nameres::resolve(&self.ast) {
+                    self.release_lock_txn(manager);
                     let msg = match &e {
                         nameres::Error::ForwardReference(sym) => {
                             format!("ForwardReference({})", manager.interner.get(*sym))
@@ -225,6 +239,7 @@ impl<'a> Transaction<'a> {
 
                 let mut types = Env::new(None);
                 if let Err(e) = tt::check(&self.ast, &mut types) {
+                    self.release_lock_txn(manager);
                     return Err(EvalError::RuntimeError(format!(
                         "Type check failed on update: {:?}",
                         e
@@ -234,8 +249,13 @@ impl<'a> Transaction<'a> {
                     std::mem::transmute::<Env<'_, ServiceType<'_>>, Env<'a, ServiceType<'a>>>(types)
                 };
 
-                let service_graphs_vec = compute_dependencies(&self.ast)
-                    .map_err(|e| EvalError::RuntimeError(e.to_string()))?;
+                let service_graphs_vec = match compute_dependencies(&self.ast) {
+                    Ok(graphs) => graphs,
+                    Err(e) => {
+                        self.release_lock_txn(manager);
+                        return Err(EvalError::RuntimeError(e.to_string()));
+                    }
+                };
 
                 let service_stmts: Vec<Symbol> = self
                     .ast
@@ -283,6 +303,7 @@ impl<'a> Transaction<'a> {
                             Decl::VarDecl { name, val, .. } => (*name, val),
                             Decl::DefDecl { .. } => continue,
                             Decl::TableDecl { .. } => {
+                                self.release_lock_txn(manager);
                                 return Err(EvalError::NotImplemented);
                             }
                         };
@@ -297,9 +318,7 @@ impl<'a> Transaction<'a> {
                         let val = match eval(expr, &env, &mut ctx).await {
                             Ok(v) => v,
                             Err(e) => {
-                                if let Some(txn) = &self.lock_txn {
-                                    manager.release_all_locks(txn);
-                                }
+                                self.release_lock_txn(manager);
                                 return Err(e);
                             }
                         };
@@ -457,5 +476,75 @@ mod tests {
 
         let txn = Transaction::new(vec![update_stmt]);
         assert_eq!(txn.state, TransactionState::Init);
+    }
+
+    /// Test lock release when `nameres` fails during update transaction
+    ///
+    /// Ensures that write locks acquired during transaction initialization
+    /// are completely released if name resolution fails on the staged AST
+    #[tokio::test]
+    async fn test_transaction_poll_releases_locks_on_nameres_failure() {
+        let mut interner = Interner::new();
+        let code = "service s1 { var x = 10; }";
+        let ast = crate::runtime::parser::parse_string(code, &mut interner).unwrap();
+        let mut node = crate::runtime::Node::new();
+        node.interner = interner.clone();
+        node.unified_ast = ast;
+        node.static_checks().unwrap();
+
+        let local_ast = node.unified_ast.clone();
+        let mut manager = node
+            .on_manager_startup(true, None, std::collections::HashMap::new(), &local_ast)
+            .await
+            .unwrap();
+
+        let update_code = "update s1 { var x = unbound_variable; }";
+        let update_ast =
+            crate::runtime::parser::parse_string(update_code, &mut manager.interner).unwrap();
+
+        let mut txn = Transaction::new(update_ast);
+        let res = txn.poll(&mut manager).await;
+        assert!(res.is_err());
+
+        let s1_sym = manager.interner.insert("s1");
+        let x_sym = manager.interner.insert("x");
+        let service = manager.services.get(&s1_sym).unwrap();
+        let var_state = service.vars.get(&x_sym).unwrap();
+        assert!(matches!(var_state.lock, VarLock::Unlocked));
+    }
+
+    /// Test lock release when `tt::check` fails during update transaction
+    ///
+    /// Ensures that write locks acquired during transaction initialization
+    /// are completely released if type checking fails on the staged AST
+    #[tokio::test]
+    async fn test_transaction_poll_releases_locks_on_tt_failure() {
+        let mut interner = Interner::new();
+        let code = "service s1 { var x = 10; }";
+        let ast = crate::runtime::parser::parse_string(code, &mut interner).unwrap();
+        let mut node = crate::runtime::Node::new();
+        node.interner = interner.clone();
+        node.unified_ast = ast;
+        node.static_checks().unwrap();
+
+        let local_ast = node.unified_ast.clone();
+        let mut manager = node
+            .on_manager_startup(true, None, std::collections::HashMap::new(), &local_ast)
+            .await
+            .unwrap();
+
+        let update_code = "update s1 { var x: string = 42; }";
+        let update_ast =
+            crate::runtime::parser::parse_string(update_code, &mut manager.interner).unwrap();
+
+        let mut txn = Transaction::new(update_ast);
+        let res = txn.poll(&mut manager).await;
+        assert!(res.is_err());
+
+        let s1_sym = manager.interner.insert("s1");
+        let x_sym = manager.interner.insert("x");
+        let service = manager.services.get(&s1_sym).unwrap();
+        let var_state = service.vars.get(&x_sym).unwrap();
+        assert!(matches!(var_state.lock, VarLock::Unlocked));
     }
 }

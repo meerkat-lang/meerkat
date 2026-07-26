@@ -1020,6 +1020,7 @@ impl Manager {
                     }
                     MeerkatMessage::UpdateServiceRequest {
                         request_id,
+                        txn_id,
                         service_name,
                         source,
                         reply_to,
@@ -1035,8 +1036,14 @@ impl Manager {
                                     &mut self.interner,
                                 ) {
                                     Ok(stmts) => {
-                                        let mut txn =
-                                            crate::runtime::update::Transaction::new(stmts);
+                                        let mut txn = match txn_id {
+                                            Some(tid) => {
+                                                crate::runtime::update::Transaction::new_with_id(
+                                                    tid, stmts,
+                                                )
+                                            }
+                                            None => crate::runtime::update::Transaction::new(stmts),
+                                        };
                                         Box::pin(txn.poll(self)).await.map_err(|e| e.to_string())
                                     }
                                     Err(e) => Err(e),

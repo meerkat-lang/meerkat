@@ -573,18 +573,28 @@ async fn run_server(
 
     println!("Server running, press Ctrl+C to stop...");
 
-    let mut pending_updates: std::collections::VecDeque<(u64, String, String, String)> =
-        std::collections::VecDeque::new();
+    let mut pending_updates: std::collections::VecDeque<(
+        u64,
+        Option<meerkat_lib::runtime::txn::TxnId>,
+        String,
+        String,
+        String,
+    )> = std::collections::VecDeque::new();
 
     let mut last_keepalive = tokio::time::Instant::now();
     loop {
         // Defer pending service updates so that network events can be processed
         // without blocking the server loop during multi-step updates
-        if let Some((request_id, source, reply_to, peer)) = pending_updates.pop_front() {
+        if let Some((request_id, txn_id, source, reply_to, peer)) = pending_updates.pop_front() {
             let parse_res = parser::parse_string(&source, &mut manager.interner);
             let res = match parse_res {
                 Ok(stmts) => {
-                    let mut txn = meerkat_lib::runtime::update::Transaction::new(stmts);
+                    let mut txn = match txn_id {
+                        Some(tid) => {
+                            meerkat_lib::runtime::update::Transaction::new_with_id(tid, stmts)
+                        }
+                        None => meerkat_lib::runtime::update::Transaction::new(stmts),
+                    };
                     txn.poll(&mut manager).await.map_err(|e| e.to_string())
                 }
                 Err(e) => Err(e),
@@ -614,11 +624,12 @@ async fn run_server(
             match msg {
                 MeerkatMessage::UpdateServiceRequest {
                     request_id,
+                    txn_id,
                     service_name: _,
                     source,
                     reply_to,
                 } => {
-                    pending_updates.push_back((request_id, source, reply_to, peer));
+                    pending_updates.push_back((request_id, txn_id, source, reply_to, peer));
                 }
                 MeerkatMessage::LookupRequest {
                     request_id,

@@ -240,6 +240,7 @@ pub enum MeerkatMessage {
     /// Request to perform a live code update on a service
     UpdateServiceRequest {
         request_id: u64,
+        txn_id: Option<TxnId>,
         service_name: String,
         source: String,
         reply_to: String,

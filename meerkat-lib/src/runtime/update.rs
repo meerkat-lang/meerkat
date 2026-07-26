@@ -64,6 +64,30 @@ impl<'a> Transaction<'a> {
         }
     }
 
+    /// Creates a new unstarted atomic update transaction bound to an existing lock `TxnId`
+    ///
+    /// Args:
+    ///     `txn_id` (`TxnId`): The transaction ID that acquired the locks
+    ///     `updates` (`Vec<Stmt>`): The service updates to apply
+    ///
+    /// Returns:
+    ///     `Self`: The initialized `Transaction` instance
+    pub fn new_with_id(txn_id: TxnId, updates: Vec<Stmt>) -> Self {
+        debug_assert!(
+            !updates.is_empty(),
+            "Transaction updates should not be empty"
+        );
+        Self {
+            state: TransactionState::Init,
+            updates,
+            ast: Vec::new(),
+            types: Env::new(None),
+            values: HashMap::new(),
+            deps: HashMap::new(),
+            lock_txn: Some(LockTxn::new(txn_id)),
+        }
+    }
+
     /// Release any locks currently held by this transaction on the manager
     ///
     /// Args:
@@ -137,7 +161,10 @@ impl<'a> Transaction<'a> {
                     lock_groups.insert(svc_name_str, group);
                 }
 
-                let mut txn = LockTxn::new(TxnId::new(manager.node_id));
+                let mut txn = self
+                    .lock_txn
+                    .take()
+                    .unwrap_or_else(|| LockTxn::new(TxnId::new(manager.node_id)));
                 let lock_res = manager
                     .acquire_lock_group_internal(&mut txn, &lock_groups)
                     .await;
@@ -336,6 +363,7 @@ impl<'a> Transaction<'a> {
                         let reply_to = manager.local_reply_addr().await;
                         let msg = crate::net::types::MeerkatMessage::UpdateServiceRequest {
                             request_id,
+                            txn_id: self.lock_txn.as_ref().map(|t| t.id.clone()),
                             service_name: svc_str.clone(),
                             source,
                             reply_to,

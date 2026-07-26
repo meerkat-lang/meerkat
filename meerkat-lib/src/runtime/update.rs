@@ -8,7 +8,7 @@
 use crate::net::LockGroup;
 use crate::runtime::ast::{Decl, Stmt, Value};
 use crate::runtime::env::Env;
-use crate::runtime::graphs::{analysis::analyze_dependencies, ServiceGraphs};
+use crate::runtime::graphs::{analysis::compute_dependencies, ServiceGraphs};
 use crate::runtime::interner::Symbol;
 use crate::runtime::interpreter::evaluator::{eval, EvalContext, EvalError};
 use crate::runtime::manager::Manager;
@@ -236,12 +236,26 @@ impl<'a> Transaction<'a> {
                     std::mem::transmute::<Env<'_, ServiceType<'_>>, Env<'a, ServiceType<'a>>>(types)
                 };
 
-                for stmt in &self.ast {
-                    if let Stmt::Service { name, decls } = stmt {
-                        let dep = analyze_dependencies(decls)
-                            .map_err(|e| EvalError::RuntimeError(e.to_string()))?;
-                        self.deps.insert(*name, dep);
-                    }
+                let service_graphs_vec = compute_dependencies(&self.ast)
+                    .map_err(|e| EvalError::RuntimeError(e.to_string()))?;
+
+                let service_stmts: Vec<Symbol> = self
+                    .ast
+                    .iter()
+                    .filter_map(|stmt| match stmt {
+                        Stmt::Service { name, .. } => Some(*name),
+                        _ => None,
+                    })
+                    .collect();
+
+                debug_assert_eq!(
+                    service_stmts.len(),
+                    service_graphs_vec.len(),
+                    "Service statement count must match computed service graph count"
+                );
+
+                for (name, graphs) in service_stmts.into_iter().zip(service_graphs_vec) {
+                    self.deps.insert(name, graphs);
                 }
 
                 let mut eval_txn = LockTxn::new(TxnId::new(manager.node_id));
@@ -286,6 +300,25 @@ impl<'a> Transaction<'a> {
 
                 self.state = TransactionState::Evaluated;
                 self.commit(manager);
+
+                let updated_svc_names: HashSet<Symbol> = self
+                    .updates
+                    .iter()
+                    .filter_map(|stmt| match stmt {
+                        Stmt::Service { name, .. } => Some(*name),
+                        Stmt::Update {
+                            service_name: name, ..
+                        } => Some(*name),
+                        _ => None,
+                    })
+                    .collect();
+
+                for updated_svc_name in updated_svc_names {
+                    if let Some(dep) = self.deps.remove(&updated_svc_name) {
+                        manager.update_service_graphs(updated_svc_name, dep).await;
+                    }
+                }
+
                 Ok(())
             }
             TransactionState::LocksAcquired => {

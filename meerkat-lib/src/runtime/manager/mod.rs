@@ -1,6 +1,6 @@
 use super::ast::{ActionStmt, Decl, Expr, Stmt, Value};
 use super::env::Env;
-use super::graphs::{analysis::analyze_dependencies, free_var::cross_service_deps, ServiceGraphs};
+use super::graphs::{analysis::compute_dependencies, free_var::cross_service_deps, ServiceGraphs};
 use super::interpreter::{eval, execute, EvalContext, EvalError, ExecuteEffect};
 use super::tt::types::ServiceType;
 use crate::net::network_layer::NetworkLayer;
@@ -249,9 +249,6 @@ impl Manager {
         name: Symbol,
         decls: Vec<Decl>,
     ) -> Result<(), EvalError> {
-        let graphs =
-            analyze_dependencies(&decls).map_err(|e| EvalError::VarNotFound(e.to_string()))?;
-
         let id = self.compute_service_net_id(name);
         // Register the service (with its real `ServiceNetId`) before
         // evaluating any declarations, so action closures built during
@@ -261,6 +258,14 @@ impl Manager {
             name,
             decls: decls.clone(),
         });
+
+        let all_graphs = compute_dependencies(&self.unified_ast)
+            .map_err(|e| EvalError::VarNotFound(e.to_string()))?;
+        let graphs = all_graphs
+            .into_iter()
+            .last()
+            .unwrap_or_else(ServiceGraphs::new);
+
         self.services.insert(
             name,
             Service {
@@ -268,7 +273,7 @@ impl Manager {
                 name,
                 vars: HashMap::new(),
                 defs: HashMap::new(),
-                graphs,
+                graphs: ServiceGraphs::new(),
                 listeners: HashMap::new(),
                 dep_cache: HashMap::new(),
                 service_lock: None,
@@ -362,67 +367,11 @@ impl Manager {
 
             // #24: now that init succeeded, register listener edges so
             // a change to a member notifies the defs that depend on it
-            // Same-service deps come from `reactive_graph`;
-            // cross-service deps come from each `def`'s `cross_deps`
-            // references, where a local owner is wired in-process and
-            // a remote owner is subscribed over the wire. Only runs on
-            // the success path: a rolled-back service must not
-            // register listeners
             // #98: also skip when a participant commit failed -- that
             // service is about to be rolled back below, so it must not
             // wire up listeners
             if commit_error.is_none() {
-                if let Some(s) = self.services.get(&svc_name) {
-                    let this_id = s.id.clone();
-                    let mut edges: Vec<(Symbol, Symbol, Symbol)> =
-                        Vec::new();
-                    for (dep_member, listener_def) in
-                        s.graphs.reactive_edges()
-                    {
-                        if s.defs.contains_key(&listener_def) {
-                            edges.push((
-                                svc_name,
-                                dep_member,
-                                listener_def,
-                            ));
-                        }
-                    }
-                    // #24: cross-service deps, derived from each stored
-                    // `def` expression (`dep_remote` removed: these
-                    // are just the keys of `dep_cache`, recomputed
-                    // here from `cross_deps`)
-                    for (def_name, cross_set) in &s.graphs.cross_deps {
-                        for (owner, member) in cross_set {
-                            edges.push((*owner, *member, *def_name));
-                        }
-                    }
-                    for (owner, member, listener_def) in edges {
-                        if self.services.contains_key(&owner) {
-                            if let Some(owner_svc) =
-                                self.services.get_mut(&owner)
-                            {
-                                owner_svc
-                                    .listeners
-                                    .entry(member)
-                                    .or_default()
-                                    .insert((
-                                        this_id.clone(),
-                                        listener_def,
-                                    ));
-                            }
-                        } else {
-                            // remote owner: subscribe over the wire
-                            // so future changes push
-                            self.subscribe_remote(
-                                owner,
-                                member,
-                                this_id.clone(),
-                                listener_def,
-                            )
-                            .await;
-                        }
-                    }
-                }
+                self.update_service_graphs(svc_name, graphs).await;
             }
 
             // #98: a participant failed to commit after prepare. Roll
@@ -431,9 +380,7 @@ impl Manager {
             // service, mirroring the init-failure path. The captured
             // error is returned below
             if commit_error.is_some() {
-                for addr in
-                    txn.participants.iter().cloned().collect::<Vec<_>>()
-                {
+                for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
                     self.send_abort(addr, &txn.id).await;
                 }
                 self.services.remove(&svc_name);
@@ -459,6 +406,57 @@ impl Manager {
                 Some(e) => Err(e),
                 None => Ok(()),
             },
+        }
+    }
+
+    /// Update pre-computed dependency graphs for a service and re-wire reactive listeners
+    ///
+    /// Args:
+    ///     `svc_name` (`Symbol`): The target service symbol
+    ///     `new_graphs` (`ServiceGraphs`): The new pre-computed service graphs
+    ///
+    /// Returns:
+    ///     `()`
+    pub async fn update_service_graphs(&mut self, svc_name: Symbol, new_graphs: ServiceGraphs) {
+        let (updated_id, edges) = match self.services.get_mut(&svc_name) {
+            Some(service) => {
+                service.graphs = new_graphs;
+                let updated_id = service.id.clone();
+                let mut edges: Vec<(Symbol, Symbol, Symbol)> = Vec::new();
+                for (dep_member, listener_def) in service.graphs.reactive_edges() {
+                    if service.defs.contains_key(&listener_def) {
+                        edges.push((svc_name, dep_member, listener_def));
+                    }
+                }
+                for (def_name, cross_set) in &service.graphs.cross_deps {
+                    for (owner, member) in cross_set {
+                        edges.push((*owner, *member, *def_name));
+                    }
+                }
+                (updated_id, edges)
+            }
+            None => return,
+        };
+
+        for service in self.services.values_mut() {
+            for listener_set in service.listeners.values_mut() {
+                listener_set.retain(|(lid, _)| *lid != updated_id);
+            }
+        }
+
+        for (owner, member, listener_def) in edges {
+            if self.services.contains_key(&owner) {
+                if let Some(owner_svc) = self.services.get_mut(&owner) {
+                    owner_svc
+                        .listeners
+                        .entry(member)
+                        .or_default()
+                        .insert((updated_id.clone(), listener_def));
+                }
+            } else {
+                self.subscribe_remote(owner, member, updated_id.clone(), listener_def)
+                    .await;
+            }
         }
     }
 
@@ -735,24 +733,22 @@ impl Manager {
             }
         };
 
-        match self
-            .services
-            .get_mut(&svc)
-            .and_then(|s| s.vars.get_mut(&def))
-        {
-            Some(var_state) => {
+        if let Some(service) = self.services.get_mut(&svc) {
+            if let Some(var_state) = service.vars.get_mut(&def) {
                 let differs = var_state.value != value;
                 var_state.value = value;
                 differs
+            } else {
+                service.vars.insert(def, VarState::new(value));
+                true
             }
-            None => {
-                log::warn!(
-                    "recompute_def: def '{}' in service '{}' disappeared after recompute",
-                    self.interner.get(def),
-                    self.interner.get(svc)
-                );
-                false
-            }
+        } else {
+            log::warn!(
+                "recompute_def: service '{}' missing when recomputing def '{}'",
+                self.interner.get(svc),
+                self.interner.get(def)
+            );
+            false
         }
     }
 
@@ -827,8 +823,17 @@ impl Manager {
         self.send_oneway(Address::new(&reply_to), msg).await;
     }
 
-    /// #24: subscribe `this_id.listener_def` as a listener on remote `owner.member`.
-    async fn subscribe_remote(
+    /// Subscribe `this_id.listener_def` as a listener on remote `owner.member`
+    ///
+    /// Args:
+    ///     `owner` (`Symbol`): The remote service owner symbol
+    ///     `member` (`Symbol`): The member symbol on the remote service
+    ///     `this_id` (`ServiceNetId`): The subscriber service identity
+    ///     `listener_def` (`Symbol`): The subscriber local definition symbol
+    ///
+    /// Returns:
+    ///     `()`
+    pub async fn subscribe_remote(
         &mut self,
         owner: Symbol,
         member: Symbol,

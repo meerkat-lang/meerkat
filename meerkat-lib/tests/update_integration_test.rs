@@ -577,3 +577,105 @@ async fn test_atomic_block_multiple_services_update() {
         Value::Int { val: 200 }
     );
 }
+
+/// Verify that an update introducing a new def correctly re-wires listeners
+/// so subsequent var assignments trigger reactive propagation
+///
+/// Returns:
+///     `()`
+#[tokio::test]
+async fn test_update_listener_rewiring_propagation() {
+    let mut interner = Interner::new();
+    let initial_code = "
+        service s1 {
+            var x = 10;
+        }
+    ";
+    let initial_ast = parse_string(initial_code, &mut interner).unwrap();
+    let mut node = Node::new();
+    node.interner = interner.clone();
+    node.unified_ast = initial_ast;
+    node.static_checks().unwrap();
+
+    let local_ast = node.unified_ast.clone();
+    let mut manager = node
+        .on_manager_startup(true, None, HashMap::new(), &local_ast)
+        .await
+        .unwrap();
+
+    let update_code = "
+        update s1 {
+            var x = 10;
+            pub def y = (x + 1);
+        }
+    ";
+    let update_ast = parse_string(update_code, &mut manager.interner).unwrap();
+    let mut txn = Transaction::new(update_ast);
+    let poll_res = txn.poll(&mut manager).await;
+    assert!(poll_res.is_ok(), "poll error: {:?}", poll_res);
+
+    let s1_sym = manager.interner.insert("s1");
+    let x_sym = manager.interner.insert("x");
+    let y_sym = manager.interner.insert("y");
+
+    // Assign x = 20 to trigger reactive propagation over newly re-wired listener
+    manager
+        .assign(s1_sym, x_sym, Value::Int { val: 20 }, None)
+        .await
+        .unwrap();
+
+    let y_val = manager.lookup(y_sym, s1_sym, None).await.unwrap();
+    assert_eq!(y_val, Value::Int { val: 21 });
+}
+
+/// Verify cross-service dependency listener re-wiring during update
+///
+/// Returns:
+///     `()`
+#[tokio::test]
+async fn test_update_cross_service_listener_rewiring() {
+    let mut interner = Interner::new();
+    let initial_code = "
+        service s1 {
+            var x = 10;
+        }
+        service s2 {
+            pub def y = s1.x;
+        }
+    ";
+    let initial_ast = parse_string(initial_code, &mut interner).unwrap();
+    let mut node = Node::new();
+    node.interner = interner.clone();
+    node.unified_ast = initial_ast;
+    node.static_checks().unwrap();
+
+    let local_ast = node.unified_ast.clone();
+    let mut manager = node
+        .on_manager_startup(true, None, HashMap::new(), &local_ast)
+        .await
+        .unwrap();
+
+    let update_code = "
+        update s2 {
+            pub def y = (s1.x * 3);
+        }
+    ";
+    let update_ast = parse_string(update_code, &mut manager.interner).unwrap();
+    let mut txn = Transaction::new(update_ast);
+    let poll_res = txn.poll(&mut manager).await;
+    assert!(poll_res.is_ok(), "poll error: {:?}", poll_res);
+
+    let s1_sym = manager.interner.insert("s1");
+    let s2_sym = manager.interner.insert("s2");
+    let x_sym = manager.interner.insert("x");
+    let y_sym = manager.interner.insert("y");
+
+    // Assign s1.x = 5 to trigger propagation across services
+    manager
+        .assign(s1_sym, x_sym, Value::Int { val: 5 }, None)
+        .await
+        .unwrap();
+
+    let y_val = manager.lookup(y_sym, s2_sym, None).await.unwrap();
+    assert_eq!(y_val, Value::Int { val: 15 });
+}

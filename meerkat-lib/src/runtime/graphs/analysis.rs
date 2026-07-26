@@ -68,20 +68,6 @@ pub fn compute_dependencies(program: &[Stmt]) -> Result<Vec<ServiceGraphs>> {
     Ok(service_graphs)
 }
 
-/// Perform dependency analysis on a sequence of service declarations using `petgraph`
-///
-/// Args:
-///   `decls` (`&[Decl]`): The service declarations to analyze
-///
-/// Returns:
-///   `Result<ServiceGraphs>`: Computed dependency graphs or a static check error
-///
-/// Errors:
-///   `Error`: If an invalid eager forward reference is detected
-pub fn analyze_dependencies(decls: &[Decl]) -> Result<ServiceGraphs> {
-    analyze_dependencies_with_ctx(decls, &HashMap::new(), &HashMap::new())
-}
-
 /// Perform dependency analysis on declarations with global cross-service context
 ///
 /// Args:
@@ -91,7 +77,7 @@ pub fn analyze_dependencies(decls: &[Decl]) -> Result<ServiceGraphs> {
 ///
 /// Returns:
 ///   `Result<ServiceGraphs>`: Computed dependency graph
-pub fn analyze_dependencies_with_ctx(
+fn analyze_dependencies_with_ctx(
     decls: &[Decl],
     global_def_bodies: &HashMap<(Symbol, Symbol), Expr>,
     global_member_order: &HashMap<Symbol, Vec<Symbol>>,
@@ -412,74 +398,88 @@ mod tests {
     use crate::runtime::tt::Param;
 
     #[test]
-    fn test_analyze_dependencies_empty_and_tables() {
-        assert!(analyze_dependencies(&[]).is_ok());
+    fn test_compute_dependencies_empty_and_tables() {
+        assert!(compute_dependencies(&[]).unwrap().is_empty());
 
         let mut interner = Interner::new();
+        let s1 = interner.insert("s1");
         let tbl = interner.insert("tbl");
 
-        let decls = vec![Decl::TableDecl {
-            name: tbl,
-            fields: vec![],
-        }];
+        let stmt = Stmt::Service {
+            name: s1,
+            decls: vec![Decl::TableDecl {
+                name: tbl,
+                fields: vec![],
+            }],
+        };
 
-        let res = analyze_dependencies(&decls);
+        let res = compute_dependencies(&[stmt]);
         assert!(res.is_ok());
-        let sg = res.unwrap();
-        assert!(sg.tables.contains(&tbl));
+        let graphs = res.unwrap();
+        assert_eq!(graphs.len(), 1);
+        assert!(graphs[0].tables.contains(&tbl));
     }
 
     #[test]
-    fn test_analyze_dependencies_valid_eager_sequence() {
+    fn test_compute_dependencies_valid_eager_sequence() {
         let mut interner = Interner::new();
+        let s1 = interner.insert("s1");
         let x = interner.insert("x");
         let y = interner.insert("y");
 
-        let decls = vec![
-            Decl::VarDecl {
-                name: x,
-                ty: None,
-                val: Expr::Literal {
-                    val: Value::Int { val: 5 },
+        let stmt = Stmt::Service {
+            name: s1,
+            decls: vec![
+                Decl::VarDecl {
+                    name: x,
+                    ty: None,
+                    val: Expr::Literal {
+                        val: Value::Int { val: 5 },
+                    },
                 },
-            },
-            Decl::VarDecl {
-                name: y,
-                ty: None,
-                val: Expr::Variable { name: x },
-            },
-        ];
+                Decl::VarDecl {
+                    name: y,
+                    ty: None,
+                    val: Expr::Variable { name: x },
+                },
+            ],
+        };
 
-        let res = analyze_dependencies(&decls);
+        let res = compute_dependencies(&[stmt]);
         assert!(res.is_ok());
-        let sg = res.unwrap();
+        let graphs = res.unwrap();
+        let sg = &graphs[0];
         assert!(sg.vars.contains(&x));
         assert!(sg.vars.contains(&y));
         assert!(sg.has_path(x, y));
     }
 
     #[test]
-    fn test_analyze_dependencies_eager_forward_ref_fails() {
+    fn test_compute_dependencies_eager_forward_ref_fails() {
         let mut interner = Interner::new();
+        let s1 = interner.insert("s1");
         let x = interner.insert("x");
         let y = interner.insert("y");
 
-        let decls = vec![
-            Decl::VarDecl {
-                name: y,
-                ty: None,
-                val: Expr::Variable { name: x },
-            },
-            Decl::VarDecl {
-                name: x,
-                ty: None,
-                val: Expr::Literal {
-                    val: Value::Int { val: 5 },
+        let stmt = Stmt::Service {
+            name: s1,
+            decls: vec![
+                Decl::VarDecl {
+                    name: y,
+                    ty: None,
+                    val: Expr::Variable { name: x },
                 },
-            },
-        ];
+                Decl::VarDecl {
+                    name: x,
+                    ty: None,
+                    val: Expr::Literal {
+                        val: Value::Int { val: 5 },
+                    },
+                },
+            ],
+        };
 
-        let res = analyze_dependencies(&decls);
+        let res = compute_dependencies(&[stmt]);
         assert!(res.is_err());
     }
 

@@ -218,18 +218,90 @@ impl<'a, 'b> Context<'a, 'b> {
                     let mut local_env = Env::new(None);
                     self.infer(expr, &mut local_env, 1)?;
                 }
-                Stmt::Atomic { .. } | Stmt::Update { .. } => {
-                    // TODO(Issue #156): Implement static checks
-                    // (deferred per Issue #34)
-                    println!(
-                        "warning: tt/check: ignoring 'update' \
-                         checks as not yet implemented"
-                    );
+                Stmt::Update {
+                    service_name,
+                    decls,
+                } => {
+                    self.check_update(*service_name, decls)?;
+                }
+                Stmt::Atomic { updates } => {
+                    for u in updates {
+                        if let Stmt::Update {
+                            service_name,
+                            decls,
+                        } = u
+                        {
+                            self.check_update(*service_name, decls)?;
+                        }
+                    }
                 }
                 Stmt::Connect { .. } | Stmt::Service { .. } | Stmt::Import { .. } => {}
             }
         }
 
+        Ok(())
+    }
+
+    /// Type check a service update block sequentially
+    ///
+    /// Args:
+    ///     `service_name` (`Symbol`): The service name being updated
+    ///     `decls` (`&[Decl]`): Declarations introduced or modified in the update
+    ///
+    /// Returns:
+    ///     `Result<(), Error>`: Ok on success
+    ///
+    /// Raises:
+    ///     `Error::UnboundVariable`: If service is not found
+    fn check_update(&mut self, service_name: Symbol, decls: &[Decl]) -> Result<(), Error> {
+        if self.local_services.find(service_name).is_none() {
+            return Err(Error::UnboundVariable(service_name));
+        }
+
+        let prev_service = self.current_service;
+        self.current_service = Some(service_name);
+        for decl in decls {
+            match decl {
+                Decl::VarDecl {
+                    name,
+                    ty: annotated,
+                    val,
+                }
+                | Decl::DefDecl {
+                    name,
+                    ty: annotated,
+                    val,
+                    ..
+                } => {
+                    let mut env = Env::new(None);
+                    let member_ty = if let Some(expected) = annotated {
+                        check_type(expected, 1)?;
+                        self.check_expr(val, expected, &mut env)?;
+                        expected.clone()
+                    } else {
+                        self.infer(val, &mut env, 1)?
+                    };
+                    if let Some(mut st) = self.local_services.remove(service_name) {
+                        if st.fields().find(*name).is_some() {
+                            let _ = st.update_field(*name, member_ty.clone());
+                        } else {
+                            let _ = st.add_field(*name, member_ty.clone());
+                        }
+                        self.local_services.bind(service_name, st);
+                    }
+                }
+                Decl::TableDecl { name, .. } => {
+                    // TODO(Issue #156): Implement Table type schema validation (deferred per Issue #34)
+                    if let Some(mut st) = self.local_services.remove(service_name) {
+                        if st.fields().find(*name).is_none() {
+                            let _ = st.add_field(*name, Type::Unit);
+                        }
+                        self.local_services.bind(service_name, st);
+                    }
+                }
+            }
+        }
+        self.current_service = prev_service;
         Ok(())
     }
 

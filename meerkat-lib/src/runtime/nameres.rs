@@ -6,7 +6,6 @@
 //! cross-service member accesses and @test blocks are fully resolved.
 //!
 //! The currently skipped operations are listed below
-//! - Service `update` statements
 //! - `TableDecl` declarations
 //! - `Insert` statements
 //! - `Select` expressions
@@ -105,7 +104,7 @@ pub enum Binding<'a> {
 /// static analysis pass, ensuring that lexical lookup rules are
 /// enforced cleanly without rigid ordering constraints.
 pub struct Resolver<'a> {
-    local_services: HashMap<Symbol, &'a [Decl]>,
+    local_services: HashMap<Symbol, Vec<&'a Decl>>,
     current_context: Option<Symbol>,
 }
 
@@ -149,7 +148,7 @@ impl<'a> Resolver<'a> {
             match stmt {
                 Stmt::Service { name, decls } => {
                     env.bind(*name, Binding::Value);
-                    self.local_services.insert(*name, decls);
+                    self.local_services.insert(*name, decls.iter().collect());
                 }
                 Stmt::Import { service_name, .. } => {
                     env.bind(*service_name, Binding::Value);
@@ -192,11 +191,31 @@ impl<'a> Resolver<'a> {
                 }
                 Ok(())
             }
-            Stmt::Update { .. } => {
-                println!(
-                    "warning: nameres: ignoring 'update' \
-                     checks as not yet implemented"
-                );
+            Stmt::Update {
+                service_name,
+                decls,
+            } => {
+                if !self.local_services.contains_key(service_name) {
+                    return Err(Error::UnknownIdentifier {
+                        name: *service_name,
+                        expected: ExpectedSort::Service,
+                        context_name: self.current_context,
+                    });
+                }
+                let prev_context = self.current_context;
+                self.current_context = Some(*service_name);
+                for decl in decls {
+                    match decl {
+                        Decl::VarDecl { val, .. } | Decl::DefDecl { val, .. } => {
+                            self.resolve_expr(val, env, 0)?;
+                        }
+                        Decl::TableDecl { .. } => {}
+                    }
+                    if let Some(svc_decls) = self.local_services.get_mut(service_name) {
+                        svc_decls.push(decl);
+                    }
+                }
+                self.current_context = prev_context;
                 Ok(())
             }
             Stmt::Connect { path: _, addr: _ } => Ok(()),
@@ -241,7 +260,7 @@ impl<'a> Resolver<'a> {
                         });
                     }
                 };
-                for decl in *decls {
+                for decl in decls {
                     match decl {
                         Decl::VarDecl { name: mem, .. }
                         | Decl::DefDecl { name: mem, .. }
@@ -875,9 +894,9 @@ mod tests {
         );
     }
 
-    /// Verify update block is ignored with warning
+    /// Verify update block resolves declarations using sequential scoping
     #[test]
-    fn test_unit_update_block_logs_warning() {
+    fn test_unit_update_block_sequential_scoping() {
         let mut interner = Interner::new();
         let s = interner.insert("s");
         let x = interner.insert("x");
@@ -888,7 +907,47 @@ mod tests {
             decls: vec![],
         };
 
-        // update s { def y = x; var x = 5; }
+        // update s { var x = 5; def y = x; }
+        let update_stmt = Stmt::Update {
+            service_name: s,
+            decls: vec![
+                Decl::VarDecl {
+                    name: x,
+                    ty: None,
+                    val: Expr::Literal {
+                        val: Value::Int { val: 5 },
+                    },
+                },
+                Decl::DefDecl {
+                    name: y,
+                    ty: None,
+                    val: Expr::Variable { name: x },
+                    is_pub: false,
+                },
+            ],
+        };
+
+        let mut env = Env::new(None);
+        let mut resolver = Resolver::new();
+        let program = vec![s_stmt, update_stmt];
+        let res = resolver.resolve_program(&program, &mut env);
+        assert_eq!(res, Ok(()));
+    }
+
+    /// Verify update block forward reference to new member fails
+    #[test]
+    fn test_unit_update_block_forward_ref_fails() {
+        let mut interner = Interner::new();
+        let s = interner.insert("s");
+        let x = interner.insert("x");
+        let y = interner.insert("y");
+
+        let s_stmt = Stmt::Service {
+            name: s,
+            decls: vec![],
+        };
+
+        // update s { def y = x; var x = 5; } -- x is new, so y cannot forward ref x
         let update_stmt = Stmt::Update {
             service_name: s,
             decls: vec![
@@ -912,7 +971,14 @@ mod tests {
         let mut resolver = Resolver::new();
         let program = vec![s_stmt, update_stmt];
         let res = resolver.resolve_program(&program, &mut env);
-        assert_eq!(res, Ok(()));
+        assert_eq!(
+            res,
+            Err(Error::UnknownIdentifier {
+                name: x,
+                expected: ExpectedSort::Variable,
+                context_name: Some(s),
+            })
+        );
     }
 
     /// Verify that `@test` blocks can resolve variables

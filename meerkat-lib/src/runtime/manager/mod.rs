@@ -958,7 +958,7 @@ impl Manager {
             None => None,
         } {
             match event {
-                NetworkEvent::MessageReceived { msg, .. } => match msg {
+                NetworkEvent::MessageReceived { msg, peer } => match msg {
                     // #24: reactive messages are not replies; handle them inline
                     // here in async context rather than buffering them.
                     MeerkatMessage::RequestUpdates {
@@ -1017,6 +1017,57 @@ impl Manager {
                             value,
                         )
                         .await;
+                    }
+                    MeerkatMessage::UpdateServiceRequest {
+                        request_id,
+                        service_name,
+                        source,
+                    } => {
+                        let res = match codec::decode_update_service_request(
+                            &service_name,
+                            &source,
+                            &mut self.interner,
+                        ) {
+                            Ok((_sym, validated_source)) => {
+                                match crate::runtime::parser::parse_string(
+                                    &validated_source,
+                                    &mut self.interner,
+                                ) {
+                                    Ok(stmts) => {
+                                        let mut txn =
+                                            crate::runtime::update::Transaction::new(stmts);
+                                        Box::pin(txn.poll(self)).await.map_err(|e| e.to_string())
+                                    }
+                                    Err(e) => Err(e),
+                                }
+                            }
+                            Err(e) => Err(e.to_string()),
+                        };
+                        let error = res.err();
+                        let reply_msg = MeerkatMessage::UpdateServiceResponse { request_id, error };
+                        if !peer.is_empty() {
+                            self.send_oneway(Address::new(&peer), reply_msg).await;
+                        }
+                    }
+                    MeerkatMessage::LockRequest {
+                        request_id,
+                        txn_id,
+                        services,
+                        reply_to,
+                    } => {
+                        let res =
+                            Box::pin(self.handle_lock_request(txn_id.clone(), services)).await;
+                        let (success, error) = match res {
+                            Ok(()) => (true, None),
+                            Err(e) => (false, Some(e.to_string())),
+                        };
+                        let reply_msg = MeerkatMessage::LockResponse {
+                            request_id,
+                            txn_id: txn_id.clone(),
+                            success,
+                            error,
+                        };
+                        self.send_oneway(Address::new(&reply_to), reply_msg).await;
                     }
                     // Everything else is a reply: route it to its waiter.
                     other => {

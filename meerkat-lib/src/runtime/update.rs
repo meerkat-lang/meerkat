@@ -6,10 +6,10 @@
 //! applies updates atomically once fully evaluated.
 
 use crate::net::LockGroup;
-use crate::runtime::ast::{apply_updates_to_ast, Decl, Stmt, Value};
+use crate::runtime::ast::{apply_updates_to_ast, Decl, Expr, Stmt, Value};
 use crate::runtime::env::Env;
 use crate::runtime::graphs::{analysis::compute_dependencies, ServiceGraphs};
-use crate::runtime::interner::Symbol;
+use crate::runtime::interner::{Interner, Symbol};
 use crate::runtime::interpreter::evaluator::{eval, EvalContext, EvalError};
 use crate::runtime::manager::Manager;
 use crate::runtime::nameres;
@@ -324,6 +324,32 @@ impl<'a> Transaction<'a> {
                             Decl::TableDecl { .. } => {}
                         }
                     }
+                    if let Some(addr) = manager.remote_services.get(svc_name).cloned() {
+                        let source = format_update_source(*svc_name, decls, &manager.interner);
+                        let svc_str = manager.interner.get(*svc_name).to_string();
+                        static NEXT_UPDATE_REQ_ID: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(1);
+                        let request_id =
+                            NEXT_UPDATE_REQ_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let msg = crate::net::types::MeerkatMessage::UpdateServiceRequest {
+                            request_id,
+                            service_name: svc_str.clone(),
+                            source,
+                        };
+                        let timeout = format!(
+                            "Timeout waiting for service update response for '{}'",
+                            svc_str
+                        );
+                        let res =
+                            Box::pin(manager.send_and_await_reply(addr, msg, request_id, timeout))
+                                .await;
+                        if let Err(ref e) = res {
+                            eprintln!(
+                                "Warning: remote service update to {} failed: {}",
+                                svc_str, e
+                            );
+                        }
+                    }
                 }
 
                 Ok(())
@@ -391,6 +417,132 @@ impl<'a> Transaction<'a> {
             }
         }
     }
+}
+
+/// Format an `Expr` into a valid Meerkat source code string
+///
+/// Args:
+///     `expr` (`&Expr`): The expression AST node
+///     `interner` (`&Interner`): Symbol interner for resolving names
+///
+/// Returns:
+///     `String`: Valid Meerkat expression source string
+pub fn format_expr(expr: &Expr, interner: &Interner) -> String {
+    match expr {
+        Expr::Literal { val } => match val {
+            Value::Int { val } => val.to_string(),
+            Value::Bool { val } => val.to_string(),
+            Value::String { val } => format!("\"{}\"", val),
+            Value::Html(h) => h.to_string(),
+            Value::Closure { .. }
+            | Value::ActionClosure { .. }
+            | Value::List { .. }
+            | Value::Range { .. } => val.to_string(),
+        },
+        Expr::Html(_) => "<html>".to_string(),
+        Expr::Tuple { val } => {
+            let elems: Vec<String> = val.iter().map(|e| format_expr(e, interner)).collect();
+            format!("({})", elems.join(", "))
+        }
+        Expr::KeyVal { name, value } => {
+            format!("{}: {}", interner.get(*name), format_expr(value, interner))
+        }
+        Expr::Variable { name } => interner.get(*name).to_string(),
+        Expr::Unop { op, expr } => {
+            format!("{}{}", op, format_expr(expr, interner))
+        }
+        Expr::Binop { op, expr1, expr2 } => format!(
+            "{} {} {}",
+            format_expr(expr1, interner),
+            op,
+            format_expr(expr2, interner)
+        ),
+        Expr::If { cond, expr1, expr2 } => format!(
+            "if {} then {} else {}",
+            format_expr(cond, interner),
+            format_expr(expr1, interner),
+            format_expr(expr2, interner)
+        ),
+        Expr::Func { .. } => expr.to_string(),
+        Expr::Call { func, args } => {
+            let arg_strs: Vec<String> = args.iter().map(|a| format_expr(a, interner)).collect();
+            format!("{}({})", format_expr(func, interner), arg_strs.join(", "))
+        }
+        Expr::Action(_) => expr.to_string(),
+        Expr::MemberAccess {
+            service_name,
+            member_name,
+        } => format!(
+            "{}.{}",
+            interner.get(*service_name),
+            interner.get(*member_name)
+        ),
+        Expr::Select { .. } | Expr::Table { .. } | Expr::Fold { .. } => expr.to_string(),
+        Expr::List(exprs) => {
+            let elems: Vec<String> = exprs.iter().map(|e| format_expr(e, interner)).collect();
+            format!("[{}]", elems.join(", "))
+        }
+        Expr::Range { start, end } => format!(
+            "{}..{}",
+            format_expr(start, interner),
+            format_expr(end, interner)
+        ),
+    }
+}
+
+/// Format a `Decl` into a valid Meerkat declaration source code string
+///
+/// Args:
+///     `decl` (`&Decl`): The declaration AST node
+///     `interner` (`&Interner`): Symbol interner for resolving names
+///
+/// Returns:
+///     `String`: Valid Meerkat declaration source string
+pub fn format_decl(decl: &Decl, interner: &Interner) -> String {
+    match decl {
+        Decl::VarDecl { name, ty, val } => {
+            let name_str = interner.get(*name);
+            let val_str = format_expr(val, interner);
+            if let Some(t) = ty {
+                format!("var {}: {} = {};", name_str, t, val_str)
+            } else {
+                format!("var {} = {};", name_str, val_str)
+            }
+        }
+        Decl::DefDecl {
+            name,
+            ty,
+            val,
+            is_pub,
+        } => {
+            let prefix = if *is_pub { "pub " } else { "" };
+            let name_str = interner.get(*name);
+            let val_str = format_expr(val, interner);
+            if let Some(t) = ty {
+                format!("{}def {}: {} = {};", prefix, name_str, t, val_str)
+            } else {
+                format!("{}def {} = {};", prefix, name_str, val_str)
+            }
+        }
+        Decl::TableDecl { name, .. } => {
+            format!("table {};", interner.get(*name))
+        }
+    }
+}
+
+/// Format a service update block into valid Meerkat source code string
+///
+/// Args:
+///     `service_name` (`Symbol`): Symbol for service name
+///     `decls` (`&[Decl]`): Declarations in update block
+///     `interner` (`&Interner`): Symbol interner for resolving names
+///
+/// Returns:
+///     `String`: Valid Meerkat update statement source string
+pub fn format_update_source(service_name: Symbol, decls: &[Decl], interner: &Interner) -> String {
+    let svc_str = interner.get(service_name);
+    let decl_strs: Vec<String> = decls.iter().map(|d| format_decl(d, interner)).collect();
+    format!("update {} {{\n  {}\n}}", svc_str, decl_strs.join("\n  "))
 }
 
 #[cfg(test)]

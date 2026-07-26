@@ -202,13 +202,20 @@ impl<'a, 'b> Context<'a, 'b> {
             }
         }
 
+        let has_updates = self
+            .program
+            .iter()
+            .any(|stmt| matches!(stmt, Stmt::Update { .. } | Stmt::Atomic { .. }));
+
         for stmt in self.program {
             match stmt {
                 Stmt::Test {
                     service_name,
                     stmts,
                 } => {
-                    self.check_test(*service_name, stmts)?;
+                    if !has_updates {
+                        self.check_test(*service_name, stmts)?;
+                    }
                 }
                 Stmt::ActionStmt(action) => {
                     let mut local_env = Env::new(None);

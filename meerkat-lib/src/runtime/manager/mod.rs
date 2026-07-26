@@ -353,39 +353,54 @@ impl Manager {
             // owner is wired in-process and a remote owner is subscribed over the
             // wire. Only runs on the success path: a rolled-back service must not
             // register listeners.
-            if let Some(s) = self.services.get(&svc_name) {
-                let this_id = s.id.clone();
-                let mut edges: Vec<(Symbol, Symbol, Symbol)> = Vec::new();
-                for (def_name, deps) in &s.dep.dep_graph {
-                    if s.defs.contains_key(def_name) {
-                        for dep_member in deps {
-                            edges.push((svc_name, *dep_member, *def_name));
+            // #98: also skip when a participant commit failed -- that service is
+            // about to be rolled back below, so it must not wire up listeners.
+            if commit_error.is_none() {
+                if let Some(s) = self.services.get(&svc_name) {
+                    let this_id = s.id.clone();
+                    let mut edges: Vec<(Symbol, Symbol, Symbol)> = Vec::new();
+                    for (def_name, deps) in &s.dep.dep_graph {
+                        if s.defs.contains_key(def_name) {
+                            for dep_member in deps {
+                                edges.push((svc_name, *dep_member, *def_name));
+                            }
+                        }
+                    }
+                    // #24: cross-service deps, derived from each stored def
+                    // expression (dep_remote removed: these are just the keys of
+                    // dep_cache, recomputed here from the def's MemberAccess refs).
+                    for (def_name, expr) in &s.defs {
+                        for (owner, member) in expr.cross_service_deps() {
+                            edges.push((owner, member, *def_name));
+                        }
+                    }
+                    for (owner, member, listener_def) in edges {
+                        if self.services.contains_key(&owner) {
+                            if let Some(owner_svc) = self.services.get_mut(&owner) {
+                                owner_svc
+                                    .listeners
+                                    .entry(member)
+                                    .or_default()
+                                    .insert((this_id.clone(), listener_def));
+                            }
+                        } else {
+                            // remote owner: subscribe over the wire so future changes push.
+                            self.subscribe_remote(owner, member, this_id.clone(), listener_def)
+                                .await;
                         }
                     }
                 }
-                // #24: cross-service deps, derived from each stored def
-                // expression (dep_remote removed: these are just the keys of
-                // dep_cache, recomputed here from the def's MemberAccess refs).
-                for (def_name, expr) in &s.defs {
-                    for (owner, member) in expr.cross_service_deps() {
-                        edges.push((owner, member, *def_name));
-                    }
+            } // end: commit_error.is_none()
+
+            // #98: a participant failed to commit after prepare. Roll the local
+            // service back rather than leaving it half-committed but live: abort
+            // participants and remove the service, mirroring the init-failure
+            // path. The captured error is returned below.
+            if commit_error.is_some() {
+                for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
+                    self.send_abort(addr, &txn.id).await;
                 }
-                for (owner, member, listener_def) in edges {
-                    if self.services.contains_key(&owner) {
-                        if let Some(owner_svc) = self.services.get_mut(&owner) {
-                            owner_svc
-                                .listeners
-                                .entry(member)
-                                .or_default()
-                                .insert((this_id.clone(), listener_def));
-                        }
-                    } else {
-                        // remote owner: subscribe over the wire so future changes push.
-                        self.subscribe_remote(owner, member, this_id.clone(), listener_def)
-                            .await;
-                    }
-                }
+                self.services.remove(&svc_name);
             }
         } else {
             // Execution failed: discard buffered writes and abort participants.

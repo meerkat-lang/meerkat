@@ -207,7 +207,10 @@ impl<'a> Resolver<'a> {
                 for decl in decls {
                     match decl {
                         Decl::VarDecl { val, .. } | Decl::DefDecl { val, .. } => {
-                            self.resolve_expr(val, env, 0)?;
+                            if let Err(e) = self.resolve_expr(val, env, 0) {
+                                self.current_context = prev_context;
+                                return Err(e);
+                            }
                         }
                         Decl::TableDecl { .. } => {}
                     }

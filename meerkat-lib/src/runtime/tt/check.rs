@@ -317,7 +317,11 @@ impl<'a, 'b> Context<'a, 'b> {
                 let prev_service = self.current_service;
                 self.current_service = Some(service_name);
                 let res = if let Some(expected) = annotated {
-                    check_type(expected, 1)?;
+                    if let Err(e) = check_type(expected, 1) {
+                        self.current_service = prev_service;
+                        self.checking_stack.pop();
+                        return Err(e);
+                    }
                     if let Some(mut st) = self.local_services.remove(service_name) {
                         let _ = st.add_field(member_name, expected.clone());
                         self.local_services.bind(service_name, st);
@@ -327,11 +331,20 @@ impl<'a, 'b> Context<'a, 'b> {
                             st.remove_field(member_name);
                             self.local_services.bind(service_name, st);
                         }
+                        self.current_service = prev_service;
+                        self.checking_stack.pop();
                         return Err(e);
                     }
                     expected.clone()
                 } else {
-                    self.infer(val, &mut env, 1)?
+                    match self.infer(val, &mut env, 1) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            self.current_service = prev_service;
+                            self.checking_stack.pop();
+                            return Err(e);
+                        }
+                    }
                 };
                 self.current_service = prev_service;
                 res
@@ -948,8 +961,9 @@ impl<'a, 'b> Context<'a, 'b> {
     fn validate_update_block(&mut self, service_name: Symbol, decls: &[Decl]) -> Result<(), Error> {
         let mut st = self
             .local_services
-            .remove(service_name)
-            .ok_or(Error::UnboundVariable(service_name))?;
+            .find(service_name)
+            .ok_or(Error::UnboundVariable(service_name))?
+            .clone();
 
         let mut update_env = Env::new(None);
         for name in st.field_order() {
@@ -975,11 +989,23 @@ impl<'a, 'b> Context<'a, 'b> {
                     ..
                 } => {
                     let member_ty = if let Some(expected) = annotated {
-                        check_type(expected, 1)?;
-                        self.check_expr(val, expected, &mut update_env)?;
+                        if let Err(e) = check_type(expected, 1) {
+                            self.current_service = prev_service;
+                            return Err(e);
+                        }
+                        if let Err(e) = self.check_expr(val, expected, &mut update_env) {
+                            self.current_service = prev_service;
+                            return Err(e);
+                        }
                         expected.clone()
                     } else {
-                        self.infer(val, &mut update_env, 1)?
+                        match self.infer(val, &mut update_env, 1) {
+                            Ok(ty) => ty,
+                            Err(e) => {
+                                self.current_service = prev_service;
+                                return Err(e);
+                            }
+                        }
                     };
                     update_env.bind(*name, member_ty.clone());
                     if st.fields().find(*name).is_some() {

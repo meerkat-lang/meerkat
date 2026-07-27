@@ -251,8 +251,6 @@ impl Transaction {
                     self.deps.insert(name, graphs);
                 }
 
-                let mut eval_txn = LockTxn::new(TxnId::new(manager.node_id));
-
                 for stmt in &self.updates {
                     let (svc_name, decls) = match stmt {
                         Stmt::Service { name, decls } => (name, decls),
@@ -278,13 +276,16 @@ impl Transaction {
                         };
 
                         let env: Vec<(Symbol, Value)> = Vec::new();
-                        let mut ctx = EvalContext {
-                            manager,
-                            service_name: *svc_name,
-                            txn: Some(&mut eval_txn),
+                        let eval_res = {
+                            let mut ctx = EvalContext {
+                                manager,
+                                service_name: *svc_name,
+                                txn: self.lock_txn.as_mut(),
+                            };
+                            eval(expr, &env, &mut ctx).await
                         };
 
-                        let val = match eval(expr, &env, &mut ctx).await {
+                        let val = match eval_res {
                             Ok(v) => v,
                             Err(e) => {
                                 self.release_lock_txn(manager);

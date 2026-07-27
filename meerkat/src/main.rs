@@ -265,7 +265,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                     .expect("Server address should be initialized when args.server is true");
 
                 run_server(
-                    prog,
+                    node.unified_ast.clone(),
                     file,
                     remote_url_map,
                     ServerConfig {

@@ -279,10 +279,6 @@ impl<'a, 'b> Context<'a, 'b> {
             }
         }
 
-        // No cached entry: walk the program to find and type the member.
-        // Both local and imported service declarations are present in
-        // `self.program` (unified_ast), so we use the normal path for all.
-
         // The checking_stack detects mutual type recursion (e.g. `def a
         // = b; def b = a;`). Execution-order dependencies are analyzed
         // in a separate compiler pass. This check strictly exists to
@@ -294,8 +290,24 @@ impl<'a, 'b> Context<'a, 'b> {
                 member: member_name,
             });
         }
-        self.checking_stack.push(key);
 
+        self.checking_stack.push(key);
+        let prev_service = self.current_service;
+        self.current_service = Some(service_name);
+
+        let res = self.type_of_member_inner(service_name, member_name);
+
+        self.current_service = prev_service;
+        self.checking_stack.pop();
+
+        res
+    }
+
+    fn type_of_member_inner(
+        &mut self,
+        service_name: Symbol,
+        member_name: Symbol,
+    ) -> Result<Type, Error> {
         let decls = self.find_service_decls(service_name)?;
         let decl = decls
             .iter()
@@ -313,15 +325,8 @@ impl<'a, 'b> Context<'a, 'b> {
                 ty: annotated, val, ..
             } => {
                 let mut env = Env::new(None);
-
-                let prev_service = self.current_service;
-                self.current_service = Some(service_name);
-                let res = if let Some(expected) = annotated {
-                    if let Err(e) = check_type(expected, 1) {
-                        self.current_service = prev_service;
-                        self.checking_stack.pop();
-                        return Err(e);
-                    }
+                if let Some(expected) = annotated {
+                    check_type(expected, 1)?;
                     if let Some(mut st) = self.local_services.remove(service_name) {
                         let _ = st.add_field(member_name, expected.clone());
                         self.local_services.bind(service_name, st);
@@ -331,28 +336,15 @@ impl<'a, 'b> Context<'a, 'b> {
                             st.remove_field(member_name);
                             self.local_services.bind(service_name, st);
                         }
-                        self.current_service = prev_service;
-                        self.checking_stack.pop();
                         return Err(e);
                     }
                     expected.clone()
                 } else {
-                    match self.infer(val, &mut env, 1) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            self.current_service = prev_service;
-                            self.checking_stack.pop();
-                            return Err(e);
-                        }
-                    }
-                };
-                self.current_service = prev_service;
-                res
+                    self.infer(val, &mut env, 1)?
+                }
             }
             Decl::TableDecl { .. } => Type::Unit,
         };
-
-        self.checking_stack.pop();
 
         if let Some(mut st) = self.local_services.remove(service_name) {
             let _ = st.add_field(member_name, ty.clone());

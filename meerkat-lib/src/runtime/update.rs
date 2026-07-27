@@ -49,10 +49,6 @@ impl Transaction {
     /// Returns:
     ///     `Self`: The initialized `Transaction` instance
     pub fn new(updates: Vec<Stmt>) -> Self {
-        debug_assert!(
-            !updates.is_empty(),
-            "Transaction updates should not be empty"
-        );
         Self {
             state: TransactionState::Init,
             updates,
@@ -73,10 +69,6 @@ impl Transaction {
     /// Returns:
     ///     `Self`: The initialized `Transaction` instance
     pub fn new_with_id(txn_id: TxnId, updates: Vec<Stmt>) -> Self {
-        debug_assert!(
-            !updates.is_empty(),
-            "Transaction updates should not be empty"
-        );
         Self {
             state: TransactionState::Init,
             updates,

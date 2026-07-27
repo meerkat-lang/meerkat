@@ -735,3 +735,16 @@ async fn test_update_adds_new_cross_service_listener_edge() {
     let y_val = manager.lookup(y_sym, s2_sym, None).await.unwrap();
     assert_eq!(y_val, Value::Int { val: 200 });
 }
+
+/// Verify empty statement lists do not panic and complete cleanly
+#[tokio::test]
+async fn test_update_empty_statements_no_panic() {
+    let interner = Interner::new();
+    let mut manager = meerkat_lib::runtime::Manager::new(interner);
+    let mut txn = Transaction::new(Vec::new());
+    let poll_res = txn.poll(&mut manager).await;
+    assert!(
+        poll_res.is_ok(),
+        "Empty transaction poll should succeed as no-op"
+    );
+}

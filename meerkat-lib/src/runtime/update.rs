@@ -319,6 +319,9 @@ impl Transaction {
                 for updated_svc_name in updated_svc_names {
                     if let Some(dep) = self.deps.remove(&updated_svc_name) {
                         manager.update_service_graphs(updated_svc_name, dep).await;
+                        if let Some(service) = manager.services.get_mut(&updated_svc_name) {
+                            service.service_lock = None;
+                        }
                     }
                 }
 
@@ -442,13 +445,6 @@ impl Transaction {
                         }
                     }
                 }
-            }
-        }
-
-        for (svc_name, dep) in std::mem::take(&mut self.deps) {
-            if let Some(service) = manager.services.get_mut(&svc_name) {
-                service.graphs = dep;
-                service.service_lock = None;
             }
         }
     }

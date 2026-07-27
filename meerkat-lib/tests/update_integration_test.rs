@@ -679,3 +679,59 @@ async fn test_update_cross_service_listener_rewiring() {
     let y_val = manager.lookup(y_sym, s2_sym, None).await.unwrap();
     assert_eq!(y_val, Value::Int { val: 15 });
 }
+
+/// Verify that adding a new cross-service dependency in an update
+/// block correctly rewires listener edges
+///
+/// Ensures listener edges are dynamically established when a definition
+/// is updated to reference a cross-service variable
+///
+/// Returns:
+///     `()`
+#[tokio::test]
+async fn test_update_adds_new_cross_service_listener_edge() {
+    let mut interner = Interner::new();
+    let initial_code = "
+        service s1 {
+            var x = 100;
+        }
+        service s2 {
+            pub def y = 1;
+        }
+    ";
+    let initial_ast = parse_string(initial_code, &mut interner).unwrap();
+    let mut node = Node::new();
+    node.interner = interner.clone();
+    node.unified_ast = initial_ast;
+    node.static_checks().unwrap();
+
+    let local_ast = node.unified_ast.clone();
+    let mut manager = node
+        .on_manager_startup(true, None, HashMap::new(), &local_ast)
+        .await
+        .unwrap();
+
+    let update_code = "
+        update s2 {
+            pub def y = s1.x;
+        }
+    ";
+    let update_ast = parse_string(update_code, &mut manager.interner).unwrap();
+    let mut txn = Transaction::new(update_ast);
+    let poll_res = txn.poll(&mut manager).await;
+    assert!(poll_res.is_ok(), "poll error: {:?}", poll_res);
+
+    let s1_sym = manager.interner.insert("s1");
+    let s2_sym = manager.interner.insert("s2");
+    let x_sym = manager.interner.insert("x");
+    let y_sym = manager.interner.insert("y");
+
+    // Assign s1.x = 200 to verify the newly wired cross-service listener triggers
+    manager
+        .assign(s1_sym, x_sym, Value::Int { val: 200 }, None)
+        .await
+        .unwrap();
+
+    let y_val = manager.lookup(y_sym, s2_sym, None).await.unwrap();
+    assert_eq!(y_val, Value::Int { val: 200 });
+}

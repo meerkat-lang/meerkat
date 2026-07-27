@@ -1157,7 +1157,7 @@ fn test_integration_delayed_fwd_ok() {
 
 /// Verify forward references in closures pass pure lexical name resolution
 #[test]
-fn test_integration_delayed_fwd_err() {
+fn test_integration_closure_fwd_ref_lexical_ok() {
     let mut interner = Interner::new();
     let input = "
         service s {

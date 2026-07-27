@@ -6,6 +6,6 @@ service battery {
   // Current battery charge level as a percentage from 0 to 100
   var charge_level: int = 85;
 
-  // Operational mode: "idle", "charging", or "discharging"
-  var status: string = "charging";
+  // Operational mode: true for charging, false for discharging
+  var status: bool = true;
 }

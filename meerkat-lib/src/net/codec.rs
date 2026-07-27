@@ -377,7 +377,7 @@ pub fn encode_type(ty: &Type) -> Result<NetType> {
 ///
 /// Raises:
 ///     `Error::Message`: If a field is missing due to a broken invariant
-pub fn encode_servicetype<'a>(st: &ServiceType<'a>, interner: &Interner) -> Result<NetServiceType> {
+pub fn encode_servicetype(st: &ServiceType, interner: &Interner) -> Result<NetServiceType> {
     let mut fields = Vec::new();
     for name in st.field_order() {
         let name_str = interner.get(*name).to_string();
@@ -476,10 +476,7 @@ pub fn decode_type(ty: NetType) -> Result<Type> {
 ///
 /// Returns:
 ///     `Result<ServiceType>`: The decoded runtime service type
-pub fn decode_servicetype<'a>(
-    nst: NetServiceType,
-    interner: &mut Interner,
-) -> Result<ServiceType<'a>> {
+pub fn decode_servicetype(nst: NetServiceType, interner: &mut Interner) -> Result<ServiceType> {
     let mut st = ServiceType::default();
     for (name_str, net_ty) in nst.fields {
         validate_identifier(&name_str)?;

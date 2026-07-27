@@ -110,7 +110,7 @@ pub struct Manager {
     /// Global unified AST of all services running on this manager
     pub unified_ast: Vec<Stmt>,
     /// Global local services type environment
-    pub local_services: Env<'static, ServiceType<'static>>,
+    pub local_services: Env<'static, ServiceType>,
 }
 
 impl Manager {

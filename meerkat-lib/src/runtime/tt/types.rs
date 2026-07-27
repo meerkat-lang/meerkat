@@ -29,13 +29,19 @@ pub enum Type {
 /// field declaration ordering. This keeps `Env` modular and highly
 /// reusable. Using standard `HashMap` inside `Env` is more performant,
 /// and separating ordering concerns leads to a simpler design overall
+/// Type representation of a Meerkat service
+///
+/// We pair the generic `Env` with a separate `Vec<Symbol>` to track
+/// field declaration ordering. This keeps `Env` modular and highly
+/// reusable. Using standard `HashMap` inside `Env` is more performant,
+/// and separating ordering concerns leads to a simpler design overall
 #[derive(Debug, Clone)]
-pub struct ServiceType<'a> {
-    fields: Env<'a, Type>,
+pub struct ServiceType {
+    fields: Env<'static, Type>,
     field_order: Vec<Symbol>,
 }
 
-impl<'a> Default for ServiceType<'a> {
+impl Default for ServiceType {
     /// Create a new, empty `ServiceType`
     ///
     /// Returns:
@@ -48,12 +54,12 @@ impl<'a> Default for ServiceType<'a> {
     }
 }
 
-impl<'a> ServiceType<'a> {
+impl ServiceType {
     /// Get a reference to the fields environment
     ///
     /// Returns:
-    ///     `&Env<'a, Type>`: Reference to the environment
-    pub fn fields(&self) -> &Env<'a, Type> {
+    ///     `&Env<'static, Type>`: Reference to the environment
+    pub fn fields(&self) -> &Env<'static, Type> {
         &self.fields
     }
 
@@ -120,7 +126,7 @@ impl<'a> ServiceType<'a> {
 // the `field_order` vector to ensure a deterministic, order-respecting
 // field equality check. This enables the live update system to compare
 // new and old service signatures to detect schema changes
-impl<'a> PartialEq for ServiceType<'a> {
+impl PartialEq for ServiceType {
     /// Compare two `ServiceType` instances for equality
     ///
     /// Args:
@@ -146,13 +152,13 @@ impl<'a> PartialEq for ServiceType<'a> {
 
 // Implement `Eq` manually because the internal `Env` type cannot
 // derive `Eq` automatically due to its `HashMap` field
-impl<'a> Eq for ServiceType<'a> {}
+impl Eq for ServiceType {}
 
 // Implement `Hash` manually using the `field_order` vector to hash
 // service fields in a deterministic order. This resolves the lack
 // of a standard `Hash` implementation on `HashMap` and provides
 // stable keys for indexing service definitions
-impl<'a> Hash for ServiceType<'a> {
+impl Hash for ServiceType {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.field_order.hash(state);
         for name in &self.field_order {

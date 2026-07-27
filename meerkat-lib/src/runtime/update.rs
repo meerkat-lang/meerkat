@@ -30,17 +30,17 @@ pub enum TransactionState {
 }
 
 /// Encapsulates the temporary isolated state during an atomic update
-pub struct Transaction<'a> {
+pub struct Transaction {
     state: TransactionState,
     updates: Vec<Stmt>,
     ast: Vec<Stmt>,
-    types: Env<'a, ServiceType<'a>>,
+    types: Env<'static, ServiceType>,
     values: HashMap<(Symbol, Symbol), Value>,
     deps: HashMap<Symbol, ServiceGraphs>,
     lock_txn: Option<LockTxn>,
 }
 
-impl<'a> Transaction<'a> {
+impl Transaction {
     /// Creates a new unstarted atomic update transaction
     ///
     /// Args:
@@ -214,9 +214,7 @@ impl<'a> Transaction<'a> {
                         e
                     )));
                 }
-                self.types = unsafe {
-                    std::mem::transmute::<Env<'_, ServiceType<'_>>, Env<'a, ServiceType<'a>>>(types)
-                };
+                self.types = types;
 
                 let service_graphs_vec = match compute_dependencies(&self.ast) {
                     Ok(graphs) => graphs,
@@ -407,11 +405,7 @@ impl<'a> Transaction<'a> {
     fn commit(&mut self, manager: &mut Manager) {
         debug_assert_eq!(self.state, TransactionState::Evaluated);
         manager.unified_ast = std::mem::take(&mut self.ast);
-        manager.local_services = unsafe {
-            std::mem::transmute::<Env<'_, ServiceType<'_>>, Env<'static, ServiceType<'static>>>(
-                std::mem::replace(&mut self.types, Env::new(None)),
-            )
-        };
+        manager.local_services = std::mem::replace(&mut self.types, Env::new(None));
 
         for ((svc_name, var_name), val) in std::mem::take(&mut self.values) {
             if let Some(service) = manager.services.get_mut(&svc_name) {

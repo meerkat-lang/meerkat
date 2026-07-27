@@ -26,18 +26,18 @@ use crate::runtime::tt::types::ServiceType;
 use crate::runtime::{nameres, tt, Env, Manager};
 
 /// Root manager for executing a Meerkat node
-pub struct Node<'a> {
+pub struct Node {
     /// Local services registered on this node
-    pub local_services: Env<'a, ServiceType<'a>>,
+    pub local_services: Env<'static, ServiceType>,
     /// Imported services referenced by this node
-    pub imported_services: Env<'a, ServiceType<'a>>,
+    pub imported_services: Env<'static, ServiceType>,
     /// Unified program statements AST
     pub unified_ast: Vec<Stmt>,
     /// Process string interner
     pub interner: Interner,
 }
 
-impl<'a> Node<'a> {
+impl Node {
     /// Create a new empty Node representing the process context
     ///
     /// Returns:
@@ -462,11 +462,7 @@ impl<'a> Node<'a> {
         manager.local = local;
         manager.network = network;
         manager.unified_ast = self.unified_ast.clone();
-        manager.local_services = unsafe {
-            std::mem::transmute::<Env<'_, ServiceType<'_>>, Env<'static, ServiceType<'static>>>(
-                self.local_services,
-            )
-        };
+        manager.local_services = self.local_services;
 
         for (svc_name, url) in &remote_url_map {
             let svc_sym = manager.interner.insert(svc_name);
@@ -537,11 +533,7 @@ impl<'a> Node<'a> {
 
         let mut local_services = Env::new(None);
         tt::check(&self.unified_ast, &mut local_services).map_err(|e| self.format_tt_error(e))?;
-        self.local_services = unsafe {
-            std::mem::transmute::<Env<'_, ServiceType<'_>>, Env<'a, ServiceType<'a>>>(
-                local_services,
-            )
-        };
+        self.local_services = local_services;
 
         compute_dependencies(&self.unified_ast)
             .map_err(|e| Error::Message(e.format_with_interner(&self.interner)))?;
@@ -695,7 +687,7 @@ impl<'a> Node<'a> {
         Ok(())
     }
 
-    pub fn run_static_checks(&mut self, program: &'a [Stmt]) -> Result<()> {
+    pub fn run_static_checks(&mut self, program: &[Stmt]) -> Result<()> {
         nameres::resolve(program).map_err(|e| match e {
             nameres::Error::UnknownIdentifier {
                 name,
@@ -743,7 +735,7 @@ impl<'a> Node<'a> {
     }
 }
 
-impl<'a> Default for Node<'a> {
+impl Default for Node {
     /// Create a new empty Node representing the process context
     ///
     /// Returns:

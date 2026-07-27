@@ -130,7 +130,7 @@ pub struct Context<'a, 'b> {
     depth: usize,
     program: &'a [Stmt],
     /// Type environments for services that are declared locally in this program
-    local_services: &'b mut Env<'a, ServiceType<'a>>,
+    local_services: &'b mut Env<'static, ServiceType>,
     checking_stack: Vec<(Symbol, Symbol)>,
     current_service: Option<Symbol>,
 }
@@ -140,13 +140,13 @@ impl<'a, 'b> Context<'a, 'b> {
     ///
     /// Args:
     ///     `program` (`&'a [Stmt]`): Slices of parsed statements
-    ///     `local_services` (`&'b mut Env<'a, ServiceType<'a>>`): Mutable
+    ///     `local_services` (`&'b mut Env<'static, ServiceType>`): Mutable
     ///         environment mapping locally-declared service names to their
     ///         accumulated `ServiceType` records
     ///
     /// Returns:
     ///     `Self`: The `Context` instance
-    fn new(program: &'a [Stmt], local_services: &'b mut Env<'a, ServiceType<'a>>) -> Self {
+    fn new(program: &'a [Stmt], local_services: &'b mut Env<'static, ServiceType>) -> Self {
         Self {
             depth: 0,
             program,
@@ -1009,7 +1009,7 @@ impl<'a, 'b> Context<'a, 'b> {
 ///
 /// Args:
 ///     `program` (`&[Stmt]`): Slices of parsed statements
-///     `local_services` (`&mut Env<'_, ServiceType<'_>>`): Mutable
+///     `local_services` (`&mut Env<'static, ServiceType>`): Mutable
 ///         environment that accumulates type information for each
 ///         locally-declared service; imported services are skipped
 ///
@@ -1018,9 +1018,9 @@ impl<'a, 'b> Context<'a, 'b> {
 ///
 /// Raises:
 ///     `Error`: Any type error encountered during resolution
-pub fn check<'a>(
-    program: &'a [Stmt],
-    local_services: &mut Env<'a, ServiceType<'a>>,
+pub fn check(
+    program: &[Stmt],
+    local_services: &mut Env<'static, ServiceType>,
 ) -> Result<(), Error> {
     let mut context = Context::new(program, local_services);
     context.check_all()?;
@@ -1064,9 +1064,7 @@ pub fn check<'a>(
         let mut post_context = Context::new(&post_update_ast, &mut post_services);
         post_context.check_all()?;
 
-        *local_services = unsafe {
-            std::mem::transmute::<Env<'_, ServiceType<'_>>, Env<'a, ServiceType<'a>>>(post_services)
-        };
+        *local_services = post_services;
     }
 
     Ok(())

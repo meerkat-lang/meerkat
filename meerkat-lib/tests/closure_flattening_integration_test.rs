@@ -14,7 +14,7 @@ use meerkat_lib::runtime::{
 use std::collections::{HashMap, HashSet};
 
 /// Helper function to parse a program string and initialize a Node
-fn setup_node<'a>(input: &'a str) -> (Node<'a>, Vec<Stmt>) {
+fn setup_node(input: &str) -> (Node, Vec<Stmt>) {
     let mut node = Node::new();
     let stmts = parse_string(input, &mut node.interner).expect("Test input must be valid syntax");
     (node, stmts)

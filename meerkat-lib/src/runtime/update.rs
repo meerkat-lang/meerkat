@@ -154,6 +154,7 @@ impl Transaction {
                                 group.writes.insert(var_str);
                             }
                             Decl::TableDecl { .. } => {
+                                self.release_lock_txn(manager);
                                 return Err(EvalError::NotImplemented);
                             }
                         }
@@ -169,11 +170,12 @@ impl Transaction {
                     .acquire_lock_group_internal(&mut txn, &lock_groups)
                     .await;
 
-                if lock_res.is_err() {
+                if let Err(e) = lock_res {
                     manager.release_all_locks(&txn);
-                    return Err(EvalError::RuntimeError(
-                        "Lock acquisition conflict during update".to_string(),
-                    ));
+                    return Err(EvalError::RuntimeError(format!(
+                        "Lock acquisition conflict during update: {}",
+                        e
+                    )));
                 }
 
                 self.lock_txn = Some(txn);

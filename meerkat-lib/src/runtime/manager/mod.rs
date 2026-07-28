@@ -404,20 +404,44 @@ impl Manager {
             self.services.remove(&svc_name);
         }
 
+        // Clean up the global unified_ast if initialization or commit failed
+        // to prevent phantom services from lingering in the AST
+        if init_error.is_some() || commit_error.is_some() {
+            self.unified_ast.retain(|s| {
+                if let Stmt::Service { name: existing, .. } = s {
+                    *existing != svc_name
+                } else {
+                    true
+                }
+            });
+        }
+
         // Release all locks held locally (always, even on error)
         let freed = self.all_locked_keys(&txn);
         self.release_locks(&freed, &txn.id);
 
-        // #98: init failure takes precedence (it already rolled back above).
-        // Otherwise, surface a participant commit failure rather than reporting
-        // success while a remote participant may hold stranded locks.
-        match init_error {
+        let result = match init_error {
             Some(e) => Err(e),
             None => match commit_error {
                 Some(e) => Err(e),
                 None => Ok(()),
             },
-        }
+        };
+
+        // Post-condition: If we return an error, ensure no phantom service was left in the AST
+        debug_assert!(
+            result.is_ok()
+                || !self.unified_ast.iter().any(|s| {
+                    if let Stmt::Service { name: existing, .. } = s {
+                        *existing == svc_name
+                    } else {
+                        false
+                    }
+                }),
+            "Invariant violation: phantom service leaked into unified_ast on failure"
+        );
+
+        result
     }
 
     /// Update pre-computed dependency graphs for a service and re-wire reactive listeners
@@ -3738,6 +3762,16 @@ mod tests {
         assert!(
             tc.manager.services.is_empty(),
             "no services should've been created"
+        );
+        assert!(
+            !tc.manager.unified_ast.iter().any(|s| {
+                if let Stmt::Service { name, .. } = s {
+                    *name == tc.foo
+                } else {
+                    false
+                }
+            }),
+            "phantom service must not remain in unified_ast after rollback"
         );
     }
 

@@ -748,3 +748,45 @@ async fn test_update_empty_statements_no_panic() {
         "Empty transaction poll should succeed as no-op"
     );
 }
+
+/// Verify that failing to create a service due to type mismatch cleans the unified AST
+///
+/// This ensures phantom `Stmt::Service` nodes are not left in the AST when initialization
+/// rolls back due to a failure (e.g. type error).
+#[tokio::test]
+async fn test_integration_create_service_rollback_cleans_ast() {
+    let mut interner = Interner::new();
+    let mut manager = setup_test_manager(&mut interner).await;
+
+    let bad_s_sym = manager.interner.insert("bad_service");
+    let x_sym = manager.interner.insert("x");
+
+    // Construct a declaration that adds an Int and a Bool, which will fail type checking/eval
+    let bad_decls = vec![meerkat_lib::runtime::ast::Decl::VarDecl {
+        name: x_sym,
+        ty: None,
+        val: meerkat_lib::runtime::ast::Expr::Binop {
+            op: meerkat_lib::runtime::ast::BinOp::Add,
+            expr1: Box::new(meerkat_lib::runtime::ast::Expr::Literal {
+                val: Value::Int { val: 42 },
+            }),
+            expr2: Box::new(meerkat_lib::runtime::ast::Expr::Literal {
+                val: Value::Bool { val: false },
+            }),
+        },
+    }];
+
+    let create_result = manager.create_service(bad_s_sym, bad_decls).await;
+    assert!(create_result.is_err(), "Service creation should fail");
+
+    assert!(
+        !manager.unified_ast.iter().any(|s| {
+            if let meerkat_lib::runtime::ast::Stmt::Service { name, .. } = s {
+                *name == bad_s_sym
+            } else {
+                false
+            }
+        }),
+        "Phantom service must not remain in unified_ast after integration rollback"
+    );
+}

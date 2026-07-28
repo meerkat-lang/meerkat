@@ -67,6 +67,7 @@ struct EagerCtx<'a> {
 ///
 /// Args:
 ///   `program` (`&[Stmt]`): Program AST containing service declarations
+///   `pre_initialized` (`Option<&HashMap<Symbol, HashSet<Symbol>>>`): Optional map of preexisting initialized symbols per service (for update blocks)
 ///
 /// Returns:
 ///   `Result<Vec<ServiceGraphs>, AnalysisError>`: Computed dependency graphs for all services
@@ -75,6 +76,7 @@ struct EagerCtx<'a> {
 ///   `AnalysisError::EagerForwardReference`: If an invalid eager forward reference is detected
 pub fn compute_dependencies(
     program: &[Stmt],
+    pre_initialized: Option<&HashMap<Symbol, HashSet<Symbol>>>,
 ) -> std::result::Result<Vec<ServiceGraphs>, AnalysisError> {
     let mut global_def_bodies = HashMap::new();
     let mut global_member_order = HashMap::new();
@@ -106,9 +108,18 @@ pub fn compute_dependencies(
 
     let mut service_graphs = Vec::new();
     for stmt in program {
-        if let Stmt::Service { name: _, decls } = stmt {
-            let sg =
-                analyze_dependencies_with_ctx(decls, &global_def_bodies, &global_member_order)?;
+        if let Stmt::Service {
+            name: svc_name,
+            decls,
+        } = stmt
+        {
+            let service_pre_init = pre_initialized.and_then(|m| m.get(svc_name));
+            let sg = analyze_dependencies_with_ctx(
+                decls,
+                &global_def_bodies,
+                &global_member_order,
+                service_pre_init,
+            )?;
             service_graphs.push(sg);
         }
     }
@@ -122,6 +133,7 @@ pub fn compute_dependencies(
 ///   `decls` (`&[Decl]`): Declarations of the current service
 ///   `global_def_bodies` (`&HashMap<(Symbol, Symbol), Expr>`): Map of all known def bodies across services
 ///   `global_member_order` (`&HashMap<Symbol, Vec<Symbol>>`): Map of member declaration order per service
+///   `pre_initialized` (`Option<&HashSet<Symbol>>`): Preexisting initialized member symbols from old state
 ///
 /// Returns:
 ///   `Result<ServiceGraphs>`: Computed dependency graph
@@ -129,6 +141,7 @@ fn analyze_dependencies_with_ctx(
     decls: &[Decl],
     global_def_bodies: &HashMap<(Symbol, Symbol), Expr>,
     global_member_order: &HashMap<Symbol, Vec<Symbol>>,
+    pre_initialized: Option<&HashSet<Symbol>>,
 ) -> std::result::Result<ServiceGraphs, AnalysisError> {
     if decls.is_empty() {
         return Ok(ServiceGraphs::new());
@@ -137,6 +150,9 @@ fn analyze_dependencies_with_ctx(
     let mut graphs = ServiceGraphs::new();
     let mut declared_symbols = HashSet::new();
     let mut initialized_symbols = HashSet::new();
+    if let Some(pre_init) = pre_initialized {
+        initialized_symbols.extend(pre_init.iter().copied());
+    }
     let mut def_bodies: HashMap<Symbol, Expr> = HashMap::new();
 
     // First pass: collect all declared service members
@@ -316,7 +332,14 @@ fn build_eager_call_graph(
                 // all call levels were discharged! Expand arguments passed across all levels.
                 if !matches!(body_expr, Expr::Func { .. } | Expr::Action(..)) {
                     for arg in all_call_args {
-                        expand_eager_argument(arg, parent_node, ctx, eager_graph)?;
+                        let mut visited_stack = Vec::new();
+                        expand_eager_argument(
+                            arg,
+                            parent_node,
+                            ctx,
+                            eager_graph,
+                            &mut visited_stack,
+                        )?;
                     }
                 }
             }
@@ -359,7 +382,19 @@ fn build_eager_call_graph(
 }
 
 /// Helper function to check whether executing a remote service member eagerly
-/// accesses any uninitialized forward reference in that remote service.
+/// accesses any uninitialized forward reference in that remote service
+///
+/// Args:
+///   `service_name` (`Symbol`): Name of remote service
+///   `member_name` (`Symbol`): Name of remote member
+///   `target_body` (`&Expr`): Body expression of target member
+///   `global_member_order` (`&HashMap<Symbol, Vec<Symbol>>`): Global member declaration order
+///
+/// Returns:
+///   `Result<(), AnalysisError>`: Success status
+///
+/// Raises:
+///   `AnalysisError::EagerForwardReference`: If an eager forward reference is detected
 fn check_remote_member_eager_validity(
     service_name: Symbol,
     member_name: Symbol,
@@ -391,11 +426,25 @@ fn check_remote_member_eager_validity(
 }
 
 /// Helper function to expand arguments executed during closure invocation
+///
+/// Args:
+///   `arg` (`&Expr`): Expression to expand
+///   `parent_node` (`Symbol`): Parent node symbol in dependency graph
+///   `ctx` (`&EagerCtx<'_>`): Eager evaluation context
+///   `eager_graph` (`&mut DiGraphMap<Symbol, ()>`): Eager dependency graph being built
+///   `visited_stack` (`&mut Vec<Symbol>`): Stack of visited variable symbols to prevent infinite cycles
+///
+/// Returns:
+///   `Result<(), AnalysisError>`: Success status
+///
+/// Raises:
+///   `AnalysisError::EagerForwardReference`: If an invalid remote member eager forward reference is detected
 fn expand_eager_argument(
     arg: &Expr,
     parent_node: Symbol,
     ctx: &EagerCtx<'_>,
     eager_graph: &mut DiGraphMap<Symbol, ()>,
+    visited_stack: &mut Vec<Symbol>,
 ) -> std::result::Result<(), AnalysisError> {
     match arg {
         Expr::Func { body, params, .. } => {
@@ -423,8 +472,19 @@ fn expand_eager_argument(
         }
         Expr::Variable { name } => {
             eager_graph.add_edge(parent_node, *name, ());
-            if let Some(arg_def_body) = ctx.def_bodies.get(name) {
-                expand_eager_argument(arg_def_body, parent_node, ctx, eager_graph)?;
+            if !visited_stack.contains(name) {
+                if let Some(arg_def_body) = ctx.def_bodies.get(name) {
+                    visited_stack.push(*name);
+                    let res = expand_eager_argument(
+                        arg_def_body,
+                        parent_node,
+                        ctx,
+                        eager_graph,
+                        visited_stack,
+                    );
+                    visited_stack.pop();
+                    res?;
+                }
             }
         }
         _ => {}
@@ -441,7 +501,7 @@ mod tests {
 
     #[test]
     fn test_compute_dependencies_empty_and_tables() {
-        assert!(compute_dependencies(&[]).unwrap().is_empty());
+        assert!(compute_dependencies(&[], None).unwrap().is_empty());
 
         let mut interner = Interner::new();
         let s1 = interner.insert("s1");
@@ -455,7 +515,7 @@ mod tests {
             }],
         };
 
-        let res = compute_dependencies(&[stmt]);
+        let res = compute_dependencies(&[stmt], None);
         assert!(res.is_ok());
         let graphs = res.unwrap();
         assert_eq!(graphs.len(), 1);
@@ -487,7 +547,7 @@ mod tests {
             ],
         };
 
-        let res = compute_dependencies(&[stmt]);
+        let res = compute_dependencies(&[stmt], None);
         assert!(res.is_ok());
         let graphs = res.unwrap();
         let sg = &graphs[0];
@@ -521,7 +581,7 @@ mod tests {
             ],
         };
 
-        let res = compute_dependencies(&[stmt]);
+        let res = compute_dependencies(&[stmt], None);
         assert!(res.is_err());
     }
 
@@ -649,18 +709,21 @@ mod tests {
             body: Box::new(Expr::Variable { name: dep1 }),
             return_ty: None,
         };
-        let _ = expand_eager_argument(&func_arg, parent, &eager_ctx, &mut eager_graph);
+        let mut stack1 = Vec::new();
+        let _ = expand_eager_argument(&func_arg, parent, &eager_ctx, &mut eager_graph, &mut stack1);
         assert!(eager_graph.contains_edge(parent, dep1));
 
         let ma_arg = Expr::MemberAccess {
             service_name: s1,
             member_name: m1,
         };
-        let _ = expand_eager_argument(&ma_arg, parent, &eager_ctx, &mut eager_graph);
+        let mut stack2 = Vec::new();
+        let _ = expand_eager_argument(&ma_arg, parent, &eager_ctx, &mut eager_graph, &mut stack2);
         assert!(eager_graph.contains_edge(parent, m1));
 
         let var_arg = Expr::Variable { name: dep1 };
-        let _ = expand_eager_argument(&var_arg, parent, &eager_ctx, &mut eager_graph);
+        let mut stack3 = Vec::new();
+        let _ = expand_eager_argument(&var_arg, parent, &eager_ctx, &mut eager_graph, &mut stack3);
         assert!(eager_graph.contains_edge(parent, dep2));
     }
 }

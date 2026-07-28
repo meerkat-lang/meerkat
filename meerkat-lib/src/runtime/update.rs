@@ -208,15 +208,25 @@ impl Transaction {
                         e
                     )));
                 }
-                self.types = types;
+                let mut pre_initialized = HashMap::new();
+                for (svc_name, svc_state) in &manager.services {
+                    let members: HashSet<Symbol> = svc_state
+                        .vars
+                        .keys()
+                        .chain(svc_state.defs.keys())
+                        .copied()
+                        .collect();
+                    pre_initialized.insert(*svc_name, members);
+                }
 
-                let service_graphs_vec = match compute_dependencies(&self.ast) {
-                    Ok(graphs) => graphs,
-                    Err(e) => {
-                        self.release_lock_txn(manager);
-                        return Err(EvalError::RuntimeError(e.to_string()));
-                    }
-                };
+                let service_graphs_vec =
+                    match compute_dependencies(&self.ast, Some(&pre_initialized)) {
+                        Ok(graphs) => graphs,
+                        Err(e) => {
+                            self.release_lock_txn(manager);
+                            return Err(EvalError::RuntimeError(e.to_string()));
+                        }
+                    };
 
                 let service_stmts: Vec<Symbol> = self
                     .ast

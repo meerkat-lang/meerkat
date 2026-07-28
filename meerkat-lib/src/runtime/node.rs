@@ -535,7 +535,7 @@ impl Node {
         tt::check(&self.unified_ast, &mut local_services).map_err(|e| self.format_tt_error(e))?;
         self.local_services = local_services;
 
-        compute_dependencies(&self.unified_ast)
+        compute_dependencies(&self.unified_ast, None)
             .map_err(|e| Error::Message(e.format_with_interner(&self.interner)))?;
 
         let mut update_stmts = Vec::new();
@@ -564,7 +564,7 @@ impl Node {
 
             nameres::resolve(&post_update_ast).map_err(|e| self.format_nameres_error(e))?;
 
-            compute_dependencies(&post_update_ast)
+            compute_dependencies(&post_update_ast, None)
                 .map_err(|e| Error::Message(e.format_with_interner(&self.interner)))?;
         }
 
@@ -720,7 +720,7 @@ impl Node {
 
         tt::check(program, &mut self.local_services).map_err(|e| self.format_tt_error(e))?;
 
-        crate::runtime::graphs::analysis::compute_dependencies(program)
+        compute_dependencies(program, None)
             .map_err(|e| Error::Message(e.format_with_interner(&self.interner)))?;
 
         Ok(())

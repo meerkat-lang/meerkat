@@ -259,7 +259,7 @@ impl Manager {
             decls: decls.clone(),
         });
 
-        let all_graphs = compute_dependencies(&self.unified_ast)
+        let all_graphs = compute_dependencies(&self.unified_ast, None)
             .map_err(|e| EvalError::VarNotFound(e.format_with_interner(&self.interner)))?;
         let graphs = all_graphs
             .into_iter()

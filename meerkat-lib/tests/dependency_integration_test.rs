@@ -42,6 +42,7 @@ fn test_intra_var_cycle_err() {
     let res = check_program(input);
     assert!(res.is_err());
     let err = res.expect_err("expected dependency cycle error");
+    println!("ERROR: {}", err);
     assert!(err.contains("dependency cycle detected"));
 }
 
@@ -57,6 +58,7 @@ fn test_intra_def_cycle_err() {
     let res = check_program(input);
     assert!(res.is_err());
     let err = res.expect_err("expected dependency cycle error");
+    println!("ERROR: {}", err);
     assert!(err.contains("dependency cycle detected"));
 }
 
@@ -87,6 +89,7 @@ fn test_inter_cycle_2_service_err() {
     let res = check_program(input);
     assert!(res.is_err());
     let err = res.expect_err("expected dependency cycle error");
+    println!("ERROR: {}", err);
     assert!(err.contains("dependency cycle detected"));
 }
 
@@ -107,6 +110,7 @@ fn test_inter_cycle_3_service_err() {
     let res = check_program(input);
     assert!(res.is_err());
     let err = res.expect_err("expected dependency cycle error");
+    println!("ERROR: {}", err);
     assert!(err.contains("dependency cycle detected"));
 }
 
@@ -131,6 +135,7 @@ fn test_inter_cycle_4_service_err() {
     let res = check_program(input);
     assert!(res.is_err());
     let err = res.expect_err("expected dependency cycle error");
+    println!("ERROR: {}", err);
     assert!(err.contains("dependency cycle detected"));
 }
 
@@ -465,5 +470,38 @@ fn test_conditional_if_eager_branch_forward_ref_rejected() {
     assert!(
         res.is_err(),
         "Static analysis MUST reject eager conditional evaluation"
+    );
+}
+
+/// Verify that mutual aliases passed as HOF arguments are properly rejected
+/// as eager forward references, preventing infinite analysis loops.
+#[test]
+fn test_mutual_aliases_hof_argument() {
+    let input = "
+        service S {
+            def hof: (int) -> int = fn(x: int) => x;
+            def c: int = hof(a);
+            def a: int = b;
+            def b: int = a;
+        }
+    ";
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let input_owned = input.to_string();
+
+    std::thread::spawn(move || {
+        let res = check_program(&input_owned);
+        let _ = tx.send(res);
+    });
+
+    let res = rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("Static analysis infinite loop or stack overflow detected!");
+
+    assert!(res.is_err());
+    let err = res.expect_err("expected dependency cycle error");
+    assert!(
+        err.contains("Invalid forward reference to uninitialized value")
+            || err.contains("dependency cycle detected")
     );
 }

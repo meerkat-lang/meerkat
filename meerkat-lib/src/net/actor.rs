@@ -420,12 +420,11 @@ impl NetworkActor {
                 let mut parsed = None;
                 if let Some(pos) = addr.0.rfind("/p2p/") {
                     let after_p2p = &addr.0[pos + 5..];
-                    let trimmed = match after_p2p.find('/') {
-                        Some(slash_idx) => &addr.0[..pos + 5 + slash_idx],
-                        None => &addr.0[..],
-                    };
-                    if let Ok(m) = trimmed.parse::<Multiaddr>() {
-                        parsed = Some(m);
+                    if let Some(slash_idx) = after_p2p.find('/') {
+                        let trimmed = &addr.0[..pos + 5 + slash_idx];
+                        if let Ok(m) = trimmed.parse::<Multiaddr>() {
+                            parsed = Some(m);
+                        }
                     }
                 }
                 match parsed {

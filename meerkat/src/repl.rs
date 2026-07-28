@@ -255,7 +255,7 @@ async fn exec_stmt(
             }
         }
         Stmt::Watch { expr } => {
-            let label = format!("{}", expr);
+            let label = meerkat_lib::runtime::update::format_expr(&expr, &manager.interner);
             // Evaluate initial value
             let initial = eval(
                 &expr,

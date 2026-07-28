@@ -452,6 +452,51 @@ impl Transaction {
     }
 }
 
+/// Format an `ActionStmt` into a valid Meerkat string, resolving symbols with the interner.
+fn format_action_stmt(stmt: &crate::runtime::ast::ActionStmt, interner: &Interner) -> String {
+    use crate::runtime::ast::ActionStmt;
+    match stmt {
+        ActionStmt::Let { name, ty, expr } => {
+            let name_str = interner.get(*name);
+            let expr_str = format_expr(expr, interner);
+            if let Some(t) = ty {
+                format!("let {}: {} = {}", name_str, t, expr_str)
+            } else {
+                format!("let {} = {}", name_str, expr_str)
+            }
+        }
+        ActionStmt::Expr(expr) => format_expr(expr, interner),
+        ActionStmt::Do(expr) => format!("do {}", format_expr(expr, interner)),
+        ActionStmt::Assert(expr, _) => format!("assert {}", format_expr(expr, interner)),
+        ActionStmt::Assign { name, expr } => {
+            format!("{} = {}", interner.get(*name), format_expr(expr, interner))
+        }
+        ActionStmt::Insert { row, table_name } => {
+            format!(
+                "insert {} into {}",
+                format_expr(row, interner),
+                interner.get(*table_name)
+            )
+        }
+        ActionStmt::For {
+            var,
+            iterable,
+            body,
+        } => {
+            let body_strs: Vec<String> = body
+                .iter()
+                .map(|s| format_action_stmt(s, interner))
+                .collect();
+            format!(
+                "for {} in {} {{ {} }}",
+                interner.get(*var),
+                format_expr(iterable, interner),
+                body_strs.join("; ")
+            )
+        }
+    }
+}
+
 /// Format an `Expr` into a valid Meerkat source code string
 ///
 /// Args:
@@ -496,12 +541,38 @@ pub fn format_expr(expr: &Expr, interner: &Interner) -> String {
             format_expr(expr1, interner),
             format_expr(expr2, interner)
         ),
-        Expr::Func { .. } => expr.to_string(),
+        Expr::Func {
+            params,
+            body,
+            return_ty,
+        } => {
+            let params_str: Vec<String> = params.iter().map(|p| p.to_string()).collect();
+            if let Some(ref ty) = return_ty {
+                format!(
+                    "fn({}) -> {}[{}]",
+                    params_str.join(","),
+                    ty,
+                    format_expr(body, interner)
+                )
+            } else {
+                format!(
+                    "fn({})[{}]",
+                    params_str.join(","),
+                    format_expr(body, interner)
+                )
+            }
+        }
         Expr::Call { func, args } => {
             let arg_strs: Vec<String> = args.iter().map(|a| format_expr(a, interner)).collect();
             format!("{}({})", format_expr(func, interner), arg_strs.join(", "))
         }
-        Expr::Action(_) => expr.to_string(),
+        Expr::Action(stmts) => {
+            let stmts_str: Vec<String> = stmts
+                .iter()
+                .map(|s| format!("{:?}", format_action_stmt(s, interner)))
+                .collect();
+            format!("Action([{}])", stmts_str.join(", "))
+        }
         Expr::MemberAccess {
             service_name,
             member_name,
@@ -510,7 +581,22 @@ pub fn format_expr(expr: &Expr, interner: &Interner) -> String {
             interner.get(*service_name),
             interner.get(*member_name)
         ),
-        Expr::Select { .. } | Expr::Table { .. } | Expr::Fold { .. } => expr.to_string(),
+        Expr::Select { where_clause, .. } => format_expr(where_clause, interner),
+        Expr::Table { records, .. } => {
+            let records_str: Vec<String> = records
+                .iter()
+                .map(|r| match r {
+                    Expr::Tuple { val } => {
+                        let entries: Vec<String> =
+                            val.iter().map(|e| format_expr(e, interner)).collect();
+                        format!("{{{}}}", entries.join(", "))
+                    }
+                    other => format!("{{{}}}", format_expr(other, interner)),
+                })
+                .collect();
+            format!("[{}]", records_str.join(", "))
+        }
+        Expr::Fold { .. } => "fold".to_string(),
         Expr::List(exprs) => {
             let elems: Vec<String> = exprs.iter().map(|e| format_expr(e, interner)).collect();
             format!("[{}]", elems.join(", "))

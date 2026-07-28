@@ -559,8 +559,13 @@ impl Node {
         }
 
         if !update_stmts.is_empty() {
-            let post_update_ast = apply_updates_to_ast(&self.unified_ast, &update_stmts)
-                .map_err(|sym| self.format_tt_error(tt::check::Error::UnboundVariable(sym)))?;
+            let post_update_ast =
+                apply_updates_to_ast(&self.unified_ast, &update_stmts).map_err(|sym| {
+                    Error::Message(format!(
+                        "Target service '{}' for update not found",
+                        self.interner.get(sym)
+                    ))
+                })?;
 
             nameres::resolve(&post_update_ast).map_err(|e| self.format_nameres_error(e))?;
 
@@ -742,5 +747,37 @@ impl Default for Node {
     ///   `Self`: Default empty Node instance
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify error mapping when apply_updates_to_ast encounters an unknown
+    /// target service symbol
+    #[test]
+    fn test_update_missing_service_err() {
+        let mut node = Node::new();
+        let sym = node.interner.insert("unknown_s");
+
+        let update_stmt = Stmt::Update {
+            service_name: sym,
+            decls: Vec::new(),
+        };
+
+        let res = apply_updates_to_ast(&node.unified_ast, &[update_stmt]).map_err(|s| {
+            Error::Message(format!(
+                "Target service '{}' for update not found",
+                node.interner.get(s)
+            ))
+        });
+
+        assert_eq!(
+            res,
+            Err(Error::Message(
+                "Target service 'unknown_s' for update not found".to_string()
+            ))
+        );
     }
 }

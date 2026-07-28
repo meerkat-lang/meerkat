@@ -286,23 +286,11 @@ fn build_eager_call_graph(
                 }
                 Expr::Func { .. } => Some(current.clone()),
                 Expr::MemberAccess {
-                    service_name,
+                    service_name: _,
                     member_name,
                 } => {
                     eager_graph.add_edge(parent_node, *member_name, ());
-                    if let Some(target_body) =
-                        ctx.global_def_bodies.get(&(*service_name, *member_name))
-                    {
-                        check_remote_member_eager_validity(
-                            *service_name,
-                            *member_name,
-                            target_body,
-                            ctx.global_member_order,
-                        )?;
-                        Some(target_body.clone())
-                    } else {
-                        None
-                    }
+                    None
                 }
                 _ => None,
             };

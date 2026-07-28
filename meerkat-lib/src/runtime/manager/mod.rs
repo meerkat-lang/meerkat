@@ -487,31 +487,6 @@ impl Manager {
             return self.remote_lookup(service_name, var_name, txn).await;
         }
 
-        // If it's a def, re-evaluate from stored expression for freshness.
-        // The transaction flows through so the def's underlying vars are locked.
-        let def_expr = self
-            .services
-            .get(&service_name)
-            .and_then(|s| s.defs.get(&var_name))
-            .cloned();
-
-        if let Some(expr) = def_expr {
-            // Evaluate the def with an empty env so its dependencies resolve
-            // through lookup (acquiring read locks and populating the cache)
-            // rather than being pre-seeded from current service var values.
-            let env: Vec<(Symbol, Value)> = Vec::new();
-            return eval(
-                &expr,
-                &env,
-                &mut EvalContext {
-                    manager: self,
-                    service_name,
-                    txn: txn.as_deref_mut(),
-                },
-            )
-            .await;
-        }
-
         // Local var read. If inside a transaction, return the cached value if
         // present, otherwise acquire a read lock lazily and cache the value.
         // Transaction state is keyed by (service id, variable) so the same name

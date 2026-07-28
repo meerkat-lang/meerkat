@@ -264,8 +264,14 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                 let server_addr = opt_server_addr
                     .expect("Server address should be initialized when args.server is true");
 
+                let target_ast = if remote_url_map.is_empty() {
+                    node.unified_ast.clone()
+                } else {
+                    prog
+                };
+
                 run_server(
-                    node.unified_ast.clone(),
+                    target_ast,
                     file,
                     remote_url_map,
                     ServerConfig {

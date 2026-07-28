@@ -611,7 +611,7 @@ impl Node {
                 );
                 Error::Message(msg)
             }
-            nameres::Error::DepthLimit => Error::Message(err.to_string()),
+            nameres::Error::DepthLimit => Error::Message(nameres::Error::DepthLimit.to_string()),
         }
     }
 

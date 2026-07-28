@@ -1028,7 +1028,11 @@ impl Manager {
                         };
                         let error = res.err();
                         let reply_msg = MeerkatMessage::UpdateServiceResponse { request_id, error };
-                        let target_addr = if !reply_to.is_empty() { reply_to } else { peer };
+                        let target_addr = if !peer.is_empty() {
+                            peer.clone()
+                        } else {
+                            reply_to
+                        };
                         if !target_addr.is_empty() {
                             self.send_oneway(Address::new(&target_addr), reply_msg)
                                 .await;
@@ -1052,7 +1056,11 @@ impl Manager {
                             success,
                             error,
                         };
-                        self.send_oneway(Address::new(&reply_to), reply_msg).await;
+                        let target_addr = if !peer.is_empty() { peer } else { reply_to };
+                        if !target_addr.is_empty() {
+                            self.send_oneway(Address::new(&target_addr), reply_msg)
+                                .await;
+                        }
                     }
                     // Everything else is a reply: route it to its waiter.
                     other => {

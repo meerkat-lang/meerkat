@@ -644,7 +644,24 @@ async fn run_server(
                     source,
                     reply_to,
                 } => {
-                    pending_updates.push_back((request_id, txn_id, source, reply_to, peer));
+                    if exceeds_pending_update_limit(&pending_updates, &peer) {
+                        let response = MeerkatMessage::UpdateServiceResponse {
+                            request_id,
+                            error: Some("Too many pending updates from this peer".to_string()),
+                        };
+                        let target_addr = if !reply_to.is_empty() {
+                            reply_to
+                        } else {
+                            peer
+                        };
+                        if !target_addr.is_empty() {
+                            if let Some(net) = manager.network.as_mut() {
+                                send_net_msg(net, &target_addr, response).await;
+                            }
+                        }
+                    } else {
+                        pending_updates.push_back((request_id, txn_id, source, reply_to, peer));
+                    }
                 }
                 MeerkatMessage::LookupRequest {
                     request_id,
@@ -1502,6 +1519,21 @@ async fn run_lock_test_client(
     Ok(())
 }
 
+/// Check if the given peer has reached the maximum number of pending update requests.
+fn exceeds_pending_update_limit(
+    queue: &std::collections::VecDeque<(
+        u64,
+        Option<meerkat_lib::runtime::txn::TxnId>,
+        String,
+        String,
+        String,
+    )>,
+    peer: &str,
+) -> bool {
+    let active_for_peer = queue.iter().filter(|(_, _, _, _, p)| p == peer).count();
+    active_for_peer >= meerkat_lib::runtime::limits::MAX_PENDING_UPDATES_PER_PEER
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1537,5 +1569,34 @@ mod tests {
         })
         .expect_err("message-sent replies are not a Listen success");
         assert_eq!(message_sent_err.to_string(), "Unexpected reply");
+    }
+
+    #[test]
+    fn test_exceeds_pending_update_limit_rejects_spam() {
+        let mut queue = std::collections::VecDeque::new();
+        let peer = "peer1";
+
+        // Fill up to the limit
+        for i in 0..meerkat_lib::runtime::limits::MAX_PENDING_UPDATES_PER_PEER {
+            queue.push_back((
+                i as u64,
+                None,
+                String::new(),
+                String::new(),
+                peer.to_string(),
+            ));
+        }
+
+        // Negative test coverage: confirm limits correctly enforce bounds for spammers
+        assert!(
+            exceeds_pending_update_limit(&queue, peer),
+            "Should reject new updates from spamming peer"
+        );
+
+        // Confirm other peers are unaffected
+        assert!(
+            !exceeds_pending_update_limit(&queue, "peer2"),
+            "Should allow new updates from different peers"
+        );
     }
 }

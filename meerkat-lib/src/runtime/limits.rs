@@ -34,3 +34,6 @@ pub const MAX_NET_REQUEST_SOURCE_LENGTH: usize = 1_048_576;
 
 /// Maximum number of services allowed to be imported
 pub const MAX_IMPORTED_SERVICES: usize = 256;
+
+/// Maximum number of pending update requests allowed per peer in the event queue
+pub const MAX_PENDING_UPDATES_PER_PEER: usize = 32;

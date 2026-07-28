@@ -15,6 +15,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tokio::sync::oneshot;
 
+pub const MAX_WAIT_DIE_RETRIES: u32 = 10;
+
 pub struct Service {
     /// Globally unique identity of this service (address-based when networked).
     pub id: ServiceNetId,
@@ -254,10 +256,19 @@ impl Manager {
         // evaluating any declarations, so action closures built during
         // initialization are stamped with the correct `ServiceNetId`
         // instead of `service_net_id_for_name`'s bare-name fallback
-        self.unified_ast.push(Stmt::Service {
-            name,
-            decls: decls.clone(),
+        let exists = self.unified_ast.iter().any(|s| {
+            if let Stmt::Service { name: existing, .. } = s {
+                *existing == name
+            } else {
+                false
+            }
         });
+        if !exists {
+            self.unified_ast.push(Stmt::Service {
+                name,
+                decls: decls.clone(),
+            });
+        }
 
         let all_graphs = compute_dependencies(&self.unified_ast, None)
             .map_err(|e| EvalError::VarNotFound(e.format_with_interner(&self.interner)))?;
@@ -1919,7 +1930,6 @@ impl Manager {
         stmts: &[ActionStmt],
         initial_env: &[(Symbol, Value)],
     ) -> Result<(), EvalError> {
-        const MAX_WAIT_DIE_RETRIES: u32 = 10;
         let mut txn_id = TxnId::new(self.node_id);
 
         loop {
@@ -2387,9 +2397,12 @@ impl Manager {
             match reply {
                 MeerkatMessage::LockResponse { success, error, .. } => {
                     if !success {
-                        return Err(EvalError::LocalDispatchFailed(error.unwrap_or_else(|| {
-                            "Lock request rejected by remote node".to_string()
-                        })));
+                        let err_str = error
+                            .unwrap_or_else(|| "Lock request rejected by remote node".to_string());
+                        if err_str.contains("Wait-die abort") {
+                            return Err(EvalError::WaitDieAbort(err_str));
+                        }
+                        return Err(EvalError::LocalDispatchFailed(err_str));
                     }
                 }
                 _ => {

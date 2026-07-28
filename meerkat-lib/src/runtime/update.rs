@@ -158,16 +158,26 @@ impl Transaction {
                     .lock_txn
                     .take()
                     .unwrap_or_else(|| LockTxn::new(TxnId::new(manager.node_id)));
-                let lock_res = manager
-                    .acquire_lock_group_internal(&mut txn, &lock_groups)
-                    .await;
 
-                if let Err(e) = lock_res {
-                    manager.release_all_locks(&txn);
-                    return Err(EvalError::RuntimeError(format!(
-                        "Lock acquisition conflict during update: {}",
-                        e
-                    )));
+                loop {
+                    let lock_res = manager
+                        .acquire_lock_group_internal(&mut txn, &lock_groups)
+                        .await;
+
+                    if let Err(e) = lock_res {
+                        manager.release_all_locks(&txn);
+                        if matches!(e, EvalError::WaitDieAbort(_))
+                            && txn.id.iteration < crate::runtime::manager::MAX_WAIT_DIE_RETRIES
+                        {
+                            txn = LockTxn::new(txn.id.retry());
+                            continue;
+                        }
+                        return Err(EvalError::RuntimeError(format!(
+                            "Lock acquisition conflict during update: {}",
+                            e
+                        )));
+                    }
+                    break;
                 }
 
                 self.lock_txn = Some(txn);

@@ -285,7 +285,16 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                 )
                 .await
             } else {
-                run_client(prog, file, remote_url_map, args.local, args.watch, interner).await
+                run_client(
+                    node.unified_ast.clone(),
+                    prog,
+                    file,
+                    remote_url_map,
+                    args.local,
+                    args.watch,
+                    interner,
+                )
+                .await
             }
         }
         None => {
@@ -969,6 +978,7 @@ async fn run_server(
 }
 
 async fn run_client(
+    full_ast: Vec<Stmt>,
     prog: Vec<Stmt>,
     input_file: &str,
     remote_url_map: std::collections::HashMap<String, String>,
@@ -978,6 +988,10 @@ async fn run_client(
 ) -> Result<(), Box<dyn Error>> {
     let mut manager = Manager::new(interner);
     manager.local = local;
+    // Pre-populate unified_ast with the full AST (including remote imports)
+    // so that runtime updates against remote services can successfully find
+    // the target service definitions to patch against and type-check.
+    manager.unified_ast = full_ast;
 
     // Start the network if we have remote imports, or always in watch mode
     // (watch needs the network to receive change notifications).

@@ -272,9 +272,9 @@ impl<'a> Resolver<'a> {
                         }
                     }
                 }
-                self.resolve_action_stmts(stmts, &mut test_env, 0)?;
+                let res = self.resolve_action_stmts(stmts, &mut test_env, 0);
                 self.current_context = prev_context;
-                Ok(())
+                res
             }
             Stmt::Watch { expr } => self.resolve_expr(expr, env, 0),
         }
@@ -1179,5 +1179,113 @@ mod tests {
         let mut resolver = Resolver::new();
         let res = resolver.resolve_action_stmt(&deep_stmt, &mut env, 0);
         assert_eq!(res, Err(Error::DepthLimit))
+    }
+
+    /// Verify that `Stmt::Update` initializer resolution failure
+    /// restores `current_context` to `None` on the `Resolver`
+    #[test]
+    fn test_unit_update_block_restores_context_on_error() {
+        let mut interner = Interner::new();
+        let s = interner.insert("s");
+        let x = interner.insert("x");
+        let unbound = interner.insert("unbound");
+        let y = interner.insert("y");
+
+        let service_stmt = Stmt::Service {
+            name: s,
+            decls: vec![Decl::VarDecl {
+                name: x,
+                ty: None,
+                val: Expr::Literal {
+                    val: Value::Int { val: 0 },
+                },
+            }],
+        };
+
+        let update_stmt = Stmt::Update {
+            service_name: s,
+            decls: vec![Decl::VarDecl {
+                name: x,
+                ty: None,
+                val: Expr::Variable { name: unbound },
+            }],
+        };
+
+        let mut env = Env::new(None);
+        let mut resolver = Resolver::new();
+
+        // Register service definition first
+        let reg_res = resolver.resolve_stmt(&service_stmt, &mut env);
+        assert!(reg_res.is_ok());
+
+        // Resolve update with invalid initializer
+        let update_res = resolver.resolve_stmt(&update_stmt, &mut env);
+        assert!(update_res.is_err());
+        assert_eq!(resolver.current_context, None);
+
+        // Verify reusable resolver does not leak stale context_name
+        let watch_stmt = Stmt::Watch {
+            expr: Expr::Variable { name: y },
+        };
+        let second_res = resolver.resolve_stmt(&watch_stmt, &mut env);
+        assert!(second_res.is_err());
+        match second_res.unwrap_err() {
+            Error::UnknownIdentifier { context_name, .. } => {
+                assert_eq!(context_name, None);
+            }
+            _ => panic!("Expected UnknownIdentifier error"),
+        }
+    }
+
+    /// Verify that `Stmt::Test` action resolution failure
+    /// restores `current_context` to `None` on the `Resolver`
+    #[test]
+    fn test_unit_test_block_restores_context_on_error() {
+        let mut interner = Interner::new();
+        let s = interner.insert("s");
+        let x = interner.insert("x");
+        let unbound = interner.insert("unbound");
+        let y = interner.insert("y");
+
+        let service_stmt = Stmt::Service {
+            name: s,
+            decls: vec![Decl::VarDecl {
+                name: x,
+                ty: None,
+                val: Expr::Literal {
+                    val: Value::Int { val: 0 },
+                },
+            }],
+        };
+
+        let test_stmt = Stmt::Test {
+            service_name: s,
+            stmts: vec![ActionStmt::Expr(Expr::Variable { name: unbound })],
+        };
+
+        let mut env = Env::new(None);
+        let mut resolver = Resolver::new();
+
+        // Register service definition first
+        let reg_res = resolver.resolve_stmt(&service_stmt, &mut env);
+        assert!(reg_res.is_ok());
+
+        // Resolve test block containing an invalid statement
+        let test_res = resolver.resolve_stmt(&test_stmt, &mut env);
+        assert!(test_res.is_err());
+        assert_eq!(resolver.current_context, None);
+
+        // Verify reusable resolver does not leak stale context_name
+        let watch_stmt = Stmt::Watch {
+            expr: Expr::Variable { name: y },
+        };
+        let second_res = resolver.resolve_stmt(&watch_stmt, &mut env);
+        assert!(second_res.is_err());
+        match second_res.unwrap_err() {
+            Error::UnknownIdentifier { context_name, .. } => {
+                assert_eq!(context_name, None);
+            }
+            _ => panic!("Expected UnknownIdentifier error"),
+        }
     }
 }

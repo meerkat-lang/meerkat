@@ -623,12 +623,32 @@ pub fn apply_updates_to_ast(base_ast: &[Stmt], updates: &[Stmt]) -> Result<Vec<S
         }
 
         if !found_service {
-            patched_ast.push(Stmt::Service {
-                name: *updated_svc_name,
-                decls: updated_decls.clone(),
-            });
+            return Err(*updated_svc_name);
         }
     }
 
     Ok(patched_ast)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::interner::Interner;
+
+    /// Tests that `apply_updates_to_ast` returns an `Err` containing
+    /// the target `Symbol` when an update targets a missing service
+    #[test]
+    fn test_apply_updates_to_ast_missing_service_returns_err() {
+        let mut interner = Interner::new();
+        let target_sym = interner.insert("non_existent_service");
+
+        let base_ast: Vec<Stmt> = Vec::new();
+        let updates: Vec<Stmt> = vec![Stmt::Update {
+            service_name: target_sym,
+            decls: Vec::new(),
+        }];
+
+        let result = apply_updates_to_ast(&base_ast, &updates);
+        assert_eq!(result, Err(target_sym));
+    }
 }

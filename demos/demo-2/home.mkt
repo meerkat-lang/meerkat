@@ -11,4 +11,11 @@ service home {
 
   // Track battery charge level
   pub def battery_level = battery.charge_level;
+
+  // Reflect the battery operational mode; initially bool, may be updated to string.
+  pub def power_source = battery.status;
+
+  // Tracks the current type of power_source as a display string.
+  // Updated atomically alongside battery.status by the controller.
+  pub def power_source_type = "bool";
 }

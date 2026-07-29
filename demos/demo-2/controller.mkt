@@ -1,23 +1,37 @@
 // Test controller node for demo-2
 //
-// Simulates an over-the-air state update changing battery and inverter states
+// Simulates an over-the-air state update changing battery and inverter states.
+// All updates are committed as a single atomic transaction.
 
 import inverter
 import battery
+import home
 
 service controller {}
 
-update battery {
-  var status: string = "discharging";
-  var charge_level: int = 35;
-}
+atomic {
+  // Change battery.status type from bool to string, and lower charge level.
+  update battery {
+    var status: string = "discharging";
+    var charge_level: int = 35;
+  }
 
-update inverter {
-  var output_kw: int = 1;
+  update inverter {
+    var output_kw: int = 1;
+  }
+
+  // Update the type annotation in home atomically with the battery type change.
+  update home {
+    pub def power_source_type = "string";
+  }
 }
 
 @test(controller) {
   assert(battery.status == "discharging");
   assert(battery.charge_level == 35);
   assert(inverter.output_kw == 1);
+
+  // Verify that the secondary service (home) reflected the type change:
+  // home.power_source is battery.status, which is now a string.
+  assert(home.power_source == "discharging");
 }

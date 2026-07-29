@@ -11,7 +11,7 @@ Purpose:
     3. Spawns local HTTP server on port 8000.
     4. Launches backend Meerkat server network (server.mkt).
     5. Polls socket until dashboard WebSocket port 9241 is accepting connections.
-    6. Opens Google Chrome directly to dashboard.mkt for WASM remote subscription.
+    6. Opens the default system browser to dashboard.mkt for WASM remote subscription.
     7. Displays an 8-second terminal countdown timer while user views initial state.
     8. Triggers controller.mkt over P2P network to push live OTA state updates.
     9. Gracefully shuts down all child processes on Ctrl+C.
@@ -24,6 +24,8 @@ import socket
 import subprocess
 import signal
 import atexit
+import platform
+import webbrowser
 
 PROCS = []
 
@@ -44,13 +46,36 @@ def cleanup():
     print("[demo-2] Cleanup complete.")
 
 def kill_port(port: int):
-    """Kill any process currently bound to the specified TCP port."""
+    """Kill any process currently bound to the specified TCP port.
+
+    Uses platform-appropriate tools:
+      - Windows: netstat + taskkill
+      - macOS/Linux: lsof + kill
+    """
     try:
-        res = subprocess.run(["lsof", "-t", f"-iTCP:{port}", "-sTCP:LISTEN"], capture_output=True, text=True)
-        pids = res.stdout.strip().split()
-        for pid in pids:
-            if pid and pid.isdigit():
-                subprocess.run(["kill", "-9", pid], capture_output=True)
+        if platform.system() == "Windows":
+            # netstat -ano lists PID in the last column for LISTENING entries
+            res = subprocess.run(
+                ["netstat", "-ano"],
+                capture_output=True, text=True
+            )
+            for line in res.stdout.splitlines():
+                if f":{port}" in line and "LISTENING" in line:
+                    parts = line.split()
+                    pid = parts[-1]
+                    if pid.isdigit():
+                        subprocess.run(
+                            ["taskkill", "/F", "/PID", pid],
+                            capture_output=True
+                        )
+        else:
+            res = subprocess.run(
+                ["lsof", "-t", f"-iTCP:{port}", "-sTCP:LISTEN"],
+                capture_output=True, text=True
+            )
+            for pid in res.stdout.strip().split():
+                if pid and pid.isdigit():
+                    subprocess.run(["kill", "-9", pid], capture_output=True)
     except Exception:
         pass
 
@@ -114,11 +139,9 @@ def main():
     if wait_for_port("127.0.0.1", 9241, timeout=40.0):
         print("[demo-2] Dashboard WebSocket port 9241 is online!")
         target_url = "http://localhost:8000/?peer_id=12D3KooWSrbdDG8vbm4z3e1XLMzFAatPQc1VdkVDRHYG5SZbBGVk&path=dashboard.mkt"
-        print(f"[demo-2] Opening Google Chrome: {target_url}")
-        try:
-            subprocess.Popen(["open", "-a", "Google Chrome", target_url])
-        except Exception:
-            subprocess.Popen(["open", target_url])
+        print(f"[demo-2] Opening browser: {target_url}")
+        # webbrowser.open is platform-agnostic: works on macOS, Linux, and Windows
+        webbrowser.open(target_url)
     else:
         print("[demo-2] Error: Timed out waiting for port 9241.")
         sys.exit(1)
@@ -135,13 +158,14 @@ def main():
 
     print("\n[demo-2] Triggering live OTA update now over P2P network...")
 
-    # 7. Execute controller client update node targeting inverter and battery on port 9240
+    # 7. Execute controller client update node targeting inverter, battery, and home on port 9240
     dashboard_peer = "12D3KooWSrbdDG8vbm4z3e1XLMzFAatPQc1VdkVDRHYG5SZbBGVk"
     controller_cmd = [
         "cargo", "run", "-p", "meerkat", "--", "--local",
         "-f", "demos/demo-2/controller.mkt",
         "-i", f"/ip4/127.0.0.1/tcp/9240/p2p/{dashboard_peer}/inverter",
-        "-i", f"/ip4/127.0.0.1/tcp/9240/p2p/{dashboard_peer}/battery"
+        "-i", f"/ip4/127.0.0.1/tcp/9240/p2p/{dashboard_peer}/battery",
+        "-i", f"/ip4/127.0.0.1/tcp/9240/p2p/{dashboard_peer}/home"
     ]
     update_res = subprocess.run(controller_cmd)
     if update_res.returncode == 0:
@@ -157,3 +181,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

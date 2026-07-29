@@ -272,9 +272,29 @@ impl Manager {
 
         let all_graphs = compute_dependencies(&self.unified_ast, None)
             .map_err(|e| EvalError::VarNotFound(e.format_with_interner(&self.interner)))?;
-        let graphs = all_graphs
+        let service_stmts: Vec<_> = self
+            .unified_ast
+            .iter()
+            .filter_map(|stmt| {
+                if let Stmt::Service { name: existing, .. } = stmt {
+                    Some(*existing)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        debug_assert_eq!(
+            service_stmts.len(),
+            all_graphs.len(),
+            "Service statement count must match graph count"
+        );
+
+        let graphs = service_stmts
             .into_iter()
-            .last()
+            .zip(all_graphs)
+            .find(|(svc_name, _)| *svc_name == name)
+            .map(|(_, g)| g)
             .unwrap_or_else(ServiceGraphs::new);
 
         self.services.insert(

@@ -263,15 +263,31 @@ impl Manager {
                 false
             }
         });
-        if !exists {
+        let inserted = !exists;
+        if inserted {
             self.unified_ast.push(Stmt::Service {
                 name,
                 decls: decls.clone(),
             });
         }
 
-        let all_graphs = compute_dependencies(&self.unified_ast, None)
-            .map_err(|e| EvalError::VarNotFound(e.format_with_interner(&self.interner)))?;
+        let all_graphs = match compute_dependencies(&self.unified_ast, None) {
+            Ok(graphs) => graphs,
+            Err(e) => {
+                if inserted {
+                    self.unified_ast.retain(|s| {
+                        if let Stmt::Service { name: existing, .. } = s {
+                            *existing != name
+                        } else {
+                            true
+                        }
+                    });
+                }
+                return Err(EvalError::VarNotFound(
+                    e.format_with_interner(&self.interner),
+                ));
+            }
+        };
         let service_stmts: Vec<_> = self
             .unified_ast
             .iter()
@@ -426,7 +442,7 @@ impl Manager {
 
         // Clean up the global unified_ast if initialization or commit failed
         // to prevent phantom services from lingering in the AST
-        if init_error.is_some() || commit_error.is_some() {
+        if (init_error.is_some() || commit_error.is_some()) && inserted {
             self.unified_ast.retain(|s| {
                 if let Stmt::Service { name: existing, .. } = s {
                     *existing != svc_name
@@ -451,6 +467,7 @@ impl Manager {
         // Post-condition: If we return an error, ensure no phantom service was left in the AST
         debug_assert!(
             result.is_ok()
+                || !inserted
                 || !self.unified_ast.iter().any(|s| {
                     if let Stmt::Service { name: existing, .. } = s {
                         *existing == svc_name

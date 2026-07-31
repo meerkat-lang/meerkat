@@ -103,6 +103,15 @@ The `Html` module was written with this in mind.  Its documentation states that
 the representation is private precisely so that it can change later, and names a
 structured tree as the anticipated direction.
 
+Existing consumers treat `Html` as text, and that does not change: `as_str` and
+the `Display` impl still produce the rendered visible content, and the AST
+printer and any text encoding serialize that content. A handler is not part of
+that text. It is carried on the tree node rather than spliced into the string,
+so a printer or a text-only consumer sees the markup without the handler and
+never serializes an action as markup. Within a single node a handler is just the
+action (or lambda) value the node holds; how a handler reference travels between
+nodes is the transport question the separate trust-boundary issue covers.
+
 A tree alone does not make rendering safe.  If the renderer walks the tree and
 concatenates it back into a string, the current injection risk is preserved.
 The design therefore requires that rendering go through DOM APIs that treat
@@ -151,17 +160,34 @@ field wants to hand the action what the user typed or toggled, so the handler
 takes that value as an argument:
 
 ```meerkat
-pub def html = (<input type="text" oninput={set_name} />);
+pub def html = (<input type="text" oninput={(s) => set_name(s)} />);
 ```
 
 Resolution: the expression for an event attribute is either an action, or a
 lambda that takes one argument and returns an action. The lambda's argument
-receives the value the event supplies -- for example, a string for `oninput` --
-and its type is checked against what the event provides. A plain action is used
-where the event carries no value (a click); a lambda is used where it does (a
-text input). This subsumes the earlier question of how an event value reaches
-the action: it arrives as the lambda's argument, needing no change to how
-actions themselves are represented.
+receives the value the event supplies, and its type is checked against what the
+event provides. A plain action is used where the event carries no value (a
+click); a lambda is used where it does (a text input).
+
+The value-carrying events, and the type each supplies, form the initial
+supported subset:
+
+| Event | Payload | Handler expression |
+| --- | --- | --- |
+| `onclick` | none | an action |
+| `oninput` | string | a lambda from string to action |
+| `onchange` (text) | string | a lambda from string to action |
+| `onchange` (checkbox) | bool | a lambda from bool to action |
+
+Any other attribute beginning with `on` is accepted with a no-argument action.
+An attribute in the value-carrying subset requires a lambda whose argument type
+matches the payload, and the compiler rejects a mismatch. The lambda form above
+is illustrative; the concrete syntax follows Meerkat's existing lambda
+expression and is fixed during implementation.
+
+This subsumes the earlier question of how an event value reaches the action: it
+arrives as the lambda's argument, needing no change to how actions themselves
+are represented.
 
 Radio buttons are a further step.  A group of radio buttons naturally maps to a
 choice among named alternatives, which Meerkat cannot currently express.  They

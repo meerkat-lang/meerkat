@@ -138,44 +138,62 @@ executable crosses the boundary, and the page cannot name an action it was never
 given.  The cost is that identifiers have to be issued, scoped to a particular
 page's session, and eventually discarded.
 
-This design does not settle the question, but no implementation should begin
-until it is settled, because the answer determines what an event attribute
-evaluates to on the client side.
+Resolution: this is a real concern, but its architecture is more global than
+this feature -- it is really about mobile code in Meerkat as a whole -- so it is
+tracked as a separate issue rather than settled here. For now, actions and
+lambdas are passed to and from the client over the wire and executed under the
+normal execution semantics, with the tampering question deferred to that issue.
 
 ## Extending to other inputs
 
-The general rule extends to inputs that carry a value, but those raise a
-question this design does not yet settle.  A checkbox or a text field wants to
-hand the action what the user typed or toggled:
+The general rule extends to inputs that carry a value. A checkbox or a text
+field wants to hand the action what the user typed or toggled, so the handler
+takes that value as an argument:
 
 ```meerkat
 pub def html = (<input type="text" oninput={set_name} />);
 ```
 
-An action closure holds statements and a captured environment but no parameter
-list, so there is currently no way to pass the event's value in.  Two options
-seem plausible: give action closures parameters, in the way ordinary closures
-already have them, or bind the event value into the captured environment under
-a well known name before invoking the action.  The first is more explicit and
-composes better with the rest of the language; the second requires no change to
-the value representation.
+Resolution: the expression for an event attribute is either an action, or a
+lambda that takes one argument and returns an action. The lambda's argument
+receives the value the event supplies -- for example, a string for `oninput` --
+and its type is checked against what the event provides. A plain action is used
+where the event carries no value (a click); a lambda is used where it does (a
+text input). This subsumes the earlier question of how an event value reaches
+the action: it arrives as the lambda's argument, needing no change to how
+actions themselves are represented.
 
 Radio buttons are a further step.  A group of radio buttons naturally maps to a
 choice among named alternatives, which Meerkat cannot currently express.  They
 are better revisited once the language has enumerations.
 
-## Open questions
+## Resolved questions
 
-Whether event attributes should be restricted to a known set of event names, or
-allowed for any attribute beginning with `on`.  A fixed set catches typos at
-check time; an open set needs no change when new events are supported.
+Attribute scope: any attribute whose name begins with `on` accepts a
+no-argument action. A designated subset of supported event attributes may
+additionally accept an action that takes an argument (via the lambda form
+above), and the compiler typechecks that the argument has the type the event
+supplies. This keeps the common case open-ended while giving the value-carrying
+events a checked contract.
 
-How the event's value should reach the action, for inputs that carry one.  See
-the section above.
+Passing an event's value to an action: resolved by the lambda form described
+under "Extending to other inputs" above.
 
-Whether a click that triggers a remote action should give the page any feedback
-while the action is in flight, or whether the reactive update arriving later is
-sufficient.
+In-flight feedback: showing the user something while a remote action is in
+flight is out of scope for now; the reactive update arriving later is treated as
+sufficient. A future approach might use compound actions -- a non-transactional
+action composed of transactional parts, where an early part shows an in-flight
+indicator and the rest carries out the command -- but that is left to a separate
+issue.
+
+## Reactivity of handler bindings
+
+Actions are often bound in local defs or variables rather than named inline, so
+a handler that references one must update inside the rendered HTML when that
+definition changes, exactly as any other interpolated value does. The structured
+HTML representation should carry handler bindings in a way that preserves this,
+so that reactivity extends to the handler an element is bound to, not only to
+the text it displays.
 
 ## Test case
 

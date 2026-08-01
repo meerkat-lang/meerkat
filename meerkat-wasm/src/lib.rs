@@ -82,10 +82,7 @@ fn current_handlers(
 /// synchronous but running an action is async, the work is spawned rather than
 /// awaited inline, and the manager is borrowed only inside the spawned task so
 /// no borrow is held across an await in the listener itself.
-fn attach_handlers(
-    manager: &Rc<RefCell<Manager>>,
-    handlers: Vec<(String, Value)>,
-) {
+fn attach_handlers(manager: &Rc<RefCell<Manager>>, handlers: Vec<(String, Value)>) {
     use wasm_bindgen::JsCast;
     let Some(win) = web_sys::window() else { return };
     let Some(doc) = win.document() else { return };
@@ -93,17 +90,27 @@ fn attach_handlers(
         return;
     };
     for (event, action) in handlers {
-        // Only onclick is wired in this slice.
-        if event != "onclick" {
+        // #153: map an on* attribute to a DOM event name by dropping "on"
+        // (onclick -> click, oninput -> input). Bind onclick to a button and
+        // other events to an input, if present under the render root.
+        let Some(dom_event) = event.strip_prefix("on") else {
             continue;
-        }
-        let Ok(Some(btn)) = root.query_selector("button") else {
+        };
+        let dom_event = dom_event.to_string();
+        let selector = if dom_event == "click" {
+            "button"
+        } else {
+            "input"
+        };
+        let Ok(Some(target)) = root.query_selector(selector) else {
             continue;
         };
         let manager_cb = Rc::clone(manager);
         let action_cb = action.clone();
         let closure = Closure::<dyn FnMut()>::new(move || {
-            // Extract the action's parts; only ActionClosure is runnable.
+            // Only ActionClosure is runnable in this slice (no-argument
+            // actions). Lambda-valued handlers for value-carrying events are a
+            // planned follow-up.
             if let Value::ActionClosure {
                 stmts,
                 env,
@@ -112,13 +119,8 @@ fn attach_handlers(
             {
                 let manager_task = Rc::clone(&manager_cb);
                 wasm_bindgen_futures::spawn_local(async move {
-                    // #153: the render loop may hold the manager borrow while it
-                    // drains network events. Rather than panic on a double
-                    // borrow, wait for it to be free, then run the action. The
-                    // borrow is held across remote_action's network await, so
-                    // the render loop pauses until the action completes -- fine
-                    // for the single-button demo; finer-grained concurrency is a
-                    // follow-up.
+                    // Wait for the render loop to release the manager borrow
+                    // rather than panicking on a double borrow.
                     loop {
                         if manager_task.try_borrow_mut().is_ok() {
                             break;
@@ -126,20 +128,14 @@ fn attach_handlers(
                         gloo_timers::future::TimeoutFuture::new(20).await;
                     }
                     let mut m = manager_task.borrow_mut();
-                    let _ = m
-                        .remote_action(&service_net_id, stmts, env, None)
-                        .await;
+                    let _ = m.remote_action(&service_net_id, stmts, env, None).await;
                 });
             }
         });
-        let _ = btn
+        let _ = target
             .dyn_ref::<web_sys::EventTarget>()
             .unwrap()
-            .add_event_listener_with_callback(
-                "click",
-                closure.as_ref().unchecked_ref(),
-            );
-        // Keep the closure alive for the lifetime of the page.
+            .add_event_listener_with_callback(&dom_event, closure.as_ref().unchecked_ref());
         closure.forget();
     }
 }

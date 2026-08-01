@@ -10,6 +10,8 @@ use meerkat_lib::runtime::ast::{Stmt, Value};
 use meerkat_lib::runtime::interner::Interner;
 use meerkat_lib::runtime::manager::Manager;
 use meerkat_lib::runtime::parser;
+use std::cell::RefCell;
+use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 
 fn js_err<E: std::fmt::Display>(e: E) -> JsValue {
@@ -118,19 +120,29 @@ pub async fn load_service(server_ws_addr: String, path: String) -> Result<String
 
     let html_sym = manager.interner.insert("html");
 
+    // #153: share the manager between the render loop and (soon) click
+    // listeners. Wasm is single-threaded, so Rc<RefCell<_>> is sufficient and
+    // correct; no Arc/Mutex needed. Setup above kept sole ownership because it
+    // runs before any listener exists.
+    let manager = Rc::new(RefCell::new(manager));
+
     // Initial render.
-    if let Some(html) = current_html(&manager, html_sym) {
+    if let Some(html) = current_html(&manager.borrow(), html_sym) {
         render_to_dom(&html);
     }
 
     // 4. Background render loop: pump network events (which apply reactive
     //    Update messages, recomputing dependent defs) and re-render the html
     //    def whenever it changes. Runs on spawn_local; no tokio runtime needed.
+    let manager_loop = Rc::clone(&manager);
     wasm_bindgen_futures::spawn_local(async move {
-        let mut last = current_html(&manager, html_sym);
+        let mut last = current_html(&manager_loop.borrow(), html_sym);
         loop {
-            manager.dispatch_network_events().await;
-            let now = current_html(&manager, html_sym);
+            // #153: hold the mutable borrow only for the dispatch call, never
+            // across the timer await below, so a click listener (which also
+            // borrows the manager) cannot collide with an outstanding borrow.
+            manager_loop.borrow_mut().dispatch_network_events().await;
+            let now = current_html(&manager_loop.borrow(), html_sym);
             if now != last {
                 if let Some(html) = &now {
                     render_to_dom(html);

@@ -4,6 +4,14 @@
 //! (they live on the server), so their defs are live network lookups that
 //! drive reactive updates. A background loop re-renders the `html` def to the
 //! DOM as Update messages arrive.
+//!
+//! #153: this client shares the Manager via Rc<RefCell> and calls &mut self
+//! methods (dispatch_network_events, remote_action) that await internally, so
+//! a borrow necessarily spans those awaits. This is sound because wasm is
+//! single-threaded and click tasks use try_borrow_mut with backoff, so the
+//! borrows never actually overlap. The lint is allowed file-wide for that
+//! reason.
+#![allow(clippy::await_holding_refcell_ref)]
 
 use meerkat_lib::net::{Address, NetworkActor, NodeType};
 use meerkat_lib::runtime::ast::{Stmt, Value};
@@ -72,16 +80,26 @@ fn current_handlers(
     Vec::new()
 }
 
-/// #153: attach DOM click listeners for the current html value's handlers.
-///
-/// For now this special-cases the single-button counter demo: each `onclick`
-/// handler is bound to the first `<button>` in the render target. General
-/// element-to-handler binding needs a full tree render on the wasm side and is
-/// tracked as a follow-up. On click, the handler's action value (an
-/// `ActionClosure`) is run via `remote_action`; because a DOM listener is
-/// synchronous but running an action is async, the work is spawned rather than
-/// awaited inline, and the manager is borrowed only inside the spawned task so
-/// no borrow is held across an await in the listener itself.
+// #153: attach DOM click listeners for the current html value's handlers.
+//
+// For now this special-cases the single-button counter demo: each `onclick`
+// handler is bound to the first `<button>` in the render target. General
+// element-to-handler binding needs a full tree render on the wasm side and is
+// tracked as a follow-up. On click, the handler's action value (an
+// `ActionClosure`) is run via `remote_action`; because a DOM listener is
+// synchronous but running an action is async, the work is spawned rather than
+// awaited inline, and the manager is borrowed only inside the spawned task so
+// no borrow is held across an await in the listener itself.
+
+thread_local! {
+    // #153: keep the current render's event closures alive. attach_handlers
+    // clears this before each render, dropping the previous render's
+    // closures, so repeated re-renders do not leak closures unboundedly
+    // (set_inner_html has already discarded the DOM nodes they were on).
+    static HANDLER_CLOSURES: RefCell<Vec<Closure<dyn FnMut()>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
 fn attach_handlers(manager: &Rc<RefCell<Manager>>, handlers: Vec<(String, Value)>) {
     use wasm_bindgen::JsCast;
     let Some(win) = web_sys::window() else { return };
@@ -89,6 +107,8 @@ fn attach_handlers(manager: &Rc<RefCell<Manager>>, handlers: Vec<(String, Value)
     let Some(root) = doc.get_element_by_id("render") else {
         return;
     };
+    // #153: drop the previous render's closures before creating this render's.
+    HANDLER_CLOSURES.with(|c| c.borrow_mut().clear());
     for (event, action) in handlers {
         // #153: map an on* attribute to a DOM event name by dropping "on"
         // (onclick -> click, oninput -> input). Bind onclick to a button and
@@ -127,8 +147,16 @@ fn attach_handlers(manager: &Rc<RefCell<Manager>>, handlers: Vec<(String, Value)
                         }
                         gloo_timers::future::TimeoutFuture::new(20).await;
                     }
-                    let mut m = manager_task.borrow_mut();
-                    let _ = m.remote_action(&service_net_id, stmts, env, None).await;
+                    // The borrow spans remote_action's await by necessity;
+                    // see the module-level note. The try_borrow_mut loop above
+                    // ensures no other borrow is live when we take this one.
+                    let result = {
+                        let mut m = manager_task.borrow_mut();
+                        m.remote_action(&service_net_id, stmts, env, None).await
+                    };
+                    if let Err(e) = result {
+                        status(&format!("action failed: {}", e));
+                    }
                 });
             }
         });
@@ -136,7 +164,9 @@ fn attach_handlers(manager: &Rc<RefCell<Manager>>, handlers: Vec<(String, Value)
             .dyn_ref::<web_sys::EventTarget>()
             .unwrap()
             .add_event_listener_with_callback(&dom_event, closure.as_ref().unchecked_ref());
-        closure.forget();
+        // #153: retain this render's closure (dropped on the next render's
+        // clear) rather than leaking it with forget().
+        HANDLER_CLOSURES.with(|c| c.borrow_mut().push(closure));
     }
 }
 
@@ -228,6 +258,7 @@ pub async fn load_service(server_ws_addr: String, path: String) -> Result<String
             // #153: hold the mutable borrow only for the dispatch call, never
             // across the timer await below, so a click listener (which also
             // borrows the manager) cannot collide with an outstanding borrow.
+            // Borrow spans dispatch's await by necessity; see module note.
             manager_loop.borrow_mut().dispatch_network_events().await;
             let now = current_html(&manager_loop.borrow(), html_sym);
             if now != last {

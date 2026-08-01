@@ -55,6 +55,95 @@ fn current_html(
     None
 }
 
+/// #153: read the event handlers bound in the current `html` value, as
+/// (event, action-value) pairs. Returns an owned copy so no borrow of the
+/// manager is held while listeners are attached.
+fn current_handlers(
+    manager: &Manager,
+    html_sym: meerkat_lib::runtime::interner::Symbol,
+) -> Vec<(String, Value)> {
+    for svc in manager.services.values() {
+        if let Some(vs) = svc.vars.get(&html_sym) {
+            if let Value::Html(h) = &vs.value {
+                return h.handlers().to_vec();
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// #153: attach DOM click listeners for the current html value's handlers.
+///
+/// For now this special-cases the single-button counter demo: each `onclick`
+/// handler is bound to the first `<button>` in the render target. General
+/// element-to-handler binding needs a full tree render on the wasm side and is
+/// tracked as a follow-up. On click, the handler's action value (an
+/// `ActionClosure`) is run via `remote_action`; because a DOM listener is
+/// synchronous but running an action is async, the work is spawned rather than
+/// awaited inline, and the manager is borrowed only inside the spawned task so
+/// no borrow is held across an await in the listener itself.
+fn attach_handlers(
+    manager: &Rc<RefCell<Manager>>,
+    handlers: Vec<(String, Value)>,
+) {
+    use wasm_bindgen::JsCast;
+    let Some(win) = web_sys::window() else { return };
+    let Some(doc) = win.document() else { return };
+    let Some(root) = doc.get_element_by_id("render") else {
+        return;
+    };
+    for (event, action) in handlers {
+        // Only onclick is wired in this slice.
+        if event != "onclick" {
+            continue;
+        }
+        let Ok(Some(btn)) = root.query_selector("button") else {
+            continue;
+        };
+        let manager_cb = Rc::clone(manager);
+        let action_cb = action.clone();
+        let closure = Closure::<dyn FnMut()>::new(move || {
+            // Extract the action's parts; only ActionClosure is runnable.
+            if let Value::ActionClosure {
+                stmts,
+                env,
+                service_net_id,
+            } = action_cb.clone()
+            {
+                let manager_task = Rc::clone(&manager_cb);
+                wasm_bindgen_futures::spawn_local(async move {
+                    // #153: the render loop may hold the manager borrow while it
+                    // drains network events. Rather than panic on a double
+                    // borrow, wait for it to be free, then run the action. The
+                    // borrow is held across remote_action's network await, so
+                    // the render loop pauses until the action completes -- fine
+                    // for the single-button demo; finer-grained concurrency is a
+                    // follow-up.
+                    loop {
+                        if manager_task.try_borrow_mut().is_ok() {
+                            break;
+                        }
+                        gloo_timers::future::TimeoutFuture::new(20).await;
+                    }
+                    let mut m = manager_task.borrow_mut();
+                    let _ = m
+                        .remote_action(&service_net_id, stmts, env, None)
+                        .await;
+                });
+            }
+        });
+        let _ = btn
+            .dyn_ref::<web_sys::EventTarget>()
+            .unwrap()
+            .add_event_listener_with_callback(
+                "click",
+                closure.as_ref().unchecked_ref(),
+            );
+        // Keep the closure alive for the lifetime of the page.
+        closure.forget();
+    }
+}
+
 /// Connect to `server_ws_addr`, fetch and instantiate the `.mkt` at `path`,
 /// then run a background loop that re-renders the `html` def as reactive
 /// updates arrive. Returns once loading is done; the loop keeps running.
@@ -126,9 +215,11 @@ pub async fn load_service(server_ws_addr: String, path: String) -> Result<String
     // runs before any listener exists.
     let manager = Rc::new(RefCell::new(manager));
 
-    // Initial render.
+    // Initial render, then attach click listeners for any handlers.
     if let Some(html) = current_html(&manager.borrow(), html_sym) {
         render_to_dom(&html);
+        let handlers = current_handlers(&manager.borrow(), html_sym);
+        attach_handlers(&manager, handlers);
     }
 
     // 4. Background render loop: pump network events (which apply reactive
@@ -146,6 +237,10 @@ pub async fn load_service(server_ws_addr: String, path: String) -> Result<String
             if now != last {
                 if let Some(html) = &now {
                     render_to_dom(html);
+                    // #153: re-attach listeners; set_inner_html replaced the
+                    // DOM nodes, so previous listeners are gone with them.
+                    let handlers = current_handlers(&manager_loop.borrow(), html_sym);
+                    attach_handlers(&manager_loop, handlers);
                 }
                 last = now;
             }

@@ -6,7 +6,7 @@ async fn test_code_updates_1() {
         service s1 {
             var a = 0;
             var b = 0;
-            def c = (fn (x: int) => x)(a);
+            def c = [a];
         }
     "#;
     let update = r#"

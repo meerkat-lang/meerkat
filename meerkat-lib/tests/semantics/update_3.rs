@@ -11,7 +11,7 @@ async fn test_code_updates_3() {
     "#;
     let update = r#"
         update s1 {
-            def c = a(b); // apply b to a, should not pass
+            def c = a(b); // apply a to b, should not pass
         }
     "#;
     let res = check_update(initial, update).await;

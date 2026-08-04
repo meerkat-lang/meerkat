@@ -169,11 +169,11 @@ fn test_function_calls() {
 fn test_error_display() {
     assert_eq!(
         Error::DepthLimitExceeded.to_string(),
-        "Depth limit exceeded"
+        "depth limit exceeded."
     );
-    assert_eq!(Error::CannotInferType.to_string(), "Cannot infer type");
-    assert_eq!(Error::InvalidTupleArity.to_string(), "Invalid tuple arity");
-    assert_eq!(Error::NotAFunction.to_string(), "Not a function");
+    assert_eq!(Error::CannotInferType.to_string(), "cannot infer type.");
+    assert_eq!(Error::InvalidTupleArity.to_string(), "invalid tuple arity.");
+    assert_eq!(Error::NotAFunction.to_string(), "not a function.");
 }
 
 /// Verify deeply nested type structures fail depth checking
@@ -498,7 +498,13 @@ fn test_circular_dependency() {
         ],
     }];
     let res = check(&program, &mut classes);
-    assert_eq!(res, Err(Error::CannotInferType))
+    assert_eq!(
+        res,
+        Err(Error::DependencyCycle {
+            service: name_s,
+            member: name_a
+        })
+    )
 }
 
 /// Verify member access across different services
@@ -901,23 +907,36 @@ fn test_lambda_annotations_in_checking_mode() {
 }
 
 /// Verify that a local service referencing a member of an imported service
-/// does not produce a type error. The type checker cannot know the member
-/// types of remote services, so it must skip the check and allow the
-/// program to proceed to runtime
+/// is fully type-checked when the unified AST contains the imported service's
+/// declarations (as produced by on_node_startup before static_checks).
 #[test]
-fn test_import_member_access_is_skipped() {
+fn test_import_member_access_resolves_with_unified_ast() {
     let mut interner = Interner::new();
     let remote_svc = interner.insert("na");
     let local_svc = interner.insert("nb");
     let remote_member = interner.insert("get_x");
     let local_val = interner.insert("val");
 
-    // Program: `import na` then `service nb { pub def val = na.get_x; }`
+    // Program simulating unified_ast:
+    //   import na           <- marks na as imported
+    //   service na { pub def get_x = 42; }   <- from fetched source
+    //   service nb { pub def val = na.get_x; }
     let program = vec![
         Stmt::Import {
             path: "na".to_string(),
             service_name: remote_svc,
             explicit_path: false,
+        },
+        Stmt::Service {
+            name: remote_svc,
+            decls: vec![Decl::DefDecl {
+                name: remote_member,
+                ty: None,
+                is_pub: true,
+                val: Expr::Literal {
+                    val: Value::Int { val: 42 },
+                },
+            }],
         },
         Stmt::Service {
             name: local_svc,

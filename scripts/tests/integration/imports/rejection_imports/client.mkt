@@ -1,0 +1,7 @@
+import server_a
+
+service rejection_client {}
+
+@test(rejection_client) {
+    assert(server_a.invalid_field == 42);
+}

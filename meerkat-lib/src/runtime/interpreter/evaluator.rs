@@ -1,6 +1,6 @@
 use crate::ast::{BinOp, Expr, UnOp, Value};
 use crate::runtime::interner::Symbol;
-use crate::runtime::txn::Transaction;
+use crate::runtime::txn::{Transaction, WaitKey};
 use crate::runtime::Manager;
 use std::collections::HashSet;
 
@@ -13,7 +13,7 @@ pub enum EvalError {
     RemoteDispatchFailed(String),
     NotImplemented,
     WaitDieAbort(String),
-    WaitOn(Symbol, Symbol),
+    WaitOn(WaitKey),
     AssertionError(String),
     RuntimeError(String),
 }
@@ -38,8 +38,8 @@ impl std::fmt::Display for EvalError {
             EvalError::RemoteDispatchFailed(s) => write!(f, "Remote dispatch failed: {}", s),
             EvalError::NotImplemented => write!(f, "Not implemented"),
             EvalError::WaitDieAbort(s) => write!(f, "Wait-die abort: {}", s),
-            EvalError::WaitOn(service, var) => {
-                write!(f, "Wait-die wait on Symbol({})::Symbol({})", service, var)
+            EvalError::WaitOn(key) => {
+                write!(f, "Wait-die wait on {:?}", key)
             }
             EvalError::AssertionError(s) => write!(f, "Assertion failed: {}", s),
             EvalError::RuntimeError(s) => write!(f, "Runtime error: {}", s),

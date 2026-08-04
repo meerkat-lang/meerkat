@@ -1,0 +1,43 @@
+{
+  "settings": {
+    "startup_timeout": 60.0,
+    "monitor_poll_interval": 0.25,
+    "terminate_timeout": 5.0
+  },
+  "nodes": [
+    {
+      "alias": "D",
+      "type": "server",
+      "file": "scripts/tests/integration/imports/pipeline/D.mkt",
+      "port": 9160
+    },
+    {
+      "alias": "C",
+      "type": "server",
+      "file": "scripts/tests/integration/imports/pipeline/C.mkt",
+      "port": 9170,
+      "imports": ["D.D"]
+    },
+    {
+      "alias": "B",
+      "type": "server",
+      "file": "scripts/tests/integration/imports/pipeline/B.mkt",
+      "port": 9180,
+      "imports": ["C.C"]
+    },
+    {
+      "alias": "A",
+      "type": "server",
+      "file": "scripts/tests/integration/imports/pipeline/A.mkt",
+      "port": 9190,
+      "imports": ["B.B"]
+    },
+    {
+      "alias": "pipeline_client",
+      "type": "client",
+      "file": "scripts/tests/integration/imports/pipeline/client.mkt",
+      "timeout": 45,
+      "imports": ["A.A"]
+    }
+  ]
+}

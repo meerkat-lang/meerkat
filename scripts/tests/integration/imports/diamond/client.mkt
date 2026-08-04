@@ -1,0 +1,10 @@
+import A
+import B
+import C
+import D
+
+service DiamondClient {}
+
+@test(DiamondClient) {
+    assert(A.get_dashboard == 350);
+}

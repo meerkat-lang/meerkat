@@ -1,0 +1,7 @@
+import D
+
+service B {
+    var val_b = 0;
+    pub def get_val_b = val_b;
+    pub def read_d = D.get_val_d;
+}

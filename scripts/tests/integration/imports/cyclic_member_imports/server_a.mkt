@@ -1,0 +1,5 @@
+import server_b
+
+service server_a {
+    pub def val_a = server_b.val_b;
+}

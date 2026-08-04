@@ -224,7 +224,7 @@ mod tests {
                 | EvalError::RemoteDispatchFailed(_)
                 | EvalError::NotImplemented
                 | EvalError::WaitDieAbort(_)
-                | EvalError::WaitOn(_, _)
+                | EvalError::WaitOn(_)
                 | EvalError::RuntimeError(_) => {
                     panic!("Expected EvalError::AssertionError")
                 }

@@ -1,0 +1,15 @@
+{
+  "settings": {
+    "startup_timeout": 30.0,
+    "monitor_poll_interval": 0.25,
+    "terminate_timeout": 5.0
+  },
+  "nodes": [
+    {
+      "alias": "file_client",
+      "type": "client",
+      "file": "scripts/tests/integration/imports/file_imports/client.mkt",
+      "timeout": 30
+    }
+  ]
+}

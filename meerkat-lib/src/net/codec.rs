@@ -8,13 +8,15 @@ use crate::net::ast::{
     NetActionStmt, NetBinOp, NetExpr, NetField, NetParam, NetServiceType, NetTableType, NetType,
     NetUnOp, NetValue,
 };
-use crate::net::types::MeerkatMessage;
+use crate::net::types::{LockGroup, MeerkatMessage};
 use crate::runtime::ast::{ActionStmt, BinOp, Expr, Field, TableType, UnOp, Value};
 use crate::runtime::interner::{Interner, Symbol};
 use crate::runtime::limits::{
-    MAX_IDENTIFIER_LENGTH, MAX_NET_REQUEST_STRING_LENGTH, MAX_STRING_LITERAL_LENGTH, MAX_TYPE_DEPTH,
+    MAX_IDENTIFIER_LENGTH, MAX_NET_REQUEST_SOURCE_LENGTH, MAX_NET_REQUEST_STRING_LENGTH,
+    MAX_STRING_LITERAL_LENGTH, MAX_TYPE_DEPTH,
 };
 use crate::runtime::tt::{Param, ServiceType, TupleType, Type};
+use std::collections::HashMap;
 
 fn validate_identifier(s: &str) -> Result<()> {
     if s.len() > MAX_IDENTIFIER_LENGTH {
@@ -64,6 +66,87 @@ pub fn validate_service_code_request(path: &str, reply_to: &str) -> Result<()> {
                 "{} exceeds maximum length of {} bytes",
                 field, MAX_NET_REQUEST_STRING_LENGTH
             )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate incoming `ServiceCodeResponse` source and path, returning the
+/// validated service name
+///
+/// Args:
+///     `path` (`&str`): Requested file path
+///     `source` (`&str`): Received source code
+///
+/// Returns:
+///     `Result<String>`: Validated service name
+///
+/// Raises:
+///     `Error::LimitExceeded`: If `source` length exceeds limit or `path` is invalid
+pub fn decode_source_response(path: &str, source: &str) -> Result<String> {
+    if source.len() > MAX_NET_REQUEST_SOURCE_LENGTH {
+        return Err(Error::LimitExceeded(format!(
+            "source size exceeds maximum length of {} bytes",
+            MAX_NET_REQUEST_SOURCE_LENGTH
+        )));
+    }
+    let service_name = path.strip_suffix(".mkt").unwrap_or(path);
+    validate_identifier(service_name)?;
+    Ok(service_name.to_string())
+}
+
+/// Validate identifier fields of a `LookupRequest` message arriving over
+/// the wire
+///
+/// Args:
+///     service (&str): Service identifier
+///     member (&str): Member identifier
+///
+/// Returns:
+///     Result<()>: Ok if valid, or an error if invalid
+///
+/// Raises:
+///     Error::LimitExceeded: If any identifier is invalid or exceeds max length
+pub fn validate_lookup_request(service: &str, member: &str) -> Result<()> {
+    validate_identifier(service)?;
+    validate_identifier(member)?;
+    Ok(())
+}
+
+/// Validate identifier fields of an `ActionRequest` message arriving over
+/// the wire
+///
+/// Args:
+///     service (&str): Service identifier
+///
+/// Returns:
+///     Result<()>: Ok if valid, or an error if invalid
+///
+/// Raises:
+///     Error::LimitExceeded: If identifier is invalid or exceeds max length
+pub fn validate_action_request(service: &str) -> Result<()> {
+    validate_identifier(service)
+}
+
+/// Validate identifier fields of a `LockRequest` message arriving over
+/// the wire
+///
+/// Args:
+///     services (&HashMap<String, LockGroup>): Map of service names to lock groups
+///
+/// Returns:
+///     Result<()>: Ok if valid, or an error if invalid
+///
+/// Raises:
+///     Error::LimitExceeded: If any service or member identifier is invalid or exceeds max length
+pub fn validate_lock_request(services: &HashMap<String, LockGroup>) -> Result<()> {
+    for (svc, group) in services {
+        validate_identifier(svc)?;
+        for r in &group.reads {
+            validate_identifier(r)?;
+        }
+        for w in &group.writes {
+            validate_identifier(w)?;
         }
     }
     Ok(())
@@ -1927,5 +2010,73 @@ mod service_code_tests {
         assert!(
             matches!(res.unwrap_err(), Error::Message(ref msg) if msg.contains("duplicate field name"))
         );
+    }
+
+    /// Verify that validate_lookup_request accepts valid identifiers and rejects invalid ones
+    #[test]
+    fn test_validate_lookup_request() {
+        assert!(validate_lookup_request("valid_service", "valid_member").is_ok());
+        assert!(validate_lookup_request("invalid-service!", "valid_member").is_err());
+        assert!(validate_lookup_request("valid_service", "123invalid_member").is_err());
+
+        let overlong_str = "a".repeat(MAX_IDENTIFIER_LENGTH + 1);
+        assert!(validate_lookup_request(&overlong_str, "valid_member").is_err());
+    }
+
+    /// Verify that validate_action_request accepts valid identifiers and rejects invalid ones
+    #[test]
+    fn test_validate_action_request() {
+        assert!(validate_action_request("valid_service").is_ok());
+        assert!(validate_action_request("invalid service").is_err());
+
+        let overlong_str = "a".repeat(MAX_IDENTIFIER_LENGTH + 1);
+        assert!(validate_action_request(&overlong_str).is_err());
+    }
+
+    /// Verify that validate_lock_request accepts valid lock groups and rejects invalid service or member identifiers
+    #[test]
+    fn test_validate_lock_request() {
+        use std::collections::HashSet;
+
+        let mut services = HashMap::new();
+        let mut reads = HashSet::new();
+        reads.insert("read_var".to_string());
+        let mut writes = HashSet::new();
+        writes.insert("write_var".to_string());
+
+        services.insert(
+            "valid_service".to_string(),
+            LockGroup {
+                service_level_lock: false,
+                reads,
+                writes,
+            },
+        );
+
+        assert!(validate_lock_request(&services).is_ok());
+
+        let mut invalid_svc_map = HashMap::new();
+        invalid_svc_map.insert(
+            "bad-service-name!".to_string(),
+            LockGroup {
+                service_level_lock: false,
+                reads: HashSet::new(),
+                writes: HashSet::new(),
+            },
+        );
+        assert!(validate_lock_request(&invalid_svc_map).is_err());
+
+        let mut invalid_read_map = HashMap::new();
+        let mut bad_reads = HashSet::new();
+        bad_reads.insert("bad member name!".to_string());
+        invalid_read_map.insert(
+            "valid_service".to_string(),
+            LockGroup {
+                service_level_lock: false,
+                reads: bad_reads,
+                writes: HashSet::new(),
+            },
+        );
+        assert!(validate_lock_request(&invalid_read_map).is_err());
     }
 }

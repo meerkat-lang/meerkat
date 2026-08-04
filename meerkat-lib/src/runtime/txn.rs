@@ -8,6 +8,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use web_time::{SystemTime, UNIX_EPOCH};
 
+/// Key identifying a resource in the lock wait queue (service or member)
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum WaitKey {
+    /// Service-level lock resource key
+    Service(ServiceNetId),
+    /// Member-level variable lock resource key
+    Member(ServiceNetId, Symbol),
+}
+
 /// A globally unique transaction identifier represented by `TxnId`
 ///
 /// Per the `Historiographer` design, a `tid` is a (unique node
@@ -186,6 +195,21 @@ impl VarLock {
             VarLock::Unlocked => {}
         }
     }
+
+    /// Return the oldest transaction holding this lock (if any) that is not `ignore_tid`
+    pub fn oldest_other_holder(&self, ignore_tid: &TxnId) -> Option<TxnId> {
+        match self {
+            VarLock::Unlocked => None,
+            VarLock::ReadLocked(set) => set.iter().filter(|tid| *tid != ignore_tid).min().cloned(),
+            VarLock::WriteLocked(tid) => {
+                if tid != ignore_tid {
+                    Some(tid.clone())
+                } else {
+                    None
+                }
+            }
+        }
+    }
 }
 
 /// Composite state for a single variable represented by `VarState`
@@ -226,6 +250,8 @@ pub struct Transaction {
     pub id: TxnId,
     /// Pairs of `(ServiceNetId, Symbol)` this transaction currently holds a lock on
     pub locked: HashSet<(ServiceNetId, Symbol)>,
+    /// Services this transaction currently holds a whole-service lock on
+    pub service_locked: HashSet<ServiceNetId>,
     /// Values already read in this transaction, keyed by (service, variable)
     /// (avoids re-fetching, including redundant network round-trips)
     pub read_cache: HashMap<(ServiceNetId, Symbol), Value>,
@@ -244,6 +270,7 @@ impl Transaction {
         Transaction {
             id,
             locked: HashSet::new(),
+            service_locked: HashSet::new(),
             read_cache: HashMap::new(),
             written: HashMap::new(),
             participants: HashSet::new(),

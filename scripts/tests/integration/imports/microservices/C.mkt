@@ -1,0 +1,4 @@
+service C {
+    var item_count = 50;
+    pub def get_item_count = item_count;
+}

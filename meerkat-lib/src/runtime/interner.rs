@@ -86,6 +86,7 @@ impl Symbol {
 }
 
 /// A string interner that maps strings to unique `Symbol`s
+#[derive(Clone)]
 pub struct Interner {
     index: HashMap<String, u32>,
     strings: Vec<String>,

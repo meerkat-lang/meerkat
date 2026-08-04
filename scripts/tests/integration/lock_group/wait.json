@@ -1,0 +1,56 @@
+{
+  "settings": {
+    "startup_timeout": 60.0,
+    "monitor_poll_interval": 0.25,
+    "terminate_timeout": 5.0
+  },
+  "nodes": [
+    {
+      "alias": "F",
+      "type": "server",
+      "file": "scripts/tests/integration/lock_group/F.mkt",
+      "port": 9030
+    },
+    {
+      "alias": "E",
+      "type": "server",
+      "file": "scripts/tests/integration/lock_group/E.mkt",
+      "port": 9040,
+      "imports": ["F.F"]
+    },
+    {
+      "alias": "D",
+      "type": "server",
+      "file": "scripts/tests/integration/lock_group/D.mkt",
+      "port": 9050
+    },
+    {
+      "alias": "C",
+      "type": "server",
+      "file": "scripts/tests/integration/lock_group/C.mkt",
+      "port": 9060,
+      "imports": ["E.E"]
+    },
+    {
+      "alias": "B",
+      "type": "server",
+      "file": "scripts/tests/integration/lock_group/B.mkt",
+      "port": 9070,
+      "imports": ["D.D"]
+    },
+    {
+      "alias": "A",
+      "type": "server",
+      "file": "scripts/tests/integration/lock_group/A.mkt",
+      "port": 9080,
+      "imports": ["B.B", "C.C"]
+    },
+    {
+      "alias": "lock_wait_client",
+      "type": "client",
+      "cmd": ["cargo", "run", "-p", "meerkat", "--", "--test-locks", "cascade_lock_wait"],
+      "timeout": 45,
+      "imports": ["A.A", "B.B", "C.C", "D.D", "E.E", "F.F"]
+    }
+  ]
+}

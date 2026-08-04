@@ -1,0 +1,8 @@
+import server_a
+import server_b
+
+service cyclic_client {}
+
+@test(cyclic_client) {
+    assert(server_a.val_a == 42);
+}

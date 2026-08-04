@@ -1,0 +1,4 @@
+service D {
+    var val_d = 0;
+    pub def get_val_d = val_d;
+}

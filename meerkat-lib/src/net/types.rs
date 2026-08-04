@@ -1,6 +1,24 @@
 use crate::net::ast::{NetActionStmt, NetValue};
 use crate::runtime::txn::TxnId;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+
+/// A group of member-level and service-level locks to acquire.
+///
+/// Details the set of members (variables or definitions) to lock
+/// for reading and writing, along with an option to acquire a
+/// service-level lock.
+///
+/// Args:
+///     service_level_lock (bool): True to lock the whole service.
+///     reads (HashSet<String>): Set of member names to read-lock.
+///     writes (HashSet<String>): Set of member names to write-lock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockGroup {
+    pub service_level_lock: bool,
+    pub reads: HashSet<String>,
+    pub writes: HashSet<String>,
+}
 
 /// Unique identifier for sent messages (for error tracking)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -190,6 +208,34 @@ pub enum MeerkatMessage {
     /// #39: error responding to a `ServiceCodeRequest`, e.g. an invalid
     /// request (oversized path/reply_to) or a missing resource.
     ServiceCodeError { request_id: u64, error: String },
+
+    /// Eagerly request bulk member-level and service-level locks
+    /// across multiple local services.
+    ///
+    /// Sent by an originator node to a participant node during live
+    /// code updates or transaction initialization. The receiver
+    /// recursively resolves and read-locks or write-locks all
+    /// requested members and their transitive local/cross-service
+    /// dependencies under the shared `txn_id`.
+    LockRequest {
+        request_id: u64,
+        txn_id: TxnId,
+        services: HashMap<String, LockGroup>,
+        reply_to: String,
+    },
+
+    /// Response to a `LockRequest` indicating success or failure.
+    ///
+    /// Sent by a participant node back to the originator. If
+    /// `success` is true, all requested locks have been successfully
+    /// acquired and are held under the transaction. If false,
+    /// contains the error (e.g. due to wait-die abort or timeout).
+    LockResponse {
+        request_id: u64,
+        txn_id: TxnId,
+        success: bool,
+        error: Option<String>,
+    },
 }
 
 /// Errors that can occur when sending messages

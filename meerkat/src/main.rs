@@ -8,12 +8,20 @@ use meerkat_lib::net::{
     codec, Address, MeerkatMessage, NetworkCommand, NetworkEvent, NetworkReply, ServiceNetId,
 };
 use meerkat_lib::runtime::ast::{AstPrinter, Stmt};
-use meerkat_lib::runtime::interner::{Interner, Symbol};
+use meerkat_lib::runtime::interner::Interner;
 use meerkat_lib::runtime::interpreter::EvalError;
 use meerkat_lib::runtime::manager::ParkedRequest;
+use meerkat_lib::runtime::txn::WaitKey;
 use meerkat_lib::runtime::{parser, Manager, Node};
 use std::collections::HashSet;
 use std::error::Error;
+
+#[cfg(debug_assertions)]
+use meerkat_lib::net::types::LockGroup;
+#[cfg(debug_assertions)]
+use meerkat_lib::runtime::txn::TxnId;
+#[cfg(debug_assertions)]
+use std::collections::HashMap;
 
 /// #151: load a persistent libp2p identity keypair from `path`, or create and
 /// save one if the file does not yet exist. Using the same file across runs
@@ -59,6 +67,30 @@ fn load_or_create_identity(
             }
         }
         Err(e) => Err(Box::new(e)),
+    }
+}
+
+/// Helper to send a message over net actor and log if message sending fails
+///
+/// TODO(GitHub Issue #174): The current routing implementation relies
+/// on payload-provided `reply_to` fields, which lack transport-layer
+/// authentication context. Moving forward, it may be beneficial to
+/// align the trust boundary by utilizing authenticated transport
+/// identities.
+///
+/// Args:
+///   `net` (`&mut NetworkActor`): Active network actor
+///   `reply_to` (`&str`): Target multiaddress string
+///   `msg` (`MeerkatMessage`): Message payload to send
+async fn send_net_msg(net: &mut NetworkActor, reply_to: &str, msg: MeerkatMessage) {
+    let reply = net
+        .handle_command(NetworkCommand::SendMessage {
+            addr: Address::new(reply_to),
+            msg,
+        })
+        .await;
+    if let NetworkReply::Failure(e) = reply {
+        log::warn!("Failed to send network message to {}: {}", reply_to, e);
     }
 }
 
@@ -112,11 +144,26 @@ struct Args {
     /// notifications asynchronously as they arrive (issue #24)
     #[arg(long = "watch", default_value_t = false)]
     watch: bool,
+
+    /// Run lock group cascade test client (debug builds only).
+    /// Accepts a test case name; requires -i flags to resolve
+    /// remote service addresses.
+    #[cfg(debug_assertions)]
+    #[arg(long = "test-locks")]
+    test_locks: Option<String>,
 }
 
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
+
+    // Intercept normal node execution to run the transitive
+    // lock-group test client. Only compiled in debug builds;
+    // the flag does not exist in release binaries.
+    #[cfg(debug_assertions)]
+    if let Some(ref test_case) = args.test_locks {
+        return run_lock_test_client(test_case, &args.import_urls).await;
+    }
 
     let log_level = if args.verbose {
         log::LevelFilter::Info
@@ -152,10 +199,52 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                 printer.print_program(&prog);
             }
 
+            let mut opt_server_net: Option<NetworkActor> = None;
+            let mut opt_server_addr: Option<String> = None;
+
+            if args.server {
+                let identity_keypair = match args.identity.as_ref() {
+                    Some(path) => Some(load_or_create_identity(path)?),
+                    None => None,
+                };
+                let mut net =
+                    NetworkActor::new_with_identity(NodeType::Server, identity_keypair).await?;
+                let listen_ip = if args.local { "127.0.0.1" } else { "0.0.0.0" };
+                let listen_addr = Address::new(format!("/ip4/{}/tcp/{}", listen_ip, args.port));
+                let reply = net
+                    .handle_command(NetworkCommand::Listen { addr: listen_addr })
+                    .await;
+                let actual_addr = listen_success_addr(reply)?;
+
+                let dummy_manager = Manager::new(node.interner.clone());
+                let node_ip = if args.local {
+                    "127.0.0.1".to_string()
+                } else {
+                    dummy_manager.get_node_ip()
+                };
+                let peer_id = net.local_peer_id();
+                let actual_addr_str = actual_addr
+                    .0
+                    .replace("0.0.0.0", &node_ip)
+                    .replace("127.0.0.1", &node_ip);
+                let full_addr = format!("{}/p2p/{}", actual_addr_str, peer_id);
+
+                opt_server_net = Some(net);
+                opt_server_addr = Some(full_addr);
+            }
+
             // Perform static validation checks on the parsed program
             // statements before executing or starting the server
-            node.check(&prog)
-                .map_err(|e| format!("Static check error: {}", e))?;
+            node.resolve_imports_with_net(
+                file,
+                remote_url_map.clone(),
+                opt_server_net.as_mut(),
+                opt_server_addr.as_deref(),
+            )
+            .await
+            .map_err(|e| format!("Import error: {}", e))?
+            .static_checks()
+            .map_err(|e| format!("Static check error: {}", e))?;
 
             // This mode must appear before `server` args check in
             // order to properly stop execution. Logic for static
@@ -167,9 +256,14 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                 return Ok(());
             }
 
-            let interner = node.interner;
+            let interner = node.interner.clone();
 
             if args.server {
+                let server_net = opt_server_net
+                    .expect("Server network should be initialized when args.server is true");
+                let server_addr = opt_server_addr
+                    .expect("Server address should be initialized when args.server is true");
+
                 run_server(
                     prog,
                     file,
@@ -181,6 +275,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                         identity: args.identity,
                     },
                     interner,
+                    Some((server_net, server_addr)),
                 )
                 .await
             } else {
@@ -218,10 +313,9 @@ async fn run_and_reply_or_park(manager: &mut Manager, parked: ParkedRequest) {
                 .execute_action_participant(service, &stmts, &env, tid.clone())
                 .await
             {
-                Err(EvalError::WaitOn(svc, var)) => {
-                    manager.park_request(
-                        svc,
-                        var,
+                Err(EvalError::WaitOn(key)) => {
+                    manager.park_request_key(
+                        key,
                         ParkedRequest::Action {
                             request_id,
                             reply_to,
@@ -239,11 +333,7 @@ async fn run_and_reply_or_park(manager: &mut Manager, parked: ParkedRequest) {
                         error: other.err().map(|e| e.to_string()),
                     };
                     if let Some(net) = manager.network.as_mut() {
-                        net.handle_command(NetworkCommand::SendMessage {
-                            addr: Address::new(&reply_to),
-                            msg: response,
-                        })
-                        .await;
+                        send_net_msg(net, &reply_to, response).await;
                     }
                 }
             }
@@ -259,10 +349,9 @@ async fn run_and_reply_or_park(manager: &mut Manager, parked: ParkedRequest) {
                 .remote_read_participant(service, member, tid.clone())
                 .await
             {
-                Err(EvalError::WaitOn(svc, var)) => {
-                    manager.park_request(
-                        svc,
-                        var,
+                Err(EvalError::WaitOn(key)) => {
+                    manager.park_request_key(
+                        key,
                         ParkedRequest::Lookup {
                             request_id,
                             reply_to,
@@ -284,11 +373,7 @@ async fn run_and_reply_or_park(manager: &mut Manager, parked: ParkedRequest) {
                         },
                     };
                     if let Some(net) = manager.network.as_mut() {
-                        net.handle_command(NetworkCommand::SendMessage {
-                            addr: Address::new(&reply_to),
-                            msg: response,
-                        })
-                        .await;
+                        send_net_msg(net, &reply_to, response).await;
                     }
                 }
                 Err(e) => {
@@ -297,11 +382,49 @@ async fn run_and_reply_or_park(manager: &mut Manager, parked: ParkedRequest) {
                         error: e.to_string(),
                     };
                     if let Some(net) = manager.network.as_mut() {
-                        net.handle_command(NetworkCommand::SendMessage {
-                            addr: Address::new(&reply_to),
-                            msg: response,
-                        })
-                        .await;
+                        send_net_msg(net, &reply_to, response).await;
+                    }
+                }
+            }
+        }
+        // Re-dispatch a previously parked LockRequest message.
+        // Attempts lock acquisition again under the transaction.
+        ParkedRequest::Lock {
+            request_id,
+            reply_to,
+            txn_id,
+            services,
+        } => {
+            match manager
+                .handle_lock_request(txn_id.clone(), services.clone())
+                .await
+            {
+                // Defensive check: If lock acquisition is blocked
+                // again (e.g., by an older transaction), park the
+                // request in the queue to await future release.
+                Err(EvalError::WaitOn(key)) => {
+                    manager.park_request_key(
+                        key,
+                        ParkedRequest::Lock {
+                            request_id,
+                            reply_to,
+                            txn_id,
+                            services,
+                        },
+                    );
+                }
+                // Terminal outcome: Lock request either succeeded
+                // completely or aborted (died under wait-die). Send
+                // the result back to the originator.
+                other => {
+                    let response = MeerkatMessage::LockResponse {
+                        request_id,
+                        txn_id,
+                        success: other.is_ok(),
+                        error: other.err().map(|e| e.to_string()),
+                    };
+                    if let Some(net) = manager.network.as_mut() {
+                        send_net_msg(net, &reply_to, response).await;
                     }
                 }
             }
@@ -311,7 +434,7 @@ async fn run_and_reply_or_park(manager: &mut Manager, parked: ParkedRequest) {
 
 /// After a holder releases its locks on commit or abort, re-dispatch the parked
 /// requests waiting on the freed variables, oldest first.
-async fn wake_ready(manager: &mut Manager, freed: HashSet<(ServiceNetId, Symbol)>) {
+async fn wake_ready(manager: &mut Manager, freed: HashSet<WaitKey>) {
     for parked in manager.take_ready_waiters(&freed) {
         run_and_reply_or_park(manager, parked).await;
     }
@@ -385,6 +508,7 @@ async fn run_server(
     remote_url_map: std::collections::HashMap<String, String>,
     config: ServerConfig,
     interner: Interner,
+    pre_init: Option<(NetworkActor, String)>,
 ) -> Result<(), Box<dyn Error>> {
     // #39: the directory the server was started from is the root for serving
     // `.mkt` files: a ServiceCodeRequest names a file by path, which is
@@ -393,31 +517,43 @@ async fn run_server(
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .to_path_buf();
-    // #151: when an identity file is configured, load (or create) a
-    // persistent keypair so the Peer ID is stable across restarts.
-    let identity_keypair = match config.identity {
-        Some(path) => Some(load_or_create_identity(&path)?),
-        None => None,
-    };
-    let mut net = NetworkActor::new_with_identity(NodeType::Server, identity_keypair).await?;
+
     let mut manager = Manager::new(interner);
     manager.local = config.local;
 
+    let (mut net, full_addr) = match pre_init {
+        Some(pair) => pair,
+        None => {
+            // #151: when an identity file is configured, load (or create) a
+            // persistent keypair so the Peer ID is stable across restarts.
+            let identity_keypair = match config.identity {
+                Some(ref path) => Some(load_or_create_identity(path)?),
+                None => None,
+            };
+            let mut net =
+                NetworkActor::new_with_identity(NodeType::Server, identity_keypair).await?;
+            let node_ip = manager.get_node_ip();
+            let listen_ip = if config.local { "127.0.0.1" } else { "0.0.0.0" };
+            let listen_addr = Address::new(format!("/ip4/{}/tcp/{}", listen_ip, config.port));
+            let reply = net
+                .handle_command(NetworkCommand::Listen { addr: listen_addr })
+                .await;
+            let actual_addr = listen_success_addr(reply)?;
+
+            let peer_id = net.local_peer_id();
+            // Replace loopback/unspecified with actual node IP
+            let actual_addr_str = actual_addr
+                .0
+                .replace("0.0.0.0", &node_ip)
+                .replace("127.0.0.1", &node_ip);
+            let full_addr = format!("{}/p2p/{}", actual_addr_str, peer_id);
+            (net, full_addr)
+        }
+    };
+
     let node_ip = manager.get_node_ip();
     let listen_ip = if config.local { "127.0.0.1" } else { "0.0.0.0" };
-    let listen_addr = Address::new(format!("/ip4/{}/tcp/{}", listen_ip, config.port));
-    let reply = net
-        .handle_command(NetworkCommand::Listen { addr: listen_addr })
-        .await;
-    let actual_addr = listen_success_addr(reply)?;
-
     let peer_id = net.local_peer_id();
-    // Replace loopback/unspecified with actual node IP
-    let actual_addr_str = actual_addr
-        .0
-        .replace("0.0.0.0", &node_ip)
-        .replace("127.0.0.1", &node_ip);
-    let full_addr = format!("{}/p2p/{}", actual_addr_str, peer_id);
     println!("Server listening at: {}", full_addr);
 
     // #39: browser (wasm) clients can only speak WebSocket, so listen on a
@@ -487,11 +623,7 @@ async fn run_server(
         if last_keepalive.elapsed() >= std::time::Duration::from_secs(5) {
             for (request_id, reply_to) in manager.parked_keepalive_targets() {
                 if let Some(net) = manager.network.as_mut() {
-                    net.handle_command(NetworkCommand::SendMessage {
-                        addr: Address::new(&reply_to),
-                        msg: MeerkatMessage::WaitParked { request_id },
-                    })
-                    .await;
+                    send_net_msg(net, &reply_to, MeerkatMessage::WaitParked { request_id }).await;
                 }
             }
             last_keepalive = tokio::time::Instant::now();
@@ -506,6 +638,16 @@ async fn run_server(
                     reply_to,
                     txn_id,
                 } => {
+                    if let Err(e) = codec::validate_lookup_request(&service, &member) {
+                        let response = MeerkatMessage::LookupError {
+                            request_id,
+                            error: e.to_string(),
+                        };
+                        if let Some(net) = manager.network.as_mut() {
+                            send_net_msg(net, &reply_to, response).await;
+                        }
+                        continue;
+                    }
                     let svc_sym = manager.interner.insert(&service);
                     let mem_sym = manager.interner.insert(&member);
                     match txn_id {
@@ -543,11 +685,7 @@ async fn run_server(
                                 },
                             };
                             if let Some(net) = manager.network.as_mut() {
-                                net.handle_command(NetworkCommand::SendMessage {
-                                    addr: Address::new(&reply_to),
-                                    msg: response,
-                                })
-                                .await;
+                                send_net_msg(net, &reply_to, response).await;
                             }
                         }
                     }
@@ -560,6 +698,17 @@ async fn run_server(
                     reply_to,
                     txn_id,
                 } => {
+                    if let Err(e) = codec::validate_action_request(&service) {
+                        let response = MeerkatMessage::ActionResponse {
+                            request_id,
+                            success: false,
+                            error: Some(e.to_string()),
+                        };
+                        if let Some(net) = manager.network.as_mut() {
+                            send_net_msg(net, &reply_to, response).await;
+                        }
+                        continue;
+                    }
                     let svc_sym = manager.interner.insert(&service);
                     let mut local_stmts = Vec::new();
                     let mut decode_failed = false;
@@ -594,11 +743,7 @@ async fn run_server(
                             error: error_msg,
                         };
                         if let Some(net) = manager.network.as_mut() {
-                            net.handle_command(NetworkCommand::SendMessage {
-                                addr: Address::new(&reply_to),
-                                msg: response,
-                            })
-                            .await;
+                            send_net_msg(net, &reply_to, response).await;
                         }
                         continue;
                     }
@@ -630,11 +775,7 @@ async fn run_server(
                                 error: result.err().map(|e| e.to_string()),
                             };
                             if let Some(net) = manager.network.as_mut() {
-                                net.handle_command(NetworkCommand::SendMessage {
-                                    addr: Address::new(&reply_to),
-                                    msg: response,
-                                })
-                                .await;
+                                send_net_msg(net, &reply_to, response).await;
                             }
                         }
                     }
@@ -655,11 +796,7 @@ async fn run_server(
                         error: result.err().map(|e| e.to_string()),
                     };
                     if let Some(net) = manager.network.as_mut() {
-                        net.handle_command(NetworkCommand::SendMessage {
-                            addr: Address::new(&reply_to),
-                            msg: response,
-                        })
-                        .await;
+                        send_net_msg(net, &reply_to, response).await;
                     }
                     // Wake transactions that were waiting on locks this
                     // commit just released.
@@ -675,15 +812,50 @@ async fn run_server(
                     // do not later wake for an abandoned transaction.
                     manager.purge_parked_txn(&txn_id);
                     if let Some(net) = manager.network.as_mut() {
-                        net.handle_command(NetworkCommand::SendMessage {
-                            addr: Address::new(&reply_to),
-                            msg: MeerkatMessage::AbortResponse { request_id },
-                        })
+                        send_net_msg(
+                            net,
+                            &reply_to,
+                            MeerkatMessage::AbortResponse { request_id },
+                        )
                         .await;
                     }
                     // Wake transactions that were waiting on locks this
                     // abort just released.
                     wake_ready(&mut manager, freed).await;
+                }
+                // Incoming LockRequest from a remote originator node.
+                // Wraps the request as a `ParkedRequest::Lock` and
+                // dispatches it: if locks are free they are acquired
+                // immediately; if blocked, the request parks on the
+                // wait queue and is retried when locks are released.
+                MeerkatMessage::LockRequest {
+                    request_id,
+                    txn_id,
+                    services,
+                    reply_to,
+                } => {
+                    if let Err(e) = codec::validate_lock_request(&services) {
+                        let response = MeerkatMessage::LockResponse {
+                            request_id,
+                            txn_id,
+                            success: false,
+                            error: Some(e.to_string()),
+                        };
+                        if let Some(net) = manager.network.as_mut() {
+                            send_net_msg(net, &reply_to, response).await;
+                        }
+                        continue;
+                    }
+                    run_and_reply_or_park(
+                        &mut manager,
+                        ParkedRequest::Lock {
+                            request_id,
+                            reply_to,
+                            txn_id,
+                            services,
+                        },
+                    )
+                    .await;
                 }
                 MeerkatMessage::RequestUpdates {
                     service,
@@ -756,16 +928,12 @@ async fn run_server(
                 } => {
                     let response = codec::serve_service_code(
                         request_id,
-                        path,
+                        path.clone(),
                         &reply_to,
                         &served_base_dir,
                     );
                     if let Some(net) = manager.network.as_mut() {
-                        net.handle_command(NetworkCommand::SendMessage {
-                            addr: Address::new(&reply_to),
-                            msg: response,
-                        })
-                        .await;
+                        send_net_msg(net, &reply_to, response).await;
                     }
                 }
                 MeerkatMessage::Ping { .. }
@@ -778,6 +946,10 @@ async fn run_server(
                 | MeerkatMessage::ActionResponse { .. }
                 | MeerkatMessage::CommitResponse { .. }
                 | MeerkatMessage::AbortResponse { .. }
+                // `LockResponse` is a reply routed back to an
+                // originator via the oneshot reply table. It is not
+                // directly handled by a server's message loop.
+                | MeerkatMessage::LockResponse { .. }
                 // #39: code responses are client-bound replies, not seen at the server.
                 | MeerkatMessage::ServiceCodeResponse { .. }
                 | MeerkatMessage::ServiceCodeError { .. }
@@ -938,6 +1110,342 @@ async fn run_client(
             }
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         }
+    }
+
+    Ok(())
+}
+
+/// Lock group cascade integration test client (debug builds only).
+///
+/// Drives the distributed transitive locking test suite from a
+/// dedicated client process. Each test case establishes a set of
+/// conflicting or cooperative lock states across the 6-node test
+/// cluster and asserts the expected outcome from the lock protocol.
+///
+/// Args:
+///     test_case (&str): Name of the test scenario to run.
+///     import_urls (&[String]): Remote service URLs (from -i flags).
+///
+/// Returns:
+///     Result<(), Box<dyn Error>>: Ok on success; Err on test failure.
+#[cfg(debug_assertions)]
+async fn run_lock_test_client(
+    test_case: &str,
+    import_urls: &[String],
+) -> Result<(), Box<dyn Error>> {
+    println!("Starting lock test client for case: {}", test_case);
+
+    let mut net = NetworkActor::new(NodeType::Server).await?;
+    let mut manager = Manager::new(Interner::new());
+    manager.local = true;
+
+    // Listen on an ephemeral port so we have a valid reply address.
+    let listen_addr = Address::new("/ip4/127.0.0.1/tcp/0");
+    let reply = net
+        .handle_command(NetworkCommand::Listen { addr: listen_addr })
+        .await;
+    let actual_addr = listen_success_addr(reply)?;
+    let peer_id = net.local_peer_id();
+    let full_addr = format!("{}/p2p/{}", actual_addr.0, peer_id);
+    manager.set_local_address(full_addr);
+
+    manager.network = Some(net);
+
+    // Register all remote service urls from the -i flags so the
+    // manager can resolve service names to network addresses.
+    for url in import_urls {
+        if let Some(slug) = url.split('/').next_back() {
+            let sym = manager.interner.insert(slug);
+            manager
+                .remote_services
+                .insert(sym, Address::new(url.clone()));
+        }
+    }
+
+    match test_case {
+        // Test: cascade_lock_success
+        // Verifies that a LockRequest arriving at Node A cascades
+        // transitively through B/C, D/E, and down to F, and that
+        // all transitive members are successfully read-locked.
+        "cascade_lock_success" => {
+            let svc_a_sym = manager.interner.insert("A");
+            let addr_a = manager.remote_addr(svc_a_sym)?;
+
+            let txn_id = TxnId::new(manager.node_id);
+            let mut services = HashMap::new();
+            services.insert(
+                "A".to_string(),
+                LockGroup {
+                    service_level_lock: false,
+                    reads: HashSet::from(["read_bc".to_string()]),
+                    writes: HashSet::new(),
+                },
+            );
+
+            println!("Sending LockRequest to Node A: {:?}", services);
+            let reply_to = manager.local_reply_addr().await;
+            let reply = manager
+                .send_and_await_reply(
+                    addr_a,
+                    MeerkatMessage::LockRequest {
+                        request_id: 1,
+                        txn_id: txn_id.clone(),
+                        services,
+                        reply_to,
+                    },
+                    1,
+                    "Timeout waiting for lock response from Node A".to_string(),
+                )
+                .await?;
+
+            // Defensive post-condition: assert LockResponse was
+            // received and indicates successful lock acquisition.
+            match reply {
+                MeerkatMessage::LockResponse { success, error, .. } => {
+                    assert!(success, "Lock request failed: {:?}", error);
+                    println!("PASS: lock cascaded successfully!");
+                }
+                other => panic!("Unexpected reply: {:?}", other),
+            }
+        }
+
+        // Test: cascade_abort_wait_die
+        // Verifies that a younger transaction starting a cascading
+        // LockRequest immediately aborts (dies) when an older
+        // transaction already holds a conflicting write lock on
+        // Node F, per the wait-die deadlock prevention protocol.
+        "cascade_abort_wait_die" => {
+            let svc_f_sym = manager.interner.insert("F");
+            let addr_f = manager.remote_addr(svc_f_sym)?;
+
+            // Phase 1: Establish a high-priority (old) conflicting
+            // write lock on Node F.
+            let conflict_txn_id = TxnId {
+                timestamp: 1,
+                node_id: 999,
+                iteration: 0,
+            };
+            let mut services_f = HashMap::new();
+            services_f.insert(
+                "F".to_string(),
+                LockGroup {
+                    service_level_lock: false,
+                    reads: HashSet::new(),
+                    writes: HashSet::from(["val_f".to_string()]),
+                },
+            );
+
+            println!("Acquiring conflict write-lock on F...");
+            let reply_to = manager.local_reply_addr().await;
+            let reply = manager
+                .send_and_await_reply(
+                    addr_f.clone(),
+                    MeerkatMessage::LockRequest {
+                        request_id: 1,
+                        txn_id: conflict_txn_id.clone(),
+                        services: services_f,
+                        reply_to,
+                    },
+                    1,
+                    "Timeout write-locking val_f on F".to_string(),
+                )
+                .await?;
+            // Defensive pre-condition: conflict lock must succeed
+            // before testing that wait-die correctly aborts the
+            // younger conflicting transaction.
+            assert!(matches!(
+                reply,
+                MeerkatMessage::LockResponse { success: true, .. }
+            ));
+
+            // Phase 2: Start a low-priority (young) transaction on
+            // Node A. It should cascade to F and abort immediately.
+            let txn_id = TxnId {
+                timestamp: 1000,
+                node_id: 1,
+                iteration: 0,
+            };
+            let svc_a_sym = manager.interner.insert("A");
+            let addr_a = manager.remote_addr(svc_a_sym)?;
+
+            let mut services_a = HashMap::new();
+            services_a.insert(
+                "A".to_string(),
+                LockGroup {
+                    service_level_lock: false,
+                    reads: HashSet::from(["read_bc".to_string()]),
+                    writes: HashSet::new(),
+                },
+            );
+
+            println!(
+                "Sending LockRequest to A (should conflict and \
+                 wait-die)..."
+            );
+            let reply_to = manager.local_reply_addr().await;
+            let reply = manager
+                .send_and_await_reply(
+                    addr_a,
+                    MeerkatMessage::LockRequest {
+                        request_id: 2,
+                        txn_id: txn_id.clone(),
+                        services: services_a,
+                        reply_to,
+                    },
+                    2,
+                    "Timeout waiting for lock response from Node A".to_string(),
+                )
+                .await?;
+
+            // Defensive post-condition: assert the younger txn
+            // was rejected with a wait-die abort error string.
+            match reply {
+                MeerkatMessage::LockResponse { success, error, .. } => {
+                    assert!(
+                        !success,
+                        "Lock request should have failed due to \
+                         wait-die"
+                    );
+                    let err_str = error.unwrap();
+                    println!("Lock response failed as expected: {}", err_str);
+                    assert!(err_str.contains("died contending"));
+                    println!(
+                        "PASS: lock cascaded and aborted \
+                         successfully via wait-die!"
+                    );
+                }
+                other => panic!("Unexpected reply: {:?}", other),
+            }
+        }
+
+        // Test: cascade_lock_wait
+        // Verifies that an older transaction that blocks on a
+        // younger transaction's lock correctly parks and is woken
+        // when the younger transaction commits.
+        "cascade_lock_wait" => {
+            let svc_f_sym = manager.interner.insert("F");
+            let addr_f = manager.remote_addr(svc_f_sym)?;
+
+            // Phase 1: Establish a low-priority (young) write lock
+            // on Node F to create the blocking condition.
+            let conflict_txn_id = TxnId {
+                timestamp: 10000,
+                node_id: 1,
+                iteration: 0,
+            };
+            let mut services_f = HashMap::new();
+            services_f.insert(
+                "F".to_string(),
+                LockGroup {
+                    service_level_lock: false,
+                    reads: HashSet::new(),
+                    writes: HashSet::from(["val_f".to_string()]),
+                },
+            );
+
+            println!("Acquiring younger write-lock on F...");
+            let reply_to = manager.local_reply_addr().await;
+            let reply = manager
+                .send_and_await_reply(
+                    addr_f.clone(),
+                    MeerkatMessage::LockRequest {
+                        request_id: 1,
+                        txn_id: conflict_txn_id.clone(),
+                        services: services_f,
+                        reply_to,
+                    },
+                    1,
+                    "Timeout write-locking val_f on F".to_string(),
+                )
+                .await?;
+            // Defensive pre-condition: conflict lock must be held
+            // before the older transaction attempts to cascade.
+            assert!(matches!(
+                reply,
+                MeerkatMessage::LockResponse { success: true, .. }
+            ));
+
+            // Phase 2: Start a high-priority (old) transaction on
+            // Node A that cascades to F and parks waiting.
+            let txn_id = TxnId {
+                timestamp: 5,
+                node_id: 1,
+                iteration: 0,
+            };
+            let svc_a_sym = manager.interner.insert("A");
+            let addr_a = manager.remote_addr(svc_a_sym)?;
+
+            let mut services_a = HashMap::new();
+            services_a.insert(
+                "A".to_string(),
+                LockGroup {
+                    service_level_lock: false,
+                    reads: HashSet::from(["read_bc".to_string()]),
+                    writes: HashSet::new(),
+                },
+            );
+
+            // Phase 3: Spawn a background task that commits the
+            // conflict transaction on F after a delay, releasing
+            // the lock and waking the parked older transaction.
+            let addr_f_clone = addr_f.clone();
+            let conflict_txn_id_clone = conflict_txn_id.clone();
+            let reply_to_addr = manager.local_reply_addr().await;
+            tokio::spawn(async move {
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                println!(
+                    "Background task: committing conflict \
+                     transaction on F to wake older lock request..."
+                );
+                if let Ok(mut temp_net) = NetworkActor::new(NodeType::Server).await {
+                    let msg = MeerkatMessage::Commit {
+                        request_id: 99,
+                        txn_id: conflict_txn_id_clone,
+                        reply_to: reply_to_addr,
+                    };
+                    let _ = temp_net
+                        .handle_command(NetworkCommand::SendMessage {
+                            addr: addr_f_clone,
+                            msg,
+                        })
+                        .await;
+                }
+            });
+
+            println!(
+                "Sending LockRequest to A (should block on F, \
+                 then get woken up and succeed)..."
+            );
+            let reply_to = manager.local_reply_addr().await;
+            let reply = manager
+                .send_and_await_reply(
+                    addr_a,
+                    MeerkatMessage::LockRequest {
+                        request_id: 2,
+                        txn_id: txn_id.clone(),
+                        services: services_a,
+                        reply_to,
+                    },
+                    2,
+                    "Timeout waiting for lock response from Node A".to_string(),
+                )
+                .await?;
+
+            // Defensive post-condition: the older transaction must
+            // have been woken successfully and its lock acquired.
+            match reply {
+                MeerkatMessage::LockResponse { success, error, .. } => {
+                    assert!(success, "Lock request failed: {:?}", error);
+                    println!(
+                        "PASS: lock cascaded and succeeded after \
+                         wait/wake!"
+                    );
+                }
+                other => panic!("Unexpected reply: {:?}", other),
+            }
+        }
+
+        _ => return Err(format!("Unknown lock test case: {}", test_case).into()),
     }
 
     Ok(())

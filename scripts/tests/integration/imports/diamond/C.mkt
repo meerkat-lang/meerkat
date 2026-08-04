@@ -1,0 +1,5 @@
+import D
+
+service C {
+    pub def get_notifications = D.get_active + 50;
+}

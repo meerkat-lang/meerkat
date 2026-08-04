@@ -1,0 +1,3 @@
+service server_b {
+    pub def remote_val = 50;
+}

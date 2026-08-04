@@ -3,11 +3,11 @@ use super::interpreter::{eval, execute, EvalContext, EvalError, ExecuteEffect};
 use super::semantic_analysis::var_analysis::{calc_dep_srv, DependAnalysis};
 use crate::net::network_layer::NetworkLayer;
 use crate::net::{
-    codec, Address, MeerkatMessage, NetworkActor, NetworkCommand, NetworkEvent, NetworkReply,
-    ServiceNetId,
+    codec, Address, LockGroup, MeerkatMessage, NetworkActor, NetworkCommand, NetworkEvent,
+    NetworkReply, ServiceNetId,
 };
 use crate::runtime::interner::{Interner, Symbol};
-use crate::runtime::txn::{Transaction, TxnId, VarState};
+use crate::runtime::txn::{Transaction, TxnId, VarState, WaitKey};
 use std::collections::{HashMap, HashSet};
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
@@ -26,6 +26,8 @@ pub struct Service {
     /// #24: cached values of each def's cross-service deps:
     /// def -> {(source service, member) -> value}.
     pub dep_cache: HashMap<Symbol, HashMap<(Symbol, Symbol), Value>>,
+    /// Optional lock for whole-service blocking during structural updates
+    pub service_lock: Option<TxnId>,
 }
 
 /// A remote request parked on a variable's wait queue because the requesting
@@ -48,6 +50,12 @@ pub enum ParkedRequest {
         member: Symbol,
         tid: TxnId,
     },
+    Lock {
+        request_id: u64,
+        reply_to: String,
+        txn_id: TxnId,
+        services: HashMap<String, LockGroup>,
+    },
 }
 
 impl ParkedRequest {
@@ -57,6 +65,7 @@ impl ParkedRequest {
         match self {
             ParkedRequest::Action { tid, .. } => tid,
             ParkedRequest::Lookup { tid, .. } => tid,
+            ParkedRequest::Lock { txn_id, .. } => txn_id,
         }
     }
 }
@@ -77,9 +86,9 @@ pub struct Manager {
     /// buffered writes) until a Commit or Abort arrives.
     pub pending_txns: HashMap<TxnId, Transaction>,
     /// Requests parked because the requesting transaction is older than a lock
-    /// holder (wait-die wait), keyed by the contended (service, var). Drained
-    /// oldest-first when that variable's lock frees on commit or abort.
-    pub wait_queue: HashMap<(ServiceNetId, Symbol), Vec<ParkedRequest>>,
+    /// holder (wait-die wait), keyed by the contended WaitKey. Drained
+    /// oldest-first when that lock frees on commit or abort.
+    pub wait_queue: HashMap<WaitKey, Vec<ParkedRequest>>,
     /// This node's canonical, dialable address, set once after the network is
     /// listening. Service identities are derived from it, so they are stable for
     /// the life of the process (never empty-then-populated) and match the URL
@@ -116,22 +125,24 @@ impl Manager {
         }
     }
 
+    /// Park a request on the wait queue for the contended `WaitKey`
+    pub fn park_request_key(&mut self, key: WaitKey, parked: ParkedRequest) {
+        self.wait_queue.entry(key).or_default().push(parked);
+    }
+
     /// Park a request on the wait queue for the contended `(service, var)`
     /// It receives no reply until that variable's lock frees and it is
     /// re-dispatched
     pub fn park_request(&mut self, service: Symbol, var: Symbol, parked: ParkedRequest) {
-        let key = (self.service_net_id_for_name(service), var);
-        self.wait_queue.entry(key).or_default().push(parked);
+        let key = WaitKey::Member(self.service_net_id_for_name(service), var);
+        self.park_request_key(key, parked);
     }
 
     /// After a holder releases locks on commit or abort, return the oldest
-    /// parked request waiting on each freed (service, var), removing it from the
+    /// parked request waiting on each freed lock key, removing it from the
     /// queue. Serving the oldest first is what keeps an older transaction from
     /// being starved by a stream of younger requests.
-    pub fn take_ready_waiters(
-        &mut self,
-        freed: &HashSet<(ServiceNetId, Symbol)>,
-    ) -> Vec<ParkedRequest> {
+    pub fn take_ready_waiters(&mut self, freed: &HashSet<WaitKey>) -> Vec<ParkedRequest> {
         let mut ready = Vec::new();
         for key in freed {
             if let Some(waiters) = self.wait_queue.get_mut(key) {
@@ -184,6 +195,11 @@ impl Manager {
                         ..
                     } => (*request_id, reply_to.clone()),
                     ParkedRequest::Lookup {
+                        request_id,
+                        reply_to,
+                        ..
+                    } => (*request_id, reply_to.clone()),
+                    ParkedRequest::Lock {
                         request_id,
                         reply_to,
                         ..
@@ -242,6 +258,7 @@ impl Manager {
                 dep,
                 listeners: HashMap::new(),
                 dep_cache: HashMap::new(),
+                service_lock: None,
             },
         );
 
@@ -315,10 +332,19 @@ impl Manager {
 
         // #87: commit on success, abort and roll back on failure (pattern from
         // execute_action_with_txn).
+        // #98: a participant commit can fail after prepare (timeout, etc.).
+        // Apply local writes, then attempt every participant commit -- do not
+        // stop at the first failure, or later participants are left prepared --
+        // and remember the first error to surface once init otherwise succeeded.
+        let mut commit_error = None;
         if init_error.is_none() {
             self.apply_committed_writes(&txn).await;
             for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
-                let _ = self.send_commit(addr, &txn.id).await;
+                if let Err(e) = self.send_commit(addr, &txn.id).await {
+                    if commit_error.is_none() {
+                        commit_error = Some(e);
+                    }
+                }
             }
 
             // #24: now that init succeeded, register listener edges so a change to
@@ -327,39 +353,54 @@ impl Manager {
             // owner is wired in-process and a remote owner is subscribed over the
             // wire. Only runs on the success path: a rolled-back service must not
             // register listeners.
-            if let Some(s) = self.services.get(&svc_name) {
-                let this_id = s.id.clone();
-                let mut edges: Vec<(Symbol, Symbol, Symbol)> = Vec::new();
-                for (def_name, deps) in &s.dep.dep_graph {
-                    if s.defs.contains_key(def_name) {
-                        for dep_member in deps {
-                            edges.push((svc_name, *dep_member, *def_name));
+            // #98: also skip when a participant commit failed -- that service is
+            // about to be rolled back below, so it must not wire up listeners.
+            if commit_error.is_none() {
+                if let Some(s) = self.services.get(&svc_name) {
+                    let this_id = s.id.clone();
+                    let mut edges: Vec<(Symbol, Symbol, Symbol)> = Vec::new();
+                    for (def_name, deps) in &s.dep.dep_graph {
+                        if s.defs.contains_key(def_name) {
+                            for dep_member in deps {
+                                edges.push((svc_name, *dep_member, *def_name));
+                            }
+                        }
+                    }
+                    // #24: cross-service deps, derived from each stored def
+                    // expression (dep_remote removed: these are just the keys of
+                    // dep_cache, recomputed here from the def's MemberAccess refs).
+                    for (def_name, expr) in &s.defs {
+                        for (owner, member) in expr.cross_service_deps() {
+                            edges.push((owner, member, *def_name));
+                        }
+                    }
+                    for (owner, member, listener_def) in edges {
+                        if self.services.contains_key(&owner) {
+                            if let Some(owner_svc) = self.services.get_mut(&owner) {
+                                owner_svc
+                                    .listeners
+                                    .entry(member)
+                                    .or_default()
+                                    .insert((this_id.clone(), listener_def));
+                            }
+                        } else {
+                            // remote owner: subscribe over the wire so future changes push.
+                            self.subscribe_remote(owner, member, this_id.clone(), listener_def)
+                                .await;
                         }
                     }
                 }
-                // #24: cross-service deps, derived from each stored def
-                // expression (dep_remote removed: these are just the keys of
-                // dep_cache, recomputed here from the def's MemberAccess refs).
-                for (def_name, expr) in &s.defs {
-                    for (owner, member) in expr.cross_service_deps() {
-                        edges.push((owner, member, *def_name));
-                    }
+            } // end: commit_error.is_none()
+
+            // #98: a participant failed to commit after prepare. Roll the local
+            // service back rather than leaving it half-committed but live: abort
+            // participants and remove the service, mirroring the init-failure
+            // path. The captured error is returned below.
+            if commit_error.is_some() {
+                for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
+                    self.send_abort(addr, &txn.id).await;
                 }
-                for (owner, member, listener_def) in edges {
-                    if self.services.contains_key(&owner) {
-                        if let Some(owner_svc) = self.services.get_mut(&owner) {
-                            owner_svc
-                                .listeners
-                                .entry(member)
-                                .or_default()
-                                .insert((this_id.clone(), listener_def));
-                        }
-                    } else {
-                        // remote owner: subscribe over the wire so future changes push.
-                        self.subscribe_remote(owner, member, this_id.clone(), listener_def)
-                            .await;
-                    }
-                }
+                self.services.remove(&svc_name);
             }
         } else {
             // Execution failed: discard buffered writes and abort participants.
@@ -370,11 +411,18 @@ impl Manager {
         }
 
         // Release all locks held locally (always, even on error)
-        self.release_locks(&txn.locked, &txn.id);
+        let freed = self.all_locked_keys(&txn);
+        self.release_locks(&freed, &txn.id);
 
+        // #98: init failure takes precedence (it already rolled back above).
+        // Otherwise, surface a participant commit failure rather than reporting
+        // success while a remote participant may hold stranded locks.
         match init_error {
             Some(e) => Err(e),
-            None => Ok(()),
+            None => match commit_error {
+                Some(e) => Err(e),
+                None => Ok(()),
+            },
         }
     }
 
@@ -675,8 +723,15 @@ impl Manager {
     /// #24: fire-and-forget send (no reply awaited).
     async fn send_oneway(&mut self, addr: Address, msg: MeerkatMessage) {
         if let Some(net) = self.network.as_mut() {
-            net.handle_command(NetworkCommand::SendMessage { addr, msg })
+            let reply = net
+                .handle_command(NetworkCommand::SendMessage {
+                    addr: addr.clone(),
+                    msg,
+                })
                 .await;
+            if let NetworkReply::Failure(e) = reply {
+                log::warn!("send_oneway to {} failed: {}", addr.0, e);
+            }
         }
     }
 
@@ -930,6 +985,7 @@ impl Manager {
                             MeerkatMessage::ActionResponse { request_id, .. } => Some(*request_id),
                             MeerkatMessage::CommitResponse { request_id, .. } => Some(*request_id),
                             MeerkatMessage::AbortResponse { request_id, .. } => Some(*request_id),
+                            MeerkatMessage::LockResponse { request_id, .. } => Some(*request_id),
                             MeerkatMessage::WaitParked { request_id, .. } => Some(*request_id),
                             // #39: code responses are replies routed to the waiting client.
                             MeerkatMessage::ServiceCodeResponse { request_id, .. } => {
@@ -947,6 +1003,7 @@ impl Manager {
                             | MeerkatMessage::ActionRequest { .. }
                             | MeerkatMessage::Commit { .. }
                             | MeerkatMessage::Abort { .. }
+                            | MeerkatMessage::LockRequest { .. }
                             | MeerkatMessage::RequestUpdates { .. }
                             // #39: an incoming code request is handled server-side, not a reply.
                             | MeerkatMessage::ServiceCodeRequest { .. }
@@ -967,7 +1024,7 @@ impl Manager {
     }
 
     /// shared by remote_lookup and remote_action.
-    async fn send_and_await_reply(
+    pub async fn send_and_await_reply(
         &mut self,
         addr: Address,
         msg: MeerkatMessage,
@@ -978,8 +1035,16 @@ impl Manager {
         let net = self.network.as_mut().ok_or_else(|| {
             EvalError::LocalDispatchFailed("No network layer available".to_string())
         })?;
-        net.handle_command(NetworkCommand::SendMessage { addr, msg })
+        let reply = net
+            .handle_command(NetworkCommand::SendMessage {
+                addr: addr.clone(),
+                msg,
+            })
             .await;
+        if let NetworkReply::Failure(e) = reply {
+            log::warn!("Failed to dispatch request to {}: {}", addr.0, e);
+            return Err(EvalError::LocalDispatchFailed(e));
+        }
 
         // Register oneshot channel for this request
         let (tx, mut rx) = oneshot::channel::<MeerkatMessage>();
@@ -1094,7 +1159,7 @@ impl Manager {
     ///
     /// Raises:
     ///     EvalError::ServiceNotFound: If the remote service is not registered
-    fn remote_addr(&self, service: Symbol) -> Result<Address, EvalError> {
+    pub fn remote_addr(&self, service: Symbol) -> Result<Address, EvalError> {
         let full_url = self.remote_services.get(&service).ok_or_else(|| {
             EvalError::ServiceNotFound(format!(
                 "Remote service '{}' not found",
@@ -1108,7 +1173,7 @@ impl Manager {
 
     /// Get our local address with peer ID for use as reply_to
     /// Replaces loopback/unspecified with the actual outbound IP
-    async fn local_reply_addr(&mut self) -> String {
+    pub async fn local_reply_addr(&mut self) -> String {
         if let Some(addr) = &self.local_address {
             return addr.clone();
         }
@@ -1299,6 +1364,8 @@ impl Manager {
             | MeerkatMessage::CommitResponse { .. }
             | MeerkatMessage::Abort { .. }
             | MeerkatMessage::AbortResponse { .. }
+            | MeerkatMessage::LockRequest { .. }
+            | MeerkatMessage::LockResponse { .. }
             | MeerkatMessage::RequestUpdates { .. }
             | MeerkatMessage::Update { .. }
             | MeerkatMessage::ServiceCodeRequest { .. }
@@ -1332,13 +1399,13 @@ impl Manager {
             Err(e) => {
                 // Wait-die wait: preserve the transaction so the parked read can
                 // resume on release; any other failure releases and drops it.
-                if matches!(e, EvalError::WaitOn(_, _)) {
+                if matches!(e, EvalError::WaitOn(_)) {
                     self.pending_txns.insert(tid, txn);
                     return Err(e);
                 }
                 // Could not acquire the read lock (e.g. conflict): release any
                 // locks taken and do not keep this transaction prepared.
-                self.release_locks(&txn.locked, &txn.id);
+                self.discard_failed_participant_txn(txn).await;
                 Err(e)
             }
         }
@@ -1437,6 +1504,8 @@ impl Manager {
             | MeerkatMessage::CommitResponse { .. }
             | MeerkatMessage::Abort { .. }
             | MeerkatMessage::AbortResponse { .. }
+            | MeerkatMessage::LockRequest { .. }
+            | MeerkatMessage::LockResponse { .. }
             | MeerkatMessage::RequestUpdates { .. }
             | MeerkatMessage::Update { .. }
             | MeerkatMessage::ServiceCodeRequest { .. }
@@ -1521,12 +1590,28 @@ impl Manager {
         var: Symbol,
         txn_id: &TxnId,
     ) -> Result<(), EvalError> {
+        let sid = self.service_net_id_for_name(service_name);
         let service = self.services.get_mut(&service_name).ok_or_else(|| {
             EvalError::ServiceNotFound(format!(
                 "Service '{}' not found",
                 self.interner.get(service_name)
             ))
         })?;
+        // Enforce service lock boundary: a whole-service lock blocks all
+        // member locks unless held by the same transaction
+        if let Some(holder) = &service.service_lock {
+            if holder != txn_id {
+                let holder_older = holder < txn_id;
+                if holder_older {
+                    return Err(EvalError::WaitDieAbort(format!(
+                        "transaction died contending for service lock on '{}'",
+                        self.interner.get(service_name)
+                    )));
+                } else {
+                    return Err(EvalError::WaitOn(WaitKey::Service(sid.clone())));
+                }
+            }
+        }
         let var_state = service.vars.get_mut(&var).ok_or_else(|| {
             EvalError::VarNotFound(format!("Variable '{}' not found", self.interner.get(var)))
         })?;
@@ -1538,7 +1623,9 @@ impl Manager {
                     "transaction died contending for write lock on '{}'",
                     self.interner.get(var)
                 ))),
-                crate::runtime::txn::WaitDie::Wait => Err(EvalError::WaitOn(service_name, var)),
+                crate::runtime::txn::WaitDie::Wait => {
+                    Err(EvalError::WaitOn(WaitKey::Member(sid, var)))
+                }
             }
         }
     }
@@ -1567,12 +1654,28 @@ impl Manager {
         var: Symbol,
         txn_id: &TxnId,
     ) -> Result<(), EvalError> {
+        let sid = self.service_net_id_for_name(service_name);
         let service = self.services.get_mut(&service_name).ok_or_else(|| {
             EvalError::ServiceNotFound(format!(
                 "Service '{}' not found",
                 self.interner.get(service_name)
             ))
         })?;
+        // Enforce service lock boundary: a whole-service lock blocks all
+        // member locks unless held by the same transaction
+        if let Some(holder) = &service.service_lock {
+            if holder != txn_id {
+                let holder_older = holder < txn_id;
+                if holder_older {
+                    return Err(EvalError::WaitDieAbort(format!(
+                        "transaction died contending for service lock on '{}'",
+                        self.interner.get(service_name)
+                    )));
+                } else {
+                    return Err(EvalError::WaitOn(WaitKey::Service(sid.clone())));
+                }
+            }
+        }
         let var_state = service.vars.get_mut(&var).ok_or_else(|| {
             EvalError::VarNotFound(format!("Variable '{}' not found", self.interner.get(var)))
         })?;
@@ -1584,7 +1687,9 @@ impl Manager {
                     "transaction died contending for read lock on '{}'",
                     self.interner.get(var)
                 ))),
-                crate::runtime::txn::WaitDie::Wait => Err(EvalError::WaitOn(service_name, var)),
+                crate::runtime::txn::WaitDie::Wait => {
+                    Err(EvalError::WaitOn(WaitKey::Member(sid, var)))
+                }
             }
         }
     }
@@ -1612,12 +1717,28 @@ impl Manager {
         var: Symbol,
         txn_id: &TxnId,
     ) -> Result<(), EvalError> {
+        let sid = self.service_net_id_for_name(service_name);
         let service = self.services.get_mut(&service_name).ok_or_else(|| {
             EvalError::ServiceNotFound(format!(
                 "Service '{}' not found",
                 self.interner.get(service_name)
             ))
         })?;
+        // Enforce service lock boundary: a whole-service lock blocks all
+        // member locks unless held by the same transaction
+        if let Some(holder) = &service.service_lock {
+            if holder != txn_id {
+                let holder_older = holder < txn_id;
+                if holder_older {
+                    return Err(EvalError::WaitDieAbort(format!(
+                        "transaction died contending for service lock on '{}'",
+                        self.interner.get(service_name)
+                    )));
+                } else {
+                    return Err(EvalError::WaitOn(WaitKey::Service(sid.clone())));
+                }
+            }
+        }
         let var_state = service.vars.get_mut(&var).ok_or_else(|| {
             EvalError::VarNotFound(format!("Variable '{}' not found", self.interner.get(var)))
         })?;
@@ -1629,17 +1750,42 @@ impl Manager {
                     "transaction died contending to upgrade lock on '{}'",
                     self.interner.get(var)
                 ))),
-                crate::runtime::txn::WaitDie::Wait => Err(EvalError::WaitOn(service_name, var)),
+                crate::runtime::txn::WaitDie::Wait => {
+                    Err(EvalError::WaitOn(WaitKey::Member(sid, var)))
+                }
             }
         }
     }
 
-    /// Release all locks held by `txn_id` on the given variables
-    fn release_locks(&mut self, locked: &HashSet<(ServiceNetId, Symbol)>, txn_id: &TxnId) {
-        for (sid, var) in locked {
-            if let Some(service) = self.service_by_net_id_mut(sid) {
-                if let Some(var_state) = service.vars.get_mut(var) {
-                    var_state.lock.release(txn_id);
+    /// Helper to get all locked keys (variables and service locks) for a transaction
+    fn all_locked_keys(&self, txn: &Transaction) -> HashSet<WaitKey> {
+        let mut keys = HashSet::new();
+        for (sid, var) in &txn.locked {
+            keys.insert(WaitKey::Member(sid.clone(), *var));
+        }
+        for sid in &txn.service_locked {
+            keys.insert(WaitKey::Service(sid.clone()));
+        }
+        keys
+    }
+
+    /// Release all locks held by `txn_id` on the given variables (and service locks)
+    fn release_locks(&mut self, locked: &HashSet<WaitKey>, txn_id: &TxnId) {
+        for key in locked {
+            match key {
+                WaitKey::Service(sid) => {
+                    if let Some(service) = self.service_by_net_id_mut(sid) {
+                        if service.service_lock.as_ref() == Some(txn_id) {
+                            service.service_lock = None;
+                        }
+                    }
+                }
+                WaitKey::Member(sid, var) => {
+                    if let Some(service) = self.service_by_net_id_mut(sid) {
+                        if let Some(var_state) = service.vars.get_mut(var) {
+                            var_state.lock.release(txn_id);
+                        }
+                    }
                 }
             }
         }
@@ -1692,7 +1838,8 @@ impl Manager {
                 for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
                     self.send_abort(addr, &txn.id).await;
                 }
-                self.release_locks(&txn.locked, &txn.id);
+                let freed = self.all_locked_keys(&txn);
+                self.release_locks(&freed, &txn.id);
                 if txn_id.iteration < MAX_WAIT_DIE_RETRIES {
                     txn_id = txn_id.retry();
                     continue;
@@ -1711,7 +1858,8 @@ impl Manager {
                 }
             }
 
-            self.release_locks(&txn.locked, &txn.id);
+            let freed = self.all_locked_keys(&txn);
+            self.release_locks(&freed, &txn.id);
 
             return match exec_error {
                 Some(e) => Err(e),
@@ -1779,11 +1927,11 @@ impl Manager {
             }
         }
         if let Some(e) = exec_error {
-            if matches!(e, EvalError::WaitOn(_, _)) {
+            if matches!(e, EvalError::WaitOn(_)) {
                 self.pending_txns.insert(tid, txn);
                 return Err(e);
             }
-            self.release_locks(&txn.locked, &txn.id);
+            self.discard_failed_participant_txn(txn).await;
             return Err(e);
         }
         self.pending_txns.insert(tid, txn);
@@ -1791,14 +1939,11 @@ impl Manager {
     }
 
     /// Participant side: apply and release a held transaction on `Commit`
-    pub async fn commit_participant(
-        &mut self,
-        tid: &TxnId,
-    ) -> Result<HashSet<(ServiceNetId, Symbol)>, EvalError> {
+    pub async fn commit_participant(&mut self, tid: &TxnId) -> Result<HashSet<WaitKey>, EvalError> {
         if let Some(txn) = self.pending_txns.remove(tid) {
-            let freed = txn.locked.clone();
+            let freed = self.all_locked_keys(&txn);
             self.apply_committed_writes(&txn).await;
-            self.release_locks(&txn.locked, &txn.id);
+            self.release_locks(&freed, &txn.id);
             let mut forward_err = None;
             for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
                 if let Err(e) = self.send_commit(addr, tid).await {
@@ -1814,19 +1959,335 @@ impl Manager {
         }
     }
 
+    /// Centralized cleanup for a participant transaction that encountered a terminal failure
+    ///
+    /// Releases local locks and aborts all sub-participants before dropping the transaction
+    ///
+    /// Args:
+    ///     txn (Transaction): The transaction context
+    ///
+    /// Returns:
+    ///     HashSet<WaitKey>: The set of freed wait keys
+    async fn discard_failed_participant_txn(&mut self, txn: Transaction) -> HashSet<WaitKey> {
+        let freed = self.all_locked_keys(&txn);
+        self.release_locks(&freed, &txn.id);
+        for addr in txn.participants {
+            self.send_abort(addr, &txn.id).await;
+        }
+        freed
+    }
+
     /// Participant side: discard and release a held transaction on `Abort`, and
     /// forward the abort down the chain to any sub-participants
-    pub async fn abort_participant(&mut self, tid: &TxnId) -> HashSet<(ServiceNetId, Symbol)> {
+    pub async fn abort_participant(&mut self, tid: &TxnId) -> HashSet<WaitKey> {
         if let Some(txn) = self.pending_txns.remove(tid) {
-            let freed = txn.locked.clone();
-            self.release_locks(&txn.locked, &txn.id);
-            for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
-                self.send_abort(addr, tid).await;
-            }
-            freed
+            self.discard_failed_participant_txn(txn).await
         } else {
             HashSet::new()
         }
+    }
+
+    /// Attempt to acquire a whole-service lock on a service
+    fn acquire_service_lock(
+        &mut self,
+        service_name: Symbol,
+        txn_id: &TxnId,
+    ) -> Result<(), EvalError> {
+        let sid = self.service_net_id_for_name(service_name);
+        let service = self.services.get_mut(&service_name).ok_or_else(|| {
+            EvalError::ServiceNotFound(format!(
+                "Service '{}' not found",
+                self.interner.get(service_name)
+            ))
+        })?;
+
+        // Step 1: Check whole-service lock boundary
+        // A service-level lock acts as an exclusive write lock on all
+        // present and future members. If held by another transaction,
+        // younger requesters abort immediately under wait-die, while
+        // older requesters yield `WaitOn(WaitKey::Service(...))` to park
+        if let Some(holder) = &service.service_lock {
+            if holder == txn_id {
+                return Ok(());
+            }
+            let holder_older = holder < txn_id;
+            if holder_older {
+                return Err(EvalError::WaitDieAbort(format!(
+                    "transaction died contending for service lock on '{}'",
+                    self.interner.get(service_name)
+                )));
+            } else {
+                return Err(EvalError::WaitOn(WaitKey::Service(sid.clone())));
+            }
+        }
+
+        // Step 2: Defensive O(N) scan across member variables
+        // Before granting the service-level lock, scan all member
+        // variables to ensure no other transaction holds an active
+        // member lock. If contention exists, apply wait-die against
+        // the oldest lock holder on that variable
+        for (var_name, var_state) in &service.vars {
+            if let Some(other_holder) = var_state.lock.oldest_other_holder(txn_id) {
+                let holder_older = &other_holder < txn_id;
+                if holder_older {
+                    return Err(EvalError::WaitDieAbort(format!(
+                        "transaction died contending for service lock on '{}'",
+                        self.interner.get(service_name)
+                    )));
+                } else {
+                    return Err(EvalError::WaitOn(WaitKey::Member(sid, *var_name)));
+                }
+            }
+        }
+
+        service.service_lock = Some(txn_id.clone());
+        Ok(())
+    }
+
+    /// Handle eager LockRequest from the network.
+    ///
+    /// Invokes lock group acquisition logic under a shared transaction,
+    /// storing the updated transaction state on success/wait, or releasing
+    /// all acquired locks on failure.
+    ///
+    /// Args:
+    ///     txn_id (TxnId): The ID of the transaction.
+    ///     services (HashMap<String, LockGroup>): The lock groups.
+    ///
+    /// Returns:
+    ///     Result<(), EvalError>: Ok on success, or an error.
+    ///
+    /// Raises:
+    ///     EvalError::WaitOn: If the transaction must wait.
+    ///     EvalError: On any other evaluation failure.
+    pub async fn handle_lock_request(
+        &mut self,
+        txn_id: TxnId,
+        services: HashMap<String, LockGroup>,
+    ) -> Result<(), EvalError> {
+        codec::validate_lock_request(&services)
+            .map_err(|e| EvalError::RuntimeError(e.to_string()))?;
+
+        let mut txn = self
+            .pending_txns
+            .remove(&txn_id)
+            .unwrap_or_else(|| Transaction::new(txn_id.clone()));
+
+        let result = self.acquire_lock_group_internal(&mut txn, &services).await;
+
+        match result {
+            Ok(()) => {
+                self.pending_txns.insert(txn_id, txn);
+                Ok(())
+            }
+            // CRITICAL: All-or-Nothing Eager Lock Group Release
+            // If a lock group acquisition encounters contention and
+            // yields `WaitOn`, we MUST NOT hold onto partial locks.
+            // Holding partial locks while parked would stall incoming
+            // atomic updates that require those same locks.
+            // On `WaitOn`, we immediately release all partial locks taken
+            // so far and clear the transaction's lock tracking sets,
+            // ensuring the transaction yields completely and retries
+            // from scratch when unparked
+            Err(EvalError::WaitOn(key)) => {
+                let freed = self.all_locked_keys(&txn);
+                self.release_locks(&freed, &txn.id);
+                txn.locked.clear();
+                txn.service_locked.clear();
+
+                // Drain and explicitly abort sub-participants to release
+                // remote partial locks
+                for addr in txn.participants.drain().collect::<Vec<_>>() {
+                    self.send_abort(addr, &txn.id).await;
+                }
+                debug_assert!(txn.participants.is_empty());
+
+                self.pending_txns.insert(txn_id, txn);
+                Err(EvalError::WaitOn(key))
+            }
+            Err(e) => {
+                self.discard_failed_participant_txn(txn).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Internal lock group acquisition: direct locks + transitive cascades.
+    ///
+    /// Iteratively resolves and locks all local dependencies, and forwards
+    /// LockRequests to remote participant nodes.
+    ///
+    /// Args:
+    ///     txn (&mut Transaction): The transaction context.
+    ///     services (&HashMap<String, LockGroup>): The lock requirements.
+    ///
+    /// Returns:
+    ///     Result<(), EvalError>: Ok on success, or an error.
+    ///
+    /// Raises:
+    ///     EvalError::WaitOn: If a lock must wait.
+    ///     EvalError::LocalDispatchFailed: If a remote lock fails/times out.
+    async fn acquire_lock_group_internal(
+        &mut self,
+        txn: &mut Transaction,
+        services: &HashMap<String, LockGroup>,
+    ) -> Result<(), EvalError> {
+        // 1. Process service-level locks first
+        for (svc_name_str, group) in services {
+            let svc_sym = self.interner.insert(svc_name_str);
+            if group.service_level_lock {
+                let net_id = self.service_net_id_for_name(svc_sym);
+                self.acquire_service_lock(svc_sym, &txn.id)?;
+                txn.service_locked.insert(net_id);
+            }
+        }
+
+        // 2. Queue for resolving all local locks (same and cross service)
+        let mut queue: Vec<(Symbol, Symbol, bool)> = Vec::new();
+        let mut visited = HashSet::new();
+
+        for (svc_name_str, group) in services {
+            let svc_sym = self.interner.insert(svc_name_str);
+            for r in &group.reads {
+                let var_sym = self.interner.insert(r);
+                queue.push((svc_sym, var_sym, false));
+            }
+            for w in &group.writes {
+                let var_sym = self.interner.insert(w);
+                queue.push((svc_sym, var_sym, true));
+            }
+        }
+
+        let mut remote_locks: HashMap<Symbol, (HashSet<String>, HashSet<String>)> = HashMap::new();
+
+        while let Some((svc_sym, mem_sym, is_write)) = queue.pop() {
+            if self.services.contains_key(&svc_sym) {
+                // Acquire the local lock (or upgrade it to a write lock
+                // if already read-locked) before checking the member's
+                // dependencies. This prevents a race condition where a
+                // def expression is mutated by another transaction
+                // after we check its dependencies but before we lock it
+                let key = (self.service_net_id_for_name(svc_sym), mem_sym);
+
+                if !txn.locked.contains(&key) {
+                    // Acquire a new lock since the variable is not
+                    // yet locked by the current transaction
+                    if is_write {
+                        self.acquire_write_lock(svc_sym, mem_sym, &txn.id)?;
+                    } else {
+                        self.acquire_read_lock(svc_sym, mem_sym, &txn.id)?;
+                    }
+                    txn.locked.insert(key);
+                } else if is_write {
+                    // Upgrade the existing read lock to a write lock
+                    // if a write lock is requested
+                    self.upgrade_to_write_lock(svc_sym, mem_sym, &txn.id)?;
+                }
+
+                // Traverse dependencies after locking
+                if visited.insert((svc_sym, mem_sym)) {
+                    if let Some(service) = self.services.get(&svc_sym) {
+                        // Transitive local dependencies
+                        if let Some(deps) = service.dep.dep_transitive.get(&mem_sym) {
+                            for dep_sym in deps {
+                                queue.push((svc_sym, *dep_sym, false));
+                            }
+                        }
+
+                        // Cross-service dependencies
+                        if let Some(expr) = service.defs.get(&mem_sym) {
+                            for (remote_svc, remote_mem) in expr.cross_service_deps() {
+                                if self.remote_services.contains_key(&remote_svc) {
+                                    // Track remote dependencies for a
+                                    // remote service to request them
+                                    // as a batch later
+                                    let remote_mem_str = self.interner.get(remote_mem).to_string();
+                                    remote_locks
+                                        .entry(remote_svc)
+                                        .or_insert_with(|| (HashSet::new(), HashSet::new()))
+                                        .0
+                                        .insert(remote_mem_str);
+                                } else {
+                                    // Queue cross-service dependency
+                                    // for local lock and traversal
+                                    queue.push((remote_svc, remote_mem, false));
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if self.remote_services.contains_key(&svc_sym) {
+                // Accumulate remote lock requirements mapped to their
+                // host node address
+                let mem_str = self.interner.get(mem_sym).to_string();
+                let entry = remote_locks
+                    .entry(svc_sym)
+                    .or_insert_with(|| (HashSet::new(), HashSet::new()));
+                if is_write {
+                    entry.1.insert(mem_str);
+                } else {
+                    entry.0.insert(mem_str);
+                }
+            }
+        }
+
+        // 4. Build and send remote lock requests
+        let mut node_requests: HashMap<Address, HashMap<String, LockGroup>> = HashMap::new();
+        for (remote_svc, (reads, writes)) in remote_locks {
+            if let Ok(addr) = self.remote_addr(remote_svc) {
+                let svc_name_str = self.interner.get(remote_svc).to_string();
+                let group = LockGroup {
+                    service_level_lock: false,
+                    reads,
+                    writes,
+                };
+                node_requests
+                    .entry(addr)
+                    .or_default()
+                    .insert(svc_name_str, group);
+            }
+        }
+
+        for (addr, remote_services) in node_requests {
+            txn.participants.insert(addr.clone());
+
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT_LOCK_REQ_ID: AtomicU64 = AtomicU64::new(1);
+            let request_id = NEXT_LOCK_REQ_ID.fetch_add(1, Ordering::SeqCst);
+
+            let msg = MeerkatMessage::LockRequest {
+                request_id,
+                txn_id: txn.id.clone(),
+                services: remote_services,
+                reply_to: self.local_reply_addr().await,
+            };
+
+            let reply = self
+                .send_and_await_reply(
+                    addr.clone(),
+                    msg,
+                    request_id,
+                    format!("Timeout waiting for lock response from {:?}", addr),
+                )
+                .await?;
+
+            match reply {
+                MeerkatMessage::LockResponse { success, error, .. } => {
+                    if !success {
+                        return Err(EvalError::LocalDispatchFailed(error.unwrap_or_else(|| {
+                            "Lock request rejected by remote node".to_string()
+                        })));
+                    }
+                }
+                _ => {
+                    return Err(EvalError::LocalDispatchFailed(
+                        "Unexpected reply to lock request".to_string(),
+                    ))
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Originator side: ask a participant to commit, awaiting its acknowledgement
@@ -1871,6 +2332,8 @@ impl Manager {
             | MeerkatMessage::Commit { .. }
             | MeerkatMessage::Abort { .. }
             | MeerkatMessage::AbortResponse { .. }
+            | MeerkatMessage::LockRequest { .. }
+            | MeerkatMessage::LockResponse { .. }
             | MeerkatMessage::RequestUpdates { .. }
             | MeerkatMessage::Update { .. }
             | MeerkatMessage::ServiceCodeRequest { .. }
@@ -2710,7 +3173,7 @@ mod tests {
     async fn test_wait_die_older_takes_wait_path() {
         // Wait-die: an older transaction contending for a lock held by
         // a younger transaction takes the wait path, surfaced as
-        // `WaitOn` carrying the contended `(service, var)` so the owner
+        // `WaitOn` carrying the contended `WaitKey` so the owner
         // can park the request
         let mut tc = TestContext::new();
         tc.manager
@@ -2745,7 +3208,7 @@ mod tests {
             iteration: 0,
         };
         let result = tc.manager.acquire_write_lock(tc.s1, tc.x, &older);
-        assert!(matches!(result, Err(EvalError::WaitOn(_, _))));
+        assert!(matches!(result, Err(EvalError::WaitOn(_))));
     }
 
     #[tokio::test]
@@ -2875,7 +3338,7 @@ mod tests {
             .execute_action_participant(tc.s1, &stmts, &[], older.clone())
             .await;
         // Parked: returns `WaitOn`, and the partial transaction is preserved
-        assert!(matches!(result, Err(EvalError::WaitOn(_, _))));
+        assert!(matches!(result, Err(EvalError::WaitOn(_))));
         assert!(tc.manager.pending_txns.contains_key(&older));
         // The lock it already took on `y` is still held (not released on park)
         assert!(matches!(
@@ -2932,7 +3395,10 @@ mod tests {
         tc.manager.park_request(tc.s1, tc.x, make(2, old.clone()));
         // Freeing `x` yields the oldest waiter first; the other stays parked
         let mut freed = std::collections::HashSet::new();
-        freed.insert((tc.manager.service_net_id_for_name(tc.s1), tc.x));
+        freed.insert(WaitKey::Member(
+            tc.manager.service_net_id_for_name(tc.s1),
+            tc.x,
+        ));
         let ready = tc.manager.take_ready_waiters(&freed);
         assert_eq!(ready.len(), 1);
         assert!(ready[0].tid() == &old);
@@ -3005,7 +3471,7 @@ mod tests {
             .manager
             .execute_action_participant(tc.s1, &stmts, &[], older.clone())
             .await;
-        assert!(matches!(r1, Err(EvalError::WaitOn(_, _))));
+        assert!(matches!(r1, Err(EvalError::WaitOn(_))));
         tc.manager.park_request(
             tc.s1,
             tc.x,
@@ -3163,7 +3629,15 @@ mod tests {
             .unwrap();
 
         // Simulate another in-flight transaction holding a write lock on s1.x.
-        let ext = TxnId::new(tc.manager.node_id);
+        // #98: use an explicit low timestamp so this transaction is
+        // deterministically older than s2's internally-generated one. s2 must
+        // be the younger party that dies under wait-die; relying on the wall
+        // clock made that ordering non-deterministic.
+        let ext = crate::runtime::txn::TxnId {
+            timestamp: 1,
+            node_id: tc.manager.node_id,
+            iteration: 0,
+        };
         assert!(tc
             .manager
             .services
@@ -3206,5 +3680,192 @@ mod tests {
             tc.manager.services.get(&tc.s1).unwrap().vars.get(&tc.x).unwrap().lock,
             crate::runtime::txn::VarLock::WriteLocked(ref t) if *t == ext
         ));
+    }
+
+    #[tokio::test]
+    async fn test_service_lock_blocks_member_read_and_write() {
+        let mut tc = TestContext::new();
+        tc.manager
+            .create_service(
+                tc.s1,
+                vec![Decl::VarDecl {
+                    name: tc.x,
+                    ty: None,
+                    val: Expr::Literal {
+                        val: Value::Int { val: 42 },
+                    },
+                }],
+            )
+            .await
+            .unwrap();
+
+        let older = TxnId {
+            timestamp: 1,
+            node_id: 1,
+            iteration: 0,
+        };
+        let younger = TxnId {
+            timestamp: 100,
+            node_id: 1,
+            iteration: 0,
+        };
+
+        // Acquire service lock under older transaction
+        assert!(tc.manager.acquire_service_lock(tc.s1, &older).is_ok());
+
+        // Younger transaction trying to read member should die
+        let res_read = tc.manager.acquire_read_lock(tc.s1, tc.x, &younger);
+        assert!(matches!(res_read, Err(EvalError::WaitDieAbort(_))));
+
+        // Younger transaction trying to write member should die
+        let res_write = tc.manager.acquire_write_lock(tc.s1, tc.x, &younger);
+        assert!(matches!(res_write, Err(EvalError::WaitDieAbort(_))));
+    }
+
+    #[tokio::test]
+    async fn test_member_lock_blocks_service_lock() {
+        let mut tc = TestContext::new();
+        tc.manager
+            .create_service(
+                tc.s1,
+                vec![Decl::VarDecl {
+                    name: tc.x,
+                    ty: None,
+                    val: Expr::Literal {
+                        val: Value::Int { val: 42 },
+                    },
+                }],
+            )
+            .await
+            .unwrap();
+
+        let older = TxnId {
+            timestamp: 1,
+            node_id: 1,
+            iteration: 0,
+        };
+        let younger = TxnId {
+            timestamp: 100,
+            node_id: 1,
+            iteration: 0,
+        };
+
+        // Acquire member write lock under older transaction
+        assert!(tc.manager.acquire_write_lock(tc.s1, tc.x, &older).is_ok());
+
+        // Younger transaction trying to acquire service lock should die
+        let res_svc = tc.manager.acquire_service_lock(tc.s1, &younger);
+        assert!(matches!(res_svc, Err(EvalError::WaitDieAbort(_))));
+
+        // Older transaction should be able to acquire service lock on its own service
+        assert!(tc.manager.acquire_service_lock(tc.s1, &older).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_handle_lock_request_eager_release_on_wait() {
+        let mut tc = TestContext::new();
+        tc.manager
+            .create_service(
+                tc.s1,
+                vec![
+                    Decl::VarDecl {
+                        name: tc.x,
+                        ty: None,
+                        val: Expr::Literal {
+                            val: Value::Int { val: 1 },
+                        },
+                    },
+                    Decl::VarDecl {
+                        name: tc.y,
+                        ty: None,
+                        val: Expr::Literal {
+                            val: Value::Int { val: 2 },
+                        },
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let younger = TxnId {
+            timestamp: 100,
+            node_id: 1,
+            iteration: 0,
+        };
+        let older = TxnId {
+            timestamp: 1,
+            node_id: 1,
+            iteration: 0,
+        };
+
+        // Younger transaction locks member x
+        assert!(tc.manager.acquire_write_lock(tc.s1, tc.x, &younger).is_ok());
+
+        // Older transaction requests LockGroup covering y and x
+        let mut writes = HashSet::new();
+        writes.insert(tc.manager.interner.get(tc.y).to_string());
+        writes.insert(tc.manager.interner.get(tc.x).to_string());
+        let lg = LockGroup {
+            service_level_lock: false,
+            reads: HashSet::new(),
+            writes,
+        };
+        let mut services = HashMap::new();
+        services.insert(tc.manager.interner.get(tc.s1).to_string(), lg);
+
+        // Seed the older transaction in `pending_txns` with a dummy
+        // participant address to verify that `participants` are drained
+        let mut pre_txn = crate::runtime::txn::Transaction::new(older.clone());
+        pre_txn
+            .participants
+            .insert(crate::net::types::Address("remote:1234".to_string()));
+        tc.manager.pending_txns.insert(older.clone(), pre_txn);
+
+        // `handle_lock_request` yields `WaitOn`
+        let res = tc
+            .manager
+            .handle_lock_request(older.clone(), services)
+            .await;
+        assert!(matches!(res, Err(EvalError::WaitOn(_))));
+
+        // Assert all-or-nothing: lock on `y` was released upon `WaitOn`
+        let y_state = tc
+            .manager
+            .services
+            .get(&tc.s1)
+            .unwrap()
+            .vars
+            .get(&tc.y)
+            .unwrap();
+        assert!(matches!(
+            y_state.lock,
+            crate::runtime::txn::VarLock::Unlocked
+        ));
+
+        // Assert all-or-nothing: `participants` were drained on `WaitOn`
+        let parked_txn = tc.manager.pending_txns.get(&older).unwrap();
+        assert!(parked_txn.participants.is_empty());
+    }
+
+    /// Verify that handle_lock_request rejects requests with invalid identifiers before interning
+    #[tokio::test]
+    async fn test_handle_lock_request_invalid_identifier_rejected() {
+        let interner = Interner::new();
+        let mut manager = Manager::new(interner);
+
+        let txn_id = TxnId::new(1);
+        let mut services = HashMap::new();
+        services.insert(
+            "bad-service-name!".to_string(),
+            LockGroup {
+                service_level_lock: false,
+                reads: HashSet::new(),
+                writes: HashSet::new(),
+            },
+        );
+
+        let res = manager.handle_lock_request(txn_id, services).await;
+        assert!(res.is_err());
+        assert!(matches!(res, Err(EvalError::RuntimeError(_))));
     }
 }

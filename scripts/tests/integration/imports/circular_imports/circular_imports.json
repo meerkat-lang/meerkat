@@ -1,0 +1,23 @@
+{
+  "settings": {
+    "startup_timeout": 45.0,
+    "monitor_poll_interval": 0.25,
+    "terminate_timeout": 5.0
+  },
+  "nodes": [
+    {
+      "alias": "node_a",
+      "type": "server",
+      "file": "scripts/tests/integration/imports/circular_imports/node_a.mkt",
+      "port": 9360,
+      "imports": ["node_b.node_b"]
+    },
+    {
+      "alias": "node_b",
+      "type": "server",
+      "file": "scripts/tests/integration/imports/circular_imports/node_b.mkt",
+      "port": 9361,
+      "imports": ["node_a.node_a"]
+    }
+  ]
+}

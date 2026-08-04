@@ -1,0 +1,5 @@
+import B
+
+service A {
+    pub def get_remote_stock = B.get_stock;
+}

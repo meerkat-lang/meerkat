@@ -1,0 +1,5 @@
+import D
+
+service B {
+    pub def get_analytics = D.get_active + D.get_active;
+}

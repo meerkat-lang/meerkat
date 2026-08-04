@@ -1,0 +1,9 @@
+import server_b
+import local_disk_c
+
+service mixed_client {}
+
+@test(mixed_client) {
+    assert(server_b.remote_val == 50);
+    assert(local_disk_c.local_val == 100);
+}

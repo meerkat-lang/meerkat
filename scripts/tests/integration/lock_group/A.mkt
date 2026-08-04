@@ -1,0 +1,8 @@
+import B
+import C
+
+service A {
+    var val_a = 0;
+    pub def get_val_a = val_a;
+    pub def read_bc = B.read_d + C.read_e;
+}

@@ -1,0 +1,7 @@
+import helper
+
+service file_client {}
+
+@test(file_client) {
+    assert(helper.factor == 5);
+}

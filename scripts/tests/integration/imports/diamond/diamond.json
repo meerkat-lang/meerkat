@@ -1,0 +1,43 @@
+{
+  "settings": {
+    "startup_timeout": 60.0,
+    "monitor_poll_interval": 0.25,
+    "terminate_timeout": 5.0
+  },
+  "nodes": [
+    {
+      "alias": "D",
+      "type": "server",
+      "file": "scripts/tests/integration/imports/diamond/D.mkt",
+      "port": 9200
+    },
+    {
+      "alias": "B",
+      "type": "server",
+      "file": "scripts/tests/integration/imports/diamond/B.mkt",
+      "port": 9210,
+      "imports": ["D.D"]
+    },
+    {
+      "alias": "C",
+      "type": "server",
+      "file": "scripts/tests/integration/imports/diamond/C.mkt",
+      "port": 9220,
+      "imports": ["D.D"]
+    },
+    {
+      "alias": "A",
+      "type": "server",
+      "file": "scripts/tests/integration/imports/diamond/A.mkt",
+      "port": 9230,
+      "imports": ["B.B", "C.C"]
+    },
+    {
+      "alias": "diamond_client",
+      "type": "client",
+      "file": "scripts/tests/integration/imports/diamond/client.mkt",
+      "timeout": 45,
+      "imports": ["A.A", "B.B", "C.C", "D.D"]
+    }
+  ]
+}

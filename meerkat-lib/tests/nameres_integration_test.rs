@@ -799,12 +799,17 @@ fn test_integration_test_block_hoisting() {
     assert!(res.is_ok());
 }
 
-/// Verify testing an imported service is ignored with a warning
+/// Verify that a @test block targeting an imported service is fully
+/// name-resolved when the service's declaration is present in the
+/// unified AST (as produced by on_node_startup before static_checks)
 #[test]
-fn test_integration_test_block_imported_ignored() {
+fn test_integration_test_block_imported_resolves() {
     let mut interner = Interner::new();
     let input = "
         import s1
+        service s1 {
+            var x = 5;
+        }
         @test(s1) {
             assert(x == 5);
         }
@@ -901,6 +906,73 @@ fn test_integration_local_member_access_valid() {
         }
         service s2 {
             pub def y = s1.x;
+        }
+    ";
+    let parse_result = parse_string(input, &mut interner);
+    assert!(parse_result.is_ok());
+    let stmts = parse_result.unwrap();
+    let res = resolve(&stmts);
+    assert!(res.is_ok());
+}
+
+/// Verify that accessing an unknown member on an imported service
+/// produces an `UnknownIdentifier` error
+#[test]
+fn test_import_member_unknown_errors() {
+    let mut interner = Interner::new();
+    let input = "
+        import s1
+        service s1 {
+            var x = 1;
+        }
+        service s2 {
+            pub def y = s1.nonexistent;
+        }
+    ";
+    let parse_result = parse_string(input, &mut interner);
+    assert!(parse_result.is_ok());
+    let stmts = parse_result.unwrap();
+    let res = resolve(&stmts);
+    assert!(res.is_err());
+}
+
+/// Verify that referencing an unknown variable inside a @test block for an
+/// imported service produces an `UnknownIdentifier` error
+#[test]
+fn test_import_test_block_member_unknown_errors() {
+    let mut interner = Interner::new();
+    let input = "
+        import s1
+        service s1 {
+            var x = 1;
+        }
+        @test(s1) {
+            assert(nonexistent_var == 5);
+        }
+    ";
+    let parse_result = parse_string(input, &mut interner);
+    assert!(parse_result.is_ok());
+    let stmts = parse_result.unwrap();
+    let res = resolve(&stmts);
+    assert!(res.is_err());
+}
+
+/// Verify that member resolution succeeds transitively across multiple
+/// imported services (A -> B -> C)
+#[test]
+fn test_transitive_import_member_access() {
+    let mut interner = Interner::new();
+    let input = "
+        import s1
+        import s2
+        service s1 {
+            var a = 10;
+        }
+        service s2 {
+            pub def b = s1.a;
+        }
+        service s3 {
+            pub def c = s2.b;
         }
     ";
     let parse_result = parse_string(input, &mut interner);

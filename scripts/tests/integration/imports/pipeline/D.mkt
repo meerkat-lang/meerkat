@@ -1,0 +1,3 @@
+service D {
+    pub def calc_tax = 10;
+}

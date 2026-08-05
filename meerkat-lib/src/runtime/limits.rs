@@ -15,7 +15,7 @@ pub const MAX_TYPE_DEPTH: usize = 16;
 pub const MAX_NET_REQUEST_STRING_LENGTH: usize = 4096;
 
 /// Maximum nesting depth of scope blocks to prevent stack overflows
-pub const MAX_SCOPE_DEPTH: usize = 128;
+pub const MAX_SCOPE_DEPTH: usize = 64;
 
 /// Maximum allowed time in seconds for an individual import attempt
 pub const INDIVIDUAL_IMPORT_TIMEOUT_SECS: u64 = 2;

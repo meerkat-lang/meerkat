@@ -501,7 +501,7 @@ fn test_mutual_aliases_hof_argument() {
     assert!(res.is_err());
     let err = res.expect_err("expected dependency cycle error");
     assert!(
-        err.contains("Invalid forward reference to uninitialized value")
+        err.contains("illegal eager forward reference")
             || err.contains("dependency cycle detected")
     );
 }

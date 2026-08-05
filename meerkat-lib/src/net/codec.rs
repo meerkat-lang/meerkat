@@ -334,7 +334,7 @@ fn encode_type_internal(ty: &Type, depth: usize) -> Result<NetType> {
             }
             Ok(NetType::Tuple(encoded_ts))
         }
-        Type::Func(t1, t2) => {
+        Type::Func(t1, t2, _) => {
             let et1 = encode_type_internal(t1, depth + 1)?;
             let et2 = encode_type_internal(t2, depth + 1)?;
             Ok(NetType::Func(Box::new(et1), Box::new(et2)))
@@ -442,7 +442,11 @@ fn decode_type_internal(ty: NetType, depth: usize) -> Result<Type> {
         NetType::Func(t1, t2) => {
             let dt1 = decode_type_internal(*t1, depth + 1)?;
             let dt2 = decode_type_internal(*t2, depth + 1)?;
-            Ok(Type::Func(Box::new(dt1), Box::new(dt2)))
+            Ok(Type::Func(
+                Box::new(dt1),
+                Box::new(dt2),
+                std::collections::HashSet::new(),
+            ))
         }
         NetType::List(t) => {
             let dt = decode_type_internal(*t, depth + 1)?;
@@ -1788,8 +1792,17 @@ mod tests {
 
         // Construct `Type::Func(Int -> String, Bool -> Unit)`
         let original_type = Type::Func(
-            Box::new(Type::Func(Box::new(Type::Int), Box::new(Type::String))),
-            Box::new(Type::Func(Box::new(Type::Bool), Box::new(Type::Unit))),
+            Box::new(Type::Func(
+                Box::new(Type::Int),
+                Box::new(Type::String),
+                std::collections::HashSet::new(),
+            )),
+            Box::new(Type::Func(
+                Box::new(Type::Bool),
+                Box::new(Type::Unit),
+                std::collections::HashSet::new(),
+            )),
+            std::collections::HashSet::new(),
         );
 
         let original_param = Param {
@@ -1830,7 +1843,11 @@ mod tests {
         // Construct a `Type` that exceeds `MAX_TYPE_DEPTH` (16)
         let mut current_type = Type::Int;
         for _ in 0..(MAX_TYPE_DEPTH + 1) {
-            current_type = Type::Func(Box::new(Type::Bool), Box::new(current_type));
+            current_type = Type::Func(
+                Box::new(Type::Bool),
+                Box::new(current_type),
+                std::collections::HashSet::new(),
+            );
         }
 
         let res = encode_type(&current_type);
@@ -2000,7 +2017,11 @@ mod service_code_tests {
         let field_func = interner.insert("f");
 
         let tuple_ty = Type::Tuple(TupleType::new(vec![Type::Int, Type::String]).unwrap());
-        let func_ty = Type::Func(Box::new(Type::Bool), Box::new(Type::Unit));
+        let func_ty = Type::Func(
+            Box::new(Type::Bool),
+            Box::new(Type::Unit),
+            std::collections::HashSet::new(),
+        );
 
         let mut original_type = ServiceType::default();
         original_type.add_field(field_tuple, tuple_ty).unwrap();

@@ -178,10 +178,10 @@ TableType: TableType = {
 Type: Type = {
     <s:SimpleType> => s,
     <s:SimpleType> "->" <t:Type> => {
-        Type::Func(Box::new(s), Box::new(t))
+        Type::Func(Box::new(s), Box::new(t), std::collections::HashSet::new())
     },
     "(" ")" "->" <t:Type> => {
-        Type::Func(Box::new(Type::Unit), Box::new(t))
+        Type::Func(Box::new(Type::Unit), Box::new(t), std::collections::HashSet::new())
     },
 }
 

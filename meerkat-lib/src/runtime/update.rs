@@ -229,14 +229,7 @@ impl Transaction {
                     pre_initialized.insert(*svc_name, members);
                 }
 
-                let service_graphs_vec =
-                    match compute_dependencies(&self.ast, Some(&pre_initialized)) {
-                        Ok(graphs) => graphs,
-                        Err(e) => {
-                            self.release_lock_txn(manager);
-                            return Err(EvalError::RuntimeError(e.to_string()));
-                        }
-                    };
+                let service_graphs_vec = compute_dependencies(&self.ast, Some(&pre_initialized));
 
                 let service_stmts: Vec<Symbol> = self
                     .ast

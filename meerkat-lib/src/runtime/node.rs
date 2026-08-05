@@ -535,8 +535,7 @@ impl Node {
         tt::check(&self.unified_ast, &mut local_services).map_err(|e| self.format_tt_error(e))?;
         self.local_services = local_services;
 
-        compute_dependencies(&self.unified_ast, None)
-            .map_err(|e| Error::Message(e.format_with_interner(&self.interner)))?;
+        compute_dependencies(&self.unified_ast, None);
 
         let mut update_stmts = Vec::new();
         for stmt in &self.unified_ast {
@@ -569,8 +568,7 @@ impl Node {
 
             nameres::resolve(&post_update_ast).map_err(|e| self.format_nameres_error(e))?;
 
-            compute_dependencies(&post_update_ast, None)
-                .map_err(|e| Error::Message(e.format_with_interner(&self.interner)))?;
+            compute_dependencies(&post_update_ast, None);
         }
 
         Ok(())
@@ -625,12 +623,19 @@ impl Node {
     ///     `Error`: The formatted Error::Message
     fn format_tt_error(&self, err: tt::check::Error) -> Error {
         match err {
-            tt::check::Error::DependencyCycle { service, member } => {
+            tt::check::Error::RecursiveTypeInference { service, member } => {
                 let service_str = self.interner.get(service);
                 let member_str = self.interner.get(member);
                 Error::Message(format!(
                     "type check error: dependency cycle detected at service '{}', member '{}'.",
                     service_str, member_str
+                ))
+            }
+            tt::check::Error::IllegalDependency(member) => {
+                let member_str = self.interner.get(member);
+                Error::Message(format!(
+                    "type check error: illegal eager forward reference or dependency cycle on '{}'",
+                    member_str
                 ))
             }
             tt::check::Error::UnboundVariable(s) => {
@@ -725,8 +730,7 @@ impl Node {
 
         tt::check(program, &mut self.local_services).map_err(|e| self.format_tt_error(e))?;
 
-        compute_dependencies(program, None)
-            .map_err(|e| Error::Message(e.format_with_interner(&self.interner)))?;
+        compute_dependencies(program, None);
 
         Ok(())
     }

@@ -271,23 +271,7 @@ impl Manager {
             });
         }
 
-        let all_graphs = match compute_dependencies(&self.unified_ast, None) {
-            Ok(graphs) => graphs,
-            Err(e) => {
-                if inserted {
-                    self.unified_ast.retain(|s| {
-                        if let Stmt::Service { name: existing, .. } = s {
-                            *existing != name
-                        } else {
-                            true
-                        }
-                    });
-                }
-                return Err(EvalError::VarNotFound(
-                    e.format_with_interner(&self.interner),
-                ));
-            }
-        };
+        let all_graphs = compute_dependencies(&self.unified_ast, None);
         let service_stmts: Vec<_> = self
             .unified_ast
             .iter()

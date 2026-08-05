@@ -198,6 +198,7 @@ fn test_ast_printer_type_display() {
             TupleType::new(vec![Type::Int, Type::String]).unwrap(),
         )),
         Box::new(Type::Bool),
+        std::collections::HashSet::new(),
     );
 
     let formatted_some = printer.format_type_opt(&Some(test_type));

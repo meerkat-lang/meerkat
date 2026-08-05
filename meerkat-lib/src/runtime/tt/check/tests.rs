@@ -18,7 +18,12 @@ fn test_type_depth_calculation() {
     assert!(check_type(&Type::Int, 1).is_ok());
     let func = Type::Func(
         Box::new(Type::Int),
-        Box::new(Type::Func(Box::new(Type::Bool), Box::new(Type::String))),
+        Box::new(Type::Func(
+            Box::new(Type::Bool),
+            Box::new(Type::String),
+            std::collections::HashSet::new(),
+        )),
+        std::collections::HashSet::new(),
     );
     assert!(check_type(&func, 1).is_ok());
 }
@@ -116,8 +121,8 @@ fn test_primitive_mismatch() {
     assert_eq!(
         res,
         Err(Error::TypeMismatch {
-            expected: Type::Int,
-            found: Type::String,
+            expected: Box::new(Type::Int),
+            found: Box::new(Type::String),
         })
     )
 }
@@ -132,7 +137,11 @@ fn test_function_calls() {
     let decls = vec![
         Decl::VarDecl {
             name: var_f,
-            ty: Some(Type::Func(Box::new(Type::Int), Box::new(Type::Int))),
+            ty: Some(Type::Func(
+                Box::new(Type::Int),
+                Box::new(Type::Int),
+                std::collections::HashSet::new(),
+            )),
             val: Expr::Func {
                 params: vec![Param {
                     name: interner.insert("a"),
@@ -500,7 +509,7 @@ fn test_circular_dependency() {
     let res = check(&program, &mut classes);
     assert_eq!(
         res,
-        Err(Error::DependencyCycle {
+        Err(Error::RecursiveTypeInference {
             service: name_s,
             member: name_a
         })
@@ -620,7 +629,11 @@ fn test_function_parameter_mismatches() {
         name: name_s,
         decls: vec![Decl::VarDecl {
             name: interner.insert("f"),
-            ty: Some(Type::Func(Box::new(Type::Int), Box::new(Type::Int))),
+            ty: Some(Type::Func(
+                Box::new(Type::Int),
+                Box::new(Type::Int),
+                std::collections::HashSet::new(),
+            )),
             val: Expr::Func {
                 params: vec![],
                 body: Box::new(Expr::Literal {
@@ -636,7 +649,11 @@ fn test_function_parameter_mismatches() {
         name: name_s,
         decls: vec![Decl::VarDecl {
             name: interner.insert("f"),
-            ty: Some(Type::Func(Box::new(Type::Int), Box::new(Type::Int))),
+            ty: Some(Type::Func(
+                Box::new(Type::Int),
+                Box::new(Type::Int),
+                std::collections::HashSet::new(),
+            )),
             val: Expr::Func {
                 params: vec![
                     Param {
@@ -685,7 +702,11 @@ fn test_call_mismatches() {
         decls: vec![
             Decl::VarDecl {
                 name: interner.insert("f"),
-                ty: Some(Type::Func(Box::new(Type::Unit), Box::new(Type::Int))),
+                ty: Some(Type::Func(
+                    Box::new(Type::Unit),
+                    Box::new(Type::Int),
+                    std::collections::HashSet::new(),
+                )),
                 val: Expr::Func {
                     params: vec![],
                     body: Box::new(Expr::Literal {
@@ -819,7 +840,11 @@ fn test_lambda_annotations_in_checking_mode() {
         name: name_s,
         decls: vec![Decl::VarDecl {
             name: interner.insert("f"),
-            ty: Some(Type::Func(Box::new(Type::Int), Box::new(Type::Int))),
+            ty: Some(Type::Func(
+                Box::new(Type::Int),
+                Box::new(Type::Int),
+                std::collections::HashSet::new(),
+            )),
             val: Expr::Func {
                 params: vec![Param {
                     name: interner.insert("x"),
@@ -836,8 +861,8 @@ fn test_lambda_annotations_in_checking_mode() {
     assert_eq!(
         res1,
         Err(Error::TypeMismatch {
-            expected: Type::Int,
-            found: Type::String,
+            expected: Box::new(Type::Int),
+            found: Box::new(Type::String),
         })
     );
     // Test contradictory parameter type: expected int -> int,
@@ -846,7 +871,11 @@ fn test_lambda_annotations_in_checking_mode() {
         name: name_s,
         decls: vec![Decl::VarDecl {
             name: interner.insert("g"),
-            ty: Some(Type::Func(Box::new(Type::Int), Box::new(Type::Int))),
+            ty: Some(Type::Func(
+                Box::new(Type::Int),
+                Box::new(Type::Int),
+                std::collections::HashSet::new(),
+            )),
             val: Expr::Func {
                 params: vec![Param {
                     name: interner.insert("x"),
@@ -863,8 +892,8 @@ fn test_lambda_annotations_in_checking_mode() {
     assert_eq!(
         res2,
         Err(Error::TypeMismatch {
-            expected: Type::Int,
-            found: Type::String,
+            expected: Box::new(Type::Int),
+            found: Box::new(Type::String),
         })
     );
     // Test contradictory tuple parameter type: expected
@@ -878,6 +907,7 @@ fn test_lambda_annotations_in_checking_mode() {
                     TupleType::new(vec![Type::Int, Type::Int]).unwrap(),
                 )),
                 Box::new(Type::Int),
+                std::collections::HashSet::new(),
             )),
             val: Expr::Func {
                 params: vec![
@@ -901,8 +931,8 @@ fn test_lambda_annotations_in_checking_mode() {
     assert_eq!(
         res3,
         Err(Error::TypeMismatch {
-            expected: Type::Int,
-            found: Type::String,
+            expected: Box::new(Type::Int),
+            found: Box::new(Type::String),
         })
     );
 }
@@ -1066,8 +1096,8 @@ fn test_update_block_type_mismatch_errors() {
     assert_eq!(
         res,
         Err(Error::TypeMismatch {
-            expected: Type::Int,
-            found: Type::Bool,
+            expected: Box::new(Type::Int),
+            found: Box::new(Type::Bool),
         })
     );
 }

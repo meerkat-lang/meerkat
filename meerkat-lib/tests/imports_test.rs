@@ -19,6 +19,7 @@ fn test_imports_local_resolution_and_circular_prevention() {
         Stmt::Import {
             path: "B.mkt".to_string(),
             service_name: sym_b,
+            explicit_path: false,
         },
         Stmt::Service {
             name: sym_a,
@@ -72,6 +73,7 @@ fn test_imports_remote_queuing() {
     let base_ast = vec![Stmt::Import {
         path: "B.mkt".to_string(),
         service_name: sym_b,
+        explicit_path: false,
     }];
 
     let mut remote_map = HashMap::new();
@@ -117,6 +119,7 @@ fn test_imports_on_recv_source_merges_and_resolves() {
     let base_ast = vec![Stmt::Import {
         path: "B.mkt".to_string(),
         service_name: sym_b,
+        explicit_path: false,
     }];
 
     let mut remote_map = HashMap::new();
@@ -198,6 +201,7 @@ fn test_imports_pending_cleanup() {
     let base_ast = vec![Stmt::Import {
         path: "B.mkt".to_string(),
         service_name: sym_b,
+        explicit_path: false,
     }];
 
     let mut remote_map = HashMap::new();

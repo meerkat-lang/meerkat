@@ -29,6 +29,9 @@ cargo build
 # Run all tests
 cargo test
 
+# Install the WASM target (one-time setup)
+rustup target add wasm32-unknown-unknown
+
 # Test WASM compatibility
 cargo check --locked -p meerkat-lib --target wasm32-unknown-unknown --all-features
 

@@ -24,6 +24,10 @@ pub struct Html {
     /// Private on purpose: no code outside this module may depend on HTML
     /// being represented as a string.
     rendered: String,
+    /// #153: event handlers bound to elements, as (event name, action value)
+    /// pairs. These are not part of the rendered string; the client attaches
+    /// them as real listeners. Empty for HTML with no handlers.
+    handlers: Vec<(String, Value)>,
 }
 
 impl Html {
@@ -35,7 +39,16 @@ impl Html {
     /// Returns:
     ///     `Html`: The constructed HTML value
     pub fn from_rendered(rendered: String) -> Self {
-        Html { rendered }
+        Html {
+            rendered,
+            handlers: Vec::new(),
+        }
+    }
+
+    /// #153: the event handlers bound in this HTML value, as (event, action)
+    /// pairs. The client reads these to attach real event listeners.
+    pub fn handlers(&self) -> &[(String, Value)] {
+        &self.handlers
     }
 
     /// Borrow the rendered markup as a string slice
@@ -72,6 +85,12 @@ impl fmt::Display for Html {
 pub(crate) enum HtmlPart {
     Text(String),
     Expr(Box<Expr>),
+    /// #153: an event handler bound to an `on*` attribute. `event` is the
+    /// attribute name (e.g. "onclick"); `expr` evaluates to an action value.
+    Handler {
+        event: String,
+        expr: Box<Expr>,
+    },
 }
 
 /// The representation of an HTML template expression, before evaluation.
@@ -98,6 +117,7 @@ impl HtmlTemplate {
         self.parts.iter().filter_map(|p| match p {
             HtmlPart::Text(_) => None,
             HtmlPart::Expr(e) => Some(e.as_ref()),
+            HtmlPart::Handler { expr, .. } => Some(expr.as_ref()),
         })
     }
 
@@ -106,6 +126,7 @@ impl HtmlTemplate {
         self.parts.iter_mut().filter_map(|p| match p {
             HtmlPart::Text(_) => None,
             HtmlPart::Expr(e) => Some(e.as_mut()),
+            HtmlPart::Handler { expr, .. } => Some(expr.as_mut()),
         })
     }
 
@@ -123,6 +144,11 @@ impl HtmlTemplate {
                     println!("Text: {:?}", t);
                 }
                 HtmlPart::Expr(e) => printer.print_expr(e, indent),
+                HtmlPart::Handler { event, expr } => {
+                    printer.print_indent(indent);
+                    println!("Handler({}):", event);
+                    printer.print_expr(expr, indent + 1);
+                }
             }
         }
     }
@@ -140,6 +166,7 @@ impl HtmlTemplate {
     /// expressions (a caller bug).
     pub fn render(&self, values: &[Value]) -> Option<Html> {
         let mut rendered = String::new();
+        let mut handlers = Vec::new();
         let mut next = 0usize;
         for part in &self.parts {
             match part {
@@ -153,9 +180,17 @@ impl HtmlTemplate {
                     let _ = write!(rendered, "{}", v);
                     next += 1;
                 }
+                HtmlPart::Handler { event, .. } => {
+                    // #153: a handler's value is the action to run on the
+                    // event; it is captured as a handler rather than rendered
+                    // into the markup.
+                    let v = values.get(next)?;
+                    handlers.push((event.clone(), v.clone()));
+                    next += 1;
+                }
             }
         }
-        Some(Html::from_rendered(rendered))
+        Some(Html { rendered, handlers })
     }
 }
 
@@ -187,6 +222,14 @@ impl HtmlTemplateBuilder {
     /// Append an embedded (interpolated) expression.
     pub fn push_expr(&mut self, expr: Expr) {
         self.parts.push(HtmlPart::Expr(Box::new(expr)));
+    }
+
+    /// #153: append an event handler bound to an `on*` attribute.
+    pub fn push_handler(&mut self, event: String, expr: Expr) {
+        self.parts.push(HtmlPart::Handler {
+            event,
+            expr: Box::new(expr),
+        });
     }
 
     /// Finish building the template.

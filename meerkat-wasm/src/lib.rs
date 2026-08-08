@@ -255,11 +255,20 @@ pub async fn load_service(server_ws_addr: String, path: String) -> Result<String
     wasm_bindgen_futures::spawn_local(async move {
         let mut last = current_html(&manager_loop.borrow(), html_sym);
         loop {
-            // #153: hold the mutable borrow only for the dispatch call, never
-            // across the timer await below, so a click listener (which also
-            // borrows the manager) cannot collide with an outstanding borrow.
-            // Borrow spans dispatch's await by necessity; see module note.
-            manager_loop.borrow_mut().dispatch_network_events().await;
+            // #153: skip this tick if a click task currently holds the
+            // manager, instead of an unconditional borrow_mut that panics on a
+            // double borrow. Stopgap: this stops the "RefCell already borrowed"
+            // crash, but the borrow is still held across dispatch's await, so UI
+            // and network work remain serialized. Releasing the manager during
+            // network waits (so the UI stays responsive) is the larger
+            // event-loop rework discussed on the PR / issue #154.
+            {
+                let Ok(mut manager) = manager_loop.try_borrow_mut() else {
+                    gloo_timers::future::TimeoutFuture::new(20).await;
+                    continue;
+                };
+                manager.dispatch_network_events().await;
+            }
             let now = current_html(&manager_loop.borrow(), html_sym);
             if now != last {
                 if let Some(html) = &now {

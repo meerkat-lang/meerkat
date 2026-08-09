@@ -7,11 +7,19 @@ use crate::net::{
     NetworkReply, ServiceNetId,
 };
 use crate::runtime::interner::{Interner, Symbol};
-use crate::runtime::txn::{Transaction, TxnId, VarState, WaitKey};
+use crate::runtime::txn::{Transaction, TxnId, VClock, VarState, WaitKey};
 use std::collections::{HashMap, HashSet};
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 use tokio::sync::oneshot;
+
+/// One cross-service dependency's cached state: the last value delivered for it
+/// plus the vector clock that value was stamped with by its writer.
+pub type DepEntry = (Value, VClock);
+
+/// #24: cached values of each def's cross-service deps:
+/// def -> {(source service, member) -> (value, clock)}.
+pub type DepCache = HashMap<Symbol, HashMap<(Symbol, Symbol), DepEntry>>;
 
 pub struct Service {
     /// Globally unique identity of this service (address-based when networked).
@@ -24,8 +32,8 @@ pub struct Service {
     /// #24: who depends on each member: member -> {(listener service id, def)}.
     pub listeners: HashMap<Symbol, HashSet<(ServiceNetId, Symbol)>>,
     /// #24: cached values of each def's cross-service deps:
-    /// def -> {(source service, member) -> value}.
-    pub dep_cache: HashMap<Symbol, HashMap<(Symbol, Symbol), Value>>,
+    /// def -> {(source service, member) -> (value, clock)}.
+    pub dep_cache: DepCache,
     /// Optional lock for whole-service blocking during structural updates
     pub service_lock: Option<TxnId>,
 }
@@ -579,7 +587,10 @@ impl Manager {
         if let Some(service) = self.services.get_mut(&service_name) {
             if let Some(var_state) = service.vars.get_mut(&var_name) {
                 var_state.value = value;
+                self.simultaneous_bump(&HashSet::new(), &HashSet::from([(service_name, var_name)]));
             } else {
+                // in theory we should never encounter this after nameres is fully integrated
+                // keep this in mind to guide future development
                 return Err(EvalError::VarNotFound(format!(
                     "Variable '{}' not found in service '{}'",
                     self.interner.get(var_name),
@@ -596,6 +607,53 @@ impl Manager {
         // propagate: re-evaluate defs that depend on this var in topo order
         self.propagate(service_name, var_name).await;
         Ok(())
+    }
+
+    // helper function to get the vector clock for a particular var def
+    fn get_clock(&self, service_name: &Symbol, var: &Symbol) -> Option<&VClock> {
+        let svc = self.services.get(service_name)?;
+        let vars = svc.vars.get(var)?;
+        Some(&vars.vector_clock)
+    }
+
+    // helper function to apply a simultaneous bump, as described in section 5.2 of vector clock semantics
+    fn simultaneous_bump(
+        &mut self,
+        read_set: &HashSet<(Symbol, Symbol)>,
+        write_set: &HashSet<(Symbol, Symbol)>,
+    ) -> VClock {
+        let mut vclocks: Vec<&VClock> = Vec::new();
+        // get all the vclocks first
+        for (svc, var) in read_set.union(write_set) {
+            match self.get_clock(svc, var) {
+                Some(clock) => vclocks.push(clock),
+                None => {
+                    log::warn!(
+                        "simultaneous_bump: clock for var {} in service {} not found",
+                        self.interner.get(*var),
+                        self.interner.get(*svc)
+                    );
+                }
+            }
+        }
+        // compute the max over all vclocks
+        let mut v_base: VClock = HashMap::new();
+        for clk in &vclocks {
+            for (dim, &c) in *clk {
+                let e = v_base.entry(*dim).or_insert(0);
+                *e = (*e).max(c);
+            }
+        }
+        // increment if they're in the write_set
+        for (svc, var) in write_set {
+            *v_base.entry((*svc, *var)).or_insert(0) += 1;
+        }
+        for (svc, var) in write_set {
+            if let Some(vs) = self.services.get_mut(svc).and_then(|s| s.vars.get_mut(var)) {
+                vs.vector_clock = v_base.clone(); // write the new base vector clock back to everything in the write set
+            }
+        }
+        v_base
     }
 
     async fn propagate(&mut self, service_name: Symbol, changed_var: Symbol) {
@@ -638,10 +696,66 @@ impl Manager {
         }
     }
 
+    // compute v_target from vector clock semantics 5.3 by taking max over all dependent vector clocks
+    // then, determine whether it is glitch-free or not
+    fn compute_v_target(&self, curr_svc: &Service, def: &Symbol) -> (VClock, bool) {
+        // get all vclocks of dependencies
+        let mut vclocks: Vec<&VClock> = Vec::new();
+
+        // local inputs
+        match curr_svc.dep.dep_graph.get(def) {
+            Some(local_deps) => {
+                for name in local_deps {
+                    match curr_svc.vars.get(name) {
+                        Some(vs) => vclocks.push(&vs.vector_clock),
+                        None => log::warn!(
+                            "gate: local dep '{}' of def '{}' missing from vars",
+                            self.interner.get(*name),
+                            self.interner.get(*def),
+                        ),
+                    }
+                }
+            }
+            None => log::warn!(
+                "gate: def '{}' missing from dep_graph in service '{}'",
+                self.interner.get(*def),
+                self.interner.get(curr_svc.name),
+            ),
+        }
+
+        // cross-service inputs
+        if let Some(deps) = curr_svc.dep_cache.get(def) {
+            for (_, clk) in deps.values() {
+                vclocks.push(clk);
+            }
+        }
+
+        // compute v_target by taking max over all dependent vector clocks
+        let mut v_target: VClock = HashMap::new();
+        for clk in &vclocks {
+            for (dim, &c) in *clk {
+                let e = v_target.entry(*dim).or_insert(0);
+                *e = (*e).max(c);
+            }
+        }
+        // gate: every input clock is >= v_target
+        let gate_ok = vclocks.iter().all(|clk| {
+            v_target
+                .iter()
+                .all(|(dim, &t)| clk.get(dim).copied().unwrap_or(0) >= t)
+        });
+        (v_target, gate_ok)
+    }
+
     /// #24: recompute `def` in `svc` from current values, seeding the reactive
     /// cache with this def's cached cross-service deps so MemberAccess resolves
     /// from cache instead of a (possibly remote) lookup. Returns whether the
     /// stored value changed.
+    ///
+    /// Vector clock PR update: to make sure that recomputing defs is safe
+    /// we add a check against the vector clocks of the dependencies of the def.
+    /// specifically, we check that for all dependent variables v that def depends on,
+    /// v has the same clock value in every vector clock stored by all vs
     async fn recompute_def(&mut self, svc: Symbol, def: Symbol) -> bool {
         let expr = match self
             .services
@@ -668,55 +782,76 @@ impl Manager {
             .services
             .get(&svc)
             .and_then(|s| s.dep_cache.get(&def))
-            .cloned()
+            // remove vector clocks for dep_cache to get reactive_cache to typecheck
+            .map(|m| m.iter().map(|(k, (v, _clk))| (*k, v.clone())).collect())
             .unwrap_or_default();
 
-        self.reactive_cache = Some(cache);
-        let result = eval(
-            &expr,
-            &env,
-            &mut EvalContext {
-                manager: self,
-                service_name: svc,
-                txn: None,
-            },
-        )
-        .await;
-        // The reactive cache is only valid for the single recompute above (its
-        // entries are this def's cached cross-service deps), so clear it before
-        // returning to avoid leaking stale entries into later evaluations.
-        self.reactive_cache = None;
-
-        let value = match result {
-            Ok(v) => v,
-            Err(e) => {
+        let curr_svc = match self.services.get(&svc) {
+            Some(svc) => svc,
+            None => {
                 log::warn!(
-                    "propagation of def '{}' failed: {}",
+                    "recompute_def: def '{}' not found in service '{}'",
                     self.interner.get(def),
-                    e
+                    self.interner.get(svc)
                 );
                 return false;
             }
         };
 
-        match self
-            .services
-            .get_mut(&svc)
-            .and_then(|s| s.vars.get_mut(&def))
-        {
-            Some(var_state) => {
-                let differs = var_state.value != value;
-                var_state.value = value;
-                differs
+        let (v_target, gate_ok) = self.compute_v_target(curr_svc, &def);
+
+        if gate_ok {
+            self.reactive_cache = Some(cache);
+
+            let result = eval(
+                &expr,
+                &env,
+                &mut EvalContext {
+                    manager: self,
+                    service_name: svc,
+                    txn: None,
+                },
+            )
+            .await;
+
+            // The reactive cache is only valid for the single recompute above (its
+            // entries are this def's cached cross-service deps), so clear it before
+            // returning to avoid leaking stale entries into later evaluations.
+            self.reactive_cache = None;
+
+            let value = match result {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!(
+                        "propagation of def '{}' failed: {}",
+                        self.interner.get(def),
+                        e
+                    );
+                    return false;
+                }
+            };
+            match self
+                .services
+                .get_mut(&svc)
+                .and_then(|s| s.vars.get_mut(&def))
+            {
+                Some(var_state) => {
+                    let differs = var_state.value != value;
+                    var_state.value = value;
+                    var_state.vector_clock = v_target;
+                    differs
+                }
+                None => {
+                    log::warn!(
+                        "recompute_def: def '{}' in service '{}' disappeared after recompute",
+                        self.interner.get(def),
+                        self.interner.get(svc)
+                    );
+                    false
+                }
             }
-            None => {
-                log::warn!(
-                    "recompute_def: def '{}' in service '{}' disappeared after recompute",
-                    self.interner.get(def),
-                    self.interner.get(svc)
-                );
-                false
-            }
+        } else {
+            false
         }
     }
 
@@ -753,11 +888,11 @@ impl Manager {
                 return;
             }
         };
-        let value = match self
+        let (value, clock) = match self
             .services
             .get(&svc)
             .and_then(|s| s.vars.get(&member))
-            .map(|vs| vs.value.clone())
+            .map(|vs| (vs.value.clone(), vs.vector_clock.clone()))
         {
             Some(v) => v,
             None => {
@@ -787,6 +922,7 @@ impl Manager {
             source_service: self.interner.get(svc).to_string(),
             member: self.interner.get(member).to_string(),
             value: net_val,
+            clock: codec::encode_clock(&clock, &self.interner),
         };
         self.send_oneway(Address::new(&reply_to), msg).await;
     }
@@ -855,8 +991,8 @@ impl Manager {
             .services
             .get(&service_sym)
             .and_then(|s| s.vars.get(&member_sym))
-            .map(|vs| vs.value.clone());
-        if let Some(value) = current {
+            .map(|vs| (vs.value.clone(), vs.vector_clock.clone()));
+        if let Some((value, clock)) = current {
             if let Ok(net_val) = codec::encode_value(&value, &self.interner) {
                 let msg = MeerkatMessage::Update {
                     listener_service: listener_id.0.clone(),
@@ -864,6 +1000,7 @@ impl Manager {
                     source_service: self.interner.get(service_sym).to_string(),
                     member: self.interner.get(member_sym).to_string(),
                     value: net_val,
+                    clock: codec::encode_clock(&clock, &self.interner),
                 };
                 self.send_oneway(Address::new(&reply_to), msg).await;
             }
@@ -879,6 +1016,7 @@ impl Manager {
         source_sym: Symbol,
         member_sym: Symbol,
         value: crate::net::ast::NetValue,
+        clock: VClock,
     ) {
         let value = match codec::decode_value(value, &mut self.interner) {
             Ok(v) => v,
@@ -899,7 +1037,7 @@ impl Manager {
             svc.dep_cache
                 .entry(listener_def_sym)
                 .or_default()
-                .insert((source_sym, member_sym), value);
+                .insert((source_sym, member_sym), (value, clock));
         }
 
         if self.recompute_def(listener_svc, listener_def_sym).await {
@@ -956,24 +1094,28 @@ impl Manager {
                         source_service,
                         member,
                         value,
+                        clock,
                     } => {
                         // #24: validate + intern wire names through codec; skip
                         // the message if any identifier fails validation.
-                        let (listener_def_sym, source_sym, member_sym) = match codec::decode_update(
-                            &listener_def,
-                            &source_service,
-                            &member,
-                            &mut self.interner,
-                        ) {
-                            Ok(syms) => syms,
-                            Err(_) => continue,
-                        };
+                        let (listener_def_sym, source_sym, member_sym, vclock) =
+                            match codec::decode_update(
+                                &listener_def,
+                                &source_service,
+                                &member,
+                                &mut self.interner,
+                                clock,
+                            ) {
+                                Ok(syms) => syms,
+                                Err(_) => continue,
+                            };
                         self.handle_update(
                             ServiceNetId(listener_service),
                             listener_def_sym,
                             source_sym,
                             member_sym,
                             value,
+                            vclock,
                         )
                         .await;
                     }
@@ -1891,6 +2033,20 @@ impl Manager {
                 }
             }
         }
+
+        // before we propagate, need to apply simultaneous bump
+        let write_set: HashSet<(Symbol, Symbol)> = txn
+            .written
+            .keys()
+            .filter_map(|(sid, var)| self.service_name_for_net_id(sid).map(|n| (n, *var)))
+            .collect();
+        let read_set: HashSet<(Symbol, Symbol)> = txn
+            .read_cache
+            .keys()
+            .filter_map(|(sid, var)| self.service_name_for_net_id(sid).map(|n| (n, *var)))
+            .collect();
+        // for now, we don't need the resulting v_base, but we will in the future
+        self.simultaneous_bump(&read_set, &write_set); // returns V_new; discarded in M1
         for ((sid, var), _) in &writes {
             if let Some(name) = self.service_name_for_net_id(sid) {
                 self.propagate(name, *var).await;
@@ -2579,10 +2735,13 @@ mod tests {
         let s2_id = tc.manager.services.get(&tc.s2).unwrap().id.0.clone();
         let net_val = codec::encode_value(&Value::Int { val: 10 }, &tc.manager.interner).unwrap();
 
-        // simulate a remote Update saying s1.y = 10
+        // simulate a remote Update saying s1.y = 10, stamped with s1.y's clock.
+        // z's only input is this cross-service member, so the gate joins a single
+        // clock and passes trivially regardless of its contents.
         let z_sym = tc.manager.interner.insert("z");
+        let clock: VClock = HashMap::from([((tc.s1, tc.y), 1u64)]);
         tc.manager
-            .handle_update(ServiceNetId(s2_id), z_sym, tc.s1, tc.y, net_val)
+            .handle_update(ServiceNetId(s2_id), z_sym, tc.s1, tc.y, net_val, clock)
             .await;
 
         // recomputed from the cached 10 (not s1's local y of 2): 10 + 2 = 12
@@ -2787,6 +2946,766 @@ mod tests {
             .unwrap();
         let result = tc.manager.lookup(tc.f, tc.foo, None).await.unwrap();
         assert_eq!(result, Value::Int { val: 15 });
+    }
+
+    // ---- vector-clock local-diamond tests ----
+
+    fn vint(n: i32) -> Value {
+        Value::Int { val: n }
+    }
+    fn lit_int(n: i32) -> Expr {
+        Expr::Literal { val: vint(n) }
+    }
+    fn mk_add(e1: Expr, e2: Expr) -> Expr {
+        Expr::Binop {
+            op: crate::ast::BinOp::Add,
+            expr1: Box::new(e1),
+            expr2: Box::new(e2),
+        }
+    }
+
+    // Local diamond in one service:
+    //   var x = 1
+    //   def a = x + 10
+    //   def b = x + 20
+    //   def q = a + b
+    // A single write to x must reach the sink q as one consistent generation.
+    // With the glitch gate, q recomputes only once a and b agree on x's clock,
+    // so q never observes a mixed (old a, new b) cut — a glitch would surface as
+    // q == 33 (11+22 or 12+21). We check both the final value and that every node
+    // on the frontier carries the same vector clock.
+    #[tokio::test]
+    async fn test_local_diamond_glitch_free() {
+        let mut tc = TestContext::new();
+        let a = tc.manager.interner.insert("a");
+        let b = tc.manager.interner.insert("b");
+        let q = tc.manager.interner.insert("q");
+
+        let decls = vec![
+            Decl::VarDecl {
+                name: tc.x,
+                ty: None,
+                val: lit_int(1),
+            },
+            Decl::DefDecl {
+                name: a,
+                ty: None,
+                val: mk_add(Expr::Variable { name: tc.x }, lit_int(10)),
+                is_pub: true,
+            },
+            Decl::DefDecl {
+                name: b,
+                ty: None,
+                val: mk_add(Expr::Variable { name: tc.x }, lit_int(20)),
+                is_pub: true,
+            },
+            Decl::DefDecl {
+                name: q,
+                ty: None,
+                val: mk_add(Expr::Variable { name: a }, Expr::Variable { name: b }),
+                is_pub: true,
+            },
+        ];
+        tc.manager.create_service(tc.foo, decls).await.unwrap();
+
+        // initial: a = 11, b = 21, q = 32
+        assert_eq!(tc.manager.lookup(q, tc.foo, None).await.unwrap(), vint(32));
+
+        // write x = 2  ->  a = 12, b = 22, q = 34
+        tc.manager
+            .assign(tc.foo, tc.x, vint(2), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            tc.manager.lookup(q, tc.foo, None).await.unwrap(),
+            vint(34),
+            "sink must reflect the fully-updated generation, never a glitch (33)"
+        );
+
+        // one write to x => generation 1 on dimension (foo, x). Every node on the
+        // frontier — the two intermediates and the sink — must agree on it.
+        let foo = tc.manager.services.get(&tc.foo).unwrap();
+        let frontier: VClock = HashMap::from([((tc.foo, tc.x), 1u64)]);
+        assert_eq!(
+            foo.vars.get(&tc.x).unwrap().vector_clock,
+            frontier,
+            "x bumped to generation 1"
+        );
+        assert_eq!(
+            foo.vars.get(&a).unwrap().vector_clock,
+            frontier,
+            "a joined x's clock"
+        );
+        assert_eq!(
+            foo.vars.get(&b).unwrap().vector_clock,
+            frontier,
+            "b joined x's clock"
+        );
+        assert_eq!(
+            foo.vars.get(&q).unwrap().vector_clock,
+            frontier,
+            "sink q carries the joined frontier"
+        );
+    }
+
+    // Overwrite a node's stored value and clock directly, to stage an
+    // inconsistent frontier the synchronous cascade would never leave behind.
+    fn stage_node(mgr: &mut Manager, svc: Symbol, name: Symbol, value: Value, clock: VClock) {
+        let vs = mgr
+            .services
+            .get_mut(&svc)
+            .unwrap()
+            .vars
+            .get_mut(&name)
+            .unwrap();
+        vs.value = value;
+        vs.vector_clock = clock;
+    }
+
+    // Targeted defer-path test. The synchronous cascade always finishes in a
+    // consistent state, so to hit the gate's DEFER branch directly we stage the
+    // frontier by hand:
+    //   var x = 1;  def a = x + 10;  def q = a + x;
+    // After settling at generation 1, we bump x to generation 2 with a NEW value
+    // but leave a at generation 1 (as if a's recompute hasn't happened yet).
+    // q's inputs now disagree on x's dimension, so recompute_def(q) must defer —
+    // otherwise q would glitch to a + x = 12 + 5 = 17. Once a catches up to
+    // generation 2, the gate is satisfied and q recomputes.
+    #[tokio::test]
+    async fn test_gate_defers_on_stale_input() {
+        let mut tc = TestContext::new();
+        let a = tc.manager.interner.insert("a");
+        let q = tc.manager.interner.insert("q");
+
+        let decls = vec![
+            Decl::VarDecl {
+                name: tc.x,
+                ty: None,
+                val: lit_int(1),
+            },
+            Decl::DefDecl {
+                name: a,
+                ty: None,
+                val: mk_add(Expr::Variable { name: tc.x }, lit_int(10)),
+                is_pub: true,
+            },
+            Decl::DefDecl {
+                name: q,
+                ty: None,
+                val: mk_add(Expr::Variable { name: a }, Expr::Variable { name: tc.x }),
+                is_pub: true,
+            },
+        ];
+        tc.manager.create_service(tc.foo, decls).await.unwrap();
+
+        let gen1: VClock = HashMap::from([((tc.foo, tc.x), 1u64)]);
+        let gen2: VClock = HashMap::from([((tc.foo, tc.x), 2u64)]);
+
+        // settle at generation 1: x = 2, a = 12, q = 14
+        tc.manager
+            .assign(tc.foo, tc.x, vint(2), None)
+            .await
+            .unwrap();
+        assert_eq!(tc.manager.lookup(q, tc.foo, None).await.unwrap(), vint(14));
+
+        // stage the inconsistency: x jumps to generation 2 with a new value,
+        // while a is left behind at generation 1 with its old value.
+        stage_node(&mut tc.manager, tc.foo, tc.x, vint(5), gen2.clone());
+
+        // gate must DEFER: a (gen 1) lags x (gen 2) on dimension (foo, x).
+        let changed = tc.manager.recompute_def(tc.foo, q).await;
+        assert!(!changed, "gate should defer while a is stale relative to x");
+        {
+            let foo = tc.manager.services.get(&tc.foo).unwrap();
+            assert_eq!(
+                foo.vars.get(&q).unwrap().value,
+                vint(14),
+                "q must keep its consistent value, not glitch to 17"
+            );
+            assert_eq!(
+                foo.vars.get(&q).unwrap().vector_clock,
+                gen1,
+                "q's clock is unchanged while deferred"
+            );
+        }
+
+        // a catches up to generation 2; now the gate passes and q recomputes.
+        stage_node(&mut tc.manager, tc.foo, a, vint(15), gen2.clone());
+        let changed = tc.manager.recompute_def(tc.foo, q).await;
+        assert!(changed, "gate should pass once a reaches generation 2");
+        {
+            let foo = tc.manager.services.get(&tc.foo).unwrap();
+            assert_eq!(
+                foo.vars.get(&q).unwrap().value,
+                vint(20),
+                "q = a + x = 15 + 5"
+            );
+            assert_eq!(
+                foo.vars.get(&q).unwrap().vector_clock,
+                gen2,
+                "q joins the generation-2 frontier"
+            );
+        }
+    }
+
+    // ---- vector-clock remote-diamond tests (the M2 wire path) ----
+
+    // Simulate a remote `Update` for `source.member` arriving at `listener_net_id`
+    // with the given value and clock, driving the same code path the network
+    // dispatcher uses. Interning is already done (these are runtime `Symbol`s),
+    // so this bypasses the wire codec and exercises `handle_update` directly.
+    async fn deliver_update(
+        mgr: &mut Manager,
+        listener_net_id: &str,
+        listener_def: Symbol,
+        source: Symbol,
+        member: Symbol,
+        value: Value,
+        clock: VClock,
+    ) {
+        let net_val = codec::encode_value(&value, &mgr.interner).unwrap();
+        mgr.handle_update(
+            ServiceNetId(listener_net_id.to_string()),
+            listener_def,
+            source,
+            member,
+            net_val,
+            clock,
+        )
+        .await;
+    }
+
+    // Build `s2` whose only def is the remote-diamond sink `z = s1.a + s1.b`,
+    // and return its network id. `s1` owns `a` and `b` as members; their local
+    // values are sentinels (0) so that if `z` ever computed from a local
+    // fallback instead of its delivered dep_cache, the result would be visibly
+    // wrong rather than coincidentally correct.
+    async fn setup_remote_diamond(tc: &mut TestContext, a: Symbol, b: Symbol, z: Symbol) -> String {
+        let s1_decls = vec![
+            Decl::VarDecl {
+                name: a,
+                ty: None,
+                val: lit_int(0),
+            },
+            Decl::VarDecl {
+                name: b,
+                ty: None,
+                val: lit_int(0),
+            },
+        ];
+        tc.manager.create_service(tc.s1, s1_decls).await.unwrap();
+
+        let s2_decls = vec![Decl::DefDecl {
+            name: z,
+            ty: None,
+            val: mk_add(
+                Expr::MemberAccess {
+                    service_name: tc.s1,
+                    member_name: a,
+                },
+                Expr::MemberAccess {
+                    service_name: tc.s1,
+                    member_name: b,
+                },
+            ),
+            is_pub: true,
+        }];
+        tc.manager.create_service(tc.s2, s2_decls).await.unwrap();
+        tc.manager.services.get(&tc.s2).unwrap().id.0.clone()
+    }
+
+    // Remote diamond across services, glitch-free (gate SUCCEEDS).
+    //   s1 owns source w and two derived members a, b (both functions of w).
+    //   s2:  def z = s1.a + s1.b
+    // z subscribes to both remote members. When a and b arrive stamped with
+    // clocks that AGREE on w's dimension, the gate joins them and z recomputes to
+    // the consistent sum. We settle a whole generation (a=11, b=21 => 32), then a
+    // second (a=12, b=22 => 34). A consistent frontier must never be spuriously
+    // deferred — this is the no-false-positive / no-deadlock direction.
+    #[tokio::test]
+    async fn test_remote_diamond_glitch_free() {
+        let mut tc = TestContext::new();
+        let a = tc.manager.interner.insert("a");
+        let b = tc.manager.interner.insert("b");
+        let z = tc.manager.interner.insert("z");
+        let s2_id = setup_remote_diamond(&mut tc, a, b, z).await;
+
+        // generation 1: both arms carry (s1,w):1, plus their own dimension. z
+        // cannot compute until both are cached, so it settles on the 2nd arrival.
+        let clk_a1: VClock = HashMap::from([((tc.s1, tc.w), 1u64), ((tc.s1, a), 1u64)]);
+        let clk_b1: VClock = HashMap::from([((tc.s1, tc.w), 1u64), ((tc.s1, b), 1u64)]);
+        deliver_update(&mut tc.manager, &s2_id, z, tc.s1, a, vint(11), clk_a1).await;
+        deliver_update(&mut tc.manager, &s2_id, z, tc.s1, b, vint(21), clk_b1).await;
+
+        let z_gen1: VClock = HashMap::from([
+            ((tc.s1, tc.w), 1u64),
+            ((tc.s1, a), 1u64),
+            ((tc.s1, b), 1u64),
+        ]);
+        {
+            let vs = tc
+                .manager
+                .services
+                .get(&tc.s2)
+                .unwrap()
+                .vars
+                .get(&z)
+                .unwrap();
+            assert_eq!(
+                vs.value,
+                vint(32),
+                "z reflects the consistent gen-1 cut (11 + 21)"
+            );
+            assert_eq!(
+                vs.vector_clock, z_gen1,
+                "z carries the joined gen-1 frontier"
+            );
+        }
+
+        // generation 2: advance both arms consistently on (s1,w):2. The lone
+        // a@gen-2 arrival transiently disagrees with the still-cached b@gen-1 and
+        // is deferred by the gate; only once b@gen-2 lands does z advance.
+        let clk_a2: VClock = HashMap::from([((tc.s1, tc.w), 2u64), ((tc.s1, a), 2u64)]);
+        let clk_b2: VClock = HashMap::from([((tc.s1, tc.w), 2u64), ((tc.s1, b), 2u64)]);
+        deliver_update(&mut tc.manager, &s2_id, z, tc.s1, a, vint(12), clk_a2).await;
+        deliver_update(&mut tc.manager, &s2_id, z, tc.s1, b, vint(22), clk_b2).await;
+
+        let z_gen2: VClock = HashMap::from([
+            ((tc.s1, tc.w), 2u64),
+            ((tc.s1, a), 2u64),
+            ((tc.s1, b), 2u64),
+        ]);
+        let vs = tc
+            .manager
+            .services
+            .get(&tc.s2)
+            .unwrap()
+            .vars
+            .get(&z)
+            .unwrap();
+        assert_eq!(
+            vs.value,
+            vint(34),
+            "z reflects the consistent gen-2 cut (12 + 22), never a glitch (33)"
+        );
+        assert_eq!(
+            vs.vector_clock, z_gen2,
+            "z carries the joined gen-2 frontier"
+        );
+    }
+
+    // Remote diamond where one arm runs ahead (gate DEFERS).
+    // Same shape: s2.z = s1.a + s1.b. After settling gen-1 (z = 32), a jumps to
+    // generation 2 while b is still cached at generation 1. z's inputs now
+    // disagree on w's dimension, so recompute_def(z) must defer — otherwise z
+    // would glitch to a(gen2) + b(gen1) = 12 + 21 = 33. Once b catches up to
+    // generation 2, the gate is satisfied and z recomputes to 34.
+    #[tokio::test]
+    async fn test_remote_diamond_defers_on_stale_arm() {
+        let mut tc = TestContext::new();
+        let a = tc.manager.interner.insert("a");
+        let b = tc.manager.interner.insert("b");
+        let z = tc.manager.interner.insert("z");
+        let s2_id = setup_remote_diamond(&mut tc, a, b, z).await;
+
+        // settle a consistent generation-1 frontier: z = 11 + 21 = 32.
+        let clk_a1: VClock = HashMap::from([((tc.s1, tc.w), 1u64), ((tc.s1, a), 1u64)]);
+        let clk_b1: VClock = HashMap::from([((tc.s1, tc.w), 1u64), ((tc.s1, b), 1u64)]);
+        deliver_update(&mut tc.manager, &s2_id, z, tc.s1, a, vint(11), clk_a1).await;
+        deliver_update(&mut tc.manager, &s2_id, z, tc.s1, b, vint(21), clk_b1).await;
+
+        let z_gen1: VClock = HashMap::from([
+            ((tc.s1, tc.w), 1u64),
+            ((tc.s1, a), 1u64),
+            ((tc.s1, b), 1u64),
+        ]);
+        assert_eq!(
+            tc.manager
+                .services
+                .get(&tc.s2)
+                .unwrap()
+                .vars
+                .get(&z)
+                .unwrap()
+                .value,
+            vint(32),
+            "baseline: consistent gen-1 cut"
+        );
+
+        // a runs ahead to generation 2 (new value + (s1,w):2), b stays at gen-1.
+        let clk_a2: VClock = HashMap::from([((tc.s1, tc.w), 2u64), ((tc.s1, a), 2u64)]);
+        deliver_update(&mut tc.manager, &s2_id, z, tc.s1, a, vint(12), clk_a2).await;
+
+        // gate must DEFER: b (gen-1) lags a (gen-2) on dimension (s1,w). z keeps
+        // its consistent value and clock rather than glitching to 12 + 21 = 33.
+        {
+            let vs = tc
+                .manager
+                .services
+                .get(&tc.s2)
+                .unwrap()
+                .vars
+                .get(&z)
+                .unwrap();
+            assert_eq!(
+                vs.value,
+                vint(32),
+                "z must not glitch to 33 while b is stale"
+            );
+            assert_eq!(
+                vs.vector_clock, z_gen1,
+                "z's clock is unchanged while deferred"
+            );
+        }
+
+        // b catches up to generation 2; the gate now passes and z recomputes.
+        let clk_b2: VClock = HashMap::from([((tc.s1, tc.w), 2u64), ((tc.s1, b), 2u64)]);
+        deliver_update(&mut tc.manager, &s2_id, z, tc.s1, b, vint(22), clk_b2).await;
+
+        let z_gen2: VClock = HashMap::from([
+            ((tc.s1, tc.w), 2u64),
+            ((tc.s1, a), 2u64),
+            ((tc.s1, b), 2u64),
+        ]);
+        let vs = tc
+            .manager
+            .services
+            .get(&tc.s2)
+            .unwrap()
+            .vars
+            .get(&z)
+            .unwrap();
+        assert_eq!(
+            vs.value,
+            vint(34),
+            "z = a + b = 12 + 22 once the frontier is consistent"
+        );
+        assert_eq!(vs.vector_clock, z_gen2, "z joins the generation-2 frontier");
+    }
+
+    // ---- vector-clock cross-node test (real codec + serde_json round-trip) ----
+
+    // Ship one remote `Update` from `src` to `dst` the way the network path
+    // actually does it: build the message with `src`'s interner (as
+    // `emit_update` does), serialize/deserialize it through serde_json (the wire
+    // format from `protocol.rs`), then decode + intern it into `dst`'s interner
+    // (as the dispatcher does) and hand it to `dst.handle_update`. The symbols
+    // are re-derived from strings on the far side, so `src` and `dst` need not
+    // share a symbol space.
+    // The payload of one such update, entirely in `src`'s symbol space.
+    struct WireUpdate {
+        listener_def: Symbol,
+        source: Symbol,
+        member: Symbol,
+        value: Value,
+        clock: VClock,
+    }
+
+    async fn send_update_over_wire(
+        src: &Manager,
+        dst: &mut Manager,
+        listener_net_id: &str,
+        update: WireUpdate,
+    ) {
+        // send side (mirrors emit_update)
+        let msg = MeerkatMessage::Update {
+            listener_service: listener_net_id.to_string(),
+            listener_def: src.interner.get(update.listener_def).to_string(),
+            source_service: src.interner.get(update.source).to_string(),
+            member: src.interner.get(update.member).to_string(),
+            value: codec::encode_value(&update.value, &src.interner).unwrap(),
+            clock: codec::encode_clock(&update.clock, &src.interner),
+        };
+
+        // real transport: the exact serde_json framing recv_message uses
+        let bytes = serde_json::to_vec(&msg).unwrap();
+        let msg: MeerkatMessage = serde_json::from_slice(&bytes).unwrap();
+
+        // recv side (mirrors the dispatcher's Update arm)
+        let (listener_service, listener_def, source_service, member, net_val, wire_clock) =
+            match msg {
+                MeerkatMessage::Update {
+                    listener_service,
+                    listener_def,
+                    source_service,
+                    member,
+                    value,
+                    clock,
+                } => (
+                    listener_service,
+                    listener_def,
+                    source_service,
+                    member,
+                    value,
+                    clock,
+                ),
+                other => panic!("expected Update, got {:?}", other),
+            };
+        let (listener_def_sym, source_sym, member_sym, vclock) = codec::decode_update(
+            &listener_def,
+            &source_service,
+            &member,
+            &mut dst.interner,
+            wire_clock,
+        )
+        .unwrap();
+        dst.handle_update(
+            ServiceNetId(listener_service),
+            listener_def_sym,
+            source_sym,
+            member_sym,
+            net_val,
+            vclock,
+        )
+        .await;
+    }
+
+    // Route B: two independent Managers with SEPARATE interners exchange the
+    // remote-diamond updates through the real wire codec + a serde_json
+    // round-trip. This is the guarantee the single-interner diamond tests cannot
+    // give: a clock's (service, var) dimensions must survive re-interning into a
+    // *different* symbol space. We deliberately offset node B's interner so the
+    // same name maps to a different Symbol id on each node — only because the
+    // wire clock is string-keyed does the clock still land on the right names.
+    #[tokio::test]
+    async fn test_wire_clock_crosses_interner_boundary() {
+        // node A: the source side. It owns no services here; we only need its
+        // interner to stamp the outgoing message, exactly as emit_update reads a
+        // stored clock in A's symbol space.
+        let mut node_a = Manager::default();
+        let a_s1 = node_a.interner.insert("s1");
+        let a_w = node_a.interner.insert("w");
+        let a_a = node_a.interner.insert("a");
+        let a_b = node_a.interner.insert("b");
+        let a_z = node_a.interner.insert("z");
+
+        // node B: the listener side, owns s2.z = s1.a + s1.b. Pad its interner
+        // first so identical names get different ids than on node A.
+        let mut node_b = Manager::default();
+        for pad in ["pad0", "pad1", "pad2", "pad3", "pad4"] {
+            node_b.interner.insert(pad);
+        }
+        let b_s1 = node_b.interner.insert("s1");
+        let b_w = node_b.interner.insert("w");
+        let b_a = node_b.interner.insert("a");
+        let b_b = node_b.interner.insert("b");
+        let b_z = node_b.interner.insert("z");
+        let b_s2 = node_b.interner.insert("s2");
+        assert_ne!(
+            a_s1, b_s1,
+            "test setup: the two nodes must not share a symbol space, else the \
+             re-interning path isn't exercised"
+        );
+
+        // Local sentinel s1 on B: it only lets s2.z evaluate at creation and
+        // resolves the not-yet-cached arm during the first delivery. z's clock
+        // never depends on it — z's inputs are cross-service, so they come from
+        // the wire via dep_cache, not from local s1's (empty) clock.
+        node_b
+            .create_service(
+                b_s1,
+                vec![
+                    Decl::VarDecl {
+                        name: b_a,
+                        ty: None,
+                        val: lit_int(0),
+                    },
+                    Decl::VarDecl {
+                        name: b_b,
+                        ty: None,
+                        val: lit_int(0),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        node_b
+            .create_service(
+                b_s2,
+                vec![Decl::DefDecl {
+                    name: b_z,
+                    ty: None,
+                    val: mk_add(
+                        Expr::MemberAccess {
+                            service_name: b_s1,
+                            member_name: b_a,
+                        },
+                        Expr::MemberAccess {
+                            service_name: b_s1,
+                            member_name: b_b,
+                        },
+                    ),
+                    is_pub: true,
+                }],
+            )
+            .await
+            .unwrap();
+        let b_s2_id = node_b.services.get(&b_s2).unwrap().id.0.clone();
+
+        // Deliver both arms at a consistent generation 1, each stamped in A's
+        // symbol space: a = 11 @ {(s1,w):1,(s1,a):1}, b = 21 @ {(s1,w):1,(s1,b):1}.
+        send_update_over_wire(
+            &node_a,
+            &mut node_b,
+            &b_s2_id,
+            WireUpdate {
+                listener_def: a_z,
+                source: a_s1,
+                member: a_a,
+                value: vint(11),
+                clock: HashMap::from([((a_s1, a_w), 1u64), ((a_s1, a_a), 1u64)]),
+            },
+        )
+        .await;
+        send_update_over_wire(
+            &node_a,
+            &mut node_b,
+            &b_s2_id,
+            WireUpdate {
+                listener_def: a_z,
+                source: a_s1,
+                member: a_b,
+                value: vint(21),
+                clock: HashMap::from([((a_s1, a_w), 1u64), ((a_s1, a_b), 1u64)]),
+            },
+        )
+        .await;
+
+        // z recomputed to the consistent sum, and its clock is the join expressed
+        // entirely in B's symbol space — proving the dimensions were re-interned,
+        // not carried as raw ids.
+        let expected: VClock = HashMap::from([
+            ((b_s1, b_w), 1u64),
+            ((b_s1, b_a), 1u64),
+            ((b_s1, b_b), 1u64),
+        ]);
+        let vs = node_b.services.get(&b_s2).unwrap().vars.get(&b_z).unwrap();
+        assert_eq!(
+            vs.value,
+            vint(32),
+            "z = s1.a + s1.b = 11 + 21 across the wire"
+        );
+        assert_eq!(
+            vs.vector_clock, expected,
+            "z's clock arrived in B's symbol space with the right dimensions"
+        );
+    }
+
+    // Simultaneity (operation A): all vars co-written in one transaction end
+    // with the SAME vector, not per-var stamps. W = {x, y}, R = ∅.
+    #[tokio::test]
+    async fn test_simultaneous_bump_identical_stamp() {
+        let mut tc = TestContext::new();
+        let decls = vec![
+            Decl::VarDecl {
+                name: tc.x,
+                ty: None,
+                val: lit_int(1),
+            },
+            Decl::VarDecl {
+                name: tc.y,
+                ty: None,
+                val: lit_int(2),
+            },
+        ];
+        tc.manager.create_service(tc.foo, decls).await.unwrap();
+
+        let w = HashSet::from([(tc.foo, tc.x), (tc.foo, tc.y)]);
+        tc.manager.simultaneous_bump(&HashSet::new(), &w);
+
+        let foo = tc.manager.services.get(&tc.foo).unwrap();
+        let xc = foo.vars.get(&tc.x).unwrap().vector_clock.clone();
+        let yc = foo.vars.get(&tc.y).unwrap().vector_clock.clone();
+        let expected: VClock = HashMap::from([((tc.foo, tc.x), 1), ((tc.foo, tc.y), 1)]);
+        assert_eq!(xc, expected);
+        assert_eq!(yc, expected);
+        assert_eq!(xc, yc, "co-written vars must share one identical stamp");
+    }
+
+    // Causal consistency (operation A): the read set is folded into V_base, so a
+    // written var's clock dominates the vars it read. R = {y}, W = {x}.
+    #[tokio::test]
+    async fn test_bump_absorbs_read_set() {
+        let mut tc = TestContext::new();
+        let decls = vec![
+            Decl::VarDecl {
+                name: tc.x,
+                ty: None,
+                val: lit_int(1),
+            },
+            Decl::VarDecl {
+                name: tc.y,
+                ty: None,
+                val: lit_int(2),
+            },
+        ];
+        tc.manager.create_service(tc.foo, decls).await.unwrap();
+
+        // advance y to generation 1 first
+        tc.manager
+            .assign(tc.foo, tc.y, vint(9), None)
+            .await
+            .unwrap();
+        // now write x having READ y
+        tc.manager.simultaneous_bump(
+            &HashSet::from([(tc.foo, tc.y)]),
+            &HashSet::from([(tc.foo, tc.x)]),
+        );
+
+        let xc = &tc
+            .manager
+            .services
+            .get(&tc.foo)
+            .unwrap()
+            .vars
+            .get(&tc.x)
+            .unwrap()
+            .vector_clock;
+        assert_eq!(
+            xc.get(&(tc.foo, tc.y)).copied(),
+            Some(1),
+            "x dominates the y it read"
+        );
+        assert_eq!(
+            xc.get(&(tc.foo, tc.x)).copied(),
+            Some(1),
+            "x still +1 on its own dimension"
+        );
+    }
+
+    // Monotonicity (operation A): repeated writes increase the clock by exactly
+    // one each time and never decrease. A write is an event, so even re-writing
+    // the same value bumps.
+    #[tokio::test]
+    async fn test_clock_monotonic_on_repeated_writes() {
+        let mut tc = TestContext::new();
+        let decls = vec![Decl::VarDecl {
+            name: tc.x,
+            ty: None,
+            val: lit_int(0),
+        }];
+        tc.manager.create_service(tc.foo, decls).await.unwrap();
+
+        let key = (tc.foo, tc.x);
+        for expected in 1..=3u64 {
+            tc.manager
+                .assign(tc.foo, tc.x, vint(7), None)
+                .await
+                .unwrap();
+            let c = tc
+                .manager
+                .services
+                .get(&tc.foo)
+                .unwrap()
+                .vars
+                .get(&tc.x)
+                .unwrap()
+                .vector_clock
+                .get(&key)
+                .copied()
+                .unwrap_or(0);
+            assert_eq!(c, expected, "clock must increase by exactly 1 per write");
+        }
     }
 
     // Helper: service with a single var x = 0

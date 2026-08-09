@@ -9,6 +9,7 @@ use crate::net::ast::{
     NetUnOp, NetValue,
 };
 use crate::net::types::{LockGroup, MeerkatMessage};
+use crate::net::ClockEntry;
 use crate::runtime::ast::{ActionStmt, BinOp, Expr, Field, TableType, UnOp, Value};
 use crate::runtime::interner::{Interner, Symbol};
 use crate::runtime::limits::{
@@ -16,6 +17,7 @@ use crate::runtime::limits::{
     MAX_STRING_LITERAL_LENGTH, MAX_TYPE_DEPTH,
 };
 use crate::runtime::tt::{Param, ServiceType, TupleType, Type};
+use crate::runtime::txn::VClock;
 use std::collections::HashMap;
 
 fn validate_identifier(s: &str) -> Result<()> {
@@ -248,19 +250,40 @@ pub fn decode_request_updates(
         interner.insert(listener_def),
     ))
 }
+/// Decode a network ClockEntry to a runtime VClock
+pub fn clock_entry_to_vclock(clock: Vec<ClockEntry>, interner: &mut Interner) -> Result<VClock> {
+    let mut vclock: VClock = HashMap::new();
+    for entry in clock {
+        validate_identifier(&entry.service)?;
+        validate_identifier(&entry.member)?;
+        let key = (
+            interner.insert(&entry.service),
+            interner.insert(&entry.member),
+        );
+        if vclock.insert(key, entry.counter).is_some() {
+            return Err(Error::LimitExceeded(format!(
+                "duplicate clock dimension: ({}, {})",
+                entry.service, entry.member
+            )));
+        }
+    }
+    Ok(vclock)
+}
 
 /// #24: validate and intern the identifier fields of an `Update` message
 /// arriving over the wire (the `value` is decoded separately via
 /// `decode_value`). As with `decode_request_updates`, all interning of
 /// network-sourced names happens here after validation.
 ///
-/// Returns `(listener_def, source_service, member)` as interned `Symbol`s.
+/// Returns `(listener_def, source_service, member, vector clock)`. The first three arguments
+/// are returned as interned symbols, while the last is returned as an interned VClock.
 pub fn decode_update(
     listener_def: &str,
     source_service: &str,
     member: &str,
     interner: &mut Interner,
-) -> Result<(Symbol, Symbol, Symbol)> {
+    clock: Vec<ClockEntry>,
+) -> Result<(Symbol, Symbol, Symbol, VClock)> {
     validate_identifier(listener_def)?;
     validate_identifier(source_service)?;
     validate_identifier(member)?;
@@ -268,6 +291,7 @@ pub fn decode_update(
         interner.insert(listener_def),
         interner.insert(source_service),
         interner.insert(member),
+        clock_entry_to_vclock(clock, interner)?,
     ))
 }
 
@@ -584,6 +608,27 @@ pub fn encode_value(val: &Value, interner: &Interner) -> Result<NetValue> {
             end: *end,
         }),
     }
+}
+
+/// Encode a vector clock into a network representation
+///
+/// Args:
+///     clock (`&VClock`): The vector clock to encode
+///     interner (`&Interner`): The `Interner` for symbol lookup
+///
+/// Returns:
+///     Vec<ClockEntry>: The resulting encoded vector clock, which is a vector of
+///     ClockEntry { service, member, counter } structs. Note that this is the direct mechanical
+///     translation of the key-value mappings in a vector clock.
+pub fn encode_clock(clock: &VClock, interner: &Interner) -> Vec<ClockEntry> {
+    let clock_vec = clock.iter();
+    clock_vec
+        .map(|((svc_sym, var_sym), i)| ClockEntry {
+            service: interner.get(*svc_sym).to_string(),
+            member: interner.get(*var_sym).to_string(),
+            counter: *i,
+        })
+        .collect()
 }
 
 /// Decode a network `NetValue` representation into a runtime `Value`
@@ -1245,6 +1290,7 @@ pub fn decode_tabletype(t: NetTableType) -> TableType {
 mod tests {
     use super::*;
     use crate::net::ServiceNetId;
+    use std::collections::HashMap;
 
     /// Verify round-trip encoding, serialization, deserialization, and decoding of `AST` types
     #[test]
@@ -1686,7 +1732,7 @@ mod tests {
                 "decode_request_updates should reject service {:?}",
                 bad
             );
-            let res = decode_update("ldef", bad, "member", &mut interner);
+            let res = decode_update("ldef", bad, "member", &mut interner, vec![]);
             assert!(
                 res.is_err(),
                 "decode_update should reject source_service {:?}",
@@ -1695,7 +1741,43 @@ mod tests {
         }
         // A well-formed identifier is accepted.
         assert!(decode_request_updates("svc", "y", "z", &mut interner).is_ok());
-        assert!(decode_update("z", "svc", "y", &mut interner).is_ok());
+        assert!(decode_update("z", "svc", "y", &mut interner, vec![]).is_ok());
+    }
+
+    /// Vector-clock PR: a clock survives an encode/decode round-trip through the
+    /// wire form. Using one interner means the re-interned `(service, member)`
+    /// keys resolve to the same `Symbol`s, so the decoded clock equals the
+    /// original.
+    #[test]
+    fn test_codec_clock_roundtrip() {
+        let mut interner = Interner::new();
+        let (svc_a, x) = (interner.insert("svc"), interner.insert("x"));
+        let (svc_b, y) = (interner.insert("other"), interner.insert("y"));
+        let original: VClock = HashMap::from([((svc_a, x), 3u64), ((svc_b, y), 7u64)]);
+
+        let wire = encode_clock(&original, &interner);
+        assert_eq!(wire.len(), 2);
+        let decoded = clock_entry_to_vclock(wire, &mut interner).expect("valid clock decodes");
+        assert_eq!(decoded, original);
+    }
+
+    /// Vector-clock PR: a wire clock carrying a non-identifier dimension name is
+    /// rejected wholesale, so a remote peer cannot intern junk via the clock
+    /// (mirrors the guarantee `decode_update` gives for the message's own name
+    /// fields).
+    #[test]
+    fn test_codec_clock_rejects_bad_dimension() {
+        let mut interner = Interner::new();
+        let bad = vec![ClockEntry {
+            service: "bad name".to_string(),
+            member: "x".to_string(),
+            counter: 1,
+        }];
+        let res = decode_update("ldef", "svc", "member", &mut interner, bad);
+        assert!(
+            res.is_err(),
+            "decode_update should reject a clock with a non-identifier dimension"
+        );
     }
 
     /// Verify that encoding a value with an oversized string

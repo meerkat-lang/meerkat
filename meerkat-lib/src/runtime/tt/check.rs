@@ -567,31 +567,28 @@ impl<'a, 'b> Context<'a, 'b> {
                         }
                     }
                     local_env.bind(params[0].name, (**expected_param).clone());
-                } else {
-                    if let Type::Tuple(ts) = expected_param.as_ref() {
-                        if params.len() != ts.len() {
-                            return Err(Error::InvalidTupleArity);
-                        }
-                        for (i, param) in params.iter().enumerate() {
-                            if let Some(param_ty) = &param.ty {
-                                if param_ty != &ts[i] {
-                                    return Err(Error::TypeMismatch {
-                                        expected: ts[i].clone(),
-                                        found: param_ty.clone(),
-                                    });
-                                }
-                            }
-                            local_env.bind(param.name, ts[i].clone());
-                        }
-                    } else {
-                        let types = params.iter().map(|_| Type::Unit).collect();
-                        let tuple_ty =
-                            TupleType::new(types).map_err(|_| Error::InvalidTupleArity)?;
-                        return Err(Error::TypeMismatch {
-                            expected: (**expected_param).clone(),
-                            found: Type::Tuple(tuple_ty),
-                        });
+                } else if let Type::Tuple(ts) = expected_param.as_ref() {
+                    if params.len() != ts.len() {
+                        return Err(Error::InvalidTupleArity);
                     }
+                    for (i, param) in params.iter().enumerate() {
+                        if let Some(param_ty) = &param.ty {
+                            if param_ty != &ts[i] {
+                                return Err(Error::TypeMismatch {
+                                    expected: ts[i].clone(),
+                                    found: param_ty.clone(),
+                                });
+                            }
+                        }
+                        local_env.bind(param.name, ts[i].clone());
+                    }
+                } else {
+                    let types = params.iter().map(|_| Type::Unit).collect();
+                    let tuple_ty = TupleType::new(types).map_err(|_| Error::InvalidTupleArity)?;
+                    return Err(Error::TypeMismatch {
+                        expected: (**expected_param).clone(),
+                        found: Type::Tuple(tuple_ty),
+                    });
                 }
                 self.check_expr(body, expected_ret, &mut local_env)?;
                 Ok(())
@@ -670,7 +667,7 @@ impl<'a, 'b> Context<'a, 'b> {
                 | Value::String { .. }
                 | Value::Html(..)
                 | Value::List { .. }
-                | Value::Range { .. } => self.infer_value(val, type_depth),
+                | Value::Range { .. } => Self::infer_value(val, type_depth),
             },
             Expr::Html(_) => Ok(Type::String),
             Expr::Variable { name } => {
@@ -753,23 +750,21 @@ impl<'a, 'b> Context<'a, 'b> {
                         }
                     } else if args.len() == 1 {
                         self.check_expr(&args[0], &param_ty, env)?;
-                    } else {
-                        if let Type::Tuple(ts) = &*param_ty {
-                            if args.len() != ts.len() {
-                                return Err(Error::InvalidTupleArity);
-                            }
-                            for (i, arg) in args.iter().enumerate() {
-                                self.check_expr(arg, &ts[i], env)?;
-                            }
-                        } else {
-                            let types = args.iter().map(|_| Type::Unit).collect();
-                            let tuple_ty =
-                                TupleType::new(types).map_err(|_| Error::InvalidTupleArity)?;
-                            return Err(Error::TypeMismatch {
-                                expected: *param_ty,
-                                found: Type::Tuple(tuple_ty),
-                            });
+                    } else if let Type::Tuple(ts) = &*param_ty {
+                        if args.len() != ts.len() {
+                            return Err(Error::InvalidTupleArity);
                         }
+                        for (i, arg) in args.iter().enumerate() {
+                            self.check_expr(arg, &ts[i], env)?;
+                        }
+                    } else {
+                        let types = args.iter().map(|_| Type::Unit).collect();
+                        let tuple_ty =
+                            TupleType::new(types).map_err(|_| Error::InvalidTupleArity)?;
+                        return Err(Error::TypeMismatch {
+                            expected: *param_ty,
+                            found: Type::Tuple(tuple_ty),
+                        });
                     }
                     Ok(*ret_ty)
                 } else {
@@ -871,7 +866,7 @@ impl<'a, 'b> Context<'a, 'b> {
     ///
     /// Returns:
     ///     Result<Type, Error>: Inferred type
-    fn infer_value(&mut self, val: &Value, type_depth: usize) -> Result<Type, Error> {
+    fn infer_value(val: &Value, type_depth: usize) -> Result<Type, Error> {
         if type_depth > crate::runtime::limits::MAX_TYPE_DEPTH {
             return Err(Error::DepthLimitExceeded);
         }
@@ -884,9 +879,9 @@ impl<'a, 'b> Context<'a, 'b> {
                 if vals.is_empty() {
                     Err(Error::CannotInferType)
                 } else {
-                    let inner = self.infer_value(&vals[0], type_depth + 1)?;
+                    let inner = Self::infer_value(&vals[0], type_depth + 1)?;
                     for v in vals {
-                        let v_ty = self.infer_value(v, type_depth + 1)?;
+                        let v_ty = Self::infer_value(v, type_depth + 1)?;
                         if v_ty != inner {
                             return Err(Error::TypeMismatch {
                                 expected: inner,

@@ -2300,6 +2300,7 @@ dependencies = [
  "libp2p-stream",
  "log",
  "logos",
+ "petgraph",
  "send_wrapper 0.6.0",
  "serde",
  "serde_json",
@@ -2319,6 +2320,7 @@ dependencies = [
  "console_error_panic_hook",
  "gloo-timers 0.4.0",
  "meerkat-lib",
+ "petgraph",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
@@ -2668,6 +2670,7 @@ dependencies = [
  "fixedbitset",
  "hashbrown 0.15.5",
  "indexmap",
+ "serde",
 ]
 
 [[package]]

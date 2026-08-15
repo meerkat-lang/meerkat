@@ -60,6 +60,9 @@ pub enum ActionStmt {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Stmt {
     ActionStmt(ActionStmt),
+    Atomic {
+        updates: Vec<Stmt>,
+    },
     Update {
         service_name: Symbol,
         decls: Vec<Decl>,
@@ -314,7 +317,7 @@ impl Display for Value {
             } => {
                 let params_str: Vec<String> = params.iter().map(|p| p.to_string()).collect();
                 let env_str: Vec<String> =
-                    env.iter().map(|(k, v)| format!("{}: {}", k, v)).collect();
+                    env.iter().map(|(k, v)| format!("{:?}: {}", k, v)).collect();
                 if let Some(ref ty) = return_ty {
                     write!(
                         f,
@@ -334,7 +337,7 @@ impl Display for Value {
                 service_net_id,
             } => {
                 let env_str: Vec<String> =
-                    env.iter().map(|(k, v)| format!("{}: {}", k, v)).collect();
+                    env.iter().map(|(k, v)| format!("{:?}: {}", k, v)).collect();
                 write!(
                     f,
                     "action[{:?}][{}]{{{:?}}}",
@@ -373,8 +376,8 @@ impl Display for Expr {
             Expr::Literal { val } => write!(f, "{}", val),
             Expr::Html(_) => write!(f, "<html>"),
             Expr::Tuple { .. } => write!(f, "vector"),
-            Expr::KeyVal { name, value } => write!(f, "keyval: {}, {}", name, value),
-            Expr::Variable { name } => write!(f, "{}", name),
+            Expr::KeyVal { name, value } => write!(f, "keyval: {:?}, {}", name, value),
+            Expr::Variable { name } => write!(f, "{:?}", name),
             Expr::Unop { op, expr } => write!(f, "{}{}", op, expr),
             Expr::Binop { op, expr1, expr2 } => write!(f, "{} {} {}", expr1, op, expr2),
             Expr::If { cond, expr1, expr2 } => {
@@ -413,7 +416,7 @@ impl Display for Expr {
             Expr::MemberAccess {
                 service_name,
                 member_name,
-            } => write!(f, "{}.{}", service_name, member_name),
+            } => write!(f, "{:?}.{:?}", service_name, member_name),
             Expr::Select { where_clause, .. } => write!(f, "{}", where_clause),
             Expr::Table { records, .. } => {
                 write!(f, "[",)?;
@@ -472,24 +475,24 @@ impl Display for ActionStmt {
         match self {
             ActionStmt::Let { name, ty, expr } => {
                 if let Some(t) = ty {
-                    write!(f, "let {}: {} = {}", name, t, expr)
+                    write!(f, "let {:?}: {} = {}", name, t, expr)
                 } else {
-                    write!(f, "let {} = {}", name, expr)
+                    write!(f, "let {:?} = {}", name, expr)
                 }
             }
             ActionStmt::Expr(expr) => write!(f, "{}", expr),
             ActionStmt::Do(expr) => write!(f, "do {}", expr),
             ActionStmt::Assert(expr, _) => write!(f, "assert {}", expr),
-            ActionStmt::Assign { name, expr } => write!(f, "{} = {}", name, expr),
+            ActionStmt::Assign { name, expr } => write!(f, "{:?} = {}", name, expr),
             ActionStmt::Insert { row, table_name } => {
-                write!(f, "insert into {} {}", table_name, row)
+                write!(f, "insert into {:?} {}", table_name, row)
             }
             ActionStmt::For {
                 var,
                 iterable,
                 body,
             } => {
-                write!(f, "for {} in {} {{ ", var, iterable)?;
+                write!(f, "for {:?} in {} {{ ", var, iterable)?;
                 for stmt in body {
                     write!(f, "{}; ", stmt)?;
                 }
@@ -514,9 +517,9 @@ impl Display for Decl {
         match self {
             Decl::VarDecl { name, ty, val } => {
                 if let Some(t) = ty {
-                    write!(f, "var {}: {} = {}", name, t, val)
+                    write!(f, "var {:?}: {} = {}", name, t, val)
                 } else {
-                    write!(f, "var {} = {}", name, val)
+                    write!(f, "var {:?} = {}", name, val)
                 }
             }
             Decl::DefDecl {
@@ -527,14 +530,125 @@ impl Display for Decl {
             } => {
                 let prefix = if *is_pub { "pub " } else { "" };
                 if let Some(t) = ty {
-                    write!(f, "{}def {}: {} = {}", prefix, name, t, val)
+                    write!(f, "{}def {:?}: {} = {}", prefix, name, t, val)
                 } else {
-                    write!(f, "{}def {} = {}", prefix, name, val)
+                    write!(f, "{}def {:?} = {}", prefix, name, val)
                 }
             }
             Decl::TableDecl { name, .. } => {
-                write!(f, "table {} created", name)
+                write!(f, "table {:?} created", name)
             }
         }
+    }
+}
+
+/// Apply a sequence of service update statements to a base AST
+///
+/// Produces a new AST where target `Stmt::Service` declarations are updated
+/// in-place with new or modified declarations, and `Stmt::Update` and
+/// `Stmt::Atomic` nodes are removed from the top level
+///
+/// Args:
+///     `base_ast` (`&[Stmt]`): The original AST statements
+///     `updates` (`&[Stmt]`): The update statements to apply
+///
+/// Returns:
+///     `Result<Vec<Stmt>, Symbol>`: The updated AST or the missing service Symbol
+///
+/// Raises:
+///     `Symbol`: If a target service for an update is not found
+pub fn apply_updates_to_ast(base_ast: &[Stmt], updates: &[Stmt]) -> Result<Vec<Stmt>, Symbol> {
+    let mut patched_ast: Vec<Stmt> = base_ast
+        .iter()
+        .filter(|stmt| !matches!(stmt, Stmt::Update { .. } | Stmt::Atomic { .. }))
+        .cloned()
+        .collect();
+
+    for stmt in updates {
+        let (updated_svc_name, updated_decls) = match stmt {
+            Stmt::Service { name, decls } => (name, decls),
+            Stmt::Update {
+                service_name: name,
+                decls,
+            } => (name, decls),
+            Stmt::Atomic {
+                updates: inner_updates,
+            } => {
+                patched_ast = apply_updates_to_ast(&patched_ast, inner_updates)?;
+                continue;
+            }
+            Stmt::Connect { .. }
+            | Stmt::Import { .. }
+            | Stmt::Test { .. }
+            | Stmt::ActionStmt(_)
+            | Stmt::Watch { .. } => continue,
+        };
+
+        let mut found_service = false;
+        for existing_stmt in &mut patched_ast {
+            if let Stmt::Service {
+                name: existing_svc_name,
+                decls: existing_decls,
+            } = existing_stmt
+            {
+                if *existing_svc_name == *updated_svc_name {
+                    found_service = true;
+                    for up_decl in updated_decls {
+                        let up_name = match up_decl {
+                            Decl::VarDecl { name: n, .. }
+                            | Decl::DefDecl { name: n, .. }
+                            | Decl::TableDecl { name: n, .. } => *n,
+                        };
+
+                        let mut matched_existing = false;
+                        for ex_decl in existing_decls.iter_mut() {
+                            let ex_name = match ex_decl {
+                                Decl::VarDecl { name: n, .. }
+                                | Decl::DefDecl { name: n, .. }
+                                | Decl::TableDecl { name: n, .. } => *n,
+                            };
+                            if ex_name == up_name {
+                                *ex_decl = up_decl.clone();
+                                matched_existing = true;
+                                break;
+                            }
+                        }
+
+                        if !matched_existing {
+                            existing_decls.push(up_decl.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        if !found_service {
+            return Err(*updated_svc_name);
+        }
+    }
+
+    Ok(patched_ast)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::interner::Interner;
+
+    /// Tests that `apply_updates_to_ast` returns an `Err` containing
+    /// the target `Symbol` when an update targets a missing service
+    #[test]
+    fn test_apply_updates_to_ast_missing_service_returns_err() {
+        let mut interner = Interner::new();
+        let target_sym = interner.insert("non_existent_service");
+
+        let base_ast: Vec<Stmt> = Vec::new();
+        let updates: Vec<Stmt> = vec![Stmt::Update {
+            service_name: target_sym,
+            decls: Vec::new(),
+        }];
+
+        let result = apply_updates_to_ast(&base_ast, &updates);
+        assert_eq!(result, Err(target_sym));
     }
 }

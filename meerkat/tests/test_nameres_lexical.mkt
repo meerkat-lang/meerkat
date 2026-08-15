@@ -1,0 +1,57 @@
+// test_nameres_lexical.mkt
+//
+// PURPOSE: Verify that the static analysis pipeline (name resolution +
+// dependency analysis) correctly distinguishes between eager forward
+// references (which must be rejected) and deferred forward references inside
+// closures (which are safe and must be accepted).
+//
+// EXPECTED OUTCOME: FAILS static checks. The file intentionally contains
+// programs in s1 and s2 that eagerly read uninitialized variables. The
+// checker stops at the first error encountered (s1), so the overall exit
+// code is non-zero.
+//
+// The safe examples (s3, s4) are included to document the accepted patterns
+// and are covered individually by the nameres_integration_test test suite.
+//
+// Makefile target: test-forward-decls (expected: exit non-zero, inverted with !)
+//
+// Per-example breakdown:
+//   s1 -- FAIL: IIFE `(fn () => x + 1)()` calls the closure immediately,
+//         eagerly reading `x` before `var x = 5` is initialized.
+//   s2 -- FAIL: `def y = f()` calls `f` immediately during init, forcing
+//         the closure body which reads `x` before `var x = 5` is initialized.
+//   s3 -- PASS: `act_closure()` returns an action closure; the action body
+//         is not executed during init, so the forward ref to `x` is safe.
+//   s4 -- PASS: `def f = fn () => x + 1` stores the closure but never calls
+//         it at init time; the forward ref to `x` is safely deferred.
+
+
+// Example 1: Direct IIFE (Closure)
+// Expected behavior: FAILS static check due to immediate forward reference 'x'
+service s1 {
+    def y = (fn () => x + 1) ();
+   var x = 5;
+}
+
+// Example 2: Indirect Function Call (Closure)
+// Expected behavior: FAILS static check due to immediate forward reference 'x'
+service s2 {
+    def f = fn () => x + 1;
+    def y = f();
+    var x = 5;
+}
+
+// Example 3: Safe nested action closure (returned but not immediately executed)
+// Expected behavior: PASSES static check as the action is not executed during init
+service s3 {
+    def act_closure = fn () => action { x = x + 1; };
+    def y = act_closure();
+    var x = 5;
+}
+
+// Example 4: Safe forward reference inside closure that is not called during init
+// Expected behavior: PASSES static check as the closure body is deferred
+service s4 {
+    def f = fn () => x + 1;
+    var x = 5;
+}

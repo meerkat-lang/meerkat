@@ -1,0 +1,18 @@
+// Initial `weather_station` service tracking `temperature` in Fahrenheit
+service weather_station {
+    var temperature: int = 72;
+    pub def is_warm = temperature > 65;
+}
+
+// Live update: update `temperature` value to `22`, introduce new
+// `is_celsius` field, and update reactive `is_warm` logic
+update weather_station {
+    var temperature: int = 22;
+    var is_celsius: bool = true;
+    pub def is_warm = if is_celsius then temperature > 18 else temperature > 65;
+}
+
+// Test executing after live update applied to `weather_station`
+@test(weather_station) {
+    assert(is_warm == true);
+}

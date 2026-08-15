@@ -1,0 +1,23 @@
+// test_typecheck_delayed_fwd.mkt
+//
+// PURPOSE: Verify that a closure body may contain a forward reference to a
+// service member declared after the closure, without triggering a static
+// check error.
+//
+// EXPECTED OUTCOME: PASSES all static checks (nameres, type checking,
+// dependency analysis).
+//
+// RATIONALE: `f`'s body `fn () => a` is never executed eagerly during
+// service initialization. The closure is a thunk -- its body is only
+// evaluated when called. At call time, `a` is guaranteed to be initialized.
+// Therefore the forward reference is safe and must be accepted.
+//
+// This is the canonical simplified example from GitHub Issue #173,
+// contributed by @neurusL and confirmed in PR #120.
+//
+// Makefile target: test-forward-decls (expected: exit 0)
+
+service s {
+    def f = fn () => a; 
+    var a = 0;
+}

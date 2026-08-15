@@ -255,7 +255,7 @@ async fn exec_stmt(
             }
         }
         Stmt::Watch { expr } => {
-            let label = format!("{}", expr);
+            let label = meerkat_lib::runtime::update::format_expr(&expr, &manager.interner);
             // Evaluate initial value
             let initial = eval(
                 &expr,
@@ -279,7 +279,9 @@ async fn exec_stmt(
             });
             Ok(Some(msg))
         }
-        Stmt::Update { .. } => Ok(Some("(not yet supported in REPL: Update)".to_string())),
+        Stmt::Atomic { .. } | Stmt::Update { .. } => {
+            Ok(Some("(not yet supported in REPL: Update)".to_string()))
+        }
         Stmt::Connect { .. } => Ok(Some("(not yet supported in REPL: Connect)".to_string())),
     }
 }

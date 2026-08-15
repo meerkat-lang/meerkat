@@ -5,22 +5,62 @@
 
 use crate::runtime::interner::Symbol;
 use crate::runtime::Env;
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
+
+/// A set of symbols representing latent dependencies of a function body
+pub type DepSet = HashSet<Symbol>;
 
 /// Represents a type in the Meerkat language
 ///
 /// This enum models all valid types including primitives,
 /// tuples, and function signatures
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub enum Type {
     Int,
     String,
     Bool,
     Unit,
     Tuple(TupleType),
-    Func(Box<Type>, Box<Type>),
+    Func(Box<Type>, Box<Type>, DepSet),
     List(Box<Type>),
     UnresolvedService(Symbol),
+}
+
+impl PartialEq for Type {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Type::Int, Type::Int) => true,
+            (Type::String, Type::String) => true,
+            (Type::Bool, Type::Bool) => true,
+            (Type::Unit, Type::Unit) => true,
+            (Type::Tuple(a), Type::Tuple(b)) => a == b,
+            (Type::Func(p1, r1, _), Type::Func(p2, r2, _)) => p1 == p2 && r1 == r2,
+            (Type::List(a), Type::List(b)) => a == b,
+            (Type::UnresolvedService(a), Type::UnresolvedService(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Type {}
+
+impl Hash for Type {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // We use discriminant values internally to hash the variant
+        core::mem::discriminant(self).hash(state);
+        match self {
+            Type::Tuple(t) => t.hash(state),
+            Type::Func(p, r, _) => {
+                p.hash(state);
+                r.hash(state);
+                // DepSet is explicitly ignored
+            }
+            Type::List(t) => t.hash(state),
+            Type::UnresolvedService(s) => s.hash(state),
+            Type::Int | Type::String | Type::Bool | Type::Unit => {}
+        }
+    }
 }
 
 /// Type representation of a Meerkat service
@@ -29,13 +69,19 @@ pub enum Type {
 /// field declaration ordering. This keeps `Env` modular and highly
 /// reusable. Using standard `HashMap` inside `Env` is more performant,
 /// and separating ordering concerns leads to a simpler design overall
+/// Type representation of a Meerkat service
+///
+/// We pair the generic `Env` with a separate `Vec<Symbol>` to track
+/// field declaration ordering. This keeps `Env` modular and highly
+/// reusable. Using standard `HashMap` inside `Env` is more performant,
+/// and separating ordering concerns leads to a simpler design overall
 #[derive(Debug, Clone)]
-pub struct ServiceType<'a> {
-    fields: Env<'a, Type>,
+pub struct ServiceType {
+    fields: Env<'static, Type>,
     field_order: Vec<Symbol>,
 }
 
-impl<'a> Default for ServiceType<'a> {
+impl Default for ServiceType {
     /// Create a new, empty `ServiceType`
     ///
     /// Returns:
@@ -48,12 +94,12 @@ impl<'a> Default for ServiceType<'a> {
     }
 }
 
-impl<'a> ServiceType<'a> {
+impl ServiceType {
     /// Get a reference to the fields environment
     ///
     /// Returns:
-    ///     `&Env<'a, Type>`: Reference to the environment
-    pub fn fields(&self) -> &Env<'a, Type> {
+    ///     `&Env<'static, Type>`: Reference to the environment
+    pub fn fields(&self) -> &Env<'static, Type> {
         &self.fields
     }
 
@@ -120,7 +166,7 @@ impl<'a> ServiceType<'a> {
 // the `field_order` vector to ensure a deterministic, order-respecting
 // field equality check. This enables the live update system to compare
 // new and old service signatures to detect schema changes
-impl<'a> PartialEq for ServiceType<'a> {
+impl PartialEq for ServiceType {
     /// Compare two `ServiceType` instances for equality
     ///
     /// Args:
@@ -146,13 +192,13 @@ impl<'a> PartialEq for ServiceType<'a> {
 
 // Implement `Eq` manually because the internal `Env` type cannot
 // derive `Eq` automatically due to its `HashMap` field
-impl<'a> Eq for ServiceType<'a> {}
+impl Eq for ServiceType {}
 
 // Implement `Hash` manually using the `field_order` vector to hash
 // service fields in a deterministic order. This resolves the lack
 // of a standard `Hash` implementation on `HashMap` and provides
 // stable keys for indexing service definitions
-impl<'a> Hash for ServiceType<'a> {
+impl Hash for ServiceType {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.field_order.hash(state);
         for name in &self.field_order {
@@ -244,7 +290,7 @@ impl std::fmt::Display for Type {
             Type::Bool => write!(f, "bool"),
             Type::Unit => write!(f, "unit"),
             Type::Tuple(ts) => write!(f, "{}", ts),
-            Type::Func(t1, t2) => {
+            Type::Func(t1, t2, _) => {
                 // Determine if the left-hand side is a function type
                 // to preserve right-associativity during formatting
                 match t1.as_ref() {
@@ -266,7 +312,7 @@ impl std::fmt::Display for Type {
                 Type::Func(..) => write!(f, "({}) list", t),
                 _ => write!(f, "{} list", t),
             },
-            Type::UnresolvedService(s) => write!(f, "unresolved_service({})", s),
+            Type::UnresolvedService(s) => write!(f, "unresolved_service({:?})", s),
         }
     }
 }
@@ -284,9 +330,9 @@ impl std::fmt::Display for Param {
     ///     `std::fmt::Result`: The result of the formatting operation
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Some(ty) = &self.ty {
-            write!(f, "{}: {}", self.name, ty)
+            write!(f, "{:?}: {}", self.name, ty)
         } else {
-            write!(f, "{}", self.name)
+            write!(f, "{:?}", self.name)
         }
     }
 }
@@ -301,43 +347,77 @@ mod tests {
     fn test_nested_type_formatting() {
         // case 1: (int -> bool) -> string
         let ty1 = Type::Func(
-            Box::new(Type::Func(Box::new(Type::Int), Box::new(Type::Bool))),
+            Box::new(Type::Func(
+                Box::new(Type::Int),
+                Box::new(Type::Bool),
+                std::collections::HashSet::new(),
+            )),
             Box::new(Type::String),
+            std::collections::HashSet::new(),
         );
         assert_eq!(ty1.to_string(), "(int -> bool) -> string");
 
         // case 2: int -> bool -> string (which is int -> (bool -> string))
         let ty2 = Type::Func(
             Box::new(Type::Int),
-            Box::new(Type::Func(Box::new(Type::Bool), Box::new(Type::String))),
+            Box::new(Type::Func(
+                Box::new(Type::Bool),
+                Box::new(Type::String),
+                std::collections::HashSet::new(),
+            )),
+            std::collections::HashSet::new(),
         );
         assert_eq!(ty2.to_string(), "int -> bool -> string");
 
         // case 3: ((int -> string) -> bool) -> unit
         let ty3 = Type::Func(
             Box::new(Type::Func(
-                Box::new(Type::Func(Box::new(Type::Int), Box::new(Type::String))),
+                Box::new(Type::Func(
+                    Box::new(Type::Int),
+                    Box::new(Type::String),
+                    std::collections::HashSet::new(),
+                )),
                 Box::new(Type::Bool),
+                std::collections::HashSet::new(),
             )),
             Box::new(Type::Unit),
+            std::collections::HashSet::new(),
         );
         assert_eq!(ty3.to_string(), "((int -> string) -> bool) -> unit");
 
         // case 4: (int -> bool) -> (string -> unit)
         let ty4 = Type::Func(
-            Box::new(Type::Func(Box::new(Type::Int), Box::new(Type::Bool))),
-            Box::new(Type::Func(Box::new(Type::String), Box::new(Type::Unit))),
+            Box::new(Type::Func(
+                Box::new(Type::Int),
+                Box::new(Type::Bool),
+                std::collections::HashSet::new(),
+            )),
+            Box::new(Type::Func(
+                Box::new(Type::String),
+                Box::new(Type::Unit),
+                std::collections::HashSet::new(),
+            )),
+            std::collections::HashSet::new(),
         );
         assert_eq!(ty4.to_string(), "(int -> bool) -> string -> unit");
 
         // case 5: () -> int
-        let ty5 = Type::Func(Box::new(Type::Unit), Box::new(Type::Int));
+        let ty5 = Type::Func(
+            Box::new(Type::Unit),
+            Box::new(Type::Int),
+            std::collections::HashSet::new(),
+        );
         assert_eq!(ty5.to_string(), "() -> int");
 
         // case 6: (() -> int) -> bool
         let ty6 = Type::Func(
-            Box::new(Type::Func(Box::new(Type::Unit), Box::new(Type::Int))),
+            Box::new(Type::Func(
+                Box::new(Type::Unit),
+                Box::new(Type::Int),
+                std::collections::HashSet::new(),
+            )),
             Box::new(Type::Bool),
+            std::collections::HashSet::new(),
         );
         assert_eq!(ty6.to_string(), "(() -> int) -> bool");
 
@@ -347,6 +427,7 @@ mod tests {
                 TupleType::new(vec![Type::Unit, Type::Unit]).unwrap(),
             )),
             Box::new(Type::Int),
+            std::collections::HashSet::new(),
         );
         assert_eq!(ty7.to_string(), "(unit, unit) -> int");
     }

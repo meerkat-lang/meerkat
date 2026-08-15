@@ -17,7 +17,8 @@ use crate::net::types::MeerkatMessage;
 use crate::net::{
     codec, Address, MessageId, NetworkActor, NetworkCommand, NetworkEvent, NetworkReply, NodeType,
 };
-use crate::runtime::ast::Stmt;
+use crate::runtime::ast::{apply_updates_to_ast, Stmt};
+use crate::runtime::graphs::analysis::compute_dependencies;
 use crate::runtime::imports::Imports;
 use crate::runtime::interner::Interner;
 use crate::runtime::limits::{IMPORT_POLL_INTERVAL_MS, IMPORT_RETRY_DELAY_MS};
@@ -25,18 +26,18 @@ use crate::runtime::tt::types::ServiceType;
 use crate::runtime::{nameres, tt, Env, Manager};
 
 /// Root manager for executing a Meerkat node
-pub struct Node<'a> {
+pub struct Node {
     /// Local services registered on this node
-    pub local_services: Env<'a, ServiceType<'a>>,
+    pub local_services: Env<'static, ServiceType>,
     /// Imported services referenced by this node
-    pub imported_services: Env<'a, ServiceType<'a>>,
+    pub imported_services: Env<'static, ServiceType>,
     /// Unified program statements AST
     pub unified_ast: Vec<Stmt>,
     /// Process string interner
     pub interner: Interner,
 }
 
-impl<'a> Node<'a> {
+impl Node {
     /// Create a new empty Node representing the process context
     ///
     /// Returns:
@@ -460,6 +461,8 @@ impl<'a> Node<'a> {
         let mut manager = Manager::new(self.interner);
         manager.local = local;
         manager.network = network;
+        manager.unified_ast = self.unified_ast.clone();
+        manager.local_services = self.local_services;
 
         for (svc_name, url) in &remote_url_map {
             let svc_sym = manager.interner.insert(svc_name);
@@ -470,12 +473,41 @@ impl<'a> Node<'a> {
         }
 
         for stmt in local_ast {
-            if let Stmt::Service { name, decls } = stmt {
-                manager
-                    .create_service(*name, decls.clone())
-                    .await
-                    .map_err(|e| Error::Message(format!("Service error: {}", e)))?;
-                println!("Service '{}' loaded", manager.interner.get(*name));
+            match stmt {
+                Stmt::Service { name, decls } => {
+                    manager
+                        .create_service(*name, decls.clone())
+                        .await
+                        .map_err(|e| Error::Message(format!("Service error: {}", e)))?;
+                    println!("Service '{}' loaded", manager.interner.get(*name));
+                }
+                Stmt::Update {
+                    service_name,
+                    decls: _,
+                } => {
+                    let mut txn = crate::runtime::update::Transaction::new(vec![stmt.clone()]);
+                    txn.poll(&mut manager)
+                        .await
+                        .map_err(|e| Error::Message(format!("Update error: {}", e)))?;
+                    println!("Service '{}' updated", manager.interner.get(*service_name));
+                }
+                Stmt::Atomic { updates } => {
+                    if !updates.is_empty() {
+                        let mut txn = crate::runtime::update::Transaction::new(updates.clone());
+                        txn.poll(&mut manager)
+                            .await
+                            .map_err(|e| Error::Message(format!("Atomic update error: {}", e)))?;
+                        println!(
+                            "Atomic update transaction completed ({} updates)",
+                            updates.len()
+                        );
+                    }
+                }
+                Stmt::Import { .. }
+                | Stmt::Test { .. }
+                | Stmt::ActionStmt(_)
+                | Stmt::Connect { .. }
+                | Stmt::Watch { .. } => {}
             }
         }
 
@@ -486,11 +518,71 @@ impl<'a> Node<'a> {
     ///
     /// Returns:
     ///   `Result<()>`: Ok if checks pass, or error
+    /// Perform static analysis checks on unified service declarations
+    ///
+    /// Validates both the pre-update static schema and any post-update AST
+    /// synthesized from service update declarations
+    ///
+    /// Returns:
+    ///   `Result<()>`: Ok if checks pass, or error
     ///
     /// Errors:
     ///   `Error`: If name resolution or type checking fails
     pub fn static_checks(&mut self) -> Result<()> {
-        nameres::resolve(&self.unified_ast).map_err(|e| match e {
+        nameres::resolve(&self.unified_ast).map_err(|e| self.format_nameres_error(e))?;
+
+        let mut local_services = Env::new(None);
+        tt::check(&self.unified_ast, &mut local_services).map_err(|e| self.format_tt_error(e))?;
+        self.local_services = local_services;
+
+        compute_dependencies(&self.unified_ast, None);
+
+        let mut update_stmts = Vec::new();
+        for stmt in &self.unified_ast {
+            match stmt {
+                Stmt::Update { .. } => {
+                    update_stmts.push(stmt.clone());
+                }
+                Stmt::Atomic { updates } => {
+                    for u in updates {
+                        update_stmts.push(u.clone());
+                    }
+                }
+                Stmt::Connect { .. }
+                | Stmt::Service { .. }
+                | Stmt::Import { .. }
+                | Stmt::Test { .. }
+                | Stmt::ActionStmt(_)
+                | Stmt::Watch { .. } => {}
+            }
+        }
+
+        if !update_stmts.is_empty() {
+            let post_update_ast =
+                apply_updates_to_ast(&self.unified_ast, &update_stmts).map_err(|sym| {
+                    Error::Message(format!(
+                        "Target service '{}' for update not found",
+                        self.interner.get(sym)
+                    ))
+                })?;
+
+            nameres::resolve(&post_update_ast).map_err(|e| self.format_nameres_error(e))?;
+
+            compute_dependencies(&post_update_ast, None);
+        }
+
+        Ok(())
+    }
+
+    /// Format a name resolution error into a user-facing error message
+    ///
+    /// Args:
+    ///     `err` (`nameres::Error`): The name resolution error to format
+    ///
+    /// Returns:
+    ///     `Error`: The formatted Error::Message
+    fn format_nameres_error(&self, err: nameres::Error) -> Error {
+        match err {
             nameres::Error::UnknownIdentifier {
                 name,
                 expected,
@@ -517,11 +609,8 @@ impl<'a> Node<'a> {
                 );
                 Error::Message(msg)
             }
-            nameres::Error::DepthLimit => Error::Message(e.to_string()),
-        })?;
-
-        let mut local_services = Env::new(None);
-        tt::check(&self.unified_ast, &mut local_services).map_err(|e| self.format_tt_error(e))
+            nameres::Error::DepthLimit => Error::Message(nameres::Error::DepthLimit.to_string()),
+        }
     }
 
     /// Format a type checking error into a user-facing error message,
@@ -534,12 +623,19 @@ impl<'a> Node<'a> {
     ///     `Error`: The formatted Error::Message
     fn format_tt_error(&self, err: tt::check::Error) -> Error {
         match err {
-            tt::check::Error::DependencyCycle { service, member } => {
+            tt::check::Error::RecursiveTypeInference { service, member } => {
                 let service_str = self.interner.get(service);
                 let member_str = self.interner.get(member);
                 Error::Message(format!(
                     "type check error: dependency cycle detected at service '{}', member '{}'.",
                     service_str, member_str
+                ))
+            }
+            tt::check::Error::IllegalDependency(member) => {
+                let member_str = self.interner.get(member);
+                Error::Message(format!(
+                    "type check error: illegal eager forward reference or dependency cycle on '{}'",
+                    member_str
                 ))
             }
             tt::check::Error::UnboundVariable(s) => {
@@ -601,7 +697,7 @@ impl<'a> Node<'a> {
         Ok(())
     }
 
-    pub fn run_static_checks(&mut self, program: &'a [Stmt]) -> Result<()> {
+    pub fn run_static_checks(&mut self, program: &[Stmt]) -> Result<()> {
         nameres::resolve(program).map_err(|e| match e {
             nameres::Error::UnknownIdentifier {
                 name,
@@ -632,7 +728,11 @@ impl<'a> Node<'a> {
             nameres::Error::DepthLimit => Error::Message(e.to_string()),
         })?;
 
-        tt::check(program, &mut self.local_services).map_err(|e| self.format_tt_error(e))
+        tt::check(program, &mut self.local_services).map_err(|e| self.format_tt_error(e))?;
+
+        compute_dependencies(program, None);
+
+        Ok(())
     }
 
     /// Start the runtime manager consuming this Node
@@ -644,12 +744,44 @@ impl<'a> Node<'a> {
     }
 }
 
-impl<'a> Default for Node<'a> {
+impl Default for Node {
     /// Create a new empty Node representing the process context
     ///
     /// Returns:
     ///   `Self`: Default empty Node instance
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify error mapping when apply_updates_to_ast encounters an unknown
+    /// target service symbol
+    #[test]
+    fn test_update_missing_service_err() {
+        let mut node = Node::new();
+        let sym = node.interner.insert("unknown_s");
+
+        let update_stmt = Stmt::Update {
+            service_name: sym,
+            decls: Vec::new(),
+        };
+
+        let res = apply_updates_to_ast(&node.unified_ast, &[update_stmt]).map_err(|s| {
+            Error::Message(format!(
+                "Target service '{}' for update not found",
+                node.interner.get(s)
+            ))
+        });
+
+        assert_eq!(
+            res,
+            Err(Error::Message(
+                "Target service 'unknown_s' for update not found".to_string()
+            ))
+        );
     }
 }

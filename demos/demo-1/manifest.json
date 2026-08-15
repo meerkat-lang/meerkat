@@ -1,0 +1,28 @@
+{
+  "settings": {
+    "startup_timeout": 10.0,
+    "monitor_poll_interval": 0.25,
+    "terminate_timeout": 5.0
+  },
+  "nodes": [
+    {
+      "alias": "inverter",
+      "type": "server",
+      "file": "demos/demo-1/inverter.mkt",
+      "port": 9200
+    },
+    {
+      "alias": "home",
+      "type": "server",
+      "file": "demos/demo-1/home.mkt",
+      "port": 9201,
+      "imports": ["inverter.inverter"]
+    },
+    {
+      "alias": "controller",
+      "type": "client",
+      "file": "demos/demo-1/controller.mkt",
+      "imports": ["inverter.inverter", "home.home"]
+    }
+  ]
+}

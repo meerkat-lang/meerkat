@@ -4,4 +4,4 @@ pub mod runtime;
 
 pub use error::*;
 pub use runtime::ast;
-pub use runtime::semantic_analysis as static_analysis;
+pub use runtime::graphs;

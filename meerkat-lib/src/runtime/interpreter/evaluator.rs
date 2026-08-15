@@ -1,4 +1,5 @@
 use crate::ast::{BinOp, Expr, UnOp, Value};
+use crate::runtime::graphs::free_var::free_var;
 use crate::runtime::interner::Symbol;
 use crate::runtime::txn::{Transaction, WaitKey};
 use crate::runtime::Manager;
@@ -159,7 +160,7 @@ pub async fn eval(
                     _ => {}
                 }
             }
-            match (op, val1, val2) {
+            match (op, &val1, &val2) {
                 (BinOp::Add, Value::Int { val: v1 }, Value::Int { val: v2 }) => {
                     Ok(Value::Int { val: v1 + v2 })
                 }
@@ -170,13 +171,8 @@ pub async fn eval(
                     Ok(Value::Int { val: v1 * v2 })
                 }
                 (BinOp::Div, Value::Int { val: v1 }, Value::Int { val: v2 }) => {
-                    // NOTE: Division by zero and division overflow (i32::MIN / -1) are the only
-                    // integer arithmetic operations that panic in Rust release mode.
-                    // If a modulo (%) operator is ever implemented in the future, it must
-                    // also include these identical bounds checks (x % 0 and i32::MIN % -1)
-                    // to prevent panics.
-                    let val = v1.checked_div(v2).ok_or_else(|| {
-                        EvalError::RuntimeError(if v2 == 0 {
+                    let val = v1.checked_div(*v2).ok_or_else(|| {
+                        EvalError::RuntimeError(if *v2 == 0 {
                             "Division by zero".to_string()
                         } else {
                             "Integer overflow".to_string()
@@ -187,6 +183,12 @@ pub async fn eval(
                 (BinOp::Eq, Value::Int { val: v1 }, Value::Int { val: v2 }) => {
                     Ok(Value::Bool { val: v1 == v2 })
                 }
+                (BinOp::Eq, Value::Bool { val: v1 }, Value::Bool { val: v2 }) => {
+                    Ok(Value::Bool { val: v1 == v2 })
+                }
+                (BinOp::Eq, Value::String { val: v1 }, Value::String { val: v2 }) => {
+                    Ok(Value::Bool { val: v1 == v2 })
+                }
                 (BinOp::Lt, Value::Int { val: v1 }, Value::Int { val: v2 }) => {
                     Ok(Value::Bool { val: v1 < v2 })
                 }
@@ -194,14 +196,15 @@ pub async fn eval(
                     Ok(Value::Bool { val: v1 > v2 })
                 }
                 (BinOp::And, Value::Bool { val: v1 }, Value::Bool { val: v2 }) => {
-                    Ok(Value::Bool { val: v1 && v2 })
+                    Ok(Value::Bool { val: *v1 && *v2 })
                 }
                 (BinOp::Or, Value::Bool { val: v1 }, Value::Bool { val: v2 }) => {
-                    Ok(Value::Bool { val: v1 || v2 })
+                    Ok(Value::Bool { val: *v1 || *v2 })
                 }
-                _ => Err(EvalError::TypeError(
-                    "Type error in binary operation".to_string(),
-                )),
+                _ => Err(EvalError::TypeError(format!(
+                    "Type error in binary operation: {:?} on {:?} and {:?}",
+                    op, val1, val2
+                ))),
             }
         }
 
@@ -233,7 +236,7 @@ pub async fn eval(
             return_ty,
         } => {
             let var_binded: HashSet<Symbol> = params.iter().map(|p| p.name).collect();
-            let free_vars = body.free_var(&HashSet::new(), &var_binded);
+            let free_vars = free_var(body, &var_binded);
             let captured_env: Vec<(Symbol, Value)> = env
                 .iter()
                 .filter(|(name, _)| {
@@ -262,10 +265,7 @@ pub async fn eval(
             // Service `vars` or `defs` are looked up fresh via the
             // `manager` at execution time
             let action_expr = Expr::Action(stmts.clone());
-            let free_vars = action_expr.free_var(
-                &std::collections::HashSet::new(),
-                &std::collections::HashSet::new(),
-            );
+            let free_vars = free_var(&action_expr, &HashSet::new());
             let captured_env: Vec<(Symbol, Value)> = env
                 .iter()
                 .filter(|(name, _)| {

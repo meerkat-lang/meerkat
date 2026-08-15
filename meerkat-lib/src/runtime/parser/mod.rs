@@ -302,6 +302,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_parse_update_block() {
+        use crate::ast::Stmt;
+        let mut interner = Interner::new();
+        let input = "update MyService { var x = 5; }";
+        let res = parse_string(input, &mut interner);
+        assert!(res.is_ok(), "Failed to parse update block: {:?}", res);
+        let ast = res.unwrap();
+        assert_eq!(ast.len(), 1);
+        match &ast[0] {
+            Stmt::Update {
+                service_name,
+                decls,
+            } => {
+                assert_eq!(interner.get(*service_name), "MyService");
+                assert_eq!(decls.len(), 1);
+            }
+            _ => panic!("Expected Stmt::Update"),
+        }
+    }
+
     /// Verify that parsing an assertion exceeding length
     /// limit fails
     #[test]
@@ -480,6 +501,50 @@ mod tests {
             matches!(exprs[0], Expr::Variable { .. }),
             "expected Variable, got {:?}",
             exprs[0]
+        );
+    }
+
+    /// Verify that an `atomic` block containing valid `update` statements
+    /// parses successfully into `Stmt::Atomic`
+    #[test]
+    fn test_parse_atomic_block() {
+        use crate::ast::Stmt;
+        let mut interner = Interner::new();
+        let input = "atomic { update S1 { var x = 5; } update S2 { var y = 10; } }";
+        let res = parse_string(input, &mut interner);
+        assert!(res.is_ok(), "Failed to parse atomic block: {:?}", res);
+        let ast = res.expect("parse string failed");
+        assert_eq!(ast.len(), 1);
+        match &ast[0] {
+            Stmt::Atomic { updates } => {
+                assert_eq!(updates.len(), 2);
+                match &updates[0] {
+                    Stmt::Update { service_name, .. } => {
+                        assert_eq!(interner.get(*service_name), "S1");
+                    }
+                    other => panic!("expected Stmt::Update, got {:?}", other),
+                }
+                match &updates[1] {
+                    Stmt::Update { service_name, .. } => {
+                        assert_eq!(interner.get(*service_name), "S2");
+                    }
+                    other => panic!("expected Stmt::Update, got {:?}", other),
+                }
+            }
+            other => panic!("expected Stmt::Atomic, got {:?}", other),
+        }
+    }
+
+    /// Verify that an `atomic` block containing invalid nested statements
+    /// is syntactically rejected at parse time
+    #[test]
+    fn test_parse_atomic_block_negative() {
+        let mut interner = Interner::new();
+        let input = "atomic { watch x; }";
+        let res = parse_string(input, &mut interner);
+        assert!(
+            res.is_err(),
+            "Expected syntax error for invalid atomic content"
         );
     }
 }

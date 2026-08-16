@@ -213,9 +213,40 @@ impl Transaction {
                 let mut types = Env::new(None);
                 if let Err(e) = tt::check(&self.ast, &mut types) {
                     self.release_lock_txn(manager);
+                    let msg = match &e {
+                        tt::Error::UnknownUpdateTarget(s) => {
+                            format!(
+                                "Target service '{}' for update not found",
+                                manager.interner.get(*s)
+                            )
+                        }
+                        tt::Error::UnboundVariable(s) => {
+                            format!("UnboundVariable({})", manager.interner.get(*s))
+                        }
+                        tt::Error::RecursiveTypeInference { service, member } => {
+                            format!(
+                                "dependency cycle detected at service '{}', member '{}'",
+                                manager.interner.get(*service),
+                                manager.interner.get(*member)
+                            )
+                        }
+                        tt::Error::IllegalDependency(member) => {
+                            format!(
+                                "illegal eager forward reference or dependency cycle on '{}'",
+                                manager.interner.get(*member)
+                            )
+                        }
+                        tt::Error::TypeMismatch { expected, found } => {
+                            format!("type mismatch: expected {}, found {}", expected, found)
+                        }
+                        tt::Error::CannotInferType
+                        | tt::Error::DepthLimitExceeded
+                        | tt::Error::InvalidTupleArity
+                        | tt::Error::NotAFunction => format!("{}", e),
+                    };
                     return Err(EvalError::RuntimeError(format!(
-                        "Type check failed on update: {:?}",
-                        e
+                        "Type check failed on update: {}",
+                        msg
                     )));
                 }
                 let mut pre_initialized = HashMap::new();

@@ -85,6 +85,7 @@ fn check_type(ty: &Type, depth: usize) -> Result<(), Error> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     UnboundVariable(Symbol),
+    UnknownUpdateTarget(Symbol),
     TypeMismatch {
         expected: Box<Type>,
         found: Box<Type>,
@@ -105,6 +106,9 @@ impl std::fmt::Display for Error {
         match self {
             Error::UnboundVariable(s) => {
                 write!(f, "unbound variable: {:?}", s)
+            }
+            Error::UnknownUpdateTarget(s) => {
+                write!(f, "target service '{:?}' for update not found.", s)
             }
             Error::TypeMismatch { expected, found } => {
                 write!(f, "type mismatch: expected {}, found {}.", expected, found)
@@ -220,21 +224,8 @@ impl<'a, 'b> Context<'a, 'b> {
             }
         }
 
-        let has_updates = self
-            .program
-            .iter()
-            .any(|stmt| matches!(stmt, Stmt::Update { .. } | Stmt::Atomic { .. }));
-
         for stmt in self.program {
             match stmt {
-                Stmt::Test {
-                    service_name,
-                    stmts,
-                } => {
-                    if !has_updates {
-                        self.check_test(*service_name, stmts)?;
-                    }
-                }
                 Stmt::ActionStmt(action) => {
                     let mut local_env = Env::new(None);
                     self.check_action_stmt(action, &mut local_env)?;
@@ -242,6 +233,12 @@ impl<'a, 'b> Context<'a, 'b> {
                 Stmt::Watch { expr } => {
                     let mut local_env = Env::new(None);
                     self.infer(expr, &mut local_env, 1)?;
+                }
+                Stmt::Test {
+                    service_name,
+                    stmts,
+                } => {
+                    self.check_test(*service_name, stmts)?;
                 }
                 Stmt::Connect { .. }
                 | Stmt::Service { .. }
@@ -1022,91 +1019,6 @@ impl<'a, 'b> Context<'a, 'b> {
         }
     }
 
-    /// Validate that a service update block is sequentially well-typed
-    ///
-    /// Args:
-    ///     `service_name` (`Symbol`): The service name symbol
-    ///     `decls` (`&[Decl]`): Declarations introduced or modified in the update
-    ///
-    /// Returns:
-    ///     `Result<(), Error>`: Ok on success
-    ///
-    /// Raises:
-    ///     `Error::UnboundVariable`: If service or member identifier is not found
-    fn validate_update_block(&mut self, service_name: Symbol, decls: &[Decl]) -> Result<(), Error> {
-        let mut st = self
-            .local_services
-            .find(service_name)
-            .ok_or(Error::UnboundVariable(service_name))?
-            .clone();
-
-        let mut update_env = Env::new(None);
-        for name in st.field_order() {
-            if let Some(ty) = st.fields().find(*name) {
-                update_env.bind(*name, ty.clone());
-            }
-        }
-
-        let prev_service = self.current_service;
-        self.current_service = Some(service_name);
-
-        for decl in decls {
-            match decl {
-                Decl::VarDecl {
-                    name,
-                    ty: annotated,
-                    val,
-                }
-                | Decl::DefDecl {
-                    name,
-                    ty: annotated,
-                    val,
-                    ..
-                } => {
-                    let member_ty = if let Some(expected) = annotated {
-                        if let Err(e) = check_type(expected, 1) {
-                            self.current_service = prev_service;
-                            return Err(e);
-                        }
-                        match self.check_expr(val, expected, &mut update_env) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                self.current_service = prev_service;
-                                return Err(e);
-                            }
-                        }
-                    } else {
-                        match self.infer(val, &mut update_env, 1) {
-                            Ok(ty) => ty,
-                            Err(e) => {
-                                self.current_service = prev_service;
-                                return Err(e);
-                            }
-                        }
-                    };
-                    update_env.bind(*name, member_ty.clone());
-                    if st.fields().find(*name).is_some() {
-                        let _ = st.update_field(*name, member_ty);
-                    } else {
-                        let _ = st.add_field(*name, member_ty);
-                    }
-                    self.initialized.insert(*name);
-                }
-                Decl::TableDecl { name, .. } => {
-                    update_env.bind(*name, Type::Unit);
-                    if st.fields().find(*name).is_none() {
-                        let _ = st.add_field(*name, Type::Unit);
-                    }
-                    self.initialized.insert(*name);
-                }
-            }
-        }
-
-        self.current_service = prev_service;
-        self.local_services.bind(service_name, st);
-        Ok(())
-    }
-
     fn type_has_deps(&self, ty: &Type) -> bool {
         match ty {
             Type::Func(_, _, deps) => !deps.is_empty(),
@@ -1214,8 +1126,6 @@ impl<'a, 'b> Context<'a, 'b> {
 
 /// Perform static type checking on a program statement list
 ///
-/// Validates both static declarations and post-update environment states
-///
 /// Args:
 ///     `program` (`&[Stmt]`): Slices of parsed statements
 ///     `local_services` (`&mut Env<'static, ServiceType>`): Mutable
@@ -1232,51 +1142,7 @@ pub fn check(
     local_services: &mut Env<'static, ServiceType>,
 ) -> Result<(), Error> {
     let mut context = Context::new(program, local_services);
-    context.check_all()?;
-
-    let mut update_stmts = Vec::new();
-    for stmt in program {
-        match stmt {
-            Stmt::Update {
-                service_name,
-                decls,
-            } => {
-                context.validate_update_block(*service_name, decls)?;
-                update_stmts.push(stmt.clone());
-            }
-            Stmt::Atomic { updates } => {
-                for u in updates {
-                    if let Stmt::Update {
-                        service_name,
-                        decls,
-                    } = u
-                    {
-                        context.validate_update_block(*service_name, decls)?;
-                    }
-                    update_stmts.push(u.clone());
-                }
-            }
-            Stmt::Connect { .. }
-            | Stmt::Service { .. }
-            | Stmt::Import { .. }
-            | Stmt::Test { .. }
-            | Stmt::ActionStmt(_)
-            | Stmt::Watch { .. } => {}
-        }
-    }
-
-    if !update_stmts.is_empty() {
-        let post_update_ast = crate::runtime::ast::apply_updates_to_ast(program, &update_stmts)
-            .map_err(Error::UnboundVariable)?;
-
-        let mut post_services = Env::new(None);
-        let mut post_context = Context::new(&post_update_ast, &mut post_services);
-        post_context.check_all()?;
-
-        *local_services = post_services;
-    }
-
-    Ok(())
+    context.check_all()
 }
 
 #[cfg(test)]

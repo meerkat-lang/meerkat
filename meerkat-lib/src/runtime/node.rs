@@ -514,62 +514,97 @@ impl Node {
         Ok(manager)
     }
 
-    /// Perform static analysis checks on unified service declarations
+    /// Perform static analysis checks across the unified AST
+    ///
+    /// Validates name resolution, types, and reactive dependencies. For
+    /// programs containing sequential updates or atomic update blocks,
+    /// verifies intermediate service states incrementally at each atomic
+    /// transaction boundary and evaluates top-level statements against
+    /// the final accumulated AST.
     ///
     /// Returns:
-    ///   `Result<()>`: Ok if checks pass, or error
-    /// Perform static analysis checks on unified service declarations
-    ///
-    /// Validates both the pre-update static schema and any post-update AST
-    /// synthesized from service update declarations
-    ///
-    /// Returns:
-    ///   `Result<()>`: Ok if checks pass, or error
+    ///   `Result<()>`: Ok if static checks pass, or error
     ///
     /// Errors:
-    ///   `Error`: If name resolution or type checking fails
+    ///   `Error`: If name resolution, type checking, or graph analysis fails
     pub fn static_checks(&mut self) -> Result<()> {
-        nameres::resolve(&self.unified_ast).map_err(|e| self.format_nameres_error(e))?;
+        let mut service_ast: Vec<Stmt> = Vec::new();
+        let mut top_level_stmts: Vec<Stmt> = Vec::new();
+        let mut update_batches: Vec<Vec<Stmt>> = Vec::new();
 
-        let mut local_services = Env::new(None);
-        tt::check(&self.unified_ast, &mut local_services).map_err(|e| self.format_tt_error(e))?;
-        self.local_services = local_services;
-
-        compute_dependencies(&self.unified_ast, None);
-
-        let mut update_stmts = Vec::new();
         for stmt in &self.unified_ast {
             match stmt {
+                Stmt::Service { .. } | Stmt::Import { .. } | Stmt::Connect { .. } => {
+                    service_ast.push(stmt.clone());
+                }
+                Stmt::Watch { .. } | Stmt::ActionStmt(_) | Stmt::Test { .. } => {
+                    top_level_stmts.push(stmt.clone());
+                }
                 Stmt::Update { .. } => {
-                    update_stmts.push(stmt.clone());
+                    update_batches.push(vec![stmt.clone()]);
                 }
                 Stmt::Atomic { updates } => {
-                    for u in updates {
-                        update_stmts.push(u.clone());
+                    if !updates.is_empty() {
+                        update_batches.push(updates.clone());
                     }
                 }
-                Stmt::Connect { .. }
-                | Stmt::Service { .. }
-                | Stmt::Import { .. }
-                | Stmt::Test { .. }
-                | Stmt::ActionStmt(_)
-                | Stmt::Watch { .. } => {}
             }
         }
 
-        if !update_stmts.is_empty() {
-            let post_update_ast =
-                apply_updates_to_ast(&self.unified_ast, &update_stmts).map_err(|sym| {
-                    Error::Message(format!(
-                        "Target service '{}' for update not found",
-                        self.interner.get(sym)
-                    ))
-                })?;
+        if update_batches.is_empty() {
+            nameres::resolve(&self.unified_ast).map_err(|e| self.format_nameres_error(e))?;
 
-            nameres::resolve(&post_update_ast).map_err(|e| self.format_nameres_error(e))?;
+            let mut local_services = Env::new(None);
+            tt::check(&self.unified_ast, &mut local_services)
+                .map_err(|e| self.format_tt_error(e))?;
+            self.local_services = local_services;
 
-            compute_dependencies(&post_update_ast, None);
+            compute_dependencies(&self.unified_ast, None);
+
+            return Ok(());
         }
+
+        // Initial validation of base service declarations
+        nameres::resolve(&service_ast).map_err(|e| self.format_nameres_error(e))?;
+        let mut initial_services = Env::new(None);
+        tt::check(&service_ast, &mut initial_services).map_err(|e| self.format_tt_error(e))?;
+        compute_dependencies(&service_ast, None);
+
+        let last_batch = update_batches.pop().unwrap();
+
+        // Process (n - 1) intermediate atomic batches
+        for batch in update_batches {
+            service_ast = apply_updates_to_ast(&service_ast, &batch).map_err(|sym| {
+                Error::Message(format!(
+                    "Target service '{}' for update not found",
+                    self.interner.get(sym)
+                ))
+            })?;
+
+            nameres::resolve(&service_ast).map_err(|e| self.format_nameres_error(e))?;
+            let mut step_services = Env::new(None);
+            tt::check(&service_ast, &mut step_services).map_err(|e| self.format_tt_error(e))?;
+            compute_dependencies(&service_ast, None);
+        }
+
+        // Process final atomic transaction batch
+        service_ast = apply_updates_to_ast(&service_ast, &last_batch).map_err(|sym| {
+            Error::Message(format!(
+                "Target service '{}' for update not found",
+                self.interner.get(sym)
+            ))
+        })?;
+
+        let mut final_ast = service_ast;
+        final_ast.extend(top_level_stmts);
+
+        nameres::resolve(&final_ast).map_err(|e| self.format_nameres_error(e))?;
+        let mut final_services = Env::new(None);
+        tt::check(&final_ast, &mut final_services).map_err(|e| self.format_tt_error(e))?;
+        compute_dependencies(&final_ast, None);
+
+        self.local_services = final_services;
+        self.unified_ast = final_ast;
 
         Ok(())
     }
@@ -645,6 +680,13 @@ impl Node {
                     var_str
                 ))
             }
+            tt::check::Error::UnknownUpdateTarget(service) => {
+                let service_str = self.interner.get(service);
+                Error::Message(format!(
+                    "Target service '{}' for update not found",
+                    service_str
+                ))
+            }
             tt::check::Error::TypeMismatch { expected, found } => Error::Message(format!(
                 "type check error: type mismatch: expected {}, found {}.",
                 expected, found
@@ -698,41 +740,8 @@ impl Node {
     }
 
     pub fn run_static_checks(&mut self, program: &[Stmt]) -> Result<()> {
-        nameres::resolve(program).map_err(|e| match e {
-            nameres::Error::UnknownIdentifier {
-                name,
-                expected,
-                context_name,
-            } => {
-                let name_str = self.interner.get(name);
-                let msg = match context_name {
-                    Some(ctx) => {
-                        let ctx_str = self.interner.get(ctx);
-                        format!(
-                            "Unknown identifier '{}' (expected {}) in service '{}'",
-                            name_str, expected, ctx_str
-                        )
-                    }
-                    None => format!("Unknown identifier '{}' (expected {})", name_str, expected),
-                };
-                Error::Message(msg)
-            }
-            nameres::Error::ForwardReference(name) => {
-                let name_str = self.interner.get(name);
-                let msg = format!(
-                    "Invalid forward reference to uninitialized value '{}'",
-                    name_str
-                );
-                Error::Message(msg)
-            }
-            nameres::Error::DepthLimit => Error::Message(e.to_string()),
-        })?;
-
-        tt::check(program, &mut self.local_services).map_err(|e| self.format_tt_error(e))?;
-
-        compute_dependencies(program, None);
-
-        Ok(())
+        self.unified_ast = program.to_vec();
+        self.static_checks()
     }
 
     /// Start the runtime manager consuming this Node
@@ -757,6 +766,8 @@ impl Default for Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::{ActionStmt, BinOp, Decl, Expr, Value};
+    use crate::runtime::tt::Type;
 
     /// Verify error mapping when apply_updates_to_ast encounters an unknown
     /// target service symbol
@@ -783,5 +794,593 @@ mod tests {
                 "Target service 'unknown_s' for update not found".to_string()
             ))
         );
+    }
+
+    /// Verify that format_tt_error properly formats UnknownUpdateTarget errors
+    #[test]
+    fn test_format_tt_error_unknown_update_target() {
+        let mut node = Node::new();
+        let sym = node.interner.insert("unknown_s");
+
+        let err = tt::check::Error::UnknownUpdateTarget(sym);
+        let res = node.format_tt_error(err);
+        assert_eq!(
+            res,
+            Error::Message("Target service 'unknown_s' for update not found".to_string())
+        );
+    }
+
+    /// Verify that a valid service update block passes static checks
+    #[test]
+    fn test_update_block_type_checks() {
+        let mut node = Node::new();
+        let s = node.interner.insert("s");
+        let x = node.interner.insert("x");
+
+        let service_stmt = Stmt::Service {
+            name: s,
+            decls: vec![],
+        };
+        let update_stmt = Stmt::Update {
+            service_name: s,
+            decls: vec![Decl::VarDecl {
+                name: x,
+                ty: Some(Type::Int),
+                val: Expr::Literal {
+                    val: Value::Int { val: 42 },
+                },
+            }],
+        };
+
+        let program = vec![service_stmt, update_stmt];
+        let res = node.run_static_checks(&program);
+        assert!(res.is_ok());
+    }
+
+    /// Verify that updating an unknown service returns target not found error
+    #[test]
+    fn test_update_block_unknown_service_errors() {
+        let mut node = Node::new();
+        let s = node.interner.insert("unknown_s");
+        let x = node.interner.insert("x");
+
+        let update_stmt = Stmt::Update {
+            service_name: s,
+            decls: vec![Decl::VarDecl {
+                name: x,
+                ty: Some(Type::Int),
+                val: Expr::Literal {
+                    val: Value::Int { val: 42 },
+                },
+            }],
+        };
+
+        let program = vec![update_stmt];
+        let res = node.run_static_checks(&program);
+        assert_eq!(
+            res,
+            Err(Error::Message(
+                "Target service 'unknown_s' for update not found".to_string()
+            ))
+        );
+    }
+
+    /// Verify that an update block with type mismatch yields a static check error
+    #[test]
+    fn test_update_block_type_mismatch_errors() {
+        let mut node = Node::new();
+        let s = node.interner.insert("s");
+        let x = node.interner.insert("x");
+
+        let service_stmt = Stmt::Service {
+            name: s,
+            decls: vec![],
+        };
+        let update_stmt = Stmt::Update {
+            service_name: s,
+            decls: vec![Decl::VarDecl {
+                name: x,
+                ty: Some(Type::Int),
+                val: Expr::Literal {
+                    val: Value::Bool { val: true },
+                },
+            }],
+        };
+
+        let program = vec![service_stmt, update_stmt];
+        let res = node.run_static_checks(&program);
+        assert!(res.is_err());
+    }
+
+    /// Verify update block inherits service environment and sequential scoping
+    #[test]
+    fn test_update_block_inherits_service_env() {
+        let mut node = Node::new();
+        let s = node.interner.insert("s");
+        let a = node.interner.insert("a");
+        let b = node.interner.insert("b");
+
+        let service_stmt = Stmt::Service {
+            name: s,
+            decls: vec![Decl::VarDecl {
+                name: a,
+                ty: Some(Type::Int),
+                val: Expr::Literal {
+                    val: Value::Int { val: 10 },
+                },
+            }],
+        };
+        let update_stmt = Stmt::Update {
+            service_name: s,
+            decls: vec![Decl::DefDecl {
+                name: b,
+                ty: None,
+                val: Expr::Variable { name: a },
+                is_pub: false,
+            }],
+        };
+
+        let program = vec![service_stmt, update_stmt];
+        let res = node.run_static_checks(&program);
+        assert!(res.is_ok());
+    }
+
+    /// Verify that forward reference to a new member in update block fails static checks
+    #[test]
+    fn test_update_block_forward_ref_fails() {
+        let mut node = Node::new();
+        let s = node.interner.insert("s");
+        let a = node.interner.insert("a");
+        let b = node.interner.insert("b");
+
+        let service_stmt = Stmt::Service {
+            name: s,
+            decls: vec![],
+        };
+
+        let update_stmt = Stmt::Update {
+            service_name: s,
+            decls: vec![
+                Decl::DefDecl {
+                    name: b,
+                    ty: None,
+                    val: Expr::Variable { name: a },
+                    is_pub: false,
+                },
+                Decl::VarDecl {
+                    name: a,
+                    ty: Some(Type::Int),
+                    val: Expr::Literal {
+                        val: Value::Int { val: 10 },
+                    },
+                },
+            ],
+        };
+
+        let program = vec![service_stmt, update_stmt];
+        let res = node.run_static_checks(&program);
+        assert!(res.is_err());
+    }
+
+    /// Verify update accumulates fields across sequential update blocks
+    #[test]
+    fn test_update_accumulates_across_blocks() {
+        let mut node = Node::new();
+        let s = node.interner.insert("s");
+        let a = node.interner.insert("a");
+        let b = node.interner.insert("b");
+
+        let service_stmt = Stmt::Service {
+            name: s,
+            decls: vec![],
+        };
+        let update1 = Stmt::Update {
+            service_name: s,
+            decls: vec![Decl::VarDecl {
+                name: a,
+                ty: Some(Type::Int),
+                val: Expr::Literal {
+                    val: Value::Int { val: 5 },
+                },
+            }],
+        };
+        let update2 = Stmt::Update {
+            service_name: s,
+            decls: vec![Decl::DefDecl {
+                name: b,
+                ty: None,
+                val: Expr::Variable { name: a },
+                is_pub: false,
+            }],
+        };
+
+        let program = vec![service_stmt, update1, update2];
+        let res = node.run_static_checks(&program);
+        assert!(res.is_ok());
+    }
+
+    /// Verify that atomic blocks containing update statements pass static checks
+    #[test]
+    fn test_atomic_block_type_checks() {
+        let mut node = Node::new();
+        let s1 = node.interner.insert("s1");
+        let x = node.interner.insert("x");
+
+        let service_stmt = Stmt::Service {
+            name: s1,
+            decls: vec![],
+        };
+        let atomic_stmt = Stmt::Atomic {
+            updates: vec![Stmt::Update {
+                service_name: s1,
+                decls: vec![Decl::VarDecl {
+                    name: x,
+                    ty: Some(Type::Int),
+                    val: Expr::Literal {
+                        val: Value::Int { val: 100 },
+                    },
+                }],
+            }],
+        };
+
+        let program = vec![service_stmt, atomic_stmt];
+        let res = node.run_static_checks(&program);
+        assert!(res.is_ok());
+    }
+
+    /// Verify that sequential atomic blocks type check properly across boundaries
+    #[test]
+    fn test_sequential_atomic_blocks_type_check() {
+        let mut node = Node::new();
+        let s1 = node.interner.insert("s1");
+        let x = node.interner.insert("x");
+        let y = node.interner.insert("y");
+
+        let service_stmt = Stmt::Service {
+            name: s1,
+            decls: vec![],
+        };
+        let atomic_stmt1 = Stmt::Atomic {
+            updates: vec![Stmt::Update {
+                service_name: s1,
+                decls: vec![Decl::VarDecl {
+                    name: x,
+                    ty: Some(Type::Int),
+                    val: Expr::Literal {
+                        val: Value::Int { val: 100 },
+                    },
+                }],
+            }],
+        };
+        let atomic_stmt2 = Stmt::Atomic {
+            updates: vec![Stmt::Update {
+                service_name: s1,
+                decls: vec![Decl::DefDecl {
+                    name: y,
+                    ty: None,
+                    val: Expr::Variable { name: x },
+                    is_pub: false,
+                }],
+            }],
+        };
+
+        let program = vec![service_stmt, atomic_stmt1, atomic_stmt2];
+        let res = node.run_static_checks(&program);
+        assert!(res.is_ok());
+    }
+
+    /// Verify that an invalid intermediate state in sequential standalone updates
+    /// fails static checks, whereas the same updates succeed in an atomic block
+    #[test]
+    fn test_non_atomic_sequence_intermediate_type_error_fails() {
+        let mut node1 = Node::new();
+        let s = node1.interner.insert("s");
+        let x = node1.interner.insert("x");
+        let y = node1.interner.insert("y");
+
+        let service_stmt = Stmt::Service {
+            name: s,
+            decls: vec![
+                Decl::VarDecl {
+                    name: x,
+                    ty: Some(Type::Int),
+                    val: Expr::Literal {
+                        val: Value::Int { val: 1 },
+                    },
+                },
+                Decl::DefDecl {
+                    name: y,
+                    ty: Some(Type::Int),
+                    val: Expr::Binop {
+                        op: BinOp::Add,
+                        expr1: Box::new(Expr::Variable { name: x }),
+                        expr2: Box::new(Expr::Literal {
+                            val: Value::Int { val: 1 },
+                        }),
+                    },
+                    is_pub: false,
+                },
+            ],
+        };
+
+        let update1 = Stmt::Update {
+            service_name: s,
+            decls: vec![Decl::VarDecl {
+                name: x,
+                ty: Some(Type::String),
+                val: Expr::Literal {
+                    val: Value::String {
+                        val: "hello".to_string(),
+                    },
+                },
+            }],
+        };
+
+        let update2 = Stmt::Update {
+            service_name: s,
+            decls: vec![Decl::DefDecl {
+                name: y,
+                ty: Some(Type::String),
+                val: Expr::Variable { name: x },
+                is_pub: false,
+            }],
+        };
+
+        let sequential_program = vec![service_stmt.clone(), update1.clone(), update2.clone()];
+        let res_sequential = node1.run_static_checks(&sequential_program);
+        assert!(res_sequential.is_err());
+
+        let mut node2 = Node::new();
+        let s_2 = node2.interner.insert("s");
+        let x_2 = node2.interner.insert("x");
+        let y_2 = node2.interner.insert("y");
+
+        let service_stmt_2 = Stmt::Service {
+            name: s_2,
+            decls: vec![
+                Decl::VarDecl {
+                    name: x_2,
+                    ty: Some(Type::Int),
+                    val: Expr::Literal {
+                        val: Value::Int { val: 1 },
+                    },
+                },
+                Decl::DefDecl {
+                    name: y_2,
+                    ty: Some(Type::Int),
+                    val: Expr::Binop {
+                        op: BinOp::Add,
+                        expr1: Box::new(Expr::Variable { name: x_2 }),
+                        expr2: Box::new(Expr::Literal {
+                            val: Value::Int { val: 1 },
+                        }),
+                    },
+                    is_pub: false,
+                },
+            ],
+        };
+
+        let update1_2 = Stmt::Update {
+            service_name: s_2,
+            decls: vec![Decl::VarDecl {
+                name: x_2,
+                ty: Some(Type::String),
+                val: Expr::Literal {
+                    val: Value::String {
+                        val: "hello".to_string(),
+                    },
+                },
+            }],
+        };
+
+        let update2_2 = Stmt::Update {
+            service_name: s_2,
+            decls: vec![Decl::DefDecl {
+                name: y_2,
+                ty: Some(Type::String),
+                val: Expr::Variable { name: x_2 },
+                is_pub: false,
+            }],
+        };
+
+        let atomic_program = vec![
+            service_stmt_2,
+            Stmt::Atomic {
+                updates: vec![update1_2, update2_2],
+            },
+        ];
+        let res_atomic = node2.run_static_checks(&atomic_program);
+        assert!(res_atomic.is_ok());
+    }
+
+    /// Verify that a test block referencing a field introduced in a second sequential update
+    /// passes static checks after all updates are applied
+    #[test]
+    fn test_sequential_updates_with_test_referencing_later_field() {
+        let mut node = Node::new();
+        let s = node.interner.insert("s");
+        let a = node.interner.insert("a");
+        let b = node.interner.insert("b");
+        let x = node.interner.insert("x");
+
+        let service_stmt = Stmt::Service {
+            name: s,
+            decls: vec![],
+        };
+
+        let update1 = Stmt::Update {
+            service_name: s,
+            decls: vec![Decl::VarDecl {
+                name: a,
+                ty: Some(Type::Int),
+                val: Expr::Literal {
+                    val: Value::Int { val: 10 },
+                },
+            }],
+        };
+
+        let update2 = Stmt::Update {
+            service_name: s,
+            decls: vec![Decl::VarDecl {
+                name: b,
+                ty: Some(Type::String),
+                val: Expr::Literal {
+                    val: Value::String {
+                        val: "hello".to_string(),
+                    },
+                },
+            }],
+        };
+
+        let test_stmt = Stmt::Test {
+            service_name: s,
+            stmts: vec![ActionStmt::Let {
+                name: x,
+                ty: Some(Type::String),
+                expr: Expr::Variable { name: b },
+            }],
+        };
+
+        let program = vec![service_stmt, update1, update2, test_stmt];
+        let res = node.run_static_checks(&program);
+        assert!(res.is_ok());
+    }
+
+    /// Verify that an empty atomic block does not suppress static type checking on tests
+    #[test]
+    fn test_empty_atomic_block_does_not_suppress_test_validation() {
+        let mut node = Node::new();
+        let s = node.interner.insert("s");
+        let x = node.interner.insert("x");
+        let a = node.interner.insert("a");
+
+        let service_stmt = Stmt::Service {
+            name: s,
+            decls: vec![Decl::VarDecl {
+                name: x,
+                ty: Some(Type::Int),
+                val: Expr::Literal {
+                    val: Value::Int { val: 10 },
+                },
+            }],
+        };
+
+        let empty_atomic = Stmt::Atomic { updates: vec![] };
+
+        let test_stmt = Stmt::Test {
+            service_name: s,
+            stmts: vec![ActionStmt::Let {
+                name: a,
+                ty: Some(Type::String),
+                expr: Expr::Variable { name: x },
+            }],
+        };
+
+        let program = vec![service_stmt, empty_atomic, test_stmt];
+        let res = node.run_static_checks(&program);
+        assert!(res.is_err());
+    }
+
+    /// Verify that a watch statement referencing a field introduced in a second sequential update
+    /// passes static checks after all updates are applied
+    #[test]
+    fn test_sequential_updates_with_watch_referencing_later_field() {
+        let mut node = Node::new();
+        let s = node.interner.insert("s");
+        let a = node.interner.insert("a");
+        let b = node.interner.insert("b");
+
+        let service_stmt = Stmt::Service {
+            name: s,
+            decls: vec![],
+        };
+
+        let update1 = Stmt::Update {
+            service_name: s,
+            decls: vec![Decl::VarDecl {
+                name: a,
+                ty: Some(Type::Int),
+                val: Expr::Literal {
+                    val: Value::Int { val: 10 },
+                },
+            }],
+        };
+
+        let update2 = Stmt::Update {
+            service_name: s,
+            decls: vec![Decl::VarDecl {
+                name: b,
+                ty: Some(Type::String),
+                val: Expr::Literal {
+                    val: Value::String {
+                        val: "hello".to_string(),
+                    },
+                },
+            }],
+        };
+
+        let watch_stmt = Stmt::Watch {
+            expr: Expr::MemberAccess {
+                service_name: s,
+                member_name: b,
+            },
+        };
+
+        let program = vec![service_stmt, update1, update2, watch_stmt];
+        let res = node.run_static_checks(&program);
+        assert!(res.is_ok());
+    }
+
+    /// Verify that an action statement referencing a field introduced in a second sequential update
+    /// passes static checks after all updates are applied
+    #[test]
+    fn test_sequential_updates_with_action_referencing_later_field() {
+        let mut node = Node::new();
+        let s = node.interner.insert("s");
+        let a = node.interner.insert("a");
+        let b = node.interner.insert("b");
+        let x = node.interner.insert("x");
+
+        let service_stmt = Stmt::Service {
+            name: s,
+            decls: vec![],
+        };
+
+        let update1 = Stmt::Update {
+            service_name: s,
+            decls: vec![Decl::VarDecl {
+                name: a,
+                ty: Some(Type::Int),
+                val: Expr::Literal {
+                    val: Value::Int { val: 10 },
+                },
+            }],
+        };
+
+        let update2 = Stmt::Update {
+            service_name: s,
+            decls: vec![Decl::VarDecl {
+                name: b,
+                ty: Some(Type::String),
+                val: Expr::Literal {
+                    val: Value::String {
+                        val: "hello".to_string(),
+                    },
+                },
+            }],
+        };
+
+        let action_stmt = Stmt::ActionStmt(ActionStmt::Let {
+            name: x,
+            ty: Some(Type::String),
+            expr: Expr::MemberAccess {
+                service_name: s,
+                member_name: b,
+            },
+        });
+
+        let program = vec![service_stmt, update1, update2, action_stmt];
+        let res = node.run_static_checks(&program);
+        assert!(res.is_ok());
     }
 }

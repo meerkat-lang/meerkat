@@ -18,7 +18,12 @@ fn test_type_depth_calculation() {
     assert!(check_type(&Type::Int, 1).is_ok());
     let func = Type::Func(
         Box::new(Type::Int),
-        Box::new(Type::Func(Box::new(Type::Bool), Box::new(Type::String))),
+        Box::new(Type::Func(
+            Box::new(Type::Bool),
+            Box::new(Type::String),
+            std::collections::HashSet::new(),
+        )),
+        std::collections::HashSet::new(),
     );
     assert!(check_type(&func, 1).is_ok());
 }
@@ -116,8 +121,8 @@ fn test_primitive_mismatch() {
     assert_eq!(
         res,
         Err(Error::TypeMismatch {
-            expected: Type::Int,
-            found: Type::String,
+            expected: Box::new(Type::Int),
+            found: Box::new(Type::String),
         })
     )
 }
@@ -132,7 +137,11 @@ fn test_function_calls() {
     let decls = vec![
         Decl::VarDecl {
             name: var_f,
-            ty: Some(Type::Func(Box::new(Type::Int), Box::new(Type::Int))),
+            ty: Some(Type::Func(
+                Box::new(Type::Int),
+                Box::new(Type::Int),
+                std::collections::HashSet::new(),
+            )),
             val: Expr::Func {
                 params: vec![Param {
                     name: interner.insert("a"),
@@ -500,7 +509,7 @@ fn test_circular_dependency() {
     let res = check(&program, &mut classes);
     assert_eq!(
         res,
-        Err(Error::DependencyCycle {
+        Err(Error::RecursiveTypeInference {
             service: name_s,
             member: name_a
         })
@@ -620,7 +629,11 @@ fn test_function_parameter_mismatches() {
         name: name_s,
         decls: vec![Decl::VarDecl {
             name: interner.insert("f"),
-            ty: Some(Type::Func(Box::new(Type::Int), Box::new(Type::Int))),
+            ty: Some(Type::Func(
+                Box::new(Type::Int),
+                Box::new(Type::Int),
+                std::collections::HashSet::new(),
+            )),
             val: Expr::Func {
                 params: vec![],
                 body: Box::new(Expr::Literal {
@@ -636,7 +649,11 @@ fn test_function_parameter_mismatches() {
         name: name_s,
         decls: vec![Decl::VarDecl {
             name: interner.insert("f"),
-            ty: Some(Type::Func(Box::new(Type::Int), Box::new(Type::Int))),
+            ty: Some(Type::Func(
+                Box::new(Type::Int),
+                Box::new(Type::Int),
+                std::collections::HashSet::new(),
+            )),
             val: Expr::Func {
                 params: vec![
                     Param {
@@ -655,7 +672,8 @@ fn test_function_parameter_mismatches() {
             },
         }],
     }];
-    assert!(check(&p2, &mut classes).is_err());
+    let mut classes2 = Env::new(None);
+    assert!(check(&p2, &mut classes2).is_err());
 }
 
 /// Verify function call arguments and function types are validated
@@ -684,7 +702,11 @@ fn test_call_mismatches() {
         decls: vec![
             Decl::VarDecl {
                 name: interner.insert("f"),
-                ty: Some(Type::Func(Box::new(Type::Unit), Box::new(Type::Int))),
+                ty: Some(Type::Func(
+                    Box::new(Type::Unit),
+                    Box::new(Type::Int),
+                    std::collections::HashSet::new(),
+                )),
                 val: Expr::Func {
                     params: vec![],
                     body: Box::new(Expr::Literal {
@@ -818,7 +840,11 @@ fn test_lambda_annotations_in_checking_mode() {
         name: name_s,
         decls: vec![Decl::VarDecl {
             name: interner.insert("f"),
-            ty: Some(Type::Func(Box::new(Type::Int), Box::new(Type::Int))),
+            ty: Some(Type::Func(
+                Box::new(Type::Int),
+                Box::new(Type::Int),
+                std::collections::HashSet::new(),
+            )),
             val: Expr::Func {
                 params: vec![Param {
                     name: interner.insert("x"),
@@ -835,8 +861,8 @@ fn test_lambda_annotations_in_checking_mode() {
     assert_eq!(
         res1,
         Err(Error::TypeMismatch {
-            expected: Type::Int,
-            found: Type::String,
+            expected: Box::new(Type::Int),
+            found: Box::new(Type::String),
         })
     );
     // Test contradictory parameter type: expected int -> int,
@@ -845,7 +871,11 @@ fn test_lambda_annotations_in_checking_mode() {
         name: name_s,
         decls: vec![Decl::VarDecl {
             name: interner.insert("g"),
-            ty: Some(Type::Func(Box::new(Type::Int), Box::new(Type::Int))),
+            ty: Some(Type::Func(
+                Box::new(Type::Int),
+                Box::new(Type::Int),
+                std::collections::HashSet::new(),
+            )),
             val: Expr::Func {
                 params: vec![Param {
                     name: interner.insert("x"),
@@ -862,8 +892,8 @@ fn test_lambda_annotations_in_checking_mode() {
     assert_eq!(
         res2,
         Err(Error::TypeMismatch {
-            expected: Type::Int,
-            found: Type::String,
+            expected: Box::new(Type::Int),
+            found: Box::new(Type::String),
         })
     );
     // Test contradictory tuple parameter type: expected
@@ -877,6 +907,7 @@ fn test_lambda_annotations_in_checking_mode() {
                     TupleType::new(vec![Type::Int, Type::Int]).unwrap(),
                 )),
                 Box::new(Type::Int),
+                std::collections::HashSet::new(),
             )),
             val: Expr::Func {
                 params: vec![
@@ -900,8 +931,8 @@ fn test_lambda_annotations_in_checking_mode() {
     assert_eq!(
         res3,
         Err(Error::TypeMismatch {
-            expected: Type::Int,
-            found: Type::String,
+            expected: Box::new(Type::Int),
+            found: Box::new(Type::String),
         })
     );
 }
@@ -984,4 +1015,231 @@ fn test_unknown_service_member_access_errors() {
     let mut classes = Env::new(None);
     let res = check(&program, &mut classes);
     assert_eq!(res, Err(Error::UnboundVariable(ghost_svc)))
+}
+
+/// Verify that a valid service update block type checks successfully
+#[test]
+fn test_update_block_type_checks() {
+    let mut interner = Interner::new();
+    let s = interner.insert("s");
+    let x = interner.insert("x");
+
+    let service_stmt = Stmt::Service {
+        name: s,
+        decls: vec![],
+    };
+    let update_stmt = Stmt::Update {
+        service_name: s,
+        decls: vec![Decl::VarDecl {
+            name: x,
+            ty: Some(Type::Int),
+            val: Expr::Literal {
+                val: Value::Int { val: 42 },
+            },
+        }],
+    };
+
+    let program = vec![service_stmt, update_stmt];
+    let mut classes = Env::new(None);
+    let res = check(&program, &mut classes);
+    assert!(res.is_ok());
+}
+
+/// Verify that updating an unknown service returns UnboundVariable error
+#[test]
+fn test_update_block_unknown_service_errors() {
+    let mut interner = Interner::new();
+    let s = interner.insert("unknown_s");
+    let x = interner.insert("x");
+
+    let update_stmt = Stmt::Update {
+        service_name: s,
+        decls: vec![Decl::VarDecl {
+            name: x,
+            ty: Some(Type::Int),
+            val: Expr::Literal {
+                val: Value::Int { val: 42 },
+            },
+        }],
+    };
+
+    let program = vec![update_stmt];
+    let mut classes = Env::new(None);
+    let res = check(&program, &mut classes);
+    assert_eq!(res, Err(Error::UnboundVariable(s)));
+}
+
+/// Verify that an update block with type mismatch yields TypeMismatch error
+#[test]
+fn test_update_block_type_mismatch_errors() {
+    let mut interner = Interner::new();
+    let s = interner.insert("s");
+    let x = interner.insert("x");
+
+    let service_stmt = Stmt::Service {
+        name: s,
+        decls: vec![],
+    };
+    let update_stmt = Stmt::Update {
+        service_name: s,
+        decls: vec![Decl::VarDecl {
+            name: x,
+            ty: Some(Type::Int),
+            val: Expr::Literal {
+                val: Value::Bool { val: true },
+            },
+        }],
+    };
+
+    let program = vec![service_stmt, update_stmt];
+    let mut classes = Env::new(None);
+    let res = check(&program, &mut classes);
+    assert_eq!(
+        res,
+        Err(Error::TypeMismatch {
+            expected: Box::new(Type::Int),
+            found: Box::new(Type::Bool),
+        })
+    );
+}
+
+/// Verify update block inherits service environment and sequential scoping
+#[test]
+fn test_update_block_inherits_service_env() {
+    let mut interner = Interner::new();
+    let s = interner.insert("s");
+    let a = interner.insert("a");
+    let b = interner.insert("b");
+
+    let service_stmt = Stmt::Service {
+        name: s,
+        decls: vec![Decl::VarDecl {
+            name: a,
+            ty: Some(Type::Int),
+            val: Expr::Literal {
+                val: Value::Int { val: 10 },
+            },
+        }],
+    };
+    let update_stmt = Stmt::Update {
+        service_name: s,
+        decls: vec![Decl::DefDecl {
+            name: b,
+            ty: None,
+            val: Expr::Variable { name: a },
+            is_pub: false,
+        }],
+    };
+
+    let program = vec![service_stmt, update_stmt];
+    let mut classes = Env::new(None);
+    let res = check(&program, &mut classes);
+    assert!(res.is_ok());
+}
+
+/// Verify that forward reference to a new member in update block yields UnboundVariable
+#[test]
+fn test_update_block_forward_ref_fails() {
+    let mut interner = Interner::new();
+    let s = interner.insert("s");
+    let a = interner.insert("a");
+    let b = interner.insert("b");
+
+    let service_stmt = Stmt::Service {
+        name: s,
+        decls: vec![],
+    };
+
+    // update s { def b = a; var a = 10; } -- 'a' is new, so 'b' cannot reference it before declaration
+    let update_stmt = Stmt::Update {
+        service_name: s,
+        decls: vec![
+            Decl::DefDecl {
+                name: b,
+                ty: None,
+                val: Expr::Variable { name: a },
+                is_pub: false,
+            },
+            Decl::VarDecl {
+                name: a,
+                ty: Some(Type::Int),
+                val: Expr::Literal {
+                    val: Value::Int { val: 10 },
+                },
+            },
+        ],
+    };
+
+    let program = vec![service_stmt, update_stmt];
+    let mut classes = Env::new(None);
+    let res = check(&program, &mut classes);
+    assert_eq!(res, Err(Error::UnboundVariable(a)));
+}
+
+/// Verify update accumulates fields across sequential update blocks
+#[test]
+fn test_update_accumulates_across_blocks() {
+    let mut interner = Interner::new();
+    let s = interner.insert("s");
+    let a = interner.insert("a");
+    let b = interner.insert("b");
+
+    let service_stmt = Stmt::Service {
+        name: s,
+        decls: vec![],
+    };
+    let update1 = Stmt::Update {
+        service_name: s,
+        decls: vec![Decl::VarDecl {
+            name: a,
+            ty: Some(Type::Int),
+            val: Expr::Literal {
+                val: Value::Int { val: 5 },
+            },
+        }],
+    };
+    let update2 = Stmt::Update {
+        service_name: s,
+        decls: vec![Decl::DefDecl {
+            name: b,
+            ty: None,
+            val: Expr::Variable { name: a },
+            is_pub: false,
+        }],
+    };
+
+    let program = vec![service_stmt, update1, update2];
+    let mut classes = Env::new(None);
+    let res = check(&program, &mut classes);
+    assert!(res.is_ok());
+}
+
+/// Verify that atomic blocks containing update statements type check properly
+#[test]
+fn test_atomic_block_type_checks() {
+    let mut interner = Interner::new();
+    let s1 = interner.insert("s1");
+    let x = interner.insert("x");
+
+    let service_stmt = Stmt::Service {
+        name: s1,
+        decls: vec![],
+    };
+    let atomic_stmt = Stmt::Atomic {
+        updates: vec![Stmt::Update {
+            service_name: s1,
+            decls: vec![Decl::VarDecl {
+                name: x,
+                ty: Some(Type::Int),
+                val: Expr::Literal {
+                    val: Value::Int { val: 100 },
+                },
+            }],
+        }],
+    };
+
+    let program = vec![service_stmt, atomic_stmt];
+    let mut classes = Env::new(None);
+    let res = check(&program, &mut classes);
+    assert!(res.is_ok());
 }

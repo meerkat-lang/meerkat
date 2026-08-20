@@ -99,6 +99,7 @@ impl<'a> Imports<'a> {
                 } => Some((*service_name, path, *explicit_path)),
                 Stmt::Service { .. } => None,
                 Stmt::ActionStmt(_) => None,
+                Stmt::Atomic { .. } => None,
                 Stmt::Update { .. } => None,
                 Stmt::Connect { .. } => None,
                 Stmt::Test { .. } => None,
@@ -237,6 +238,7 @@ impl<'a> Imports<'a> {
                 }
                 Stmt::Service { .. } => {}
                 Stmt::ActionStmt(_) => {}
+                Stmt::Atomic { .. } => {}
                 Stmt::Update { .. } => {}
                 Stmt::Connect { .. } => {}
                 Stmt::Test { .. } => {}

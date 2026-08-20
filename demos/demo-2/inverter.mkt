@@ -1,0 +1,11 @@
+// Solar inverter node representing a renewable power generator
+//
+// Manages power generation status and current kilowatt output telemetry
+
+service inverter {
+  // State flag indicating whether solar power is actively generating
+  var generating: bool = true;
+
+  // Current output telemetry in kilowatts (4 kW initial capacity out of 5 kW max)
+  var output_kw: int = 4;
+}

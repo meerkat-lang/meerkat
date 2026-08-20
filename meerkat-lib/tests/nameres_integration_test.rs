@@ -37,6 +37,7 @@ fn test_integration_resolve_valid_service() {
 }
 
 /// Verify eager forward references are rejected in services
+/// Verify that service forward references pass pure lexical name resolution
 #[test]
 fn test_integration_rejects_forward_reference() {
     let mut interner = Interner::new();
@@ -50,9 +51,7 @@ fn test_integration_rejects_forward_reference() {
     assert!(parse_result.is_ok());
     let stmts = parse_result.unwrap();
     let res = resolve(&stmts);
-    assert!(res.is_err());
-    let x = interner.insert("x");
-    assert_eq!(res.unwrap_err(), Error::ForwardReference(x));
+    assert!(res.is_ok());
 }
 
 /// Verify that local let binds shadow service variables in actions
@@ -168,10 +167,10 @@ fn test_integration_watch_unbound() {
     );
 }
 
-/// Verify that update statements are ignored with a warning
+/// Verify that valid update statements resolve successfully
 /// during name resolution
 #[test]
-fn test_integration_update_stmt_ignored() {
+fn test_integration_update_stmt_resolves() {
     let mut interner = Interner::new();
     let s1 = interner.insert("s1");
     let y = interner.insert("y");
@@ -197,10 +196,9 @@ fn test_integration_update_stmt_ignored() {
     assert!(res.is_ok());
 }
 
-/// Verify that update on unbound service name is ignored
-/// with a warning
+/// Verify that update on unbound service name yields an UnknownIdentifier error
 #[test]
-fn test_integration_update_unbound_ignored() {
+fn test_integration_update_unbound_errors() {
     let mut interner = Interner::new();
     let s2 = interner.insert("s2");
     let y = interner.insert("y");
@@ -219,7 +217,14 @@ fn test_integration_update_unbound_ignored() {
 
     let stmts = vec![update_stmt];
     let res = resolve(&stmts);
-    assert!(res.is_ok());
+    assert_eq!(
+        res,
+        Err(Error::UnknownIdentifier {
+            name: s2,
+            expected: ExpectedSort::Service,
+            context_name: None,
+        })
+    );
 }
 
 /// Verify that select expressions validate their table name
@@ -682,9 +687,10 @@ fn test_integration_nested_blocks_let_isolation() {
     );
 }
 
-/// Verify service update block is ignored
+/// Verify that forward reference to a new member in an update block fails
+/// per REBLS operational semantics
 #[test]
-fn test_integration_update_stmt_ignored_forward_reference() {
+fn test_integration_update_stmt_forward_reference_fails() {
     let mut interner = Interner::new();
     let s1 = interner.insert("s1");
     let x = interner.insert("x");
@@ -715,10 +721,17 @@ fn test_integration_update_stmt_ignored_forward_reference() {
 
     let stmts = vec![s1_stmt, update_stmt];
     let res = resolve(&stmts);
-    assert!(res.is_ok());
+    assert_eq!(
+        res,
+        Err(Error::UnknownIdentifier {
+            name: x,
+            expected: ExpectedSort::Variable,
+            context_name: Some(s1),
+        })
+    );
 }
 
-/// Verify service update block variables are not visible
+/// Verify service update block variables do not leak to global scope
 #[test]
 fn test_integration_update_stmt_scoping() {
     let mut interner = Interner::new();
@@ -753,6 +766,147 @@ fn test_integration_update_stmt_scoping() {
             context_name: None,
         })
     );
+}
+
+/// Verify update block inherits service environment
+#[test]
+fn test_integration_update_inherits_service_env() {
+    let mut interner = Interner::new();
+    let s1 = interner.insert("s1");
+    let a = interner.insert("a");
+    let b = interner.insert("b");
+
+    let s1_stmt = Stmt::Service {
+        name: s1,
+        decls: vec![Decl::VarDecl {
+            name: a,
+            ty: None,
+            val: Expr::Literal {
+                val: Value::Int { val: 10 },
+            },
+        }],
+    };
+    let update_stmt = Stmt::Update {
+        service_name: s1,
+        decls: vec![Decl::DefDecl {
+            name: b,
+            ty: None,
+            val: Expr::Variable { name: a },
+            is_pub: false,
+        }],
+    };
+
+    let stmts = vec![s1_stmt, update_stmt];
+    let res = resolve(&stmts);
+    assert!(res.is_ok());
+}
+
+/// Verify update block sequential scoping (in-order references succeed)
+#[test]
+fn test_integration_update_sequential_scoping() {
+    let mut interner = Interner::new();
+    let s1 = interner.insert("s1");
+    let a = interner.insert("a");
+    let b = interner.insert("b");
+
+    let s1_stmt = Stmt::Service {
+        name: s1,
+        decls: vec![],
+    };
+    let update_stmt = Stmt::Update {
+        service_name: s1,
+        decls: vec![
+            Decl::VarDecl {
+                name: a,
+                ty: None,
+                val: Expr::Literal {
+                    val: Value::Int { val: 10 },
+                },
+            },
+            Decl::DefDecl {
+                name: b,
+                ty: None,
+                val: Expr::Variable { name: a },
+                is_pub: false,
+            },
+        ],
+    };
+
+    let stmts = vec![s1_stmt, update_stmt];
+    let res = resolve(&stmts);
+    assert!(res.is_ok());
+}
+
+/// Verify update declarations accumulate across sequential update blocks
+#[test]
+fn test_integration_update_accumulates_across_blocks() {
+    let mut interner = Interner::new();
+    let s1 = interner.insert("s1");
+    let a = interner.insert("a");
+    let b = interner.insert("b");
+
+    let s1_stmt = Stmt::Service {
+        name: s1,
+        decls: vec![],
+    };
+    let update1 = Stmt::Update {
+        service_name: s1,
+        decls: vec![Decl::VarDecl {
+            name: a,
+            ty: None,
+            val: Expr::Literal {
+                val: Value::Int { val: 5 },
+            },
+        }],
+    };
+    let update2 = Stmt::Update {
+        service_name: s1,
+        decls: vec![Decl::DefDecl {
+            name: b,
+            ty: None,
+            val: Expr::Variable { name: a },
+            is_pub: false,
+        }],
+    };
+
+    let stmts = vec![s1_stmt, update1, update2];
+    let res = resolve(&stmts);
+    assert!(res.is_ok());
+}
+
+/// Verify atomic update blocks resolve service member references properly
+#[test]
+fn test_integration_atomic_update_inherits_service_env() {
+    let mut interner = Interner::new();
+    let s1 = interner.insert("s1");
+    let a = interner.insert("a");
+    let b = interner.insert("b");
+
+    let s1_stmt = Stmt::Service {
+        name: s1,
+        decls: vec![Decl::VarDecl {
+            name: a,
+            ty: None,
+            val: Expr::Literal {
+                val: Value::Int { val: 1 },
+            },
+        }],
+    };
+    let atomic_stmt = Stmt::Atomic {
+        updates: vec![Stmt::Update {
+            service_name: s1,
+            decls: vec![Decl::DefDecl {
+                name: b,
+                ty: None,
+                val: Expr::Variable { name: a },
+                is_pub: false,
+            }],
+        }],
+    };
+
+    let stmts = vec![s1_stmt, atomic_stmt];
+    let res = resolve(&stmts);
+    assert!(res.is_ok());
 }
 
 /// Verify that `@test` blocks can resolve variables
@@ -973,6 +1127,62 @@ fn test_transitive_import_member_access() {
         }
         service s3 {
             pub def c = s2.b;
+        }
+    ";
+    let parse_result = parse_string(input, &mut interner);
+    assert!(parse_result.is_ok());
+    let stmts = parse_result.unwrap();
+    let res = resolve(&stmts);
+    assert!(res.is_ok());
+}
+
+/// Verify delayed forward reference succeeds if variable is
+/// initialized before closure invocation
+#[test]
+fn test_integration_delayed_fwd_ok() {
+    let mut interner = Interner::new();
+    let input = "
+        service s {
+            def f = fn () => x;
+            var x = 5;
+            var y = f();
+        }
+    ";
+    let parse_result = parse_string(input, &mut interner);
+    assert!(parse_result.is_ok());
+    let stmts = parse_result.unwrap();
+    let res = resolve(&stmts);
+    assert!(res.is_ok());
+}
+
+/// Verify forward references in closures pass pure lexical name resolution
+#[test]
+fn test_integration_closure_fwd_ref_lexical_ok() {
+    let mut interner = Interner::new();
+    let input = "
+        service s {
+            def f = fn () => x;
+            var y = f();
+            var x = 5;
+        }
+    ";
+    let parse_result = parse_string(input, &mut interner);
+    assert!(parse_result.is_ok());
+    let stmts = parse_result.unwrap();
+    let res = resolve(&stmts);
+    assert!(res.is_ok());
+}
+
+/// Verify delayed action forward reference succeeds when executed
+/// after target variable initialization
+#[test]
+fn test_integration_action_fwd_ok() {
+    let mut interner = Interner::new();
+    let input = "
+        service s {
+            def act = action { let a = x; };
+            var x = 10;
+            pub def run = action { do act; };
         }
     ";
     let parse_result = parse_string(input, &mut interner);

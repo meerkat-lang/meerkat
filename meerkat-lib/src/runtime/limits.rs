@@ -15,7 +15,7 @@ pub const MAX_TYPE_DEPTH: usize = 16;
 pub const MAX_NET_REQUEST_STRING_LENGTH: usize = 4096;
 
 /// Maximum nesting depth of scope blocks to prevent stack overflows
-pub const MAX_SCOPE_DEPTH: usize = 128;
+pub const MAX_SCOPE_DEPTH: usize = 64;
 
 /// Maximum allowed time in seconds for an individual import attempt
 pub const INDIVIDUAL_IMPORT_TIMEOUT_SECS: u64 = 2;
@@ -34,3 +34,6 @@ pub const MAX_NET_REQUEST_SOURCE_LENGTH: usize = 1_048_576;
 
 /// Maximum number of services allowed to be imported
 pub const MAX_IMPORTED_SERVICES: usize = 256;
+
+/// Maximum number of pending update requests allowed per peer in the event queue
+pub const MAX_PENDING_UPDATES_PER_PEER: usize = 32;

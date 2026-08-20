@@ -1,0 +1,78 @@
+// Interactive visual dashboard node loaded by WebAssembly client
+//
+// macOS-inspired Smart Grid Live Dashboard with thin progress bars and industrial telemetry status indicators
+
+import inverter
+import battery
+import home
+
+service dashboard {
+  // Expose battery status as local definition
+  pub def battery_status = battery.status;
+
+  // Expose battery level as local definition
+  pub def battery_percent = battery.charge_level;
+
+  // Expose solar output as local definition
+  pub def solar_kw = inverter.output_kw;
+
+  // Calculate solar output percentage based on 5 kW max capacity
+  pub def solar_percent = (inverter.output_kw * 100) / 5;
+
+  // Reflect the home service's view of battery mode.
+  // home.power_source changes type from bool -> string when the controller
+  // pushes its atomic update, and this def propagates that type change here.
+  pub def power_source = home.power_source;
+
+  // Live type annotation for power_source, updated atomically alongside the value.
+  pub def power_source_type = home.power_source_type;
+
+  // Live reactive HTML template rendered in WebAssembly client
+  pub def html = (
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Helvetica Neue', sans-serif; max-width: 520px; margin: 2rem auto; padding: 1.5rem; background: #ffffff; border-radius: 16px; border: 1px solid #e2e8f0; box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.05), 0 8px 10px -6px rgba(0, 0, 0, 0.01);">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem;">
+        <h2 style="color: #0f172a; font-weight: 600; font-size: 1.25rem; margin: 0; letter-spacing: -0.02em;">Smart Grid Live Dashboard</h2>
+        <span style="font-size: 0.75rem; font-weight: 600; color: #3b82f6; background: #eff6ff; padding: 0.25rem 0.65rem; border-radius: 9999px;">P2P Connected</span>
+      </div>
+
+      <div style="margin-bottom: 1.25rem; padding: 1rem; background: #f8fafc; border-radius: 12px; border: 1px solid #f1f5f9;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.6rem; font-size: 0.85rem; font-weight: 500; color: #475569;">
+          <span>Solar Inverter Output</span>
+          <span style="font-weight: 600; color: #0f172a;">{solar_kw} kW / 5.0 kW ({solar_percent}%)</span>
+        </div>
+        <div style="width: 100%; background: #e2e8f0; border-radius: 9999px; height: 8px; overflow: hidden;">
+          <div class="progress-fill" data-key="solar" data-width="{solar_percent}" style="width: {solar_percent}%; background: #f59e0b; height: 100%; border-radius: 9999px;"></div>
+        </div>
+      </div>
+
+      <div style="margin-bottom: 1.25rem; padding: 1rem; background: #f8fafc; border-radius: 12px; border: 1px solid #f1f5f9;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.6rem; font-size: 0.85rem; font-weight: 500; color: #475569;">
+          <span>Battery Storage Capacity</span>
+          <span style="font-weight: 600; color: #0f172a;">{battery_percent}% / 100%</span>
+        </div>
+        <div style="width: 100%; background: #e2e8f0; border-radius: 9999px; height: 8px; overflow: hidden;">
+          <div class="progress-fill" data-key="battery" data-width="{battery_percent}" style="width: {battery_percent}%; background: #10b981; height: 100%; border-radius: 9999px;"></div>
+        </div>
+      </div>
+
+      <div style="padding: 1rem; background: #f8fafc; border-radius: 12px; border: 1px solid #f1f5f9;">
+        <div style="font-size: 0.78rem; font-weight: 600; color: #64748b; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 0.6rem;">Automated Power Routing</div>
+        <div class="industrial-telemetry-panel">
+          <div class="telemetry-badge badge-solar"><span class="led-dot led-solar"></span>☀️ SOLAR</div>
+          <div class="telemetry-badge badge-battery"><span class="led-dot led-battery"></span>🔋 BATTERY BACKUP</div>
+        </div>
+        <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.85rem; margin-top: 0.5rem;">
+          <span style="color: #64748b; font-weight: 500;">Active Supply</span>
+          <span class="active-supply-text" style="font-weight: 600; color: #0f172a;"></span>
+        </div>
+        <div style="margin-top: 0.85rem; padding-top: 0.75rem; border-top: 1px solid #e2e8f0;">
+          <div style="font-size: 0.78rem; font-weight: 600; color: #64748b; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 0.5rem;">Battery Mode (via home)</div>
+          <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.85rem;">
+            <span style="color: #475569; font-weight: 500; font-family: 'SF Mono', ui-monospace, monospace;">home.power_source</span>
+            <span style="font-weight: 600; color: #334155; background: #f1f5f9; padding: 0.2rem 0.55rem; border-radius: 6px; font-family: 'SF Mono', ui-monospace, monospace;">{power_source} : {power_source_type}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

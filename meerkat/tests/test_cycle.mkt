@@ -1,3 +1,19 @@
+// test_cycle.mkt
+//
+// PURPOSE: Verify that the type checker detects and rejects programs with
+// mutual cross-service dependency cycles that make type inference impossible.
+//
+// EXPECTED OUTCOME: FAILS static checks (type checker emits a
+// DependencyCycle error).
+//
+// RATIONALE: The four services form a cycle:
+//   s1.val1 -> s2.val2 -> s3.val3 -> s4.val4 -> s1.val1
+// There is no acyclic evaluation order. Type inference for any member in
+// the cycle cannot terminate, so the type checker must detect and reject
+// this before the program can run.
+//
+// Makefile target: test-forward-decls (expected: exit non-zero, inverted with !)
+
 service s1 {
     pub def val1 = s2.val2;
 }

@@ -21,7 +21,7 @@ fn test_ast_printer_format_symbol() {
     let printer = AstPrinter::new(&interner);
     let formatted = printer.format_symbol(symbol);
 
-    let expected = format!("{} (\"my_variable\")", symbol);
+    let expected = format!("{:?} (\"my_variable\")", symbol);
     assert_eq!(formatted, expected);
 }
 
@@ -103,8 +103,10 @@ fn test_interner_insert_duplicate() {
 fn test_ast_printer_format_symbol_empty() {
     let interner = Interner::new();
     let printer = AstPrinter::new(&interner);
-    let formatted = printer.format_symbol(Symbol::empty());
-    assert_eq!(formatted, "0 (\"\")");
+    let symbol = Symbol::empty();
+    let formatted = printer.format_symbol(symbol);
+    let expected = format!("{:?} (\"\")", symbol);
+    assert_eq!(formatted, expected);
 }
 
 /// Verify `Symbol` copy semantics
@@ -128,7 +130,7 @@ fn test_ast_printer_custom_spaces() {
     let symbol = interner.insert("test_spacing");
     let printer = AstPrinter::with_spaces(4, &interner);
     let formatted = printer.format_symbol(symbol);
-    let expected = format!("{} (\"test_spacing\")", symbol);
+    let expected = format!("{:?} (\"test_spacing\")", symbol);
     assert_eq!(formatted, expected);
 }
 
@@ -196,6 +198,7 @@ fn test_ast_printer_type_display() {
             TupleType::new(vec![Type::Int, Type::String]).unwrap(),
         )),
         Box::new(Type::Bool),
+        std::collections::HashSet::new(),
     );
 
     let formatted_some = printer.format_type_opt(&Some(test_type));

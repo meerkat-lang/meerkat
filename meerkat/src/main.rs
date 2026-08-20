@@ -265,8 +265,14 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                 let server_addr = opt_server_addr
                     .expect("Server address should be initialized when args.server is true");
 
+                let target_ast = if remote_url_map.is_empty() {
+                    node.unified_ast.clone()
+                } else {
+                    prog
+                };
+
                 run_server(
-                    prog,
+                    target_ast,
                     file,
                     remote_url_map,
                     ServerConfig {
@@ -280,7 +286,16 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                 )
                 .await
             } else {
-                run_client(prog, file, remote_url_map, args.local, args.watch, interner).await
+                run_client(
+                    node.unified_ast.clone(),
+                    prog,
+                    file,
+                    remote_url_map,
+                    args.local,
+                    args.watch,
+                    interner,
+                )
+                .await
             }
         }
         None => {
@@ -574,8 +589,42 @@ async fn run_server(
 
     println!("Server running, press Ctrl+C to stop...");
 
+    let mut pending_updates: std::collections::VecDeque<(
+        u64,
+        Option<meerkat_lib::runtime::txn::TxnId>,
+        String,
+        String,
+        String,
+    )> = std::collections::VecDeque::new();
+
     let mut last_keepalive = tokio::time::Instant::now();
     loop {
+        // Defer pending service updates so that network events can be processed
+        // without blocking the server loop during multi-step updates
+        if let Some((request_id, txn_id, source, reply_to, peer)) = pending_updates.pop_front() {
+            let parse_res = parser::parse_string(&source, &mut manager.interner);
+            let res = match parse_res {
+                Ok(stmts) => {
+                    let mut txn = match txn_id {
+                        Some(tid) => {
+                            meerkat_lib::runtime::update::Transaction::new_with_id(tid, stmts)
+                        }
+                        None => meerkat_lib::runtime::update::Transaction::new(stmts),
+                    };
+                    txn.poll(&mut manager).await.map_err(|e| e.to_string())
+                }
+                Err(e) => Err(e),
+            };
+            let error = res.err();
+            let response = MeerkatMessage::UpdateServiceResponse { request_id, error };
+            let target_addr = if !reply_to.is_empty() { reply_to } else { peer };
+            if !target_addr.is_empty() {
+                if let Some(net) = manager.network.as_mut() {
+                    send_net_msg(net, &target_addr, response).await;
+                }
+            }
+        }
+
         // Periodically reassure parked waiters (wait-die wait) that they are
         // still queued, so their reply timeout never fires while we hold them.
         if last_keepalive.elapsed() >= std::time::Duration::from_secs(5) {
@@ -587,8 +636,34 @@ async fn run_server(
             last_keepalive = tokio::time::Instant::now();
         }
         let event = manager.network.as_mut().and_then(|n| n.try_recv_event());
-        if let Some(NetworkEvent::MessageReceived { msg, .. }) = event {
+        if let Some(NetworkEvent::MessageReceived { msg, peer }) = event {
             match msg {
+                MeerkatMessage::UpdateServiceRequest {
+                    request_id,
+                    txn_id,
+                    service_name: _,
+                    source,
+                    reply_to,
+                } => {
+                    if exceeds_pending_update_limit(&pending_updates, &peer) {
+                        let response = MeerkatMessage::UpdateServiceResponse {
+                            request_id,
+                            error: Some("Too many pending updates from this peer".to_string()),
+                        };
+                        let target_addr = if !reply_to.is_empty() {
+                            reply_to
+                        } else {
+                            peer
+                        };
+                        if !target_addr.is_empty() {
+                            if let Some(net) = manager.network.as_mut() {
+                                send_net_msg(net, &target_addr, response).await;
+                            }
+                        }
+                    } else {
+                        pending_updates.push_back((request_id, txn_id, source, reply_to, peer));
+                    }
+                }
                 MeerkatMessage::LookupRequest {
                     request_id,
                     service,
@@ -911,6 +986,7 @@ async fn run_server(
                 // #39: code responses are client-bound replies, not seen at the server.
                 | MeerkatMessage::ServiceCodeResponse { .. }
                 | MeerkatMessage::ServiceCodeError { .. }
+                | MeerkatMessage::UpdateServiceResponse { .. }
                 | MeerkatMessage::WaitParked { .. } => {}
             }
         }
@@ -920,7 +996,8 @@ async fn run_server(
 }
 
 async fn run_client(
-    base_prog: Vec<Stmt>,
+    full_ast: Vec<Stmt>,
+    prog: Vec<Stmt>,
     input_file: &str,
     remote_url_map: std::collections::HashMap<String, String>,
     local: bool,
@@ -929,6 +1006,10 @@ async fn run_client(
 ) -> Result<(), Box<dyn Error>> {
     let mut manager = Manager::new(interner);
     manager.local = local;
+    // Pre-populate unified_ast with the full AST (including remote imports)
+    // so that runtime updates against remote services can successfully find
+    // the target service definitions to patch against and type-check.
+    manager.unified_ast = full_ast;
 
     // Start the network if we have remote imports, or always in watch mode
     // (watch needs the network to receive change notifications).
@@ -946,10 +1027,13 @@ async fn run_client(
         let addr = listen_success_addr(reply)?;
         let node_ip = manager.get_node_ip();
         let peer_id = n.local_peer_id();
-        let addr_str = addr
-            .0
-            .replace("0.0.0.0", &node_ip)
-            .replace("127.0.0.1", &node_ip);
+        let addr_str = if local {
+            addr.0.clone()
+        } else {
+            addr.0
+                .replace("0.0.0.0", &node_ip)
+                .replace("127.0.0.1", &node_ip)
+        };
         local_full_addr = Some(format!("{}/p2p/{}", addr_str, peer_id));
         net = Some(n);
     }
@@ -971,13 +1055,13 @@ async fn run_client(
     let (importer, _initial_cmds) = Imports::new(
         &mut manager.interner,
         remote_url_map,
-        &base_prog,
+        &prog,
         base_dir,
         my_addr,
     )
     .unwrap();
     let imported_ast = importer.finalize();
-    let mut full_prog = base_prog;
+    let mut full_prog = prog;
     full_prog.extend(imported_ast);
 
     for stmt in &full_prog {
@@ -988,6 +1072,29 @@ async fn run_client(
                     .await
                     .map_err(|e| format!("Service error: {}", e))?;
                 println!("Service '{}' loaded", manager.interner.get(name));
+            }
+            &Stmt::Update {
+                service_name,
+                ref decls,
+            } => {
+                let _ = decls;
+                let mut txn = meerkat_lib::runtime::update::Transaction::new(vec![stmt.clone()]);
+                txn.poll(&mut manager)
+                    .await
+                    .map_err(|e| format!("Update error: {}", e))?;
+                println!("Service '{}' updated", manager.interner.get(service_name));
+            }
+            Stmt::Atomic { updates } => {
+                if !updates.is_empty() {
+                    let mut txn = meerkat_lib::runtime::update::Transaction::new(updates.clone());
+                    txn.poll(&mut manager)
+                        .await
+                        .map_err(|e| format!("Atomic update error: {}", e))?;
+                    println!(
+                        "Atomic update transaction completed ({} updates)",
+                        updates.len()
+                    );
+                }
             }
             &Stmt::Test {
                 service_name,
@@ -1401,6 +1508,21 @@ async fn run_lock_test_client(
     Ok(())
 }
 
+/// Check if the given peer has reached the maximum number of pending update requests.
+fn exceeds_pending_update_limit(
+    queue: &std::collections::VecDeque<(
+        u64,
+        Option<meerkat_lib::runtime::txn::TxnId>,
+        String,
+        String,
+        String,
+    )>,
+    peer: &str,
+) -> bool {
+    let active_for_peer = queue.iter().filter(|(_, _, _, _, p)| p == peer).count();
+    active_for_peer >= meerkat_lib::runtime::limits::MAX_PENDING_UPDATES_PER_PEER
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1436,5 +1558,34 @@ mod tests {
         })
         .expect_err("message-sent replies are not a Listen success");
         assert_eq!(message_sent_err.to_string(), "Unexpected reply");
+    }
+
+    #[test]
+    fn test_exceeds_pending_update_limit_rejects_spam() {
+        let mut queue = std::collections::VecDeque::new();
+        let peer = "peer1";
+
+        // Fill up to the limit
+        for i in 0..meerkat_lib::runtime::limits::MAX_PENDING_UPDATES_PER_PEER {
+            queue.push_back((
+                i as u64,
+                None,
+                String::new(),
+                String::new(),
+                peer.to_string(),
+            ));
+        }
+
+        // Negative test coverage: confirm limits correctly enforce bounds for spammers
+        assert!(
+            exceeds_pending_update_limit(&queue, peer),
+            "Should reject new updates from spamming peer"
+        );
+
+        // Confirm other peers are unaffected
+        assert!(
+            !exceeds_pending_update_limit(&queue, "peer2"),
+            "Should allow new updates from different peers"
+        );
     }
 }

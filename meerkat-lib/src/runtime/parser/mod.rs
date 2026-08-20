@@ -139,6 +139,46 @@ pub fn parse_repl(input: &str, interner: &mut Interner) -> ReplParseResult {
 /// Literal text is copied verbatim; each brace-delimited `{ ... }`
 /// interpolation is parsed as an expression through the public `Expr` rule.
 /// A `{` with no matching `}` is a parse error.
+/// #153: if `text` ends with an event-attribute prefix like `onclick=` or
+/// `onclick="` (optionally with a quote), return the event name and the byte
+/// offset where the attribute begins, so the caller can strip it from the
+/// literal text and treat the following `{expr}` as an event handler rather
+/// than interpolated content. Only names beginning with `on` qualify.
+fn trailing_event_attr(text: &str) -> Option<(String, usize)> {
+    let bytes = text.as_bytes();
+    let mut i = bytes.len();
+    // optional opening quote right before the `{`
+    if i > 0 && (bytes[i - 1] == b'"' || bytes[i - 1] == b'\'') {
+        i -= 1;
+    }
+    // require an `=`
+    if i == 0 || bytes[i - 1] != b'=' {
+        return None;
+    }
+    i -= 1;
+    let name_end = i;
+    // attribute name: ascii letters/digits/-, scanning left
+    while i > 0 {
+        let b = bytes[i - 1];
+        if b.is_ascii_alphanumeric() || b == b'-' {
+            i -= 1;
+        } else {
+            break;
+        }
+    }
+    let name = &text[i..name_end];
+    // the char before the name must be whitespace or `<` (attribute boundary)
+    let boundary_ok = i == 0 || {
+        let pb = bytes[i - 1];
+        pb.is_ascii_whitespace() || pb == b'<'
+    };
+    if boundary_ok && name.len() > 2 && name.starts_with("on") {
+        Some((name.to_string(), i))
+    } else {
+        None
+    }
+}
+
 pub fn parse_template(
     raw: &str,
     interner: &mut Interner,
@@ -149,6 +189,12 @@ pub fn parse_template(
 
     while let Some((_, c)) = chars.next() {
         if c == '{' {
+            // #153: detect an event-attribute prefix so the following
+            // interpolation becomes a handler, not rendered content.
+            let handler_event = trailing_event_attr(&text);
+            if let Some((_, start)) = &handler_event {
+                text.truncate(*start);
+            }
             builder.push_text(std::mem::take(&mut text).as_str());
             // #39: brace depth counting does not account for a `}` inside a
             // string literal within the interpolation (e.g. `{ "}" }`); such a
@@ -181,7 +227,10 @@ pub fn parse_template(
                 );
             }
             let expr = parse_expr_fragment(frag.trim(), interner)?;
-            builder.push_expr(expr);
+            match handler_event {
+                Some((event, _)) => builder.push_handler(event, expr),
+                None => builder.push_expr(expr),
+            }
         } else {
             text.push(c);
         }
@@ -250,6 +299,27 @@ mod tests {
                 assert_eq!(text, "x == 5");
             }
             _ => panic!("Expected ActionStmt::Assert"),
+        }
+    }
+
+    #[test]
+    fn test_parse_update_block() {
+        use crate::ast::Stmt;
+        let mut interner = Interner::new();
+        let input = "update MyService { var x = 5; }";
+        let res = parse_string(input, &mut interner);
+        assert!(res.is_ok(), "Failed to parse update block: {:?}", res);
+        let ast = res.unwrap();
+        assert_eq!(ast.len(), 1);
+        match &ast[0] {
+            Stmt::Update {
+                service_name,
+                decls,
+            } => {
+                assert_eq!(interner.get(*service_name), "MyService");
+                assert_eq!(decls.len(), 1);
+            }
+            _ => panic!("Expected Stmt::Update"),
         }
     }
 
@@ -350,6 +420,29 @@ mod tests {
         assert_eq!(template.embedded_exprs().count(), 0);
     }
 
+    /// #153: an `on*` attribute interpolation becomes a handler part, and
+    /// the `on...=` prefix is stripped from the literal text.
+    #[test]
+    fn test_event_attr_becomes_handler() {
+        let mut interner = Interner::new();
+        let template = parse_template("<button onclick={bump}>go</button>", &mut interner).unwrap();
+        // the handler's expr is still an embedded expr (so deps track it)
+        assert_eq!(template.embedded_exprs().count(), 1);
+        // and it is recorded as a handler, not content: rendering it with a
+        // placeholder value must not put the value inside the markup.
+        let printed = format!("{:?}", template);
+        assert!(
+            printed.contains("Handler"),
+            "expected a Handler part, got {}",
+            printed
+        );
+        assert!(
+            !printed.contains("onclick="),
+            "onclick= prefix should be stripped from literal text: {}",
+            printed
+        );
+    }
+
     /// #39: an unterminated interpolation is an error, not a panic.
     #[test]
     fn test_parse_template_unterminated() {
@@ -408,6 +501,50 @@ mod tests {
             matches!(exprs[0], Expr::Variable { .. }),
             "expected Variable, got {:?}",
             exprs[0]
+        );
+    }
+
+    /// Verify that an `atomic` block containing valid `update` statements
+    /// parses successfully into `Stmt::Atomic`
+    #[test]
+    fn test_parse_atomic_block() {
+        use crate::ast::Stmt;
+        let mut interner = Interner::new();
+        let input = "atomic { update S1 { var x = 5; } update S2 { var y = 10; } }";
+        let res = parse_string(input, &mut interner);
+        assert!(res.is_ok(), "Failed to parse atomic block: {:?}", res);
+        let ast = res.expect("parse string failed");
+        assert_eq!(ast.len(), 1);
+        match &ast[0] {
+            Stmt::Atomic { updates } => {
+                assert_eq!(updates.len(), 2);
+                match &updates[0] {
+                    Stmt::Update { service_name, .. } => {
+                        assert_eq!(interner.get(*service_name), "S1");
+                    }
+                    other => panic!("expected Stmt::Update, got {:?}", other),
+                }
+                match &updates[1] {
+                    Stmt::Update { service_name, .. } => {
+                        assert_eq!(interner.get(*service_name), "S2");
+                    }
+                    other => panic!("expected Stmt::Update, got {:?}", other),
+                }
+            }
+            other => panic!("expected Stmt::Atomic, got {:?}", other),
+        }
+    }
+
+    /// Verify that an `atomic` block containing invalid nested statements
+    /// is syntactically rejected at parse time
+    #[test]
+    fn test_parse_atomic_block_negative() {
+        let mut interner = Interner::new();
+        let input = "atomic { watch x; }";
+        let res = parse_string(input, &mut interner);
+        assert!(
+            res.is_err(),
+            "Expected syntax error for invalid atomic content"
         );
     }
 }

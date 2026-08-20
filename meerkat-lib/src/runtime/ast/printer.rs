@@ -97,12 +97,17 @@ impl<'a> AstPrinter<'a> {
             Stmt::Connect { path, addr } => {
                 println!("Connect: {{ path: \"{}\", addr: \"{}\" }}", path, addr);
             }
-            Stmt::Import { path, service_name } => {
+            Stmt::Import {
+                path,
+                service_name,
+                explicit_path,
+            } => {
                 let service_name = *service_name;
                 println!(
-                    "Import: {{ path: \"{}\", service_name: {} }}",
+                    "Import: {{ path: \"{}\", service_name: {}, explicit_path: {} }}",
                     path,
-                    self.format_symbol(service_name)
+                    self.format_symbol(service_name),
+                    explicit_path,
                 );
             }
             Stmt::Service { name, decls } => {

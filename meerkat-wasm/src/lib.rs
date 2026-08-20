@@ -209,6 +209,7 @@ pub async fn load_service(server_ws_addr: String, path: String) -> Result<String
             Stmt::Import {
                 path: _,
                 service_name,
+                explicit_path: _,
             } => {
                 manager
                     .remote_services

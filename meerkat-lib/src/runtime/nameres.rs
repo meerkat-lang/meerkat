@@ -225,6 +225,7 @@ impl<'a> Resolver<'a> {
             Stmt::Import {
                 path: _,
                 service_name,
+                explicit_path: _,
             } => {
                 env.bind(*service_name, Binding::Value);
                 Ok(())

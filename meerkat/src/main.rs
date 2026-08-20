@@ -8,6 +8,7 @@ use meerkat_lib::net::{
     codec, Address, MeerkatMessage, NetworkCommand, NetworkEvent, NetworkReply, ServiceNetId,
 };
 use meerkat_lib::runtime::ast::{AstPrinter, Stmt};
+use meerkat_lib::runtime::imports::Imports;
 use meerkat_lib::runtime::interner::Interner;
 use meerkat_lib::runtime::interpreter::EvalError;
 use meerkat_lib::runtime::manager::ParkedRequest;
@@ -1043,11 +1044,27 @@ async fn run_client(
     }
     // Record the canonical address (if networked) so service identities are
     // stable for the life of the process.
-    if let Some(addr) = local_full_addr {
-        manager.set_local_address(addr);
+    if let Some(addr) = &local_full_addr {
+        manager.set_local_address(addr.clone());
     }
 
-    for stmt in &prog {
+    let my_addr = &local_full_addr.unwrap_or("".to_string());
+    let base_dir = std::path::Path::new(input_file)
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    let (importer, _initial_cmds) = Imports::new(
+        &mut manager.interner,
+        remote_url_map,
+        &prog,
+        base_dir,
+        my_addr,
+    )
+    .unwrap();
+    let imported_ast = importer.finalize();
+    let mut full_prog = prog;
+    full_prog.extend(imported_ast);
+
+    for stmt in &full_prog {
         match stmt {
             &Stmt::Service { name, ref decls } => {
                 manager
@@ -1098,39 +1115,8 @@ async fn run_client(
                     println!("@test({}) passed", manager.interner.get(service_name));
                 }
             }
-            &Stmt::Import {
-                ref path,
-                service_name,
-            } => {
-                if let Some(url) = remote_url_map.get(manager.interner.get(service_name)) {
-                    manager
-                        .remote_services
-                        .insert(service_name, Address::new(url.as_str()));
-                    println!(
-                        "Remote service '{}' registered at {}",
-                        manager.interner.get(service_name),
-                        url
-                    );
-                } else {
-                    let base_dir = std::path::Path::new(input_file)
-                        .parent()
-                        .unwrap_or(std::path::Path::new("."));
-                    let import_path = base_dir.join(path);
-                    let import_stmts =
-                        parser::parse_file(import_path.to_str().unwrap(), &mut manager.interner)
-                            .map_err(|e| format!("Import parse error: {}", e))?;
-                    for import_stmt in &import_stmts {
-                        if let &Stmt::Service { name, ref decls } = import_stmt {
-                            manager
-                                .create_service(name, decls.clone())
-                                .await
-                                .map_err(|e| format!("Import service error: {}", e))?;
-                            println!("Imported service '{}'", manager.interner.get(name));
-                        }
-                    }
-                }
-            }
-            &Stmt::ActionStmt(_) | &Stmt::Connect { .. } | &Stmt::Watch { .. } => {}
+            &Stmt::ActionStmt(_) => {}
+            &Stmt::Connect { .. } | &Stmt::Watch { .. } | &Stmt::Import { .. } => {}
         }
     }
 

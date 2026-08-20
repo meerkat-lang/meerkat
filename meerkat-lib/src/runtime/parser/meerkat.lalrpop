@@ -82,7 +82,7 @@ extern {
 
 pub Prog: Vec<Stmt> = {
     <stmts: Stmts> => stmts
-}   
+}
 
 Stmts: Vec<Stmt> = Stmt*;
 
@@ -104,7 +104,10 @@ Stmt: Stmt = {
         Stmt::Test { service_name: i, stmts: astmts }
     },
     "import" <i:Ident> => {
-        Stmt::Import { path: format!("{}.mkt", interner.get(i)), service_name: i }
+        Stmt::Import { path: format!("{}.mkt", interner.get(i)), service_name: i, explicit_path : false }
+    },
+    "import" <i:Ident> "from" <p:"strlit"> => {
+        Stmt::Import { path: p.to_string(), service_name: i, explicit_path : true }
     },
     <a:ActionStmt> => Stmt::ActionStmt(a),
     "watch" <e:Expr> ";" => Stmt::Watch { expr: e },
@@ -164,7 +167,7 @@ Decls: Vec<Decl> = Decl*;
 TableField: Field = {
    <i:Ident> ":" <t: TableType> "," => {
     Field {name: i, ty: t}
-   } 
+   }
 }
 
 TableFields: Vec<Field> = TableField*;
@@ -226,7 +229,7 @@ Params: Vec<Param> = {
 }
 
 Args: Vec<Expr> = {
-    <mut v:(<Expr> ",")*> <e:Expr?> => 
+    <mut v:(<Expr> ",")*> <e:Expr?> =>
     match e {
         None => v,
         Some(e) => {
@@ -244,8 +247,8 @@ SubExpr: Expr = {
     "{" <args: Args> "}" => Expr::Tuple {val: args},
     "[" <args: Args> "]" => Expr::List(args),
     "(" <Expr> ")" => <>,
-    
-    <expr:SubExpr> "(" <args:Args> ")" => 
+
+    <expr:SubExpr> "(" <args:Args> ")" =>
         Expr::Call { func: Box::new(expr), args },
 
     <s:Ident> "." <m:Ident> => Expr::MemberAccess { service_name: s, member_name: m },
@@ -273,39 +276,39 @@ pub Expr: Expr = {
         Expr::Unop { expr: Box::new(e), op: UnOp::Not }
     },
     <i: Ident> ":" <e: Expr> => Expr::KeyVal {name: i, value: Box::new(e)},
-    
-    
+
+
 
     #[precedence(level="2")] #[assoc(side="left")]
     <e1:Expr> "*" <e2:Expr> => {
-        Expr::Binop { 
-            expr1: Box::new(e1), 
-            expr2: Box::new(e2), 
-            op: BinOp::Mul 
+        Expr::Binop {
+            expr1: Box::new(e1),
+            expr2: Box::new(e2),
+            op: BinOp::Mul
         }
     },
     <e1:Expr> "/" <e2:Expr> => {
-        Expr::Binop { 
-            expr1: Box::new(e1), 
-            expr2: Box::new(e2), 
-            op: BinOp::Div 
+        Expr::Binop {
+            expr1: Box::new(e1),
+            expr2: Box::new(e2),
+            op: BinOp::Div
         }
     },
-    
+
 
     #[precedence(level="3")] #[assoc(side="left")]
     <e1:Expr> "+" <e2:Expr> => {
-        Expr::Binop { 
-            expr1: Box::new(e1), 
-            expr2: Box::new(e2), 
-            op: BinOp::Add 
+        Expr::Binop {
+            expr1: Box::new(e1),
+            expr2: Box::new(e2),
+            op: BinOp::Add
         }
     },
     <e1:Expr> "-" <e2:Expr> => {
-        Expr::Binop { 
-            expr1: Box::new(e1), 
-            expr2: Box::new(e2), 
-            op: BinOp::Sub 
+        Expr::Binop {
+            expr1: Box::new(e1),
+            expr2: Box::new(e2),
+            op: BinOp::Sub
         }
     },
 
@@ -319,52 +322,52 @@ pub Expr: Expr = {
 
     #[precedence(level="5")] #[assoc(side="left")]
     <e1:Expr> "==" <e2:Expr> => {
-        Expr::Binop { 
-            expr1: Box::new(e1), 
-            expr2: Box::new(e2), 
-            op: BinOp::Eq 
+        Expr::Binop {
+            expr1: Box::new(e1),
+            expr2: Box::new(e2),
+            op: BinOp::Eq
         }
     },
     <e1:Expr> "<" <e2:Expr> => {
-        Expr::Binop { 
-            expr1: Box::new(e1), 
-            expr2: Box::new(e2), 
-            op: BinOp::Lt 
+        Expr::Binop {
+            expr1: Box::new(e1),
+            expr2: Box::new(e2),
+            op: BinOp::Lt
         }
     },
     <e1:Expr> ">" <e2:Expr> => {
-        Expr::Binop { 
-            expr1: Box::new(e1), 
-            expr2: Box::new(e2), 
-            op: BinOp::Gt 
+        Expr::Binop {
+            expr1: Box::new(e1),
+            expr2: Box::new(e2),
+            op: BinOp::Gt
         }
     },
 
     #[precedence(level="6")] #[assoc(side="left")]
     <e1:Expr> "&&" <e2:Expr> => {
-        Expr::Binop { 
-            expr1: Box::new(e1), 
-            expr2: Box::new(e2), 
-            op: BinOp::And 
+        Expr::Binop {
+            expr1: Box::new(e1),
+            expr2: Box::new(e2),
+            op: BinOp::And
         }
     },
 
     #[precedence(level="7")] #[assoc(side="left")]
     <e1:Expr> "||" <e2:Expr> => {
-        Expr::Binop { 
-            expr1: Box::new(e1), 
-            expr2: Box::new(e2), 
-            op: BinOp::Or 
+        Expr::Binop {
+            expr1: Box::new(e1),
+            expr2: Box::new(e2),
+            op: BinOp::Or
         }
     },
 
     #[precedence(level="8")] #[assoc(side="left")]
     "if" <e1:Expr> "then" <e2:Expr> "else" <e3:Expr> => {
-        Expr::If { 
+        Expr::If {
             cond: Box::new(e1),
-            expr1: Box::new(e2), 
-            expr2: Box::new(e3), 
-        }    
+            expr1: Box::new(e2),
+            expr2: Box::new(e3),
+        }
     },
 
     #[precedence(level="9")] #[assoc(side="left")]
@@ -379,13 +382,13 @@ pub Expr: Expr = {
         table_name: t,
         column_names: {
             let mut v = cols;
-            if let Some(col) = c { 
+            if let Some(col) = c {
                 v.push(col); }
             v
         },
         where_clause: Box::new(cond)
     },
-    "fold" "(" <tn:Ident> "." <cn:Ident> "," <op:Expr> "," <id:Expr> ")" => 
+    "fold" "(" <tn:Ident> "." <cn:Ident> "," <op:Expr> "," <id:Expr> ")" =>
     Expr::Fold {
         table_name: tn,
         column_name: cn,
@@ -396,7 +399,7 @@ pub Expr: Expr = {
 
 Bool: bool = {
     "true" => true,
-    "false" => false, 
+    "false" => false,
 }
 
 Number: i32 = {

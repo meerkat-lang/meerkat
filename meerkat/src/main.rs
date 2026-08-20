@@ -13,7 +13,7 @@ use meerkat_lib::runtime::interner::Interner;
 use meerkat_lib::runtime::interpreter::EvalError;
 use meerkat_lib::runtime::manager::ParkedRequest;
 use meerkat_lib::runtime::txn::WaitKey;
-use meerkat_lib::runtime::{Manager, Node};
+use meerkat_lib::runtime::{parser, Manager, Node};
 use std::collections::HashSet;
 use std::error::Error;
 
@@ -1116,10 +1116,7 @@ async fn run_client(
                 }
             }
             &Stmt::ActionStmt(_) => {}
-            &Stmt::Update { .. }
-            | &Stmt::Connect { .. }
-            | &Stmt::Watch { .. }
-            | &Stmt::Import { .. } => {}
+            &Stmt::Connect { .. } | &Stmt::Watch { .. } | &Stmt::Import { .. } => {}
         }
     }
 

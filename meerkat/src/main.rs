@@ -8,11 +8,12 @@ use meerkat_lib::net::{
     codec, Address, MeerkatMessage, NetworkCommand, NetworkEvent, NetworkReply, ServiceNetId,
 };
 use meerkat_lib::runtime::ast::{AstPrinter, Stmt};
-use meerkat_lib::runtime::interner::{Interner, Symbol};
+use meerkat_lib::runtime::imports::Imports;
+use meerkat_lib::runtime::interner::Interner;
 use meerkat_lib::runtime::interpreter::EvalError;
 use meerkat_lib::runtime::manager::ParkedRequest;
 use meerkat_lib::runtime::txn::WaitKey;
-use meerkat_lib::runtime::{parser, Manager, Node};
+use meerkat_lib::runtime::{Manager, Node};
 use std::collections::HashSet;
 use std::error::Error;
 
@@ -447,49 +448,6 @@ fn listen_success_addr(reply: NetworkReply) -> Result<Address, Box<dyn Error>> {
         NetworkReply::MessageSent { .. } | NetworkReply::LocalAddresses { .. } => {
             Err("Unexpected reply".into())
         }
-    }
-}
-
-pub(crate) async fn import_from_file(
-    manager: &mut Manager,
-    explicit_path: bool,
-    import_path: std::path::PathBuf,
-    service_name: Symbol,
-) -> Result<Option<String>, Box<dyn Error>> {
-    let import_stmts = parser::parse_file(import_path.to_str().unwrap(), &mut manager.interner)
-        .map_err(|e| format!("Import parse error: {}", e))?;
-    let mut services = import_stmts.into_iter().filter_map(|stmt| match stmt {
-        Stmt::Service { name, decls } => Some((name, decls)),
-        _ => None,
-    });
-    if explicit_path {
-        if let Some((name, decls)) = services.find(|(name, _)| *name == service_name) {
-            manager
-                .create_service(name, decls)
-                .await
-                .map_err(|e| format!("Imported service '{}': {}", manager.interner.get(name), e))?;
-            Ok(Some(format!(
-                "Imported service: {}.",
-                manager.interner.get(service_name)
-            )))
-        } else {
-            Err(format!(
-                "Service '{}' not found in '{}'",
-                manager.interner.get(service_name),
-                import_path.to_str().unwrap(),
-            )
-            .into())
-        }
-    } else {
-        let mut loaded = Vec::new();
-        for (name, decls) in services {
-            manager
-                .create_service(name, decls)
-                .await
-                .map_err(|e| format!("Imported service '{}': {}", manager.interner.get(name), e))?;
-            loaded.push(manager.interner.get(name).to_string());
-        }
-        Ok(Some(format!("Imported service(s): {}.", loaded.join(", "))))
     }
 }
 
@@ -962,7 +920,7 @@ async fn run_server(
 }
 
 async fn run_client(
-    prog: Vec<Stmt>,
+    base_prog: Vec<Stmt>,
     input_file: &str,
     remote_url_map: std::collections::HashMap<String, String>,
     local: bool,
@@ -1002,11 +960,27 @@ async fn run_client(
     }
     // Record the canonical address (if networked) so service identities are
     // stable for the life of the process.
-    if let Some(addr) = local_full_addr {
-        manager.set_local_address(addr);
+    if let Some(addr) = &local_full_addr {
+        manager.set_local_address(addr.clone());
     }
 
-    for stmt in &prog {
+    let my_addr = &local_full_addr.unwrap_or("".to_string());
+    let base_dir = std::path::Path::new(input_file)
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    let (importer, _initial_cmds) = Imports::new(
+        &mut manager.interner,
+        remote_url_map,
+        &base_prog,
+        base_dir,
+        my_addr,
+    )
+    .unwrap();
+    let imported_ast = importer.finalize();
+    let mut full_prog = base_prog;
+    full_prog.extend(imported_ast);
+
+    for stmt in &full_prog {
         match stmt {
             &Stmt::Service { name, ref decls } => {
                 manager
@@ -1034,35 +1008,11 @@ async fn run_client(
                     println!("@test({}) passed", manager.interner.get(service_name));
                 }
             }
-            &Stmt::Import {
-                ref path,
-                service_name,
-                explicit_path,
-            } => {
-                if let Some(url) = remote_url_map.get(manager.interner.get(service_name)) {
-                    manager
-                        .remote_services
-                        .insert(service_name, Address::new(url.as_str()));
-                    println!(
-                        "Remote service '{}' registered at {}",
-                        manager.interner.get(service_name),
-                        url
-                    );
-                } else {
-                    let base_dir = std::path::Path::new(input_file)
-                        .parent()
-                        .unwrap_or(std::path::Path::new("."));
-                    let import_path = base_dir.join(path);
-                    if let Some(output) =
-                        import_from_file(&mut manager, explicit_path, import_path, service_name)
-                            .await?
-                    {
-                        println!("{}", output);
-                    }
-                }
-            }
             &Stmt::ActionStmt(_) => {}
-            &Stmt::Update { .. } | &Stmt::Connect { .. } | &Stmt::Watch { .. } => {}
+            &Stmt::Update { .. }
+            | &Stmt::Connect { .. }
+            | &Stmt::Watch { .. }
+            | &Stmt::Import { .. } => {}
         }
     }
 
@@ -1486,86 +1436,5 @@ mod tests {
         })
         .expect_err("message-sent replies are not a Listen success");
         assert_eq!(message_sent_err.to_string(), "Unexpected reply");
-    }
-
-    // Verify that imports with an explicit path load the target file
-    // and create the imported service.
-    #[tokio::test]
-    async fn test_import_path_member_access() {
-        let temp_dir = std::env::temp_dir().join(format!(
-            "meerkat-import-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        let main_path = temp_dir.join("main.mkt");
-        let imported_path = temp_dir.join("s1.mkt");
-        std::fs::write(&imported_path, "service s1 { var x = 7; }").unwrap();
-        std::fs::write(
-            &main_path,
-            "import s1 from \"./s1.mkt\"\nservice s2 { pub def y = s1.x; }",
-        )
-        .unwrap();
-
-        let mut interner = Interner::new();
-        let program = parser::parse_file(main_path.to_str().unwrap(), &mut interner).unwrap();
-        let mut manager = Manager::new(interner);
-
-        for stmt in program {
-            match stmt {
-                Stmt::Service { name, decls } => {
-                    manager.create_service(name, decls).await.unwrap();
-                }
-                Stmt::Import {
-                    path,
-                    service_name,
-                    explicit_path,
-                } => {
-                    let base_dir = main_path.parent().unwrap();
-                    let import_path = base_dir.join(path);
-
-                    let import_stmts =
-                        parser::parse_file(import_path.to_str().unwrap(), &mut manager.interner)
-                            .unwrap();
-                    let mut services = import_stmts.into_iter().filter_map(|stmt| match stmt {
-                        Stmt::Service { name, decls } => Some((name, decls)),
-                        _ => None,
-                    });
-
-                    if explicit_path {
-                        if let Some((name, decls)) =
-                            services.find(|(name, _)| *name == service_name)
-                        {
-                            manager.create_service(name, decls).await.unwrap();
-                        } else {
-                            panic!("service import was not loaded");
-                        }
-                    } else {
-                        panic!("expected explicit path import");
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let s1 = manager.interner.insert("s1");
-        let x = manager.interner.insert("x");
-        let service = manager
-            .services
-            .get(&s1)
-            .expect("imported service should be installed");
-        assert!(
-            service.vars.contains_key(&x),
-            "imported service should contain x"
-        );
-
-        let s2 = manager.interner.insert("s2");
-        let y = manager.interner.insert("y");
-
-        let value = manager.lookup(y, s2, None).await.unwrap();
-        assert_eq!(value, meerkat_lib::runtime::ast::Value::Int { val: 7 });
     }
 }

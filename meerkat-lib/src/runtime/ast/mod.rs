@@ -74,6 +74,7 @@ pub enum Stmt {
     Import {
         path: String,
         service_name: Symbol,
+        is_explicit: bool,
     },
     Service {
         name: Symbol,

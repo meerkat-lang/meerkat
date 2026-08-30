@@ -217,7 +217,9 @@ async fn exec_stmt(
                 manager.interner.get(service_name)
             )))
         }
-        Stmt::Import { path, service_name } => {
+        Stmt::Import {
+            path, service_name, ..
+        } => {
             let svc_name_str = manager.interner.get(service_name);
             if let Some(url) = remote_url_map.get(svc_name_str) {
                 manager

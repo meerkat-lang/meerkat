@@ -1101,6 +1101,7 @@ async fn run_client(
             &Stmt::Import {
                 ref path,
                 service_name,
+                ..
             } => {
                 if let Some(url) = remote_url_map.get(manager.interner.get(service_name)) {
                     manager

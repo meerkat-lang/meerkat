@@ -204,14 +204,14 @@ impl<'a> Imports<'a> {
                             self.visited_services.insert(*name);
                             self.accumulated_ast.push(Stmt::Service {
                                 name: *name,
-                                decls: decls.clone(),
+                                decls: decls.to_vec(),
                             });
-                            return Some(());
-                        }
-                    }
-                    None
+                            Some(())
+                        } else { None } // This is not the service you are looking for.
+                    } else { None } // This is not a service.
                 })
                 .is_some();
+
             if !found {
                 return Err(Error::Message("Service not found in import file".into()));
             }
@@ -383,7 +383,9 @@ impl<'a> Imports<'a> {
                 Some(path.clone())
             } else {
                 self.remote_url_map.get(&service_name).cloned()
-            } {
+            } 
+            
+            {
                 self.pending_services.insert(service_name.clone());
                 self.request_counter = self.request_counter.wrapping_add(1);
                 let req_id = self.request_counter;

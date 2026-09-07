@@ -221,27 +221,34 @@ async fn exec_stmt(
             path, service_name, ..
         } => {
             let svc_name_str = manager.interner.get(service_name);
+            // Check if it was imported before (command line args)
             if let Some(url) = remote_url_map.get(svc_name_str) {
                 manager
                     .remote_services
                     .insert(service_name, meerkat_lib::net::Address::new(url.as_str()));
-                return Ok(Some(format!(
+                Ok(Some(format!(
                     "Remote service '{}' registered at {}.",
                     svc_name_str, url
-                )));
-            }
-            let import_stmts = parse_file(&path, &mut manager.interner)
-                .map_err(|e| format!("Import '{}': {}", path, e))?;
-            let mut loaded = Vec::new();
-            for s in import_stmts {
-                if let Stmt::Service { name, decls } = s {
-                    manager.create_service(name, decls).await.map_err(|e| {
-                        format!("Imported service '{}': {}", manager.interner.get(name), e)
-                    })?;
-                    loaded.push(manager.interner.get(name).to_string());
+                )))
+            } else {
+                // Check if this is a file or an ip address
+                let import_stmts = parse_file(&path, &mut manager.interner)
+                    .map_err(|e| format!("Import '{}': {}", path, e))?;
+                let mut loaded = Vec::new();
+                for s in import_stmts {
+                    match s {
+                        Stmt::Service { name, decls } => {
+                            manager.create_service(name, decls).await.map_err(|e| {
+                                format!("Imported service '{}': {}", manager.interner.get(name), e)
+                            })?;
+                            loaded.push(manager.interner.get(name).to_string());
+                        },
+                        _ => () // ignore all that are not Imports
+                        // TODO: What if it is an import? We should recurse on that.
+                    }
                 }
-            }
-            Ok(Some(format!("Imported service(s): {}.", loaded.join(", "))))
+                Ok(Some(format!("Imported service(s): {}.", loaded.join(", "))))
+            }   
         }
         Stmt::ActionStmt(action_stmt) => {
             let effect = execute(&action_stmt, repl_env, manager, Symbol::empty(), None)

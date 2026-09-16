@@ -1,7 +1,7 @@
 import s1
 
 service s2 {
-    pub def inc_delegate = fn n => s1.inc_x;
+    pub def inc_delegate = fn (n:int) => s1.inc_x;
     var w = s1.y - 2;
     pub def z = s1.y * 2;
 }

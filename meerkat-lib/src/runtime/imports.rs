@@ -89,10 +89,14 @@ impl<'a> Imports<'a> {
         };
 
         let mut initial_cmds = Vec::new();
-        let imports_in_base: Vec<Symbol> = base_ast
+        let imports_in_base: Vec<(Symbol, &String, bool)> = base_ast
             .iter()
             .filter_map(|stmt| match stmt {
-                Stmt::Import { service_name, .. } => Some(*service_name),
+                Stmt::Import {
+                    service_name,
+                    path,
+                    is_explicit,
+                } => Some((*service_name, path, *is_explicit)),
                 Stmt::Service { .. } => None,
                 Stmt::ActionStmt(_) => None,
                 Stmt::Atomic { .. } => None,
@@ -103,8 +107,8 @@ impl<'a> Imports<'a> {
             })
             .collect();
 
-        for sym in imports_in_base {
-            let cmds = imports.resolve_import(sym, base_dir)?;
+        for (sym, path, explicit_path) in imports_in_base {
+            let cmds = imports.resolve_import(sym, base_dir, path, explicit_path)?;
             initial_cmds.extend(cmds);
         }
 
@@ -165,6 +169,7 @@ impl<'a> Imports<'a> {
         source: &str,
         service_name: &str,
         base_dir: &Path,
+        is_explicit: bool,
     ) -> Result<Vec<ImportCommand>> {
         if self.visited_services.len() >= MAX_IMPORTED_SERVICES {
             return Err(Error::LimitExceeded(format!(
@@ -189,22 +194,46 @@ impl<'a> Imports<'a> {
         let parsed_stmts = parser::parse_string(source, self.interner)
             .map_err(|e| Error::Message(e.to_string()))?;
 
-        // Mark all services in received file as visited
-        for stmt in &parsed_stmts {
-            if let Stmt::Service { name, .. } = stmt {
-                self.visited_services.insert(*name);
-            }
-        }
+        if is_explicit {
+            //Mark specified service in file as visited
+            let found = parsed_stmts
+                .iter()
+                .find_map(|stmt| {
+                    if let Stmt::Service { name, decls } = stmt {
+                        if self.interner.get(*name) == service_name {
+                            self.visited_services.insert(*name);
+                            self.accumulated_ast.push(Stmt::Service {
+                                name: *name,
+                                decls: decls.to_vec(),
+                            });
+                            Some(())
+                        } else { None } // This is not the service you are looking for.
+                    } else { None } // This is not a service.
+                })
+                .is_some();
 
-        self.accumulated_ast.extend(parsed_stmts.clone());
+            if !found {
+                return Err(Error::Message("Service not found in import file".into()));
+            }
+        } else {
+            // Mark all services in received file as visited
+            for stmt in &parsed_stmts {
+                if let Stmt::Service { name, .. } = stmt {
+                    self.visited_services.insert(*name);
+                }
+            }
+            self.accumulated_ast.extend(parsed_stmts.clone());
+        }
 
         let mut new_cmds = Vec::new();
         for stmt in &parsed_stmts {
             match stmt {
                 Stmt::Import {
-                    service_name: sym, ..
+                    service_name: sym,
+                    path,
+                    is_explicit,
                 } => {
-                    let cmds = self.resolve_import(*sym, base_dir)?;
+                    let cmds = self.resolve_import(*sym, base_dir, path, *is_explicit)?;
                     new_cmds.extend(cmds);
                 }
                 Stmt::Service { .. } => {}
@@ -335,16 +364,28 @@ impl<'a> Imports<'a> {
         &mut self,
         service_sym: Symbol,
         base_dir: &Path,
+        path: &String,
+        is_explicit: bool,
     ) -> Result<Vec<ImportCommand>> {
         if self.visited_services.contains(&service_sym) {
             return Ok(Vec::new());
         }
 
+        // REVIEW: Perhaps this insert should only happen in on_recv_source after successful resolution,
+        // to avoid marking failed imports as visited. service_sym may also represent a file and not a service,
+        // which could lead to incorrect behavior if an import of a service with the same name is attempted later.
         self.visited_services.insert(service_sym);
+
         let service_name = self.interner.get(service_sym).to_string();
 
         if !self.my_addr.is_empty() {
-            if let Some(target_url) = self.remote_url_map.get(&service_name).cloned() {
+            if let Some(target_url) = if is_explicit {
+                Some(path.clone())
+            } else {
+                self.remote_url_map.get(&service_name).cloned()
+            } 
+            
+            {
                 self.pending_services.insert(service_name.clone());
                 self.request_counter = self.request_counter.wrapping_add(1);
                 let req_id = self.request_counter;
@@ -363,7 +404,11 @@ impl<'a> Imports<'a> {
         }
 
         // Local disk resolution fallback
-        let file_path = base_dir.join(format!("{}.mkt", service_name));
+        let file_path = if is_explicit {
+            base_dir.join(path)
+        } else {
+            base_dir.join(format!("{}.mkt", service_name))
+        };
         let source = std::fs::read_to_string(&file_path).map_err(|e| {
             Error::Message(format!(
                 "Failed to read local import file '{:?}': {}",
@@ -371,6 +416,6 @@ impl<'a> Imports<'a> {
             ))
         })?;
 
-        self.on_recv_source(&source, &service_name, base_dir)
+        self.on_recv_source(&source, &service_name, base_dir, is_explicit)
     }
 }

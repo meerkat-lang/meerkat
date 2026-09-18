@@ -636,6 +636,10 @@ impl Manager {
                 t.written.insert(key.clone(), value.clone());
                 // Reads later in the same transaction see the buffered write
                 t.read_cache.insert(key, value);
+                // ...and so do defs derived from it: refresh their cached
+                // values inside the transaction so read-your-own-writes holds
+                // for derived members too (see `propagate_in_txn`).
+                self.propagate_in_txn(service_name, var_name, t).await;
             }
             return Ok(());
         }
@@ -781,6 +785,164 @@ impl Manager {
             );
             false
         }
+    }
+
+    /// Transaction-local counterpart of `propagate`: refresh the defs that
+    /// depend on `changed_var` using the transaction's own (uncommitted) view
+    /// of the world, caching the results in `txn.read_cache`.
+    ///
+    /// A `def` is an eagerly evaluated, cached terminal value, not a thunk, so
+    /// a plain `lookup` of a def returns whatever the last committed
+    /// propagation stored. Without this, a transaction that writes `x` and then
+    /// reads a `def y = x + 1` would see the pre-transaction `y`, breaking
+    /// read-your-own-writes for derived members (e.g. an `@test` block, which
+    /// runs as a single transaction).
+    ///
+    /// This deliberately mirrors `propagate` but differs in three ways:
+    ///   - results go into `txn.read_cache`, never into `service.vars`, so an
+    ///     aborted transaction leaves no trace;
+    ///   - remote listeners are not notified, because nothing is committed yet
+    ///     (commit-time `propagate` still notifies them);
+    ///   - no locks are taken, since the recompute reads only values the
+    ///     transaction has already locked plus each def's cached cross-service
+    ///     deps.
+    pub(crate) async fn propagate_in_txn(
+        &mut self,
+        service_name: Symbol,
+        changed_var: Symbol,
+        txn: &mut Transaction,
+    ) {
+        let mut worklist: Vec<(Symbol, Symbol)> = vec![(service_name, changed_var)];
+
+        while let Some((svc, member)) = worklist.pop() {
+            let listeners: Vec<(ServiceNetId, Symbol)> = self
+                .services
+                .get(&svc)
+                .and_then(|s| s.listeners.get(&member))
+                .map(|set| set.iter().cloned().collect())
+                .unwrap_or_default();
+
+            for (listener_id, listener_def) in listeners {
+                // `None` means the listener lives on another node. It is not
+                // notified here: the write is still uncommitted, and
+                // commit-time `propagate` will emit the update.
+                let Some(lsvc) = self.service_name_for_net_id(&listener_id) else {
+                    continue;
+                };
+                if self.recompute_def_in_txn(lsvc, listener_def, txn).await {
+                    worklist.push((lsvc, listener_def));
+                }
+            }
+        }
+    }
+
+    /// Recompute `def` in `svc` against the transaction's view and cache the
+    /// result in `txn.read_cache`. Returns whether the value changed (which is
+    /// what stops `propagate_in_txn` from cascading forever around a cycle).
+    async fn recompute_def_in_txn(
+        &mut self,
+        svc: Symbol,
+        def: Symbol,
+        txn: &mut Transaction,
+    ) -> bool {
+        let Some(expr) = self
+            .services
+            .get(&svc)
+            .and_then(|s| s.defs.get(&def))
+            .cloned()
+        else {
+            return false;
+        };
+
+        let sid = self.service_net_id_for_name(svc);
+
+        // Seed the environment from the service's members, with anything the
+        // transaction has read or written taking precedence, so local
+        // dependencies resolve from `env` without re-locking.
+        let env: Vec<(Symbol, Value)> = self
+            .services
+            .get(&svc)
+            .map(|s| {
+                s.vars
+                    .iter()
+                    .map(|(k, v)| {
+                        let value = txn
+                            .read_cache
+                            .get(&(sid.clone(), *k))
+                            .cloned()
+                            .unwrap_or_else(|| v.value.clone());
+                        (*k, value)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Cross-service deps resolve from this def's reactive cache (as in
+        // `recompute_def`) so no remote round trip or remote lock is needed,
+        // overridden by anything this transaction has already seen for the
+        // same member.
+        let mut cache = self
+            .services
+            .get(&svc)
+            .and_then(|s| s.dep_cache.get(&def))
+            .cloned()
+            .unwrap_or_default();
+        // `dep_cache` is only populated from remote update notifications, so
+        // the def's statically known cross-service deps are the authoritative
+        // set to consult for a transaction-local override.
+        let cross_deps: Vec<(Symbol, Symbol)> = self
+            .services
+            .get(&svc)
+            .and_then(|s| s.graphs.cross_deps.get(&def))
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default();
+        for (owner, member) in cache
+            .keys()
+            .cloned()
+            .chain(cross_deps)
+            .collect::<HashSet<_>>()
+        {
+            let owner_id = self.service_net_id_for_name(owner);
+            if let Some(v) = txn.read_cache.get(&(owner_id, member)) {
+                cache.insert((owner, member), v.clone());
+            }
+        }
+
+        self.reactive_cache = Some(cache);
+        let result = eval(
+            &expr,
+            &env,
+            &mut EvalContext {
+                manager: self,
+                service_name: svc,
+                txn: None,
+            },
+        )
+        .await;
+        self.reactive_cache = None;
+
+        let value = match result {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!(
+                    "in-transaction propagation of def '{}' failed: {}",
+                    self.interner.get(def),
+                    e
+                );
+                return false;
+            }
+        };
+
+        let key = (sid, def);
+        let previous = txn.read_cache.get(&key).cloned().or_else(|| {
+            self.services
+                .get(&svc)
+                .and_then(|s| s.vars.get(&def))
+                .map(|v| v.value.clone())
+        });
+        let changed = previous.as_ref() != Some(&value);
+        txn.read_cache.insert(key, value);
+        changed
     }
 
     /// #24: fire-and-forget send (no reply awaited).
@@ -2995,6 +3157,103 @@ mod tests {
             &x_state(tc).lock,
             crate::runtime::txn::VarLock::Unlocked
         ));
+    }
+
+    /// Helper: service `foo` with `var x = 0` and `def y = x + 1`
+    async fn manager_with_x_and_def_y() -> TestContext {
+        let mut tc = TestContext::new();
+        let decls = vec![
+            Decl::VarDecl {
+                name: tc.x,
+                ty: None,
+                val: Expr::Literal {
+                    val: Value::Int { val: 0 },
+                },
+            },
+            Decl::DefDecl {
+                name: tc.y,
+                ty: None,
+                val: Expr::Binop {
+                    op: crate::ast::BinOp::Add,
+                    expr1: Box::new(Expr::Variable { name: tc.x }),
+                    expr2: Box::new(Expr::Literal {
+                        val: Value::Int { val: 1 },
+                    }),
+                },
+                is_pub: true,
+            },
+        ];
+        tc.manager.create_service(tc.foo, decls).await.unwrap();
+        tc
+    }
+
+    /// Statement `x = x + n`
+    fn incr_x(tc: &TestContext, n: i32) -> ActionStmt {
+        ActionStmt::Assign {
+            name: tc.x,
+            expr: Expr::Binop {
+                op: crate::ast::BinOp::Add,
+                expr1: Box::new(Expr::Variable { name: tc.x }),
+                expr2: Box::new(Expr::Literal {
+                    val: Value::Int { val: n },
+                }),
+            },
+        }
+    }
+
+    /// Statement `assert(<sym> == n)`
+    fn assert_eq_stmt(sym: Symbol, n: i32) -> ActionStmt {
+        ActionStmt::Assert(
+            Expr::Binop {
+                op: crate::ast::BinOp::Eq,
+                expr1: Box::new(Expr::Variable { name: sym }),
+                expr2: Box::new(Expr::Literal {
+                    val: Value::Int { val: n },
+                }),
+            },
+            "derived value is stale".to_string(),
+        )
+    }
+
+    /// A `def` is a cached terminal value refreshed by propagation, but a
+    /// transaction still has to see its own writes reflected in it: writing
+    /// `x` and then reading `def y = x + 1` in the same action must observe
+    /// the new `y`. This is what `@test` blocks rely on, since the whole
+    /// block runs as one transaction.
+    #[tokio::test]
+    async fn test_txn_sees_own_writes_through_def() {
+        let mut tc = manager_with_x_and_def_y().await;
+        let stmts = vec![
+            assert_eq_stmt(tc.y, 1),
+            incr_x(&tc, 1),
+            assert_eq_stmt(tc.y, 2),
+            incr_x(&tc, 1),
+            assert_eq_stmt(tc.y, 3),
+        ];
+        tc.manager.execute_action(tc.foo, &stmts).await.unwrap();
+
+        // ...and the committed value agrees with what the transaction saw
+        let y = tc.manager.lookup(tc.y, tc.foo, None).await.unwrap();
+        assert_eq!(y, Value::Int { val: 3 });
+    }
+
+    /// In-transaction def refresh is buffered like any other write: an
+    /// aborted transaction must not leave a recomputed def behind.
+    #[tokio::test]
+    async fn test_aborted_txn_leaves_def_unchanged() {
+        let mut tc = manager_with_x_and_def_y().await;
+        let stmts = vec![
+            incr_x(&tc, 41),
+            assert_eq_stmt(tc.y, 42),
+            // Fails, aborting the transaction
+            assert_eq_stmt(tc.x, 999),
+        ];
+        assert!(tc.manager.execute_action(tc.foo, &stmts).await.is_err());
+
+        let x = tc.manager.lookup(tc.x, tc.foo, None).await.unwrap();
+        let y = tc.manager.lookup(tc.y, tc.foo, None).await.unwrap();
+        assert_eq!(x, Value::Int { val: 0 });
+        assert_eq!(y, Value::Int { val: 1 });
     }
 
     #[tokio::test]

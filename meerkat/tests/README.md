@@ -101,10 +101,20 @@ does not fall back to the remote service's committed value:
 
 Expected: @test(loc_write) passed.
 
+A nested action, so that a write made on a node this client never contacted is
+still visible to a local def derived from it (client -> ryow_mid -> ryow_c):
+
+    cargo run -- -f meerkat/tests/ryow_c.mkt -s -p 9400 --local
+    cargo run -- -f meerkat/tests/ryow_mid.mkt -s -p 9500 --local -i <ryow_c URL>
+    cargo run -- -f meerkat/tests/dist_ryow_nested.mkt -i <ryow_mid URL> -i <ryow_c URL>
+
+Expected: @test(nested_cli) passed.
+
 The single-process forms need no server:
 
     cargo run -- -f meerkat/tests/dist_ryow_two_remotes.mkt
     cargo run -- -f meerkat/tests/dist_ryow_local_write.mkt
+    cargo run -- -f meerkat/tests/dist_ryow_nested.mkt
 
 ## Unit tests
 

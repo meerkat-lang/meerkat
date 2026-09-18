@@ -421,3 +421,39 @@ async fn test_transitive_imports_are_dependency_ordered() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Both entry points that assemble a unified AST must order imports first.
+///
+/// `resolve_imports_with_net` and `on_node_startup` build it separately, and
+/// `run_static_checks_with_imports` runs the checks through the latter. Fixing
+/// only one left the other rejecting the same programs.
+#[tokio::test]
+async fn test_on_node_startup_also_orders_imports_first() {
+    let dir = std::env::temp_dir().join(format!(
+        "meerkat_startup_order_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("dep.mkt"),
+        "service dep {\n    var x = 0;\n    pub def y = x + 1;\n}\n",
+    )
+    .unwrap();
+    let main_path = dir.join("main.mkt");
+    std::fs::write(
+        &main_path,
+        "import dep\n\nservice app {\n    pub def z = dep.y * 2;\n}\n",
+    )
+    .unwrap();
+
+    let mut node = meerkat_lib::runtime::Node::new();
+    let result = node
+        .run_static_checks_with_imports(main_path.to_str().unwrap(), &HashMap::new())
+        .await;
+    std::fs::remove_dir_all(&dir).ok();
+    result.expect("static checks through on_node_startup must accept an imported def over a var");
+}

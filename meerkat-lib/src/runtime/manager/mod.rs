@@ -752,6 +752,14 @@ impl Manager {
             .cloned()
             .unwrap_or_default();
 
+        // Save and restore rather than clear. Evaluation can await a remote
+        // read, and while it waits `send_and_await_reply` pumps network events,
+        // so an incoming `Update` can re-enter this function through
+        // `handle_update`. Clearing on the way out would drop the cache that an
+        // outer, suspended recompute is relying on, and it would resume
+        // resolving member accesses against the wrong state. Restoring the
+        // previous value keeps the caches properly nested.
+        let outer_cache = self.reactive_cache.take();
         self.reactive_cache = Some(cache);
         let result = eval(
             &expr,
@@ -763,10 +771,7 @@ impl Manager {
             },
         )
         .await;
-        // The reactive cache is only valid for the single recompute above (its
-        // entries are this def's cached cross-service deps), so clear it before
-        // returning to avoid leaking stale entries into later evaluations.
-        self.reactive_cache = None;
+        self.reactive_cache = outer_cache;
 
         let value = match result {
             Ok(v) => v,
@@ -849,36 +854,45 @@ impl Manager {
         Ok(())
     }
 
-    /// Originator side: after a composed action has run on `remote_svc` under
-    /// this transaction, refresh the local defs that depend on that service.
+    /// Originator side: after a composed action has run on another node under
+    /// this transaction, refresh the local defs derived from remote state.
     ///
-    /// The write happened in the participant's own `Transaction` on another
-    /// node, so nothing on this node called `assign` and `propagate_in_txn`
-    /// never fired here. A local `def z = remote.y * 2` therefore still holds
-    /// its last committed value, and reading it later in the same transaction
-    /// would return a stale result -- and could commit a value derived from it.
+    /// The write happened in a participant's own `Transaction` on another node,
+    /// so nothing here called `assign` and `propagate_in_txn` never fired. A
+    /// local `def z = remote.y * 2` therefore still holds its last committed
+    /// value, and reading it later in the same transaction would return a stale
+    /// result -- and could commit a value derived from it.
     ///
-    /// The fix relies on two pieces that are already in place: `remote_lookup`
-    /// never caches on the requesting side, and the owning node serves a
-    /// transactional read out of the buffered state it is holding for this same
-    /// transaction id (`remote_read_participant`). So recomputing these defs
-    /// with `CrossDepMode::Live` re-reads the members across the wire and gets
-    /// the participant's uncommitted view, which is exactly read-your-own-writes
-    /// across nodes.
+    /// This refreshes every local def with any remote dependency, not only defs
+    /// naming the service that was contacted. An action can compose further
+    /// actions on nodes this one never spoke to (origin to B to C), and B's
+    /// `ActionResponse` reports nothing about C, so which remote members the
+    /// transaction has touched is simply not knowable here. Recomputing the
+    /// candidates and letting each one re-read its own dependencies is the
+    /// conservative choice that is actually correct.
+    ///
+    /// It works because `remote_lookup` never caches on the requesting side and
+    /// the owning node serves a transactional read out of the buffered state it
+    /// holds for this same transaction id (`remote_read_participant`) -- which
+    /// C is doing, since B forwarded the shared id when it composed the action.
+    /// A def whose value has not moved recomputes to the same value and
+    /// cascades no further.
     pub(crate) async fn refresh_remote_cross_deps_in_txn(
         &mut self,
-        remote_svc: Symbol,
         txn: &mut Transaction,
     ) -> Result<(), EvalError> {
-        // Local defs (never vars -- they are not reactive) that name a member
-        // of `remote_svc` among their statically computed cross-service deps.
+        // Local defs (never vars -- they are not reactive) with at least one
+        // dependency owned by a service this node does not host.
         let mut targets: Vec<(Symbol, Symbol)> = Vec::new();
         for (svc_name, svc) in &self.services {
             for (member_name, deps) in &svc.graphs.cross_deps {
                 if !svc.defs.contains_key(member_name) {
                     continue;
                 }
-                if deps.iter().any(|(owner, _)| *owner == remote_svc) {
+                let has_remote_dep = deps.iter().any(|(owner, _)| {
+                    self.remote_services.contains_key(owner) || txn.remote_writes.contains(owner)
+                });
+                if has_remote_dep {
                     targets.push((*svc_name, *member_name));
                 }
             }
@@ -955,22 +969,28 @@ impl Manager {
             .map(|set| set.iter().cloned().collect())
             .unwrap_or_default();
 
-        // Deps owned by a service this transaction has run an action on must be
-        // re-read from that owner under the shared transaction id. Its writes
-        // are buffered there and appear in no cache on this node, because
-        // `remote_lookup` deliberately never caches on the requesting side.
+        // A dependency owned by another node has to be read from that node
+        // under the shared transaction id. Nothing on this side can stand in
+        // for it: `dep_cache` is a reactive push cache with no transactional
+        // meaning (it holds whatever the last `Update` delivered, which may
+        // predate a write this transaction made or a commit by someone else),
+        // and `remote_lookup` deliberately never caches on the requesting side.
+        // Only the owner knows the value this transaction should see, and only
+        // a read carrying the shared id takes the read lock that keeps it
+        // stable for the rest of the transaction.
         //
-        // Every such service counts, not just the one most recently acted on:
-        // recomputing `z = a.x + b.y` right after an action on `b` must still
-        // pick up the earlier action on `a`, or it would combine a committed
-        // `a.x` with a transactional `b.y` and store a value that was never
-        // true. For the same reason a later local write that re-triggers this
-        // recompute has to go back to the wire rather than reuse a cache entry.
+        // This covers three cases that a narrower rule kept getting wrong:
+        // a service this transaction wrote directly; a service it wrote only
+        // through a nested action on some other node, which no response on this
+        // side reports; and a service it merely reads, where a stale cache
+        // entry would otherwise be preferred over a real read.
         let live: HashSet<Symbol> = cache
             .keys()
             .map(|(owner, _)| *owner)
             .chain(cross_deps.iter().map(|(owner, _)| *owner))
-            .filter(|owner| txn.remote_writes.contains(owner))
+            .filter(|owner| {
+                self.remote_services.contains_key(owner) || txn.remote_writes.contains(owner)
+            })
             .collect();
 
         // Dropping a live owner's entries makes `MemberAccess` miss the
@@ -993,6 +1013,10 @@ impl Manager {
             }
         }
 
+        // Saved and restored, not cleared: see `recompute_def`. This path is the
+        // more exposed of the two, because a live dependency deliberately
+        // awaits a remote read while the cache is installed.
+        let outer_cache = self.reactive_cache.take();
         self.reactive_cache = Some(cache);
         // With nothing live every dependency is seeded, so evaluation never
         // reaches `lookup` and takes no locks. With something live the
@@ -1021,7 +1045,7 @@ impl Manager {
             )
             .await
         };
-        self.reactive_cache = None;
+        self.reactive_cache = outer_cache;
 
         // Unlike commit-time propagation, which is best-effort because the
         // transaction has already committed, a failure here is still
@@ -1909,7 +1933,7 @@ impl Manager {
                         // later recomputation of a def over this service has to
                         // re-read from the owner, not from a cache.
                         t.remote_writes.insert(remote_svc);
-                        self.refresh_remote_cross_deps_in_txn(remote_svc, t).await?;
+                        self.refresh_remote_cross_deps_in_txn(t).await?;
                     }
                     Ok(())
                 } else {
@@ -3328,6 +3352,37 @@ mod tests {
             },
             "derived value is stale".to_string(),
         )
+    }
+
+    /// Recomputing a def must restore whatever reactive cache was already
+    /// active, not clear it.
+    ///
+    /// Evaluation can await a remote read, and `send_and_await_reply` pumps
+    /// network events while it waits, so an inbound `Update` re-enters
+    /// `recompute_def` through `handle_update` in the middle of an outer
+    /// recompute. Clearing the cache on the way out would leave the suspended
+    /// outer evaluation resolving member accesses against nothing.
+    #[tokio::test]
+    async fn test_recompute_def_restores_an_active_reactive_cache() {
+        let mut tc = manager_with_x_and_def_y().await;
+        let other_svc = tc.manager.interner.insert("other_svc");
+        let other_member = tc.manager.interner.insert("other_member");
+
+        // Stand in for an outer recompute that is suspended at an await with
+        // its own cross-service deps installed.
+        let outer: HashMap<(Symbol, Symbol), Value> =
+            [((other_svc, other_member), Value::Int { val: 7 })]
+                .into_iter()
+                .collect();
+        tc.manager.reactive_cache = Some(outer.clone());
+
+        tc.manager.recompute_def(tc.foo, tc.y).await;
+
+        assert_eq!(
+            tc.manager.reactive_cache,
+            Some(outer),
+            "a nested recompute must hand the outer cache back untouched"
+        );
     }
 
     /// A `def` is a cached terminal value refreshed by propagation, but a

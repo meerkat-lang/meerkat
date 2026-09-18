@@ -243,3 +243,69 @@ async fn test_failed_recompute_aborts_the_transaction() {
     assert_eq!(m.lookup(d, s, None).await.unwrap(), Value::Int { val: 1 });
     assert_eq!(m.lookup(y, s, None).await.unwrap(), Value::Int { val: 100 });
 }
+
+/// A dependency owned by another node must be read from that node under the
+/// transaction, never served from `dep_cache`.
+///
+/// `dep_cache` is a reactive push cache: it holds whatever the last `Update`
+/// delivered, which can predate a write this transaction made (directly, or
+/// through an action that composed further actions elsewhere) or a commit by
+/// another transaction. It also carries no read lock, so a value taken from it
+/// is not stable for the rest of the transaction.
+///
+/// The service is pointed at a remote address with no network layer behind it,
+/// so a real read fails in a way the test can see. Serving the seeded cache
+/// value instead would let the transaction succeed with a stale number.
+#[tokio::test]
+async fn test_remote_dependency_is_never_served_from_dep_cache() {
+    let (mut m, tests) = setup(
+        "
+        service rmt {
+            var b = 100;
+            pub def gb = b;
+        }
+        service q {
+            var p = 1;
+            pub def z = p + rmt.gb;
+        }
+        @test(q) {
+            p = 5;
+        }
+        ",
+    )
+    .await;
+
+    let rmt = m.interner.insert("rmt");
+    let gb = m.interner.insert("gb");
+    let q = m.interner.insert("q");
+    let z = m.interner.insert("z");
+
+    // A cache entry the old behaviour would have reused instead of reading.
+    m.services
+        .get_mut(&q)
+        .unwrap()
+        .dep_cache
+        .entry(z)
+        .or_default()
+        .insert((rmt, gb), Value::Int { val: 100 });
+
+    // Re-point `rmt` at another node. `lookup` consults `remote_services`
+    // first, so reads must now go over a network that is not there.
+    m.remote_services.insert(
+        rmt,
+        meerkat_lib::net::Address::new("/ip4/127.0.0.1/tcp/1/p2p/12D3KooWTest"),
+    );
+
+    let (svc, stmts) = &tests[0];
+    let err = run_test_block(&mut m, svc, stmts)
+        .await
+        .expect_err("recomputing `z` must attempt a real read of the remote dependency");
+    assert!(
+        !err.to_string().is_empty(),
+        "expected the failed remote read to surface"
+    );
+
+    // The write was rolled back with the rest of the transaction.
+    let p = m.interner.insert("p");
+    assert_eq!(m.lookup(p, q, None).await.unwrap(), Value::Int { val: 1 });
+}

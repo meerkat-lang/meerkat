@@ -1057,6 +1057,21 @@ async fn run_client(
         })
         .collect();
 
+    // Register every configured remote service up front, before any import is
+    // processed. Doing it lazily as each root `Stmt::Import` is reached makes
+    // instantiation order-dependent: an earlier local import walks the whole
+    // unified AST, and a remote service it finds there would be built locally
+    // as a phantom copy. A remote service reached only transitively has no root
+    // `Stmt::Import` at all, so it would never be registered and every read and
+    // action would silently target that local copy instead of the owning node.
+    for (svc, url) in &remote_url_map {
+        let sym = manager.interner.insert(svc);
+        manager
+            .remote_services
+            .insert(sym, Address::new(url.as_str()));
+        println!("Remote service '{}' registered at {}", svc, url);
+    }
+
     for stmt in &prog {
         match stmt {
             &Stmt::Service { name, ref decls } => {
@@ -1112,15 +1127,8 @@ async fn run_client(
                 ref path,
                 service_name,
             } => {
-                if let Some(url) = remote_url_map.get(manager.interner.get(service_name)) {
-                    manager
-                        .remote_services
-                        .insert(service_name, Address::new(url.as_str()));
-                    println!(
-                        "Remote service '{}' registered at {}",
-                        manager.interner.get(service_name),
-                        url
-                    );
+                if manager.remote_services.contains_key(&service_name) {
+                    // Already registered above, before any import ran.
                 } else {
                     // Locally resolved import. `unified_ast` already holds the
                     // full transitive closure in dependency order, so take the

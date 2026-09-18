@@ -262,6 +262,20 @@ pub struct Transaction {
     /// Remote nodes that joined this transaction (executed a composed action
     /// under this `id` and are holding locks or buffered writes until commit or abort)
     pub participants: HashSet<Address>,
+    /// Remote services this transaction has run a composed action on, so their
+    /// members may hold writes that are buffered on the owning node and visible
+    /// nowhere else.
+    ///
+    /// A member of one of these services can only be read correctly by going
+    /// back to its owner under this transaction's id: `remote_lookup`
+    /// deliberately does not cache on the requesting side, so neither
+    /// `read_cache` here nor a service's `dep_cache` ever holds the buffered
+    /// value. Recomputing a derived member therefore has to treat every one of
+    /// these services as live, not just the one most recently acted on.
+    ///
+    /// This over-approximates: an action that only reads still lands here. The
+    /// cost is a redundant read, never a wrong value.
+    pub remote_writes: HashSet<Symbol>,
 }
 
 impl Transaction {
@@ -274,6 +288,7 @@ impl Transaction {
             read_cache: HashMap::new(),
             written: HashMap::new(),
             participants: HashSet::new(),
+            remote_writes: HashSet::new(),
         }
     }
 }

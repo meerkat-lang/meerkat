@@ -34,19 +34,6 @@ pub struct Service {
     pub service_lock: Option<TxnId>,
 }
 
-/// How a def's cross-service dependencies are resolved when it is recomputed
-/// inside a transaction (see `recompute_def_in_txn`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum CrossDepMode {
-    /// Resolve from the def's cached dependency values, overlaid with anything
-    /// this transaction has already seen. Takes no locks and sends nothing.
-    Cached,
-    /// Re-read the named service's members from their owner under this
-    /// transaction's id, so the values reflect writes this transaction made on
-    /// that node. Every other service still resolves from cache.
-    Live(Symbol),
-}
-
 /// A remote request parked on a variable's wait queue because the requesting
 /// transaction is older than the current lock holder (wait-die wait). It holds
 /// everything needed to re-dispatch the request and send its deferred reply
@@ -664,7 +651,7 @@ impl Manager {
                 // ...and so do defs derived from it: refresh their cached
                 // values inside the transaction so read-your-own-writes holds
                 // for derived members too (see `propagate_in_txn`).
-                self.propagate_in_txn(service_name, var_name, t).await;
+                self.propagate_in_txn(service_name, var_name, t).await?;
             }
             return Ok(());
         }
@@ -836,7 +823,7 @@ impl Manager {
         service_name: Symbol,
         changed_var: Symbol,
         txn: &mut Transaction,
-    ) {
+    ) -> Result<(), EvalError> {
         let mut worklist: Vec<(Symbol, Symbol)> = vec![(service_name, changed_var)];
 
         while let Some((svc, member)) = worklist.pop() {
@@ -854,14 +841,12 @@ impl Manager {
                 let Some(lsvc) = self.service_name_for_net_id(&listener_id) else {
                     continue;
                 };
-                if self
-                    .recompute_def_in_txn(lsvc, listener_def, txn, CrossDepMode::Cached)
-                    .await
-                {
+                if self.recompute_def_in_txn(lsvc, listener_def, txn).await? {
                     worklist.push((lsvc, listener_def));
                 }
             }
         }
+        Ok(())
     }
 
     /// Originator side: after a composed action has run on `remote_svc` under
@@ -884,7 +869,7 @@ impl Manager {
         &mut self,
         remote_svc: Symbol,
         txn: &mut Transaction,
-    ) {
+    ) -> Result<(), EvalError> {
         // Local defs (never vars -- they are not reactive) that name a member
         // of `remote_svc` among their statically computed cross-service deps.
         let mut targets: Vec<(Symbol, Symbol)> = Vec::new();
@@ -900,14 +885,12 @@ impl Manager {
         }
 
         for (svc, def) in targets {
-            if self
-                .recompute_def_in_txn(svc, def, txn, CrossDepMode::Live(remote_svc))
-                .await
-            {
+            if self.recompute_def_in_txn(svc, def, txn).await? {
                 // Cascade to anything derived from the def we just refreshed.
-                self.propagate_in_txn(svc, def, txn).await;
+                self.propagate_in_txn(svc, def, txn).await?;
             }
         }
+        Ok(())
     }
 
     /// Recompute `def` in `svc` against the transaction's view and cache the
@@ -918,15 +901,15 @@ impl Manager {
         svc: Symbol,
         def: Symbol,
         txn: &mut Transaction,
-        cross: CrossDepMode,
-    ) -> bool {
+    ) -> Result<bool, EvalError> {
+        // Not a def: `var`s are leaves and never recomputed. Not an error.
         let Some(expr) = self
             .services
             .get(&svc)
             .and_then(|s| s.defs.get(&def))
             .cloned()
         else {
-            return false;
+            return Ok(false);
         };
 
         let sid = self.service_net_id_for_name(svc);
@@ -962,14 +945,6 @@ impl Manager {
             .and_then(|s| s.dep_cache.get(&def))
             .cloned()
             .unwrap_or_default();
-        // In `Live` mode the named service's members must NOT come from the
-        // cache: the transaction has just run an action there, so only a fresh
-        // read under the shared transaction id reflects that node's buffered
-        // writes. Dropping these entries makes `MemberAccess` fall through to
-        // `lookup`, which routes to `remote_lookup` with this transaction.
-        if let CrossDepMode::Live(live_svc) = cross {
-            cache.retain(|(owner, _), _| *owner != live_svc);
-        }
         // `dep_cache` is only populated from remote update notifications, so
         // the def's statically known cross-service deps are the authoritative
         // set to consult for a transaction-local override.
@@ -979,13 +954,37 @@ impl Manager {
             .and_then(|s| s.graphs.cross_deps.get(&def))
             .map(|set| set.iter().cloned().collect())
             .unwrap_or_default();
+
+        // Deps owned by a service this transaction has run an action on must be
+        // re-read from that owner under the shared transaction id. Its writes
+        // are buffered there and appear in no cache on this node, because
+        // `remote_lookup` deliberately never caches on the requesting side.
+        //
+        // Every such service counts, not just the one most recently acted on:
+        // recomputing `z = a.x + b.y` right after an action on `b` must still
+        // pick up the earlier action on `a`, or it would combine a committed
+        // `a.x` with a transactional `b.y` and store a value that was never
+        // true. For the same reason a later local write that re-triggers this
+        // recompute has to go back to the wire rather than reuse a cache entry.
+        let live: HashSet<Symbol> = cache
+            .keys()
+            .map(|(owner, _)| *owner)
+            .chain(cross_deps.iter().map(|(owner, _)| *owner))
+            .filter(|owner| txn.remote_writes.contains(owner))
+            .collect();
+
+        // Dropping a live owner's entries makes `MemberAccess` miss the
+        // reactive cache and fall through to `lookup`, which routes to
+        // `remote_lookup` under this transaction.
+        cache.retain(|(owner, _), _| !live.contains(owner));
+
         for (owner, member) in cache
             .keys()
             .cloned()
             .chain(cross_deps)
             .collect::<HashSet<_>>()
         {
-            if matches!(cross, CrossDepMode::Live(live_svc) if owner == live_svc) {
+            if live.contains(&owner) {
                 continue;
             }
             let owner_id = self.service_net_id_for_name(owner);
@@ -995,50 +994,48 @@ impl Manager {
         }
 
         self.reactive_cache = Some(cache);
-        // `Cached` takes no locks: every dependency is already seeded, so
-        // evaluation never reaches `lookup`. `Live` must pass the transaction
-        // through, because the whole point is for the dropped cross-service
-        // reads to reach `remote_lookup` under the shared id (which also
-        // registers the owner as a participant).
-        let result = match cross {
-            CrossDepMode::Cached => {
-                eval(
-                    &expr,
-                    &env,
-                    &mut EvalContext {
-                        manager: self,
-                        service_name: svc,
-                        txn: None,
-                    },
-                )
-                .await
-            }
-            CrossDepMode::Live(_) => {
-                eval(
-                    &expr,
-                    &env,
-                    &mut EvalContext {
-                        manager: self,
-                        service_name: svc,
-                        txn: Some(txn),
-                    },
-                )
-                .await
-            }
+        // With nothing live every dependency is seeded, so evaluation never
+        // reaches `lookup` and takes no locks. With something live the
+        // transaction has to be threaded through, so the re-read carries the
+        // shared id (which also registers the owner as a participant).
+        let result = if live.is_empty() {
+            eval(
+                &expr,
+                &env,
+                &mut EvalContext {
+                    manager: self,
+                    service_name: svc,
+                    txn: None,
+                },
+            )
+            .await
+        } else {
+            eval(
+                &expr,
+                &env,
+                &mut EvalContext {
+                    manager: self,
+                    service_name: svc,
+                    txn: Some(txn),
+                },
+            )
+            .await
         };
         self.reactive_cache = None;
 
-        let value = match result {
-            Ok(v) => v,
-            Err(e) => {
-                log::warn!(
-                    "in-transaction propagation of def '{}' failed: {}",
-                    self.interner.get(def),
-                    e
-                );
-                return false;
-            }
-        };
+        // Unlike commit-time propagation, which is best-effort because the
+        // transaction has already committed, a failure here is still
+        // recoverable and must abort. Swallowing it would commit a state whose
+        // derived member does not follow from it, and would also drop a
+        // `WaitDieAbort` from a live re-read, defeating the retry loop.
+        let value = result.map_err(|e| {
+            log::warn!(
+                "in-transaction recomputation of def '{}' failed: {}",
+                self.interner.get(def),
+                e
+            );
+            e
+        })?;
 
         let key = (sid, def);
         let previous = txn.read_cache.get(&key).cloned().or_else(|| {
@@ -1049,7 +1046,7 @@ impl Manager {
         });
         let changed = previous.as_ref() != Some(&value);
         txn.read_cache.insert(key, value);
-        changed
+        Ok(changed)
     }
 
     /// #24: fire-and-forget send (no reply awaited).
@@ -1908,7 +1905,11 @@ impl Manager {
                     // refresh those defs before the transaction reads them.
                     if let Some(t) = txn {
                         let remote_svc = self.interner.insert(&slug);
-                        self.refresh_remote_cross_deps_in_txn(remote_svc, t).await;
+                        // Remember it for the rest of the transaction: any
+                        // later recomputation of a def over this service has to
+                        // re-read from the owner, not from a cache.
+                        t.remote_writes.insert(remote_svc);
+                        self.refresh_remote_cross_deps_in_txn(remote_svc, t).await?;
                     }
                     Ok(())
                 } else {

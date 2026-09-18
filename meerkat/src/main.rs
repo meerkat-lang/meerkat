@@ -997,7 +997,7 @@ async fn run_server(
 async fn run_client(
     full_ast: Vec<Stmt>,
     prog: Vec<Stmt>,
-    input_file: &str,
+    _input_file: &str,
     remote_url_map: std::collections::HashMap<String, String>,
     local: bool,
     watch: bool,
@@ -1046,6 +1046,16 @@ async fn run_client(
     if let Some(addr) = local_full_addr {
         manager.set_local_address(addr);
     }
+
+    // Services declared by this program itself. An import must not instantiate
+    // these: they are created by the `Stmt::Service` arm below, in program order.
+    let local_service_names: HashSet<_> = prog
+        .iter()
+        .filter_map(|s| match s {
+            Stmt::Service { name, .. } => Some(*name),
+            _ => None,
+        })
+        .collect();
 
     for stmt in &prog {
         match stmt {
@@ -1112,21 +1122,31 @@ async fn run_client(
                         url
                     );
                 } else {
-                    let base_dir = std::path::Path::new(input_file)
-                        .parent()
-                        .unwrap_or(std::path::Path::new("."));
-                    let import_path = base_dir.join(path);
-                    let import_stmts =
-                        parser::parse_file(import_path.to_str().unwrap(), &mut manager.interner)
-                            .map_err(|e| format!("Import parse error: {}", e))?;
-                    for import_stmt in &import_stmts {
-                        if let &Stmt::Service { name, ref decls } = import_stmt {
-                            manager
-                                .create_service(name, decls.clone())
-                                .await
-                                .map_err(|e| format!("Import service error: {}", e))?;
-                            println!("Imported service '{}'", manager.interner.get(name));
-                        }
+                    // Locally resolved import. `unified_ast` already holds the
+                    // full transitive closure in dependency order, so take the
+                    // services from there rather than re-parsing just the named
+                    // file: that file may itself import others, and those have
+                    // to exist before it can be instantiated.
+                    let _ = path;
+                    let pending: Vec<(_, _)> = manager
+                        .unified_ast
+                        .iter()
+                        .filter_map(|s| match s {
+                            Stmt::Service { name, decls } => Some((*name, decls.clone())),
+                            _ => None,
+                        })
+                        .filter(|(name, _)| {
+                            !local_service_names.contains(name)
+                                && !manager.services.contains_key(name)
+                                && !manager.remote_services.contains_key(name)
+                        })
+                        .collect();
+                    for (name, decls) in pending {
+                        manager
+                            .create_service(name, decls)
+                            .await
+                            .map_err(|e| format!("Import service error: {}", e))?;
+                        println!("Imported service '{}'", manager.interner.get(name));
                     }
                 }
             }

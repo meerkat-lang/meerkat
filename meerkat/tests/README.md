@@ -77,9 +77,44 @@ Demonstrates s1 -> s2 -> s3, where s2's composed action itself composes s3.
 
    Expected: @test(chk) passed (s2.w_val == 15 and s3.z_val == 107).
 
+## Read-your-own-writes across nodes
+
+A transaction must see its own writes reflected in the `def`s derived from
+them, including when the write happened on another node. These two run
+standalone as a single process (imports resolve from disk) and distributed
+against real servers; the assertions are the same either way.
+
+Two remote services, so that refreshing a def after an action on one does not
+discard an earlier action on the other:
+
+    cargo run -- -f meerkat/tests/ryow_a.mkt -s -p 9200 --local
+    cargo run -- -f meerkat/tests/ryow_b.mkt -s -p 9300 --local
+    cargo run -- -f meerkat/tests/dist_ryow_two_remotes.mkt -i <ryow_a URL> -i <ryow_b URL> --local
+
+Expected: @test(two_rem) passed.
+
+A local write after a remote action, so that recomputing the def a second time
+does not fall back to the remote service's committed value:
+
+    cargo run -- -f meerkat/tests/ryow_a.mkt -s -p 9200 --local
+    cargo run -- -f meerkat/tests/dist_ryow_local_write.mkt -i <ryow_a URL> --local
+
+Expected: @test(loc_write) passed.
+
+The single-process forms need no server:
+
+    cargo run -- -f meerkat/tests/dist_ryow_two_remotes.mkt
+    cargo run -- -f meerkat/tests/dist_ryow_local_write.mkt
+
 ## Unit tests
 
 The transaction logic also has Rust unit tests (cross-service composition,
 read-then-write lock upgrade, nested do, no partial writes on failure):
 
     cargo test --lib
+
+The transaction-local reactivity rules (derived values refreshed within a
+transaction, `var`s staying non-reactive, a failed recompute aborting) have
+their own suite:
+
+    cargo test --test txn_reactivity_test

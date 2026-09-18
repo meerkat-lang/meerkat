@@ -201,3 +201,45 @@ async fn test_participant_transactional_read_sees_buffered_def() {
     assert_eq!(m.lookup(x, svc, None).await.unwrap(), Value::Int { val: 0 });
     assert_eq!(m.lookup(y, svc, None).await.unwrap(), Value::Int { val: 1 });
 }
+
+/// A derived member that cannot be recomputed must abort the transaction, not
+/// be left silently stale.
+///
+/// Commit-time propagation is best-effort by design -- the transaction has
+/// already committed and there is no way back. Inside the transaction there
+/// still is, so swallowing the error would commit a state whose `def` does not
+/// follow from the `var` it is derived from. (It would also drop a
+/// `WaitDieAbort` raised by a live cross-node re-read, defeating the retry
+/// loop in `execute_action_with_txn`.)
+#[tokio::test]
+async fn test_failed_recompute_aborts_the_transaction() {
+    let (mut m, tests) = setup(
+        "
+        service s {
+            var d = 1;
+            pub def y = 100 / d;
+        }
+        @test(s) {
+            assert(y == 100);
+            d = 0;
+        }
+        ",
+    )
+    .await;
+    let (svc, stmts) = &tests[0];
+    let err = run_test_block(&mut m, svc, stmts)
+        .await
+        .expect_err("writing d = 0 makes `y` uncomputable and must fail the transaction");
+    assert!(
+        err.to_string().contains("Division by zero"),
+        "expected the recompute failure to surface, got: {err}"
+    );
+
+    // Aborted, so nothing was committed: `d` keeps its old value and `y` still
+    // follows from it.
+    let d = m.interner.insert("d");
+    let y = m.interner.insert("y");
+    let s = m.interner.insert("s");
+    assert_eq!(m.lookup(d, s, None).await.unwrap(), Value::Int { val: 1 });
+    assert_eq!(m.lookup(y, s, None).await.unwrap(), Value::Int { val: 100 });
+}

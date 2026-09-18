@@ -360,3 +360,64 @@ async fn test_imports_precede_local_program_in_unified_ast() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Transitive imports must be ordered by dependency, not by arrival.
+///
+/// `Imports::on_recv_source` records a file before resolving that file's own
+/// imports, so `main -> a -> b` accumulates as `[a, b]` -- the reverse of what
+/// `tt::check` needs when `a` reads `b.y`. `finalize` therefore emits modules
+/// in post-order over the import graph.
+#[tokio::test]
+async fn test_transitive_imports_are_dependency_ordered() {
+    let dir = std::env::temp_dir().join(format!(
+        "meerkat_nested_import_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // b is the leaf; a reads b; main reads a.
+    std::fs::write(
+        dir.join("b.mkt"),
+        "service b {\n    var n = 1;\n    pub def y = n + 1;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("a.mkt"),
+        "import b\n\nservice a {\n    pub def q = b.y * 10;\n}\n",
+    )
+    .unwrap();
+    let main_path = dir.join("main.mkt");
+    std::fs::write(
+        &main_path,
+        "import a\n\nservice main_s {\n    pub def r = a.q + 1;\n}\n",
+    )
+    .unwrap();
+
+    let mut node = meerkat_lib::runtime::Node::new();
+    node.resolve_imports_with_net(main_path.to_str().unwrap(), HashMap::new(), None, None)
+        .await
+        .expect("imports resolve");
+
+    let order: Vec<String> = node
+        .unified_ast
+        .iter()
+        .filter_map(|s| match s {
+            Stmt::Service { name, .. } => Some(node.interner.get(*name).to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        order,
+        vec!["b".to_string(), "a".to_string(), "main_s".to_string()],
+        "a transitive dependency must precede the module that imports it"
+    );
+
+    node.static_checks()
+        .expect("a chain of imports must type check in dependency order");
+
+    std::fs::remove_dir_all(&dir).ok();
+}

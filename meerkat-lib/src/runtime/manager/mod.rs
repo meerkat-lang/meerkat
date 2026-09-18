@@ -34,6 +34,19 @@ pub struct Service {
     pub service_lock: Option<TxnId>,
 }
 
+/// How a def's cross-service dependencies are resolved when it is recomputed
+/// inside a transaction (see `recompute_def_in_txn`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CrossDepMode {
+    /// Resolve from the def's cached dependency values, overlaid with anything
+    /// this transaction has already seen. Takes no locks and sends nothing.
+    Cached,
+    /// Re-read the named service's members from their owner under this
+    /// transaction's id, so the values reflect writes this transaction made on
+    /// that node. Every other service still resolves from cache.
+    Live(Symbol),
+}
+
 /// A remote request parked on a variable's wait queue because the requesting
 /// transaction is older than the current lock holder (wait-die wait). It holds
 /// everything needed to re-dispatch the request and send its deferred reply
@@ -484,9 +497,21 @@ impl Manager {
                         edges.push((svc_name, dep_member, listener_def));
                     }
                 }
-                for (def_name, cross_set) in &service.graphs.cross_deps {
+                // Only `def`s are reactive. Per `docs/internals/statics.md`, a
+                // `var` is a leaf: its initializer may read other members, but
+                // it does not propagate reactive changes. `cross_deps` is built
+                // for `VarDecl` and `DefDecl` alike, so filter here exactly as
+                // the intra-service loop above does -- otherwise a
+                // `var w = other.m - 2` is registered as a listener that
+                // `recompute_def` can never satisfy (it is not in `defs`),
+                // which costs a pointless remote subscription and logs a
+                // spurious "def not found" warning on every propagation.
+                for (member_name, cross_set) in &service.graphs.cross_deps {
+                    if !service.defs.contains_key(member_name) {
+                        continue;
+                    }
                     for (owner, member) in cross_set {
-                        edges.push((*owner, *member, *def_name));
+                        edges.push((*owner, *member, *member_name));
                     }
                 }
                 (updated_id, edges)
@@ -829,9 +854,58 @@ impl Manager {
                 let Some(lsvc) = self.service_name_for_net_id(&listener_id) else {
                     continue;
                 };
-                if self.recompute_def_in_txn(lsvc, listener_def, txn).await {
+                if self
+                    .recompute_def_in_txn(lsvc, listener_def, txn, CrossDepMode::Cached)
+                    .await
+                {
                     worklist.push((lsvc, listener_def));
                 }
+            }
+        }
+    }
+
+    /// Originator side: after a composed action has run on `remote_svc` under
+    /// this transaction, refresh the local defs that depend on that service.
+    ///
+    /// The write happened in the participant's own `Transaction` on another
+    /// node, so nothing on this node called `assign` and `propagate_in_txn`
+    /// never fired here. A local `def z = remote.y * 2` therefore still holds
+    /// its last committed value, and reading it later in the same transaction
+    /// would return a stale result -- and could commit a value derived from it.
+    ///
+    /// The fix relies on two pieces that are already in place: `remote_lookup`
+    /// never caches on the requesting side, and the owning node serves a
+    /// transactional read out of the buffered state it is holding for this same
+    /// transaction id (`remote_read_participant`). So recomputing these defs
+    /// with `CrossDepMode::Live` re-reads the members across the wire and gets
+    /// the participant's uncommitted view, which is exactly read-your-own-writes
+    /// across nodes.
+    pub(crate) async fn refresh_remote_cross_deps_in_txn(
+        &mut self,
+        remote_svc: Symbol,
+        txn: &mut Transaction,
+    ) {
+        // Local defs (never vars -- they are not reactive) that name a member
+        // of `remote_svc` among their statically computed cross-service deps.
+        let mut targets: Vec<(Symbol, Symbol)> = Vec::new();
+        for (svc_name, svc) in &self.services {
+            for (member_name, deps) in &svc.graphs.cross_deps {
+                if !svc.defs.contains_key(member_name) {
+                    continue;
+                }
+                if deps.iter().any(|(owner, _)| *owner == remote_svc) {
+                    targets.push((*svc_name, *member_name));
+                }
+            }
+        }
+
+        for (svc, def) in targets {
+            if self
+                .recompute_def_in_txn(svc, def, txn, CrossDepMode::Live(remote_svc))
+                .await
+            {
+                // Cascade to anything derived from the def we just refreshed.
+                self.propagate_in_txn(svc, def, txn).await;
             }
         }
     }
@@ -844,6 +918,7 @@ impl Manager {
         svc: Symbol,
         def: Symbol,
         txn: &mut Transaction,
+        cross: CrossDepMode,
     ) -> bool {
         let Some(expr) = self
             .services
@@ -887,6 +962,14 @@ impl Manager {
             .and_then(|s| s.dep_cache.get(&def))
             .cloned()
             .unwrap_or_default();
+        // In `Live` mode the named service's members must NOT come from the
+        // cache: the transaction has just run an action there, so only a fresh
+        // read under the shared transaction id reflects that node's buffered
+        // writes. Dropping these entries makes `MemberAccess` fall through to
+        // `lookup`, which routes to `remote_lookup` with this transaction.
+        if let CrossDepMode::Live(live_svc) = cross {
+            cache.retain(|(owner, _), _| *owner != live_svc);
+        }
         // `dep_cache` is only populated from remote update notifications, so
         // the def's statically known cross-service deps are the authoritative
         // set to consult for a transaction-local override.
@@ -902,6 +985,9 @@ impl Manager {
             .chain(cross_deps)
             .collect::<HashSet<_>>()
         {
+            if matches!(cross, CrossDepMode::Live(live_svc) if owner == live_svc) {
+                continue;
+            }
             let owner_id = self.service_net_id_for_name(owner);
             if let Some(v) = txn.read_cache.get(&(owner_id, member)) {
                 cache.insert((owner, member), v.clone());
@@ -909,16 +995,37 @@ impl Manager {
         }
 
         self.reactive_cache = Some(cache);
-        let result = eval(
-            &expr,
-            &env,
-            &mut EvalContext {
-                manager: self,
-                service_name: svc,
-                txn: None,
-            },
-        )
-        .await;
+        // `Cached` takes no locks: every dependency is already seeded, so
+        // evaluation never reaches `lookup`. `Live` must pass the transaction
+        // through, because the whole point is for the dropped cross-service
+        // reads to reach `remote_lookup` under the shared id (which also
+        // registers the owner as a participant).
+        let result = match cross {
+            CrossDepMode::Cached => {
+                eval(
+                    &expr,
+                    &env,
+                    &mut EvalContext {
+                        manager: self,
+                        service_name: svc,
+                        txn: None,
+                    },
+                )
+                .await
+            }
+            CrossDepMode::Live(_) => {
+                eval(
+                    &expr,
+                    &env,
+                    &mut EvalContext {
+                        manager: self,
+                        service_name: svc,
+                        txn: Some(txn),
+                    },
+                )
+                .await
+            }
+        };
         self.reactive_cache = None;
 
         let value = match result {
@@ -1728,7 +1835,7 @@ impl Manager {
         service_net_id: &ServiceNetId,
         stmts: Vec<ActionStmt>,
         env: Vec<(Symbol, Value)>,
-        txn: Option<&mut Transaction>,
+        mut txn: Option<&mut Transaction>,
     ) -> Result<(), EvalError> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT_ACTION_ID: AtomicU64 = AtomicU64::new(1);
@@ -1753,7 +1860,7 @@ impl Manager {
         // the remote never received the request, the `Abort` it gets is a
         // harmless no-op
         if shared_tid.is_some() {
-            if let Some(t) = txn {
+            if let Some(t) = txn.as_deref_mut() {
                 t.participants.insert(addr.clone());
             }
         }
@@ -1795,7 +1902,14 @@ impl Manager {
         match reply {
             MeerkatMessage::ActionResponse { success, error, .. } => {
                 if success {
-                    // Participant already registered above; nothing more to do.
+                    // Participant already registered above. The action may have
+                    // written members this node derives local defs from, and
+                    // those writes live in the participant's buffered state, so
+                    // refresh those defs before the transaction reads them.
+                    if let Some(t) = txn {
+                        let remote_svc = self.interner.insert(&slug);
+                        self.refresh_remote_cross_deps_in_txn(remote_svc, t).await;
+                    }
                     Ok(())
                 } else {
                     Err(EvalError::LocalDispatchFailed(

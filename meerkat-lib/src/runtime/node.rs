@@ -420,8 +420,15 @@ impl Node {
             stmts
         };
 
-        self.unified_ast = local_prog;
-        self.unified_ast.extend(imported_ast);
+        // Imported services come first. `tt::check` walks the unified AST in
+        // order and tracks initialized members in a single flat set, so a
+        // member is only usable once its declaration has been checked. An
+        // importing service depends on what it imports, never the reverse, so
+        // imports-first is the topological order the checker needs. Appending
+        // them instead made every imported service that derives a `def` from
+        // its own `var` fail with a spurious `IllegalDependency`.
+        self.unified_ast = imported_ast;
+        self.unified_ast.extend(local_prog);
         Ok(self)
     }
 

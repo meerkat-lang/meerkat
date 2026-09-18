@@ -301,3 +301,62 @@ fn test_imports_max_imported_services_limit() {
     let res = imports.on_recv_source("service Overflow {}", "Overflow", Path::new(""));
     assert!(res.is_err());
 }
+
+/// The unified AST must place imported services before the importing program.
+///
+/// `tt::check` walks services in AST order and tracks initialized members in a
+/// single flat set, so a member is only usable once its declaration has been
+/// checked. An importing service depends on what it imports, never the reverse.
+/// When imports were appended after the local program instead, any imported
+/// service deriving a `def` from its own `var` failed static checks with a
+/// spurious `IllegalDependency` -- which blocked every distributed CLI test.
+#[tokio::test]
+async fn test_imports_precede_local_program_in_unified_ast() {
+    let dir = std::env::temp_dir().join(format!(
+        "meerkat_import_order_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // The imported service derives a `def` from its own `var`.
+    std::fs::write(
+        dir.join("dep.mkt"),
+        "service dep {\n    var x = 0;\n    pub def y = x + 1;\n}\n",
+    )
+    .unwrap();
+    let main_path = dir.join("main.mkt");
+    std::fs::write(
+        &main_path,
+        "import dep\n\nservice app {\n    pub def z = dep.y * 2;\n}\n",
+    )
+    .unwrap();
+
+    let mut node = meerkat_lib::runtime::Node::new();
+    node.resolve_imports_with_net(main_path.to_str().unwrap(), HashMap::new(), None, None)
+        .await
+        .expect("imports resolve");
+
+    let order: Vec<String> = node
+        .unified_ast
+        .iter()
+        .filter_map(|s| match s {
+            Stmt::Service { name, .. } => Some(node.interner.get(*name).to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        order,
+        vec!["dep".to_string(), "app".to_string()],
+        "imported services must be checked before the program that imports them"
+    );
+
+    // And the ordering is what makes the static checks pass.
+    node.static_checks()
+        .expect("a def over the imported service's own var must type check");
+
+    std::fs::remove_dir_all(&dir).ok();
+}

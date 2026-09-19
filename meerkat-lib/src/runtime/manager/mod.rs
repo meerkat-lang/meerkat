@@ -19,6 +19,41 @@ use tokio::sync::oneshot;
 
 pub const MAX_WAIT_DIE_RETRIES: u32 = 10;
 
+/// How long an originator pauses between wait-die retries.
+///
+/// Short enough not to matter against a lock that frees quickly, long enough
+/// that the retries are not a tight spin (see `wait_die_backoff`).
+pub const WAIT_DIE_RETRY_BACKOFF_MS: u64 = 2;
+
+/// Pause between two attempts of a transaction that died or was told to wait.
+///
+/// Without it `execute_action_with_txn` re-runs immediately on failure, so all
+/// `MAX_WAIT_DIE_RETRIES` attempts happen back to back within microseconds and
+/// contend with exactly the state the first one saw. A transaction with no
+/// participants never awaits anything on that path -- there is no `send_abort`
+/// to make -- so the retry budget is spent before whoever holds the lock has
+/// had any chance at all to commit, and ordinary contention is reported as an
+/// exhausted wait.
+///
+/// This is a yield point, not a fix for the case where the only thing that
+/// could release the lock is a message this node cannot receive while it is
+/// inside the retry loop; that needs the background message loop of #28, which
+/// `send_and_await_reply` is also waiting on. It does resolve the case where
+/// the holder is something else that can make progress concurrently.
+///
+/// Platform-split like the timer in `send_and_await_reply`: wasm has no tokio
+/// timer driver in the browser, and `SendWrapper` keeps the (browser-thread
+/// only) timer future usable from the `Send`-bounded eval path.
+async fn wait_die_backoff() {
+    #[cfg(not(target_arch = "wasm32"))]
+    tokio::time::sleep(Duration::from_millis(WAIT_DIE_RETRY_BACKOFF_MS)).await;
+    #[cfg(target_arch = "wasm32")]
+    send_wrapper::SendWrapper::new(gloo_timers::future::TimeoutFuture::new(
+        WAIT_DIE_RETRY_BACKOFF_MS as u32,
+    ))
+    .await;
+}
+
 pub struct Service {
     /// Globally unique identity of this service (address-based when networked).
     pub id: ServiceNetId,
@@ -1572,8 +1607,10 @@ impl Manager {
         self.pending_replies.insert(request_id, tx);
 
         // Loop dispatching pending network events then checking for reply,
-        // timeout, or a short yield. The loop is required until the background
-        // message-loop architecture is implemented as a follow-up.
+        // timeout, or a short yield. The loop is required until #28's
+        // background message-loop architecture lands: today a node only listens
+        // for network events while it is making an outbound call, which is
+        // exactly what this loop is doing.
         //
         // #39: the timer is platform-split. Native uses tokio's timer; wasm has
         // no tokio timer driver in the browser, so it uses gloo-timers, the same
@@ -2346,9 +2383,11 @@ impl Manager {
     /// dropping partial locks on a wait, and service initialization all
     /// release locks, and each one that computed a key set and then dropped it
     /// left requests waiting on a lock nobody held. A caller that wants to
-    /// wake them synchronously still can -- `commit_participant` does -- and
-    /// draining a key twice is harmless, since the second drain finds either
-    /// nothing or a waiter that genuinely still needs serving.
+    /// wake them synchronously still can -- `commit_participant` does -- but it
+    /// then has to take its own keys back out of the queue, because a key
+    /// delivered twice is woken twice: the second wake reaches the next waiter
+    /// while the first one is holding the lock it was just handed, and wait-die
+    /// kills it rather than leaving it parked.
     ///
     /// Only keys with a waiter are recorded, which is what keeps
     /// `freed_awaiting_wake` bounded on a node that parks nothing and so never
@@ -2449,6 +2488,9 @@ impl Manager {
                 self.release_locks(&freed, &txn.id);
                 if txn_id.iteration < MAX_WAIT_DIE_RETRIES {
                     txn_id = txn_id.retry();
+                    // Give whoever holds the contended lock a chance to finish
+                    // before contending for it again.
+                    wait_die_backoff().await;
                     continue;
                 }
                 // Out of retries. `WaitOn` never leaves this loop as itself:
@@ -2587,6 +2629,29 @@ impl Manager {
             .pending_txns
             .remove(&tid)
             .unwrap_or_else(|| Transaction::new(tid.clone()));
+        // What the transaction had buffered before this action started. A
+        // `WaitOn` below parks the *whole* action and re-dispatches it from the
+        // first statement when the lock frees, so a run that parks has to leave
+        // the buffered state exactly as it found it. Otherwise the re-run reads
+        // its own half-finished output: `x = x + 1` sees the `1` the first
+        // attempt buffered and commits `2`.
+        //
+        // `assign` is where this bites. It buffers the write and only then
+        // refreshes the defs derived from it, and that refresh reads -- so it
+        // can raise `WaitOn` with the new value already in `written` and
+        // `read_cache`.
+        //
+        // Only the buffers are rolled back. Locks, participants and
+        // `remote_writes` are deliberately kept: holding the locks across the
+        // park is what keeps this (older) transaction's place in line, and the
+        // nodes it has already drawn in still have state under this id that has
+        // to be committed or aborted with it.
+        //
+        // Restoring rather than clearing matters for the other caller of this
+        // function: an originator can compose two actions onto the same
+        // participant under one transaction id, and the second must not discard
+        // what the first wrote.
+        let buffered_before = (txn.written.clone(), txn.read_cache.clone());
         let mut env: Vec<(Symbol, Value)> = initial_env.to_vec();
         let mut exec_error: Option<EvalError> = None;
         for stmt in stmts {
@@ -2601,6 +2666,7 @@ impl Manager {
         }
         if let Some(e) = exec_error {
             if matches!(e, EvalError::WaitOn(_)) {
+                (txn.written, txn.read_cache) = buffered_before;
                 self.pending_txns.insert(tid, txn);
                 return Err(e);
             }
@@ -2642,11 +2708,22 @@ impl Manager {
         // Held until here, like the originator holds its own. Today the event
         // loop is blocked for the whole of this call, so nothing else on this
         // node can apply a write in the meantime and the earlier release was
-        // harmless. That stops being true under the background message loop
-        // `send_and_await_reply` is waiting on, at which point releasing before
-        // the nodes below have committed exposes half of a distributed
-        // transaction to whoever takes the lock next.
+        // harmless. That stops being true under #28's background message loop,
+        // which `send_and_await_reply` is also waiting on: once other work can
+        // interleave here, releasing before the nodes below have committed
+        // exposes half of a distributed transaction to whoever takes the lock
+        // next.
         self.release_locks(&freed, &txn.id);
+        // `release_locks` queues what it frees for the loop to wake later,
+        // because most release sites raise an `EvalError` and have nowhere to
+        // return a key set. This one does return it, and the caller wakes it on
+        // the spot, so take these keys back out of the deferred queue: two
+        // deliveries of the same key wake a second waiter immediately behind
+        // the one that just took the lock, and wait-die kills that waiter
+        // outright instead of leaving it parked for the holder to release.
+        // Nothing is lost -- every waiter the queued copy would have reached is
+        // reachable from `freed`, which the caller is about to wake.
+        self.freed_awaiting_wake.retain(|k| !freed.contains(k));
         ParticipantCommit {
             freed,
             forward_error,
@@ -4392,6 +4469,281 @@ mod tests {
                 .lock,
             crate::runtime::txn::VarLock::WriteLocked(_)
         ));
+    }
+
+    /// A participant run that parks must not leave its own writes buffered.
+    ///
+    /// `assign` buffers the write and only then refreshes the defs derived from
+    /// it, and that refresh reads -- so a single `x = x + 1` can raise `WaitOn`
+    /// with `1` already sitting in `written` and `read_cache`. The transaction
+    /// is preserved across the park and the whole action is re-dispatched from
+    /// its first statement when the lock frees, so anything left behind is read
+    /// back by the re-run: the increment would be applied twice and commit `2`.
+    #[tokio::test]
+    async fn test_parked_participant_run_rolls_back_what_it_buffered() {
+        // `foo` holds `x` and `w`, with `def y = x + w` derived from both, so
+        // writing `x` has to read `w` to refresh `y`.
+        let mut tc = TestContext::new();
+        let decls = vec![
+            Decl::VarDecl {
+                name: tc.x,
+                ty: None,
+                val: Expr::Literal {
+                    val: Value::Int { val: 0 },
+                },
+            },
+            Decl::VarDecl {
+                name: tc.w,
+                ty: None,
+                val: Expr::Literal {
+                    val: Value::Int { val: 0 },
+                },
+            },
+            Decl::DefDecl {
+                name: tc.y,
+                ty: None,
+                val: Expr::Binop {
+                    op: crate::ast::BinOp::Add,
+                    expr1: Box::new(Expr::Variable { name: tc.x }),
+                    expr2: Box::new(Expr::Variable { name: tc.w }),
+                },
+                is_pub: true,
+            },
+        ];
+        tc.manager.create_service(tc.foo, decls).await.unwrap();
+        let sid = tc.manager.service_net_id_for_name(tc.foo);
+
+        // A younger transaction holds `w`, so the older one below waits on it.
+        let younger = TxnId {
+            timestamp: u128::MAX,
+            node_id: tc.manager.node_id,
+            iteration: 0,
+        };
+        tc.manager
+            .services
+            .get_mut(&tc.foo)
+            .unwrap()
+            .vars
+            .get_mut(&tc.w)
+            .unwrap()
+            .lock = crate::runtime::txn::VarLock::WriteLocked(younger);
+
+        let older = TxnId {
+            timestamp: 1,
+            node_id: tc.manager.node_id,
+            iteration: 0,
+        };
+        let stmts = vec![incr_x(&tc, 1)];
+
+        // First attempt: `x` is written and buffered, then refreshing `y` hits
+        // the lock on `w` and the action parks.
+        let parked = tc
+            .manager
+            .execute_action_participant(tc.foo, &stmts, &[], older.clone())
+            .await;
+        assert!(
+            matches!(parked, Err(EvalError::WaitOn(_))),
+            "refreshing `y` must wait on `w`, got {parked:?}"
+        );
+        assert_eq!(
+            tc.manager.pending_txns[&older]
+                .written
+                .get(&(sid.clone(), tc.x)),
+            None,
+            "the parked attempt buffered `x` and then failed, so the write it \
+             made must not survive into the re-run"
+        );
+        // The write lock it took on `x` is still held: the park keeps this
+        // (older) transaction's place in line.
+        assert!(matches!(
+            tc.manager.services[&tc.foo].vars[&tc.x].lock,
+            crate::runtime::txn::VarLock::WriteLocked(_)
+        ));
+
+        // `w` frees and the parked action is re-dispatched from the top.
+        tc.manager
+            .services
+            .get_mut(&tc.foo)
+            .unwrap()
+            .vars
+            .get_mut(&tc.w)
+            .unwrap()
+            .lock = crate::runtime::txn::VarLock::Unlocked;
+        tc.manager
+            .execute_action_participant(tc.foo, &stmts, &[], older.clone())
+            .await
+            .expect("with `w` free the action completes");
+        assert_eq!(
+            tc.manager.pending_txns[&older].written[&(sid, tc.x)],
+            Value::Int { val: 1 },
+            "`x = x + 1` ran once as far as the program is concerned, so the \
+             buffered value must be 1 -- 2 means the re-run read the value the \
+             first attempt buffered"
+        );
+    }
+
+    /// A second action composed onto the same participant under one transaction
+    /// id must keep what the first one wrote.
+    ///
+    /// The rollback above restores the buffers a parked run started from rather
+    /// than clearing them, precisely so this case still works: an originator
+    /// can call two actions on the same remote service inside one transaction,
+    /// and both arrive here under the same id.
+    #[tokio::test]
+    async fn test_second_action_under_one_txn_keeps_the_first_write() {
+        let mut tc = manager_with_a_and_x().await;
+        let a = tc.manager.interner.insert("a");
+        let sid = tc.manager.service_net_id_for_name(tc.foo);
+        let tid = TxnId::new(tc.manager.node_id);
+
+        tc.manager
+            .execute_action_participant(
+                tc.foo,
+                &[ActionStmt::Assign {
+                    name: a,
+                    expr: Expr::Literal {
+                        val: Value::Int { val: 7 },
+                    },
+                }],
+                &[],
+                tid.clone(),
+            )
+            .await
+            .unwrap();
+        tc.manager
+            .execute_action_participant(tc.foo, &[incr_x(&tc, 1)], &[], tid.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tc.manager.pending_txns[&tid].written[&(sid.clone(), a)],
+            Value::Int { val: 7 },
+            "the first action's write must still be buffered"
+        );
+        assert_eq!(
+            tc.manager.pending_txns[&tid].written[&(sid, tc.x)],
+            Value::Int { val: 1 },
+            "the second action's write must be buffered alongside it"
+        );
+    }
+
+    /// A commit hands its freed keys to the caller, which wakes them on the
+    /// spot, so it must not also leave them in the deferred queue.
+    ///
+    /// Two deliveries of one key wake two waiters: the second wake fires from
+    /// `run_and_reply_or_park` while the first waiter is holding the lock it
+    /// was just handed, and wait-die kills the second rather than leaving it
+    /// parked for the new holder to release.
+    #[tokio::test]
+    async fn test_commit_does_not_queue_the_keys_it_hands_back() {
+        let mut tc = manager_with_a_and_x().await;
+        let sid = tc.manager.service_net_id_for_name(tc.foo);
+        let key = WaitKey::Member(sid, tc.x);
+
+        // A prepared participant transaction holding the write lock on `x`.
+        let holder = TxnId::new(tc.manager.node_id);
+        tc.manager
+            .execute_action_participant(tc.foo, &[incr_x(&tc, 1)], &[], holder.clone())
+            .await
+            .unwrap();
+
+        // Two waiters parked behind it, oldest first.
+        let parked_action = |tid: TxnId, stmts: Vec<ActionStmt>| ParkedRequest::Action {
+            request_id: 1,
+            reply_to: String::new(),
+            service: tc.foo,
+            stmts,
+            env: vec![],
+            tid,
+        };
+        let first = TxnId {
+            timestamp: 1,
+            node_id: tc.manager.node_id,
+            iteration: 0,
+        };
+        let second = TxnId {
+            timestamp: 2,
+            node_id: tc.manager.node_id,
+            iteration: 0,
+        };
+        tc.manager.park_request_key(
+            key.clone(),
+            parked_action(first.clone(), vec![incr_x(&tc, 1)]),
+        );
+        tc.manager.park_request_key(
+            key.clone(),
+            parked_action(second.clone(), vec![incr_x(&tc, 1)]),
+        );
+
+        // The server loop commits, then wakes what the commit reports.
+        let committed = tc.manager.commit_participant(&holder).await;
+        assert!(committed.freed.contains(&key));
+        assert!(
+            tc.manager.take_freed_awaiting_wake().is_empty(),
+            "the commit returns its freed keys for the caller to wake, so \
+             queueing the same keys for a deferred wake delivers them twice"
+        );
+
+        // Waking them serves the oldest waiter, which takes the lock.
+        let ready = tc.manager.take_ready_waiters(&committed.freed);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].tid(), &first);
+        tc.manager
+            .execute_action_participant(tc.foo, &[incr_x(&tc, 1)], &[], first.clone())
+            .await
+            .expect("the freed lock is now the first waiter's");
+
+        // `run_and_reply_or_park` drains the deferred queue after each run. It
+        // must find nothing: a second delivery here would wake the younger
+        // waiter against a lock the first one is holding.
+        assert!(tc.manager.take_freed_awaiting_wake().is_empty());
+        assert_eq!(
+            tc.manager.wait_queue.get(&key).map(|w| w.len()),
+            Some(1),
+            "the younger waiter must stay parked until the new holder commits"
+        );
+    }
+
+    /// The wait-die retry loop must not be a tight spin.
+    ///
+    /// An originator with no participants awaits nothing on the retry path, so
+    /// without a pause all `MAX_WAIT_DIE_RETRIES` attempts run back to back
+    /// within microseconds and the budget is gone before the holder could
+    /// possibly have committed.
+    #[tokio::test]
+    async fn test_wait_die_retries_are_paced() {
+        let mut tc = manager_with_a_and_x().await;
+
+        // A younger transaction holds `x` for the whole run, so every attempt
+        // waits on it and the retries are exhausted.
+        let younger = TxnId {
+            timestamp: u128::MAX,
+            node_id: tc.manager.node_id,
+            iteration: 0,
+        };
+        tc.manager
+            .services
+            .get_mut(&tc.foo)
+            .unwrap()
+            .vars
+            .get_mut(&tc.x)
+            .unwrap()
+            .lock = crate::runtime::txn::VarLock::WriteLocked(younger);
+
+        let started = std::time::Instant::now();
+        tc.manager
+            .execute_action(tc.foo, &[incr_x(&tc, 1)])
+            .await
+            .expect_err("`x` is held for the whole run");
+        let elapsed = started.elapsed();
+
+        let expected =
+            Duration::from_millis(WAIT_DIE_RETRY_BACKOFF_MS * u64::from(MAX_WAIT_DIE_RETRIES));
+        assert!(
+            elapsed >= expected,
+            "each of the {MAX_WAIT_DIE_RETRIES} retries must pause first, so the \
+             run cannot finish in {elapsed:?} (under {expected:?})"
+        );
     }
 
     #[tokio::test]

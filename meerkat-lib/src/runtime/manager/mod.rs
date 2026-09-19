@@ -111,8 +111,8 @@ pub struct Manager {
     /// holder (wait-die wait), keyed by the contended WaitKey. Drained
     /// oldest-first when that lock frees on commit or abort.
     pub wait_queue: HashMap<WaitKey, Vec<ParkedRequest>>,
-    /// Locks released by a transaction that failed and was discarded, waiting
-    /// for the event loop to wake whatever is parked on them.
+    /// Locks released by a transaction that failed and was discarded, on which
+    /// a request is parked waiting to be woken.
     ///
     /// A commit hands its freed keys straight back to the caller, which wakes
     /// them on the spot. A failure cannot: it is raised deep inside evaluation
@@ -121,6 +121,10 @@ pub struct Manager {
     /// `dispatch_network_events`, has no dispatcher to hand them to at all.
     /// Collecting them here instead means no failure path can forget, and the
     /// loop drains this with `take_freed_awaiting_wake`.
+    ///
+    /// Only keys with a waiter are recorded, which is what keeps this bounded
+    /// on a node that has no loop to drain it: a CLI client parks nothing, so
+    /// it queues nothing, even though it can reach the discard path.
     freed_awaiting_wake: HashSet<WaitKey>,
     /// This node's canonical, dialable address, set once after the network is
     /// listening. Service identities are derived from it, so they are stable for
@@ -991,27 +995,6 @@ impl Manager {
 
         let sid = self.service_net_id_for_name(svc);
 
-        // Seed the environment from the service's members, with anything the
-        // transaction has read or written taking precedence, so local
-        // dependencies resolve from `env` without re-locking.
-        let env: Vec<(Symbol, Value)> = self
-            .services
-            .get(&svc)
-            .map(|s| {
-                s.vars
-                    .iter()
-                    .map(|(k, v)| {
-                        let value = txn
-                            .read_cache
-                            .get(&(sid.clone(), *k))
-                            .cloned()
-                            .unwrap_or_else(|| v.value.clone());
-                        (*k, value)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
         // Cross-service deps resolve from this def's reactive cache (as in
         // `recompute_def`) so no remote round trip or remote lock is needed,
         // overridden by anything this transaction has already seen for the
@@ -1081,18 +1064,31 @@ impl Manager {
         // awaits a remote read while the cache is installed.
         let outer_cache = self.reactive_cache.take();
         self.reactive_cache = Some(cache);
-        // Always evaluate under the transaction. Seeding decides what does not
-        // need to be read at all: a same-service dependency resolves from `env`
-        // and a seeded cross-service one from the reactive cache, so neither
-        // reaches `lookup` and neither takes a lock. What is left is exactly
-        // the set that must be read -- a live remote dependency, or a
-        // cross-service one nothing has cached yet -- and those reads belong to
-        // this transaction. Reading them without it would skip the lock and let
-        // a concurrent transaction change a dependency underneath a derived
-        // value that is about to be committed.
+        // Evaluate under the transaction, with an empty environment so that
+        // every same-service dependency goes through `lookup`.
+        //
+        // This used to seed `env` from all of the service's members, which
+        // skipped the lock: `Expr::Variable` resolves from `env` before it ever
+        // reaches `lookup`, and `lookup` is the only thing that takes one. The
+        // members a def reads are part of the transactional view its value
+        // rests on, so under two-phase locking they have to be held until
+        // commit, exactly as if the program had read them directly. Without
+        // that, a concurrent transaction could move a dependency underneath a
+        // derived value this one was about to commit.
+        //
+        // Nothing is lost by the round trip. `lookup` serves anything this
+        // transaction has already read or written out of `txn.read_cache` --
+        // which is where its own writes and any def refreshed earlier in this
+        // cascade live -- and otherwise reads the same `service.vars` entry the
+        // seeding used, now under a read lock recorded in `txn.locked`.
+        //
+        // Cross-service deps keep their own rule: a seeded one resolves from
+        // the reactive cache without a remote round trip, and what is left -- a
+        // live remote dependency, or a cross-service one nothing has cached yet
+        // -- is read from its owner under this transaction's id.
         let result = eval(
             &expr,
-            &env,
+            &[],
             &mut EvalContext {
                 manager: self,
                 service_name: svc,
@@ -2643,7 +2639,16 @@ impl Manager {
     async fn discard_failed_participant_txn(&mut self, txn: Transaction) {
         let freed = self.all_locked_keys(&txn);
         self.release_locks(&freed, &txn.id);
-        self.freed_awaiting_wake.extend(freed);
+        // Only the keys something is actually parked on. A key with no waiter
+        // has nothing to wake, and a node that never parks -- a CLI client,
+        // which serves a `LockRequest` inline from `dispatch_network_events`
+        // but has no dispatcher and no wait queue -- would otherwise collect
+        // entries no loop of its own ever drains.
+        let waited_on: Vec<WaitKey> = freed
+            .into_iter()
+            .filter(|k| self.wait_queue.get(k).is_some_and(|w| !w.is_empty()))
+            .collect();
+        self.freed_awaiting_wake.extend(waited_on);
         for addr in txn.participants {
             self.send_abort(addr, &txn.id).await;
         }
@@ -4420,6 +4425,65 @@ mod tests {
         let removed = tc.manager.purge_parked_txn(&mid);
         assert_eq!(removed.len(), 1);
         assert!(tc.manager.wait_queue.is_empty());
+    }
+
+    /// The freed-key queue holds only keys something is actually parked on.
+    ///
+    /// `freed_awaiting_wake` exists for one purpose: to wake requests parked
+    /// behind a lock a failed transaction just released. A key nothing is
+    /// waiting on has nothing to wake, so queueing it is not just wasted work
+    /// -- on a node that never parks anything it is an entry that is never
+    /// drained. A CLI client is exactly that node: it serves a `LockRequest`
+    /// inline from `dispatch_network_events` while awaiting some other reply,
+    /// so it can reach the discard path, but it has no dispatcher and never
+    /// parks, so it has no loop that would ever drain the queue.
+    #[tokio::test]
+    async fn test_freed_keys_are_queued_only_when_something_is_parked_on_them() {
+        let mut tc = manager_with_x_and_def_y().await;
+        let key = WaitKey::Member(tc.manager.service_net_id_for_name(tc.foo), tc.x);
+
+        // Locks `x`, then fails terminally, so `x` is released either way.
+        let stmts = vec![
+            incr_x(&tc, 1),
+            ActionStmt::Assert(
+                Expr::Literal {
+                    val: Value::Bool { val: false },
+                },
+                "always fails".to_string(),
+            ),
+        ];
+
+        let tid = TxnId::new(tc.manager.node_id);
+        tc.manager
+            .execute_action_participant(tc.foo, &stmts, &[], tid)
+            .await
+            .expect_err("the assertion fails the action");
+        assert!(
+            tc.manager.take_freed_awaiting_wake().is_empty(),
+            "nothing is parked on `x`, so its release has nothing to wake and must \
+             not leave an entry behind on a node that never drains one"
+        );
+
+        // With a waiter, the same failure reports the key.
+        tc.manager.park_request_key(
+            key.clone(),
+            ParkedRequest::Lookup {
+                request_id: 1,
+                reply_to: String::new(),
+                service: tc.foo,
+                member: tc.x,
+                tid: TxnId::new(tc.manager.node_id),
+            },
+        );
+        let tid = TxnId::new(tc.manager.node_id);
+        tc.manager
+            .execute_action_participant(tc.foo, &stmts, &[], tid)
+            .await
+            .expect_err("the assertion fails the action");
+        assert!(
+            tc.manager.take_freed_awaiting_wake().contains(&key),
+            "a request is parked on `x`, so releasing it must be reported for waking"
+        );
     }
 
     #[tokio::test]

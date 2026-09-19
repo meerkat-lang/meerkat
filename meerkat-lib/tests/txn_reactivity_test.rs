@@ -369,3 +369,88 @@ async fn test_uncached_cross_service_dependency_is_read_under_the_transaction() 
     let w = m.interner.insert("w");
     assert_eq!(m.lookup(w, q, None).await.unwrap(), Value::Int { val: 0 });
 }
+
+/// Recomputing a def inside a transaction must read-lock the members it reads.
+///
+/// `recompute_def_in_txn` evaluates the def's expression under the transaction.
+/// Any member it reads is part of the transactional view the committed result
+/// rests on, so under two-phase locking it has to be locked until commit --
+/// exactly as it would be had the program read it directly.
+///
+/// Seeding the evaluation environment from every member of the service defeats
+/// that: `Expr::Variable` resolves from `env` before it ever reaches `lookup`,
+/// which is the only thing that takes a lock. The dependency is then read
+/// without a lock, and a concurrent transaction is free to change it underneath
+/// a value this transaction is about to commit.
+#[tokio::test]
+async fn test_recompute_in_txn_read_locks_same_service_dependencies() {
+    use meerkat_lib::runtime::ast::Expr;
+
+    let (mut m, _tests) = setup(
+        "
+        service s {
+            var x = 0;
+            var b = 5;
+            pub def y = x + b;
+        }
+        ",
+    )
+    .await;
+
+    let s = m.interner.insert("s");
+    let x = m.interner.insert("x");
+    let b = m.interner.insert("b");
+
+    // An older transaction writes `x`, which recomputes `def y = x + b` and so
+    // reads `b`. Run it as a participant so it stays prepared, holding whatever
+    // locks it took.
+    let older = TxnId {
+        timestamp: 1,
+        node_id: m.node_id,
+        iteration: 0,
+    };
+    m.execute_action_participant(
+        s,
+        &[ActionStmt::Assign {
+            name: x,
+            expr: Expr::Literal {
+                val: Value::Int { val: 1 },
+            },
+        }],
+        &[],
+        older.clone(),
+    )
+    .await
+    .expect("the write and its recompute must succeed");
+
+    assert!(
+        m.pending_txns
+            .get(&older)
+            .expect("the participant transaction is held until commit")
+            .locked
+            .contains(&(m.service_net_id_for_name(s), b)),
+        "`b` was read to recompute `y`, so the transaction must hold a read lock on it"
+    );
+
+    // What the lock is for: a younger transaction must not be able to move `b`
+    // under the older one. Wait-die says the younger contender dies.
+    let younger = TxnId::new(m.node_id);
+    let err = m
+        .execute_action_participant(
+            s,
+            &[ActionStmt::Assign {
+                name: b,
+                expr: Expr::Literal {
+                    val: Value::Int { val: 99 },
+                },
+            }],
+            &[],
+            younger,
+        )
+        .await
+        .expect_err(
+            "`b` is part of the older transaction's view, so a younger writer must die \
+             rather than change it underneath a value that transaction will commit",
+        );
+    assert!(matches!(err, EvalError::WaitDieAbort(_)), "got: {err}");
+}

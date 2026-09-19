@@ -1511,11 +1511,16 @@ impl Manager {
     /// wait-die would otherwise be retried through the whole budget and then
     /// reported as a lock conflict that never happened, hiding the real
     /// failure.
+    ///
+    /// The prefix is stripped rather than kept, because `WaitDieAbort` writes
+    /// it back when it displays itself. Keeping it would nest one copy per node
+    /// the failure passed through -- a retry exhausted on the originator, or a
+    /// node in the middle forwarding it on -- and the message a `@test` reports
+    /// would read `Wait-die abort: Wait-die abort: ...`.
     fn remote_error(err: String) -> EvalError {
-        if err.starts_with(WAIT_DIE_DISPLAY_PREFIX) {
-            EvalError::WaitDieAbort(err)
-        } else {
-            EvalError::LocalDispatchFailed(err)
+        match err.strip_prefix(WAIT_DIE_DISPLAY_PREFIX) {
+            Some(reason) => EvalError::WaitDieAbort(reason.to_string()),
+            None => EvalError::LocalDispatchFailed(err),
         }
     }
 
@@ -2373,7 +2378,26 @@ impl Manager {
                 }
             }
 
-            if matches!(exec_error, Some(EvalError::WaitDieAbort(_))) {
+            // Both wait-die outcomes come back here. `WaitDieAbort` is this
+            // transaction dying against an older holder; `WaitOn` is the other
+            // half of the rule -- this transaction is the older one and is
+            // meant to wait. A participant parks a `WaitOn` in the server's
+            // wait queue and the request is re-run when the lock frees, but an
+            // originator drives its own transaction and has no queue to park
+            // in, so retrying the whole transaction is how it waits. Returning
+            // the `WaitOn` instead fails an `@test` outright over contention
+            // that was supposed to resolve itself, and reports it as a raw
+            // `WaitKey`, which is an internal control signal and not something
+            // a user can act on.
+            //
+            // A local dependency reaches this the same way a remote one does:
+            // `recompute_def_in_txn` evaluates under the transaction, so a
+            // cross-service dependency nothing has cached is read through
+            // `lookup` and takes a read lock like any other transactional read.
+            if matches!(
+                exec_error,
+                Some(EvalError::WaitDieAbort(_)) | Some(EvalError::WaitOn(_))
+            ) {
                 for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
                     self.send_abort(addr, &txn.id).await;
                 }
@@ -2383,7 +2407,17 @@ impl Manager {
                     txn_id = txn_id.retry();
                     continue;
                 }
-                return Err(exec_error.unwrap());
+                // Out of retries. `WaitOn` never leaves this loop as itself:
+                // its payload is a `WaitKey` holding interned symbols, which
+                // only this node can read back, so name what was contended.
+                return Err(match exec_error.unwrap() {
+                    EvalError::WaitOn(key) => EvalError::WaitDieAbort(format!(
+                        "gave up waiting for {} after {} retries",
+                        self.describe_wait_key(&key),
+                        MAX_WAIT_DIE_RETRIES
+                    )),
+                    other => other,
+                });
             }
 
             if exec_error.is_none() {
@@ -2394,10 +2428,27 @@ impl Manager {
                 // value that was never true and leaving it there until an
                 // asynchronous update happened to repair it.
                 self.store_committed_writes(&txn);
+                // A participant can refuse the commit or never answer it. Same
+                // handling as service initialization (`init_service`): try every
+                // participant rather than stopping at the first failure, or the
+                // later ones are left prepared and holding locks, and keep the
+                // first reason to report. There is no rollback to offer here --
+                // the decision to commit is already taken and this node's own
+                // writes are stored -- but the caller must not be told the
+                // transaction succeeded: on `Ok` the CLI prints
+                // `@test(...) passed` for a transaction only part of which is
+                // committed.
+                let mut commit_error = None;
                 for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
-                    let _ = self.send_commit(addr, &txn.id).await;
+                    if let Err(e) = self.send_commit(addr.clone(), &txn.id).await {
+                        log::warn!("participant {} failed to commit: {}", addr.0, e);
+                        if commit_error.is_none() {
+                            commit_error = Some(e);
+                        }
+                    }
                 }
                 self.propagate_committed_writes(&txn).await;
+                exec_error = commit_error;
             } else {
                 for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
                     self.send_abort(addr, &txn.id).await;
@@ -2411,6 +2462,25 @@ impl Manager {
                 Some(e) => Err(e),
                 None => Ok(()),
             };
+        }
+    }
+
+    /// Render a contended lock key the way a user can read it.
+    ///
+    /// `WaitKey` carries a `ServiceNetId` and an interned `Symbol`, neither of
+    /// which means anything outside this node, so its `Debug` form is no use in
+    /// an error message.
+    fn describe_wait_key(&self, key: &WaitKey) -> String {
+        let name_of = |sid: &ServiceNetId| {
+            self.service_name_for_net_id(sid)
+                .map(|n| self.interner.get(n).to_string())
+                .unwrap_or_else(|| sid.0.clone())
+        };
+        match key {
+            WaitKey::Service(sid) => format!("service '{}'", name_of(sid)),
+            WaitKey::Member(sid, member) => {
+                format!("'{}.{}'", name_of(sid), self.interner.get(*member))
+            }
         }
     }
 
@@ -3514,6 +3584,29 @@ mod tests {
             matches!(rebuilt, EvalError::WaitDieAbort(_)),
             "the originator must see a retryable wait-die abort, not a terminal dispatch failure"
         );
+    }
+
+    /// A wait-die abort must read the same after any number of hops.
+    ///
+    /// `Display` writes `WAIT_DIE_DISPLAY_PREFIX`, and the reply carries that
+    /// text, so rebuilding the variant from the whole reply stores the prefix
+    /// inside the payload and prints it twice. Every further hop -- a retry
+    /// exhausted on the originator, or a node in the middle forwarding the
+    /// failure on -- adds another copy, so the message a `@test` reports grows
+    /// a prefix per node it passed through.
+    #[tokio::test]
+    async fn test_remote_wait_die_prefix_is_not_repeated_per_hop() {
+        let original = EvalError::WaitDieAbort("transaction died contending for 'x'".to_string());
+        let expected = original.to_string();
+
+        let mut text = expected.clone();
+        for hop in 1..=3 {
+            text = Manager::remote_error(text).to_string();
+            assert_eq!(
+                text, expected,
+                "after {hop} hop(s) the message must still read as one wait-die abort"
+            );
+        }
     }
 
     /// A remote failure that merely mentions wait-die must stay a failure.

@@ -457,3 +457,74 @@ async fn test_on_node_startup_also_orders_imports_first() {
     std::fs::remove_dir_all(&dir).ok();
     result.expect("static checks through on_node_startup must accept an imported def over a var");
 }
+
+/// The same ordering must hold when the modules arrive over the network.
+///
+/// Local disk resolution recurses through `on_recv_source`, so the disk test
+/// above already exercises the arrival order indirectly. Over the network the
+/// replies arrive as separate events, which is the case `Imports` was actually
+/// reported for: `main -> a -> b` is recorded as `[a, b]` because a file's own
+/// imports are only resolved once that file has been recorded.
+#[test]
+fn test_network_imports_are_dependency_ordered_regardless_of_arrival() {
+    let mut node = meerkat_lib::runtime::node::Node::new();
+    let sym_a = node.interner.insert("a");
+    let base_ast = vec![
+        Stmt::Import {
+            path: "a.mkt".to_string(),
+            service_name: sym_a,
+        },
+        Stmt::Service {
+            name: node.interner.insert("main_s"),
+            decls: Vec::new(),
+        },
+    ];
+
+    let mut remote_map = HashMap::new();
+    remote_map.insert("a".to_string(), "/ip4/127.0.0.1/tcp/9000".to_string());
+    remote_map.insert("b".to_string(), "/ip4/127.0.0.1/tcp/9001".to_string());
+
+    let (mut imports, initial_cmds) = Imports::new(
+        &mut node.interner,
+        remote_map,
+        &base_ast,
+        Path::new(""),
+        "/ip4/127.0.0.1/tcp/8000/p2p/peer_main",
+    )
+    .expect("Imports::new success");
+    assert_eq!(initial_cmds.len(), 1, "only `a` is known at the start");
+
+    // `a` arrives first and only then reveals that it imports `b`.
+    let cmds = imports
+        .on_recv_source(
+            "import b\n\nservice a {\n    pub def q = b.y * 10;\n}",
+            "a",
+            Path::new(""),
+        )
+        .expect("on_recv_source a");
+    assert_eq!(cmds.len(), 1, "receiving `a` must request `b`");
+
+    let cmds = imports
+        .on_recv_source(
+            "service b {\n    var n = 1;\n    pub def y = n + 1;\n}",
+            "b",
+            Path::new(""),
+        )
+        .expect("on_recv_source b");
+    assert!(cmds.is_empty());
+    assert!(imports.is_done());
+
+    let order: Vec<String> = imports
+        .finalize()
+        .iter()
+        .filter_map(|s| match s {
+            Stmt::Service { name, .. } => Some(node.interner.get(*name).to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        order,
+        vec!["b".to_string(), "a".to_string()],
+        "`b` arrived second but `a` reads it, so it must be checked first"
+    );
+}

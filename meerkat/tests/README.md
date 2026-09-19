@@ -145,3 +145,16 @@ covered by a test that stands in for the node below with a bare network peer,
 so the ordering is observable rather than timing-dependent:
 
     cargo test --test participant_commit_order_test
+
+What happens when that commit does not get through -- a participant refusing it
+or never answering -- uses the same stand-in peer, so the outcome is chosen by
+the test. The originator must report the failure rather than let the CLI print
+`@test(...) passed` for a transaction only part of which committed:
+
+    cargo test --test commit_failure_test
+
+Wait-die's "wait" half at the node that started the transaction: a participant
+parks a contended request in the server's wait queue, but an originator has no
+queue to park in, so it waits by running the transaction again:
+
+    cargo test --test originator_wait_test

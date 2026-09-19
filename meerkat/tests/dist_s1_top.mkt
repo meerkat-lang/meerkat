@@ -4,7 +4,7 @@ service s1 {
     var x = 0;
     pub def update_chain = action {
         x = x + 1;
-        do s2.update;
+        do s2.bump;
     };
 }
 

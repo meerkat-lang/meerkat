@@ -2,7 +2,7 @@ import s3
 
 service s2 {
     var w = 10;
-    pub def update = action {
+    pub def bump = action {
         w = w + 5;
         do s3.bump3;
     };

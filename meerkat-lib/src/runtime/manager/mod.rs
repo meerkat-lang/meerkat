@@ -1,7 +1,9 @@
 use super::ast::{ActionStmt, Decl, Expr, Stmt, Value};
 use super::env::Env;
 use super::graphs::{analysis::compute_dependencies, free_var::cross_service_deps, ServiceGraphs};
-use super::interpreter::{eval, execute, EvalContext, EvalError, ExecuteEffect};
+use super::interpreter::{
+    eval, execute, EvalContext, EvalError, ExecuteEffect, WAIT_DIE_DISPLAY_PREFIX,
+};
 use super::tt::types::ServiceType;
 use crate::net::network_layer::NetworkLayer;
 use crate::net::{
@@ -74,6 +76,22 @@ impl ParkedRequest {
     }
 }
 
+/// What a participant's `Commit` left behind: the locks it released, and any
+/// failure forwarding that commit to the nodes below it.
+///
+/// Kept apart rather than folded into a `Result` because the caller needs both
+/// on the failing path. The local commit is irreversible once the writes are
+/// stored, so a forwarding failure is something to report upward, not a reason
+/// to skip waking whatever was parked on the locks this just freed.
+#[derive(Debug, Default)]
+pub struct ParticipantCommit {
+    /// Locks released by this commit, to wake anything parked on them
+    pub freed: HashSet<WaitKey>,
+    /// Failure forwarding `Commit` to a sub-participant, reported to the
+    /// originator once the local commit has finished
+    pub forward_error: Option<EvalError>,
+}
+
 pub struct Manager {
     pub services: HashMap<Symbol, Service>,
     /// Maps service name to remote address (for distributed services)
@@ -93,6 +111,22 @@ pub struct Manager {
     /// holder (wait-die wait), keyed by the contended WaitKey. Drained
     /// oldest-first when that lock frees on commit or abort.
     pub wait_queue: HashMap<WaitKey, Vec<ParkedRequest>>,
+    /// Locks a transaction released, on which a request is parked waiting to
+    /// be woken.
+    ///
+    /// A commit hands its freed keys straight back to the caller, which wakes
+    /// them on the spot. A failure cannot: it is raised deep inside evaluation
+    /// and surfaces as an `EvalError` through call paths that have nowhere to
+    /// put a key set -- and one of them, `handle_lock_request` under
+    /// `dispatch_network_events`, has no dispatcher to hand them to at all.
+    /// Collecting them here instead means no failure path can forget: every
+    /// release goes through `release_locks`, which is what fills this, and the
+    /// loop drains it with `take_freed_awaiting_wake`.
+    ///
+    /// Only keys with a waiter are recorded, which is what keeps this bounded
+    /// on a node that has no loop to drain it: a CLI client parks nothing, so
+    /// it queues nothing, even though it can reach the discard path.
+    freed_awaiting_wake: HashSet<WaitKey>,
     /// This node's canonical, dialable address, set once after the network is
     /// listening. Service identities are derived from it, so they are stable for
     /// the life of the process (never empty-then-populated) and match the URL
@@ -125,6 +159,7 @@ impl Manager {
             node_id: Self::random_node_id(),
             pending_txns: HashMap::new(),
             wait_queue: HashMap::new(),
+            freed_awaiting_wake: HashSet::new(),
             local_address: None,
             local: false,
             interner,
@@ -138,6 +173,12 @@ impl Manager {
     /// Park a request on the wait queue for the contended `WaitKey`
     pub fn park_request_key(&mut self, key: WaitKey, parked: ParkedRequest) {
         self.wait_queue.entry(key).or_default().push(parked);
+    }
+
+    /// Take the locks released by failed transactions since the last call, to
+    /// wake whatever is parked on them. Empty on a quiet loop iteration.
+    pub fn take_freed_awaiting_wake(&mut self) -> HashSet<WaitKey> {
+        std::mem::take(&mut self.freed_awaiting_wake)
     }
 
     /// Park a request on the wait queue for the contended `(service, var)`
@@ -484,9 +525,21 @@ impl Manager {
                         edges.push((svc_name, dep_member, listener_def));
                     }
                 }
-                for (def_name, cross_set) in &service.graphs.cross_deps {
+                // Only `def`s are reactive. Per `docs/internals/statics.md`, a
+                // `var` is a leaf: its initializer may read other members, but
+                // it does not propagate reactive changes. `cross_deps` is built
+                // for `VarDecl` and `DefDecl` alike, so filter here exactly as
+                // the intra-service loop above does -- otherwise a
+                // `var w = other.m - 2` is registered as a listener that
+                // `recompute_def` can never satisfy (it is not in `defs`),
+                // which costs a pointless remote subscription and logs a
+                // spurious "def not found" warning on every propagation.
+                for (member_name, cross_set) in &service.graphs.cross_deps {
+                    if !service.defs.contains_key(member_name) {
+                        continue;
+                    }
                     for (owner, member) in cross_set {
-                        edges.push((*owner, *member, *def_name));
+                        edges.push((*owner, *member, *member_name));
                     }
                 }
                 (updated_id, edges)
@@ -636,6 +689,10 @@ impl Manager {
                 t.written.insert(key.clone(), value.clone());
                 // Reads later in the same transaction see the buffered write
                 t.read_cache.insert(key, value);
+                // ...and so do defs derived from it: refresh their cached
+                // values inside the transaction so read-your-own-writes holds
+                // for derived members too (see `propagate_in_txn`).
+                self.propagate_in_txn(service_name, var_name, t).await?;
             }
             return Ok(());
         }
@@ -736,6 +793,14 @@ impl Manager {
             .cloned()
             .unwrap_or_default();
 
+        // Save and restore rather than clear. Evaluation can await a remote
+        // read, and while it waits `send_and_await_reply` pumps network events,
+        // so an incoming `Update` can re-enter this function through
+        // `handle_update`. Clearing on the way out would drop the cache that an
+        // outer, suspended recompute is relying on, and it would resume
+        // resolving member accesses against the wrong state. Restoring the
+        // previous value keeps the caches properly nested.
+        let outer_cache = self.reactive_cache.take();
         self.reactive_cache = Some(cache);
         let result = eval(
             &expr,
@@ -747,10 +812,7 @@ impl Manager {
             },
         )
         .await;
-        // The reactive cache is only valid for the single recompute above (its
-        // entries are this def's cached cross-service deps), so clear it before
-        // returning to avoid leaking stale entries into later evaluations.
-        self.reactive_cache = None;
+        self.reactive_cache = outer_cache;
 
         let value = match result {
             Ok(v) => v,
@@ -781,6 +843,292 @@ impl Manager {
             );
             false
         }
+    }
+
+    /// Transaction-local counterpart of `propagate`: refresh the defs that
+    /// depend on `changed_var` using the transaction's own (uncommitted) view
+    /// of the world, caching the results in `txn.read_cache`.
+    ///
+    /// A `def` is an eagerly evaluated, cached terminal value, not a thunk, so
+    /// a plain `lookup` of a def returns whatever the last committed
+    /// propagation stored. Without this, a transaction that writes `x` and then
+    /// reads a `def y = x + 1` would see the pre-transaction `y`, breaking
+    /// read-your-own-writes for derived members (e.g. an `@test` block, which
+    /// runs as a single transaction).
+    ///
+    /// This deliberately mirrors `propagate` but differs in three ways:
+    ///   - results go into `txn.read_cache`, never into `service.vars`, so an
+    ///     aborted transaction leaves no trace;
+    ///   - remote listeners are not notified, because nothing is committed yet
+    ///     (commit-time `propagate` still notifies them);
+    ///   - it reads under the transaction, so a dependency the transaction has
+    ///     not already read or written is locked like any other transactional
+    ///     read. That is not incidental: a recomputed def is part of what the
+    ///     transaction goes on to observe and commit, so the members it derives
+    ///     from have to stay stable until commit. Removing that locking lets a
+    ///     concurrent transaction move a dependency underneath a derived value
+    ///     this one is about to commit. A recompute can therefore fail with a
+    ///     wait-die outcome, which is why this returns a `Result` and why the
+    ///     originator's retry loop handles `WaitOn` as well as `WaitDieAbort`.
+    pub(crate) async fn propagate_in_txn(
+        &mut self,
+        service_name: Symbol,
+        changed_var: Symbol,
+        txn: &mut Transaction,
+    ) -> Result<(), EvalError> {
+        let mut worklist: Vec<(Symbol, Symbol)> = vec![(service_name, changed_var)];
+
+        while let Some((svc, member)) = worklist.pop() {
+            let listeners: Vec<(ServiceNetId, Symbol)> = self
+                .services
+                .get(&svc)
+                .and_then(|s| s.listeners.get(&member))
+                .map(|set| set.iter().cloned().collect())
+                .unwrap_or_default();
+
+            for (listener_id, listener_def) in listeners {
+                // `None` means the listener lives on another node. It is not
+                // notified here: the write is still uncommitted, and
+                // commit-time `propagate` will emit the update.
+                let Some(lsvc) = self.service_name_for_net_id(&listener_id) else {
+                    continue;
+                };
+                if self.recompute_def_in_txn(lsvc, listener_def, txn).await? {
+                    worklist.push((lsvc, listener_def));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Services whose state a prepared (not yet committed) transaction has
+    /// touched on this node, plus everything it touched further downstream.
+    ///
+    /// Reported back to whoever composed the action so they can refresh the
+    /// derived members that depend on those services. The downstream half
+    /// matters: this node may itself have composed actions onto other nodes,
+    /// and the originator has no other way to learn about them.
+    pub fn touched_services_for_txn(&self, tid: &TxnId) -> Vec<String> {
+        let Some(txn) = self.pending_txns.get(tid) else {
+            return Vec::new();
+        };
+        let mut names: HashSet<Symbol> = txn.remote_writes.clone();
+        for (sid, _) in txn.written.keys() {
+            if let Some(name) = self.service_name_for_net_id(sid) {
+                names.insert(name);
+            }
+        }
+        names
+            .into_iter()
+            .map(|n| self.interner.get(n).to_string())
+            .collect()
+    }
+
+    /// Originator side: after a composed action has run on another node under
+    /// this transaction, refresh the local defs derived from remote state.
+    ///
+    /// The write happened in a participant's own `Transaction` on another node,
+    /// so nothing here called `assign` and `propagate_in_txn` never fired. A
+    /// local `def z = remote.y * 2` therefore still holds its last committed
+    /// value, and reading it later in the same transaction would return a stale
+    /// result -- and could commit a value derived from it.
+    ///
+    /// This refreshes every local def with any remote dependency, not only defs
+    /// naming the service that was contacted. An action can compose further
+    /// actions on nodes this one never spoke to (origin to B to C), and B's
+    /// `ActionResponse` reports nothing about C, so which remote members the
+    /// transaction has touched is simply not knowable here. Recomputing the
+    /// candidates and letting each one re-read its own dependencies is the
+    /// conservative choice that is actually correct.
+    ///
+    /// It works because `remote_lookup` never caches on the requesting side and
+    /// the owning node serves a transactional read out of the buffered state it
+    /// holds for this same transaction id (`remote_read_participant`) -- which
+    /// C is doing, since B forwarded the shared id when it composed the action.
+    /// A def whose value has not moved recomputes to the same value and
+    /// cascades no further.
+    pub(crate) async fn refresh_remote_cross_deps_in_txn(
+        &mut self,
+        txn: &mut Transaction,
+    ) -> Result<(), EvalError> {
+        // Local defs (never vars -- they are not reactive) that depend on a
+        // service this transaction has actually touched. Scoping to the
+        // reported set matters for more than efficiency: refreshing every
+        // remote dependency would make a transaction fail whenever some
+        // unrelated service it happens to import is unavailable, since these
+        // recomputations read over the network and their errors abort.
+        let mut targets: Vec<(Symbol, Symbol)> = Vec::new();
+        for (svc_name, svc) in &self.services {
+            for (member_name, deps) in &svc.graphs.cross_deps {
+                if !svc.defs.contains_key(member_name) {
+                    continue;
+                }
+                if deps
+                    .iter()
+                    .any(|(owner, _)| txn.remote_writes.contains(owner))
+                {
+                    targets.push((*svc_name, *member_name));
+                }
+            }
+        }
+
+        for (svc, def) in targets {
+            if self.recompute_def_in_txn(svc, def, txn).await? {
+                // Cascade to anything derived from the def we just refreshed.
+                self.propagate_in_txn(svc, def, txn).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Recompute `def` in `svc` against the transaction's view and cache the
+    /// result in `txn.read_cache`. Returns whether the value changed (which is
+    /// what stops `propagate_in_txn` from cascading forever around a cycle).
+    async fn recompute_def_in_txn(
+        &mut self,
+        svc: Symbol,
+        def: Symbol,
+        txn: &mut Transaction,
+    ) -> Result<bool, EvalError> {
+        // Not a def: `var`s are leaves and never recomputed. Not an error.
+        let Some(expr) = self
+            .services
+            .get(&svc)
+            .and_then(|s| s.defs.get(&def))
+            .cloned()
+        else {
+            return Ok(false);
+        };
+
+        let sid = self.service_net_id_for_name(svc);
+
+        // Cross-service deps resolve from this def's reactive cache (as in
+        // `recompute_def`) so no remote round trip or remote lock is needed,
+        // overridden by anything this transaction has already seen for the
+        // same member.
+        let mut cache = self
+            .services
+            .get(&svc)
+            .and_then(|s| s.dep_cache.get(&def))
+            .cloned()
+            .unwrap_or_default();
+        // `dep_cache` is only populated from remote update notifications, so
+        // the def's statically known cross-service deps are the authoritative
+        // set to consult for a transaction-local override.
+        let cross_deps: Vec<(Symbol, Symbol)> = self
+            .services
+            .get(&svc)
+            .and_then(|s| s.graphs.cross_deps.get(&def))
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default();
+
+        // A dependency owned by another node has to be read from that node
+        // under the shared transaction id. Nothing on this side can stand in
+        // for it: `dep_cache` is a reactive push cache with no transactional
+        // meaning (it holds whatever the last `Update` delivered, which may
+        // predate a write this transaction made or a commit by someone else),
+        // and `remote_lookup` deliberately never caches on the requesting side.
+        // Only the owner knows the value this transaction should see, and only
+        // a read carrying the shared id takes the read lock that keeps it
+        // stable for the rest of the transaction.
+        //
+        // This covers three cases that a narrower rule kept getting wrong:
+        // a service this transaction wrote directly; a service it wrote only
+        // through a nested action on some other node, which no response on this
+        // side reports; and a service it merely reads, where a stale cache
+        // entry would otherwise be preferred over a real read.
+        let live: HashSet<Symbol> = cache
+            .keys()
+            .map(|(owner, _)| *owner)
+            .chain(cross_deps.iter().map(|(owner, _)| *owner))
+            .filter(|owner| {
+                self.remote_services.contains_key(owner) || txn.remote_writes.contains(owner)
+            })
+            .collect();
+
+        // Dropping a live owner's entries makes `MemberAccess` miss the
+        // reactive cache and fall through to `lookup`, which routes to
+        // `remote_lookup` under this transaction.
+        cache.retain(|(owner, _), _| !live.contains(owner));
+
+        for (owner, member) in cache
+            .keys()
+            .cloned()
+            .chain(cross_deps)
+            .collect::<HashSet<_>>()
+        {
+            if live.contains(&owner) {
+                continue;
+            }
+            let owner_id = self.service_net_id_for_name(owner);
+            if let Some(v) = txn.read_cache.get(&(owner_id, member)) {
+                cache.insert((owner, member), v.clone());
+            }
+        }
+
+        // Saved and restored, not cleared: see `recompute_def`. This path is the
+        // more exposed of the two, because a live dependency deliberately
+        // awaits a remote read while the cache is installed.
+        let outer_cache = self.reactive_cache.take();
+        self.reactive_cache = Some(cache);
+        // Evaluate under the transaction, with an empty environment so that
+        // every same-service dependency goes through `lookup`.
+        //
+        // This used to seed `env` from all of the service's members, which
+        // skipped the lock: `Expr::Variable` resolves from `env` before it ever
+        // reaches `lookup`, and `lookup` is the only thing that takes one. The
+        // members a def reads are part of the transactional view its value
+        // rests on, so under two-phase locking they have to be held until
+        // commit, exactly as if the program had read them directly. Without
+        // that, a concurrent transaction could move a dependency underneath a
+        // derived value this one was about to commit.
+        //
+        // Nothing is lost by the round trip. `lookup` serves anything this
+        // transaction has already read or written out of `txn.read_cache` --
+        // which is where its own writes and any def refreshed earlier in this
+        // cascade live -- and otherwise reads the same `service.vars` entry the
+        // seeding used, now under a read lock recorded in `txn.locked`.
+        //
+        // Cross-service deps keep their own rule: a seeded one resolves from
+        // the reactive cache without a remote round trip, and what is left -- a
+        // live remote dependency, or a cross-service one nothing has cached yet
+        // -- is read from its owner under this transaction's id.
+        let result = eval(
+            &expr,
+            &[],
+            &mut EvalContext {
+                manager: self,
+                service_name: svc,
+                txn: Some(txn),
+            },
+        )
+        .await;
+        self.reactive_cache = outer_cache;
+
+        // Unlike commit-time propagation, which is best-effort because the
+        // transaction has already committed, a failure here is still
+        // recoverable and must abort. Swallowing it would commit a state whose
+        // derived member does not follow from it, and would also drop a
+        // `WaitDieAbort` from a live re-read, defeating the retry loop.
+        let value = result.map_err(|e| {
+            log::warn!(
+                "in-transaction recomputation of def '{}' failed: {}",
+                self.interner.get(def),
+                e
+            );
+            e
+        })?;
+
+        let key = (sid, def);
+        let previous = txn.read_cache.get(&key).cloned().or_else(|| {
+            self.services
+                .get(&svc)
+                .and_then(|s| s.vars.get(&def))
+                .map(|v| v.value.clone())
+        });
+        let changed = previous.as_ref() != Some(&value);
+        txn.read_cache.insert(key, value);
+        Ok(changed)
     }
 
     /// #24: fire-and-forget send (no reply awaited).
@@ -1169,6 +1517,34 @@ impl Manager {
     }
 
     /// shared by remote_lookup and remote_action.
+    /// Rebuild a structured error from a failure a remote node reported.
+    ///
+    /// Errors cross the wire as their `Display` text, so a wait-die abort comes
+    /// back as an ordinary string. Flattening it to `LocalDispatchFailed` turns
+    /// ordinary lock contention into a terminal failure, because
+    /// `execute_action_with_txn` retries `WaitDieAbort` and nothing else. Every
+    /// reply that can carry a lock outcome goes through here so lock requests,
+    /// reads and composed actions all behave the same way.
+    ///
+    /// Matched on the prefix `EvalError`'s `Display` writes, not on the phrase
+    /// appearing anywhere. Error text quotes user input -- an assertion carries
+    /// its own source text, for one -- so a message that merely mentions
+    /// wait-die would otherwise be retried through the whole budget and then
+    /// reported as a lock conflict that never happened, hiding the real
+    /// failure.
+    ///
+    /// The prefix is stripped rather than kept, because `WaitDieAbort` writes
+    /// it back when it displays itself. Keeping it would nest one copy per node
+    /// the failure passed through -- a retry exhausted on the originator, or a
+    /// node in the middle forwarding it on -- and the message a `@test` reports
+    /// would read `Wait-die abort: Wait-die abort: ...`.
+    fn remote_error(err: String) -> EvalError {
+        match err.strip_prefix(WAIT_DIE_DISPLAY_PREFIX) {
+            Some(reason) => EvalError::WaitDieAbort(reason.to_string()),
+            None => EvalError::LocalDispatchFailed(err),
+        }
+    }
+
     pub async fn send_and_await_reply(
         &mut self,
         addr: Address,
@@ -1499,7 +1875,7 @@ impl Manager {
                     .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?;
                 Ok(val)
             }
-            MeerkatMessage::LookupError { error, .. } => Err(EvalError::LocalDispatchFailed(error)),
+            MeerkatMessage::LookupError { error, .. } => Err(Self::remote_error(error)),
             MeerkatMessage::Ping { .. }
             | MeerkatMessage::Pong { .. }
             | MeerkatMessage::Announce { .. }
@@ -1566,7 +1942,7 @@ impl Manager {
         service_net_id: &ServiceNetId,
         stmts: Vec<ActionStmt>,
         env: Vec<(Symbol, Value)>,
-        txn: Option<&mut Transaction>,
+        mut txn: Option<&mut Transaction>,
     ) -> Result<(), EvalError> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT_ACTION_ID: AtomicU64 = AtomicU64::new(1);
@@ -1591,7 +1967,7 @@ impl Manager {
         // the remote never received the request, the `Abort` it gets is a
         // harmless no-op
         if shared_tid.is_some() {
-            if let Some(t) = txn {
+            if let Some(t) = txn.as_deref_mut() {
                 t.participants.insert(addr.clone());
             }
         }
@@ -1631,12 +2007,42 @@ impl Manager {
             .await?;
 
         match reply {
-            MeerkatMessage::ActionResponse { success, error, .. } => {
+            MeerkatMessage::ActionResponse {
+                success,
+                error,
+                touched_services,
+                ..
+            } => {
                 if success {
-                    // Participant already registered above; nothing more to do.
+                    // Participant already registered above. The action may have
+                    // written members this node derives local defs from, and
+                    // those writes live in the participant's buffered state, so
+                    // refresh those defs before the transaction reads them.
+                    if let Some(t) = txn {
+                        // Remember what this action touched for the rest of the
+                        // transaction: any later recomputation of a def over one
+                        // of these services has to re-read from its owner rather
+                        // than from a cache. The participant reports the
+                        // transitive set, so a node it composed onto in turn is
+                        // included even though this node never spoke to it.
+                        codec::validate_touched_services(&touched_services)
+                            .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?;
+                        if touched_services.is_empty() {
+                            // A participant that reports nothing (an older peer,
+                            // or an action that named nothing) is covered by
+                            // assuming the service we contacted.
+                            t.remote_writes.insert(self.interner.insert(&slug));
+                        } else {
+                            for name in &touched_services {
+                                let sym = self.interner.insert(name);
+                                t.remote_writes.insert(sym);
+                            }
+                        }
+                        self.refresh_remote_cross_deps_in_txn(t).await?;
+                    }
                     Ok(())
                 } else {
-                    Err(EvalError::LocalDispatchFailed(
+                    Err(Self::remote_error(
                         error.unwrap_or_else(|| "Remote action failed".to_string()),
                     ))
                 }
@@ -1930,6 +2336,23 @@ impl Manager {
         self.release_locks(&keys, &txn.id);
     }
 
+    /// Release the locks a transaction held, and record the ones something is
+    /// parked behind so the loop can wake them.
+    ///
+    /// The recording lives here because this is the single point every release
+    /// passes through, and the alternative has now been got wrong repeatedly:
+    /// an originator retrying under wait-die, an originator finishing, a
+    /// participant discarding a failed transaction, `handle_lock_request`
+    /// dropping partial locks on a wait, and service initialization all
+    /// release locks, and each one that computed a key set and then dropped it
+    /// left requests waiting on a lock nobody held. A caller that wants to
+    /// wake them synchronously still can -- `commit_participant` does -- and
+    /// draining a key twice is harmless, since the second drain finds either
+    /// nothing or a waiter that genuinely still needs serving.
+    ///
+    /// Only keys with a waiter are recorded, which is what keeps
+    /// `freed_awaiting_wake` bounded on a node that parks nothing and so never
+    /// drains it.
     fn release_locks(&mut self, locked: &HashSet<WaitKey>, txn_id: &TxnId) {
         for key in locked {
             match key {
@@ -1949,6 +2372,12 @@ impl Manager {
                 }
             }
         }
+        let waited_on: Vec<WaitKey> = locked
+            .iter()
+            .filter(|k| self.wait_queue.get(k).is_some_and(|w| !w.is_empty()))
+            .cloned()
+            .collect();
+        self.freed_awaiting_wake.extend(waited_on);
     }
 
     /// Execute action statements as a transaction with lazy lock
@@ -1993,7 +2422,26 @@ impl Manager {
                 }
             }
 
-            if matches!(exec_error, Some(EvalError::WaitDieAbort(_))) {
+            // Both wait-die outcomes come back here. `WaitDieAbort` is this
+            // transaction dying against an older holder; `WaitOn` is the other
+            // half of the rule -- this transaction is the older one and is
+            // meant to wait. A participant parks a `WaitOn` in the server's
+            // wait queue and the request is re-run when the lock frees, but an
+            // originator drives its own transaction and has no queue to park
+            // in, so retrying the whole transaction is how it waits. Returning
+            // the `WaitOn` instead fails an `@test` outright over contention
+            // that was supposed to resolve itself, and reports it as a raw
+            // `WaitKey`, which is an internal control signal and not something
+            // a user can act on.
+            //
+            // A local dependency reaches this the same way a remote one does:
+            // `recompute_def_in_txn` evaluates under the transaction, so a
+            // cross-service dependency nothing has cached is read through
+            // `lookup` and takes a read lock like any other transactional read.
+            if matches!(
+                exec_error,
+                Some(EvalError::WaitDieAbort(_)) | Some(EvalError::WaitOn(_))
+            ) {
                 for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
                     self.send_abort(addr, &txn.id).await;
                 }
@@ -2003,14 +2451,48 @@ impl Manager {
                     txn_id = txn_id.retry();
                     continue;
                 }
-                return Err(exec_error.unwrap());
+                // Out of retries. `WaitOn` never leaves this loop as itself:
+                // its payload is a `WaitKey` holding interned symbols, which
+                // only this node can read back, so name what was contended.
+                return Err(match exec_error.unwrap() {
+                    EvalError::WaitOn(key) => EvalError::WaitDieAbort(format!(
+                        "gave up waiting for {} after {} retries",
+                        self.describe_wait_key(&key),
+                        MAX_WAIT_DIE_RETRIES
+                    )),
+                    other => other,
+                });
             }
 
             if exec_error.is_none() {
-                self.apply_committed_writes(&txn).await;
+                // Store locally, then commit the participants, and only then
+                // recompute what is derived from the writes. Propagating first
+                // would recompute a def over a remote member while that
+                // member's node is still holding the write buffered, storing a
+                // value that was never true and leaving it there until an
+                // asynchronous update happened to repair it.
+                self.store_committed_writes(&txn);
+                // A participant can refuse the commit or never answer it. Same
+                // handling as service initialization (`init_service`): try every
+                // participant rather than stopping at the first failure, or the
+                // later ones are left prepared and holding locks, and keep the
+                // first reason to report. There is no rollback to offer here --
+                // the decision to commit is already taken and this node's own
+                // writes are stored -- but the caller must not be told the
+                // transaction succeeded: on `Ok` the CLI prints
+                // `@test(...) passed` for a transaction only part of which is
+                // committed.
+                let mut commit_error = None;
                 for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
-                    let _ = self.send_commit(addr, &txn.id).await;
+                    if let Err(e) = self.send_commit(addr.clone(), &txn.id).await {
+                        log::warn!("participant {} failed to commit: {}", addr.0, e);
+                        if commit_error.is_none() {
+                            commit_error = Some(e);
+                        }
+                    }
                 }
+                self.propagate_committed_writes(&txn).await;
+                exec_error = commit_error;
             } else {
                 for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
                     self.send_abort(addr, &txn.id).await;
@@ -2027,22 +2509,46 @@ impl Manager {
         }
     }
 
+    /// Render a contended lock key the way a user can read it.
+    ///
+    /// `WaitKey` carries a `ServiceNetId` and an interned `Symbol`, neither of
+    /// which means anything outside this node, so its `Debug` form is no use in
+    /// an error message.
+    fn describe_wait_key(&self, key: &WaitKey) -> String {
+        let name_of = |sid: &ServiceNetId| {
+            self.service_name_for_net_id(sid)
+                .map(|n| self.interner.get(n).to_string())
+                .unwrap_or_else(|| sid.0.clone())
+        };
+        match key {
+            WaitKey::Service(sid) => format!("service '{}'", name_of(sid)),
+            WaitKey::Member(sid, member) => {
+                format!("'{}.{}'", name_of(sid), self.interner.get(*member))
+            }
+        }
+    }
+
     /// Apply a transaction's buffered writes to the owning services, record
     /// the writing transaction, and propagate to dependent definitions
     ///
-    /// Shared by local commit and by a participant committing on a remote
-    /// `Commit` message
+    /// Only for a transaction with nothing below it to commit first. Both
+    /// commit paths that can have participants (`execute_action_with_txn` and
+    /// `commit_participant`) call the two halves separately so they can commit
+    /// those participants in between; see `store_committed_writes`
     ///
     /// Infallible: once we are applying writes the transaction is
     /// committed, so there is no going back. Propagation is best-effort
     async fn apply_committed_writes(&mut self, txn: &Transaction) {
-        let writes: Vec<((ServiceNetId, Symbol), Value)> = txn
-            .written
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        self.store_committed_writes(txn);
+        self.propagate_committed_writes(txn).await;
+    }
+
+    /// Store a committed transaction's buffered writes into the owning
+    /// services, without propagating. Split out so a node can commit the
+    /// participants below it before recomputing anything derived from them.
+    fn store_committed_writes(&mut self, txn: &Transaction) {
         let txn_id = txn.id.clone();
-        for ((sid, var), value) in &writes {
+        for ((sid, var), value) in txn.written.iter() {
             if let Some(service) = self.service_by_net_id_mut(sid) {
                 if let Some(var_state) = service.vars.get_mut(var) {
                     var_state.value = value.clone();
@@ -2050,7 +2556,15 @@ impl Manager {
                 }
             }
         }
-        for ((sid, var), _) in &writes {
+    }
+
+    /// Recompute the members derived from a committed transaction's writes.
+    ///
+    /// Best-effort by the same logic as `apply_committed_writes`: the
+    /// transaction has committed and there is no way back.
+    async fn propagate_committed_writes(&mut self, txn: &Transaction) {
+        let written: Vec<(ServiceNetId, Symbol)> = txn.written.keys().cloned().collect();
+        for (sid, var) in &written {
             if let Some(name) = self.service_name_for_net_id(sid) {
                 self.propagate(name, *var).await;
             }
@@ -2098,23 +2612,44 @@ impl Manager {
     }
 
     /// Participant side: apply and release a held transaction on `Commit`
-    pub async fn commit_participant(&mut self, tid: &TxnId) -> Result<HashSet<WaitKey>, EvalError> {
-        if let Some(txn) = self.pending_txns.remove(tid) {
-            let freed = self.all_locked_keys(&txn);
-            self.apply_committed_writes(&txn).await;
-            self.release_locks(&freed, &txn.id);
-            let mut forward_err = None;
-            for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
-                if let Err(e) = self.send_commit(addr, tid).await {
-                    forward_err = Some(e);
-                }
+    ///
+    /// Reports the locks it released and any failure forwarding the commit to a
+    /// node below as two separate things, because they are independent: the
+    /// local commit is done either way, and whatever is parked on those locks
+    /// has to be woken even when the forward failed. Returning only the error
+    /// left parked requests waiting on a lock nothing holds any more.
+    pub async fn commit_participant(&mut self, tid: &TxnId) -> ParticipantCommit {
+        let Some(txn) = self.pending_txns.remove(tid) else {
+            return ParticipantCommit::default();
+        };
+        let freed = self.all_locked_keys(&txn);
+        // Same order as the originator in `execute_action_with_txn`, and
+        // for the same reason: a node in the middle of a chain has written
+        // locally *and* composed an action onto a node below it, and
+        // `mid.view = mv + below.member` derives from both. Propagating
+        // first recomputes that def while the node below is still holding
+        // its write buffered, storing a value that was never true and
+        // leaving it there until an asynchronous update happened to repair
+        // it. Store, commit downward, then recompute.
+        self.store_committed_writes(&txn);
+        let mut forward_error = None;
+        for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
+            if let Err(e) = self.send_commit(addr, tid).await {
+                forward_error = Some(e);
             }
-            match forward_err {
-                Some(e) => Err(e),
-                None => Ok(freed),
-            }
-        } else {
-            Ok(HashSet::new())
+        }
+        self.propagate_committed_writes(&txn).await;
+        // Held until here, like the originator holds its own. Today the event
+        // loop is blocked for the whole of this call, so nothing else on this
+        // node can apply a write in the meantime and the earlier release was
+        // harmless. That stops being true under the background message loop
+        // `send_and_await_reply` is waiting on, at which point releasing before
+        // the nodes below have committed exposes half of a distributed
+        // transaction to whoever takes the lock next.
+        self.release_locks(&freed, &txn.id);
+        ParticipantCommit {
+            freed,
+            forward_error,
         }
     }
 
@@ -2122,27 +2657,34 @@ impl Manager {
     ///
     /// Releases local locks and aborts all sub-participants before dropping the transaction
     ///
+    /// The freed keys go to `freed_awaiting_wake` rather than to the caller.
+    /// Every path that reaches here does so by raising an `EvalError` back
+    /// through `execute_action_participant`, `remote_read_participant` or
+    /// `handle_lock_request`, none of which has room in its return type for a
+    /// key set -- which is why all three used to drop it, leaving requests
+    /// parked on locks nobody held any more.
+    ///
     /// Args:
     ///     txn (Transaction): The transaction context
-    ///
-    /// Returns:
-    ///     HashSet<WaitKey>: The set of freed wait keys
-    async fn discard_failed_participant_txn(&mut self, txn: Transaction) -> HashSet<WaitKey> {
+    async fn discard_failed_participant_txn(&mut self, txn: Transaction) {
         let freed = self.all_locked_keys(&txn);
+        // `release_locks` records what is parked behind these keys.
         self.release_locks(&freed, &txn.id);
         for addr in txn.participants {
             self.send_abort(addr, &txn.id).await;
         }
-        freed
     }
 
     /// Participant side: discard and release a held transaction on `Abort`, and
     /// forward the abort down the chain to any sub-participants
-    pub async fn abort_participant(&mut self, tid: &TxnId) -> HashSet<WaitKey> {
+    ///
+    /// The locks it releases go to `freed_awaiting_wake` like every other
+    /// discarded transaction's, so the caller wakes them with
+    /// `take_freed_awaiting_wake` rather than from a return value. One channel
+    /// for every failure path, so a new one cannot quietly drop them.
+    pub async fn abort_participant(&mut self, tid: &TxnId) {
         if let Some(txn) = self.pending_txns.remove(tid) {
-            self.discard_failed_participant_txn(txn).await
-        } else {
-            HashSet::new()
+            self.discard_failed_participant_txn(txn).await;
         }
     }
 
@@ -2444,10 +2986,7 @@ impl Manager {
                     if !success {
                         let err_str = error
                             .unwrap_or_else(|| "Lock request rejected by remote node".to_string());
-                        if err_str.contains("Wait-die abort") {
-                            return Err(EvalError::WaitDieAbort(err_str));
-                        }
-                        return Err(EvalError::LocalDispatchFailed(err_str));
+                        return Err(Self::remote_error(err_str));
                     }
                 }
                 _ => {
@@ -2536,8 +3075,10 @@ impl Manager {
         };
         // We await the ack so that in the normal case the participant's locks
         // are released before we return. If the ack times out the participant
-        // may still hold locks; durable abort retries and error reporting are
-        // tracked under issue #54.
+        // may still hold locks, and nothing here can tell: `AbortResponse`
+        // carries no outcome and this reply is discarded. Reporting the failure
+        // is issue #54; retrying the abort until it lands is issue #191, which
+        // covers the same gap on the commit side.
         let _ = self
             .send_and_await_reply(
                 addr,
@@ -2995,6 +3536,328 @@ mod tests {
             &x_state(tc).lock,
             crate::runtime::txn::VarLock::Unlocked
         ));
+    }
+
+    /// Helper: service `foo` with `var x = 0` and `def y = x + 1`
+    async fn manager_with_x_and_def_y() -> TestContext {
+        let mut tc = TestContext::new();
+        let decls = vec![
+            Decl::VarDecl {
+                name: tc.x,
+                ty: None,
+                val: Expr::Literal {
+                    val: Value::Int { val: 0 },
+                },
+            },
+            Decl::DefDecl {
+                name: tc.y,
+                ty: None,
+                val: Expr::Binop {
+                    op: crate::ast::BinOp::Add,
+                    expr1: Box::new(Expr::Variable { name: tc.x }),
+                    expr2: Box::new(Expr::Literal {
+                        val: Value::Int { val: 1 },
+                    }),
+                },
+                is_pub: true,
+            },
+        ];
+        tc.manager.create_service(tc.foo, decls).await.unwrap();
+        tc
+    }
+
+    /// Statement `x = x + n`
+    fn incr_x(tc: &TestContext, n: i32) -> ActionStmt {
+        ActionStmt::Assign {
+            name: tc.x,
+            expr: Expr::Binop {
+                op: crate::ast::BinOp::Add,
+                expr1: Box::new(Expr::Variable { name: tc.x }),
+                expr2: Box::new(Expr::Literal {
+                    val: Value::Int { val: n },
+                }),
+            },
+        }
+    }
+
+    /// Statement `assert(<sym> == n)`
+    fn assert_eq_stmt(sym: Symbol, n: i32) -> ActionStmt {
+        ActionStmt::Assert(
+            Expr::Binop {
+                op: crate::ast::BinOp::Eq,
+                expr1: Box::new(Expr::Variable { name: sym }),
+                expr2: Box::new(Expr::Literal {
+                    val: Value::Int { val: n },
+                }),
+            },
+            "derived value is stale".to_string(),
+        )
+    }
+
+    /// A wait-die abort raised on a participant must still be a wait-die abort
+    /// once it has crossed the wire.
+    ///
+    /// Errors travel as `Display` text, and `execute_action_with_txn` retries
+    /// `WaitDieAbort` and nothing else, so flattening the reply to
+    /// `LocalDispatchFailed` would turn ordinary lock contention into a
+    /// terminal failure. This walks the round trip: the participant's error,
+    /// serialized the way the reply does it, then rebuilt on the originator.
+    #[tokio::test]
+    async fn test_remote_wait_die_survives_the_round_trip() {
+        let mut tc = manager_with_x_and_def_y().await;
+
+        // An older transaction holds `x` exclusively.
+        let older = TxnId {
+            timestamp: 1,
+            node_id: 1,
+            iteration: 0,
+        };
+        tc.manager
+            .services
+            .get_mut(&tc.foo)
+            .unwrap()
+            .vars
+            .get_mut(&tc.x)
+            .unwrap()
+            .lock = crate::runtime::txn::VarLock::WriteLocked(older);
+
+        // A younger transaction reads it as a participant would: wait-die says die.
+        let younger = TxnId::new(tc.manager.node_id);
+        let err = tc
+            .manager
+            .remote_read_participant(tc.foo, tc.x, younger)
+            .await
+            .expect_err("a younger transaction must die against an older holder");
+        assert!(matches!(err, EvalError::WaitDieAbort(_)));
+
+        // This is exactly what the reply carries and what the originator gets.
+        let on_the_wire = err.to_string();
+        let rebuilt = Manager::remote_error(on_the_wire);
+        assert!(
+            matches!(rebuilt, EvalError::WaitDieAbort(_)),
+            "the originator must see a retryable wait-die abort, not a terminal dispatch failure"
+        );
+    }
+
+    /// A wait-die abort must read the same after any number of hops.
+    ///
+    /// `Display` writes `WAIT_DIE_DISPLAY_PREFIX`, and the reply carries that
+    /// text, so rebuilding the variant from the whole reply stores the prefix
+    /// inside the payload and prints it twice. Every further hop -- a retry
+    /// exhausted on the originator, or a node in the middle forwarding the
+    /// failure on -- adds another copy, so the message a `@test` reports grows
+    /// a prefix per node it passed through.
+    #[tokio::test]
+    async fn test_remote_wait_die_prefix_is_not_repeated_per_hop() {
+        let original = EvalError::WaitDieAbort("transaction died contending for 'x'".to_string());
+        let expected = original.to_string();
+
+        let mut text = expected.clone();
+        for hop in 1..=3 {
+            text = Manager::remote_error(text).to_string();
+            assert_eq!(
+                text, expected,
+                "after {hop} hop(s) the message must still read as one wait-die abort"
+            );
+        }
+    }
+
+    /// A remote failure that merely mentions wait-die must stay a failure.
+    ///
+    /// The reply carries `Display` text, so the prefix `WaitDieAbort` writes is
+    /// the only thing that marks a lock conflict. Error messages quote user
+    /// input -- an assertion carries its own source text, so a program that
+    /// compares against the phrase produces one -- and accepting the phrase
+    /// anywhere would send `execute_action_with_txn` through the whole wait-die
+    /// retry budget and then report a lock conflict that never happened,
+    /// instead of the assertion that actually failed.
+    #[tokio::test]
+    async fn test_remote_error_matches_the_wait_die_prefix_not_the_phrase() {
+        let mut tc = TestContext::new();
+
+        // `assert` carries the source text of its condition, so this is the
+        // message a real program produces, not a hand-built string.
+        let stmt = ActionStmt::Assert(
+            Expr::Literal {
+                val: Value::Bool { val: false },
+            },
+            "note == \"Wait-die abort: seen in the log\"".to_string(),
+        );
+        let on_the_wire = match execute(&stmt, &[], &mut tc.manager, tc.foo, None).await {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a false assertion must fail"),
+        };
+        assert!(
+            on_the_wire.contains("Wait-die abort"),
+            "this test is only meaningful if the message mentions the phrase, got: {on_the_wire}"
+        );
+        assert!(
+            matches!(
+                Manager::remote_error(on_the_wire),
+                EvalError::LocalDispatchFailed(_)
+            ),
+            "a failure that only quotes the phrase must stay terminal, not become retryable"
+        );
+    }
+
+    /// Refreshing after a remote action must only touch the services that
+    /// action actually wrote, not every remote service in scope.
+    ///
+    /// These recomputations read over the network and their failures abort the
+    /// transaction, so pulling in unrelated remotes would couple every
+    /// distributed action to the availability of services it never used.
+    #[tokio::test]
+    async fn test_refresh_is_scoped_to_touched_services() {
+        let mut tc = TestContext::new();
+        let reachable = tc.manager.interner.insert("reachable");
+        let dead = tc.manager.interner.insert("dead");
+        let holder = tc.manager.interner.insert("holder");
+        let gp = tc.manager.interner.insert("gp");
+        let gy = tc.manager.interner.insert("gy");
+        let za = tc.manager.interner.insert("za");
+        let zb = tc.manager.interner.insert("zb");
+
+        let leaf = |name: Symbol, member: Symbol| {
+            vec![
+                Decl::VarDecl {
+                    name,
+                    ty: None,
+                    val: Expr::Literal {
+                        val: Value::Int { val: 1 },
+                    },
+                },
+                Decl::DefDecl {
+                    name: member,
+                    ty: None,
+                    val: Expr::Variable { name },
+                    is_pub: true,
+                },
+            ]
+        };
+        tc.manager
+            .create_service(reachable, leaf(tc.x, gp))
+            .await
+            .unwrap();
+        tc.manager
+            .create_service(dead, leaf(tc.y, gy))
+            .await
+            .unwrap();
+
+        // One def over each of the two services.
+        tc.manager
+            .create_service(
+                holder,
+                vec![
+                    Decl::DefDecl {
+                        name: za,
+                        ty: None,
+                        val: Expr::MemberAccess {
+                            service_name: reachable,
+                            member_name: gp,
+                        },
+                        is_pub: true,
+                    },
+                    Decl::DefDecl {
+                        name: zb,
+                        ty: None,
+                        val: Expr::MemberAccess {
+                            service_name: dead,
+                            member_name: gy,
+                        },
+                        is_pub: true,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        // `dead` now lives on a node that is not there; there is no network
+        // layer at all, so any read of it fails.
+        tc.manager.remote_services.insert(
+            dead,
+            crate::net::Address::new("/ip4/127.0.0.1/tcp/1/p2p/12D3KooWTest"),
+        );
+
+        // An action touched only `reachable`.
+        let mut txn = Transaction::new(TxnId::new(tc.manager.node_id));
+        txn.remote_writes.insert(reachable);
+
+        tc.manager
+            .refresh_remote_cross_deps_in_txn(&mut txn)
+            .await
+            .expect("an action on one service must not drag in an unrelated remote");
+    }
+
+    /// Recomputing a def must restore whatever reactive cache was already
+    /// active, not clear it.
+    ///
+    /// Evaluation can await a remote read, and `send_and_await_reply` pumps
+    /// network events while it waits, so an inbound `Update` re-enters
+    /// `recompute_def` through `handle_update` in the middle of an outer
+    /// recompute. Clearing the cache on the way out would leave the suspended
+    /// outer evaluation resolving member accesses against nothing.
+    #[tokio::test]
+    async fn test_recompute_def_restores_an_active_reactive_cache() {
+        let mut tc = manager_with_x_and_def_y().await;
+        let other_svc = tc.manager.interner.insert("other_svc");
+        let other_member = tc.manager.interner.insert("other_member");
+
+        // Stand in for an outer recompute that is suspended at an await with
+        // its own cross-service deps installed.
+        let outer: HashMap<(Symbol, Symbol), Value> =
+            [((other_svc, other_member), Value::Int { val: 7 })]
+                .into_iter()
+                .collect();
+        tc.manager.reactive_cache = Some(outer.clone());
+
+        tc.manager.recompute_def(tc.foo, tc.y).await;
+
+        assert_eq!(
+            tc.manager.reactive_cache,
+            Some(outer),
+            "a nested recompute must hand the outer cache back untouched"
+        );
+    }
+
+    /// A `def` is a cached terminal value refreshed by propagation, but a
+    /// transaction still has to see its own writes reflected in it: writing
+    /// `x` and then reading `def y = x + 1` in the same action must observe
+    /// the new `y`. This is what `@test` blocks rely on, since the whole
+    /// block runs as one transaction.
+    #[tokio::test]
+    async fn test_txn_sees_own_writes_through_def() {
+        let mut tc = manager_with_x_and_def_y().await;
+        let stmts = vec![
+            assert_eq_stmt(tc.y, 1),
+            incr_x(&tc, 1),
+            assert_eq_stmt(tc.y, 2),
+            incr_x(&tc, 1),
+            assert_eq_stmt(tc.y, 3),
+        ];
+        tc.manager.execute_action(tc.foo, &stmts).await.unwrap();
+
+        // ...and the committed value agrees with what the transaction saw
+        let y = tc.manager.lookup(tc.y, tc.foo, None).await.unwrap();
+        assert_eq!(y, Value::Int { val: 3 });
+    }
+
+    /// In-transaction def refresh is buffered like any other write: an
+    /// aborted transaction must not leave a recomputed def behind.
+    #[tokio::test]
+    async fn test_aborted_txn_leaves_def_unchanged() {
+        let mut tc = manager_with_x_and_def_y().await;
+        let stmts = vec![
+            incr_x(&tc, 41),
+            assert_eq_stmt(tc.y, 42),
+            // Fails, aborting the transaction
+            assert_eq_stmt(tc.x, 999),
+        ];
+        assert!(tc.manager.execute_action(tc.foo, &stmts).await.is_err());
+
+        let x = tc.manager.lookup(tc.x, tc.foo, None).await.unwrap();
+        let y = tc.manager.lookup(tc.y, tc.foo, None).await.unwrap();
+        assert_eq!(x, Value::Int { val: 0 });
+        assert_eq!(y, Value::Int { val: 1 });
     }
 
     #[tokio::test]
@@ -3585,6 +4448,188 @@ mod tests {
         assert!(tc.manager.wait_queue.is_empty());
     }
 
+    /// The freed-key queue holds only keys something is actually parked on.
+    ///
+    /// `freed_awaiting_wake` exists for one purpose: to wake requests parked
+    /// behind a lock a failed transaction just released. A key nothing is
+    /// waiting on has nothing to wake, so queueing it is not just wasted work
+    /// -- on a node that never parks anything it is an entry that is never
+    /// drained. A CLI client is exactly that node: it serves a `LockRequest`
+    /// inline from `dispatch_network_events` while awaiting some other reply,
+    /// so it can reach the discard path, but it has no dispatcher and never
+    /// parks, so it has no loop that would ever drain the queue.
+    #[tokio::test]
+    async fn test_freed_keys_are_queued_only_when_something_is_parked_on_them() {
+        let mut tc = manager_with_x_and_def_y().await;
+        let key = WaitKey::Member(tc.manager.service_net_id_for_name(tc.foo), tc.x);
+
+        // Locks `x`, then fails terminally, so `x` is released either way.
+        let stmts = vec![
+            incr_x(&tc, 1),
+            ActionStmt::Assert(
+                Expr::Literal {
+                    val: Value::Bool { val: false },
+                },
+                "always fails".to_string(),
+            ),
+        ];
+
+        let tid = TxnId::new(tc.manager.node_id);
+        tc.manager
+            .execute_action_participant(tc.foo, &stmts, &[], tid)
+            .await
+            .expect_err("the assertion fails the action");
+        assert!(
+            tc.manager.take_freed_awaiting_wake().is_empty(),
+            "nothing is parked on `x`, so its release has nothing to wake and must \
+             not leave an entry behind on a node that never drains one"
+        );
+
+        // With a waiter, the same failure reports the key.
+        tc.manager.park_request_key(
+            key.clone(),
+            ParkedRequest::Lookup {
+                request_id: 1,
+                reply_to: String::new(),
+                service: tc.foo,
+                member: tc.x,
+                tid: TxnId::new(tc.manager.node_id),
+            },
+        );
+        let tid = TxnId::new(tc.manager.node_id);
+        tc.manager
+            .execute_action_participant(tc.foo, &stmts, &[], tid)
+            .await
+            .expect_err("the assertion fails the action");
+        assert!(
+            tc.manager.take_freed_awaiting_wake().contains(&key),
+            "a request is parked on `x`, so releasing it must be reported for waking"
+        );
+    }
+
+    /// A service with two independent vars, for contention tests that need one
+    /// lock taken and another blocked.
+    async fn manager_with_a_and_x() -> TestContext {
+        let mut tc = TestContext::new();
+        let a = tc.manager.interner.insert("a");
+        let decls = vec![
+            Decl::VarDecl {
+                name: a,
+                ty: None,
+                val: Expr::Literal {
+                    val: Value::Int { val: 0 },
+                },
+            },
+            Decl::VarDecl {
+                name: tc.x,
+                ty: None,
+                val: Expr::Literal {
+                    val: Value::Int { val: 0 },
+                },
+            },
+        ];
+        tc.manager.create_service(tc.foo, decls).await.unwrap();
+        tc
+    }
+
+    /// Every lock an originator transaction releases has to be reported for
+    /// waking, on the ordinary path as much as the failing one.
+    ///
+    /// `execute_action_with_txn` releases its locks in two places -- once when
+    /// it retries or gives up under wait-die, once when it finishes -- and a
+    /// request parked behind one of those keys is only ever re-dispatched by
+    /// the loop draining `take_freed_awaiting_wake`. Dropping the key set at
+    /// either site leaves that request waiting on a lock nobody holds.
+    #[tokio::test]
+    async fn test_originator_reports_locks_released_on_success() {
+        let mut tc = manager_with_x_and_def_y().await;
+        let key = WaitKey::Member(tc.manager.service_net_id_for_name(tc.foo), tc.x);
+        tc.manager.park_request_key(
+            key.clone(),
+            ParkedRequest::Lookup {
+                request_id: 1,
+                reply_to: String::new(),
+                service: tc.foo,
+                member: tc.x,
+                tid: TxnId::new(tc.manager.node_id),
+            },
+        );
+
+        tc.manager
+            .execute_action(tc.foo, &[incr_x(&tc, 1)])
+            .await
+            .expect("an uncontended write commits");
+
+        assert!(
+            tc.manager.take_freed_awaiting_wake().contains(&key),
+            "the committed transaction released its write lock on `x`, so the \
+             request parked on it must be reported for waking"
+        );
+    }
+
+    /// The same for the wait-die retry path, which releases everything the
+    /// attempt had locked before running the transaction again.
+    #[tokio::test]
+    async fn test_originator_reports_locks_released_when_it_gives_up() {
+        let mut tc = manager_with_a_and_x().await;
+        let a = tc.manager.interner.insert("a");
+        let sid = tc.manager.service_net_id_for_name(tc.foo);
+
+        // A younger transaction holds `x`, so an older writer waits on it.
+        let younger = TxnId {
+            timestamp: u128::MAX,
+            node_id: tc.manager.node_id,
+            iteration: 0,
+        };
+        tc.manager
+            .services
+            .get_mut(&tc.foo)
+            .unwrap()
+            .vars
+            .get_mut(&tc.x)
+            .unwrap()
+            .lock = crate::runtime::txn::VarLock::WriteLocked(younger);
+
+        // Someone is parked on `a`, which the transaction locks before it
+        // contends on `x`.
+        let key_a = WaitKey::Member(sid, a);
+        tc.manager.park_request_key(
+            key_a.clone(),
+            ParkedRequest::Lookup {
+                request_id: 1,
+                reply_to: String::new(),
+                service: tc.foo,
+                member: a,
+                tid: TxnId::new(tc.manager.node_id),
+            },
+        );
+
+        let stmts = vec![
+            ActionStmt::Assign {
+                name: a,
+                expr: Expr::Literal {
+                    val: Value::Int { val: 1 },
+                },
+            },
+            ActionStmt::Assign {
+                name: tc.x,
+                expr: Expr::Literal {
+                    val: Value::Int { val: 2 },
+                },
+            },
+        ];
+        tc.manager
+            .execute_action(tc.foo, &stmts)
+            .await
+            .expect_err("`x` is held for the whole run, so the retries are exhausted");
+
+        assert!(
+            tc.manager.take_freed_awaiting_wake().contains(&key_a),
+            "each attempt released the lock it had taken on `a`, so the request \
+             parked on it must be reported for waking"
+        );
+    }
+
     #[tokio::test]
     async fn test_wait_die_parked_request_resumes_after_release() {
         // Wait-die end to end (single node, no network): an older
@@ -3662,8 +4707,11 @@ mod tests {
             },
         );
 
-        // The younger holder aborts, freeing `x`
-        let freed = tc.manager.abort_participant(&younger).await;
+        // The younger holder aborts, freeing `x`. The keys it released reach
+        // the caller through `take_freed_awaiting_wake`, the single channel
+        // every discarded transaction reports on.
+        tc.manager.abort_participant(&younger).await;
+        let freed = tc.manager.take_freed_awaiting_wake();
         assert!(matches!(
             tc.manager
                 .services

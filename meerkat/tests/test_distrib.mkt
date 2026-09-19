@@ -1,7 +1,7 @@
 import s1 // remotely linked via command-line parameter
 
 service s2 {
-    pub def mul_y = fn n => s1.y * n;
+    pub def mul_y = fn (n:int) => s1.y * n;
 }
 
 @test(s2) {

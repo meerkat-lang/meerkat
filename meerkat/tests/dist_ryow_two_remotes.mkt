@@ -1,0 +1,14 @@
+import ryow_a
+import ryow_b
+
+service two_rem {
+    pub def z = ryow_a.x + ryow_b.y;
+}
+
+@test(two_rem) {
+    assert(z == 4);
+    do ryow_a.bump_a;
+    assert(z == 14);
+    do ryow_b.bump_b;
+    assert(z == 114);
+}

@@ -315,6 +315,21 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
 /// lock holder (wait-die), park it on the contended variable's queue to be
 /// re-run when that lock frees.
 async fn run_and_reply_or_park(manager: &mut Manager, parked: ParkedRequest) {
+    dispatch_parked(manager, parked).await;
+    // A terminal failure inside any of the three branches discards the
+    // transaction and releases every lock it held. Those keys reach us through
+    // `freed_awaiting_wake` rather than a return value, because the failure
+    // surfaces as an `EvalError`; without this, a request parked behind one of
+    // them waits for the life of the process on a lock nobody holds.
+    let freed = manager.take_freed_awaiting_wake();
+    if !freed.is_empty() {
+        Box::pin(wake_ready(manager, freed)).await;
+    }
+}
+
+/// Run one parked request and send its reply, or re-park it on the key it
+/// contended. Split out so `run_and_reply_or_park` can wake what the run freed.
+async fn dispatch_parked(manager: &mut Manager, parked: ParkedRequest) {
     match parked {
         ParkedRequest::Action {
             request_id,
@@ -342,10 +357,19 @@ async fn run_and_reply_or_park(manager: &mut Manager, parked: ParkedRequest) {
                     );
                 }
                 other => {
+                    // Report what this transaction has touched here and
+                    // downstream, so the originator can refresh the derived
+                    // members that depend on those services.
+                    let touched_services = if other.is_ok() {
+                        manager.touched_services_for_txn(&tid)
+                    } else {
+                        Vec::new()
+                    };
                     let response = MeerkatMessage::ActionResponse {
                         request_id,
                         success: other.is_ok(),
                         error: other.err().map(|e| e.to_string()),
+                        touched_services,
                     };
                     if let Some(net) = manager.network.as_mut() {
                         send_net_msg(net, &reply_to, response).await;
@@ -598,6 +622,15 @@ async fn run_server(
 
     let mut last_keepalive = tokio::time::Instant::now();
     loop {
+        // Locks released by a transaction that failed where no dispatcher could
+        // see it. `dispatch_network_events` serves a `LockRequest` inline while
+        // this node is awaiting some other reply, and a terminal failure there
+        // discards the transaction with nobody to hand the freed keys to.
+        let freed = manager.take_freed_awaiting_wake();
+        if !freed.is_empty() {
+            wake_ready(&mut manager, freed).await;
+        }
+
         // Defer pending service updates so that network events can be processed
         // without blocking the server loop during multi-step updates
         if let Some((request_id, txn_id, source, reply_to, peer)) = pending_updates.pop_front() {
@@ -735,6 +768,7 @@ async fn run_server(
                             request_id,
                             success: false,
                             error: Some(e.to_string()),
+                            touched_services: Vec::new(),
                         };
                         if let Some(net) = manager.network.as_mut() {
                             send_net_msg(net, &reply_to, response).await;
@@ -773,6 +807,7 @@ async fn run_server(
                             request_id,
                             success: false,
                             error: error_msg,
+                            touched_services: Vec::new(),
                         };
                         if let Some(net) = manager.network.as_mut() {
                             send_net_msg(net, &reply_to, response).await;
@@ -805,6 +840,9 @@ async fn run_server(
                                 request_id,
                                 success: result.is_ok(),
                                 error: result.err().map(|e| e.to_string()),
+                                // Standalone action: committed already, so
+                                // there is no shared transaction to report to.
+                                touched_services: Vec::new(),
                             };
                             if let Some(net) = manager.network.as_mut() {
                                 send_net_msg(net, &reply_to, response).await;
@@ -817,29 +855,29 @@ async fn run_server(
                     txn_id,
                     reply_to,
                 } => {
-                    let result = manager.commit_participant(&txn_id).await;
-                    let freed = match &result {
-                        Ok(f) => f.clone(),
-                        Err(_) => HashSet::new(),
-                    };
+                    let committed = manager.commit_participant(&txn_id).await;
                     let response = MeerkatMessage::CommitResponse {
                         request_id,
-                        success: result.is_ok(),
-                        error: result.err().map(|e| e.to_string()),
+                        success: committed.forward_error.is_none(),
+                        error: committed.forward_error.as_ref().map(|e| e.to_string()),
                     };
                     if let Some(net) = manager.network.as_mut() {
                         send_net_msg(net, &reply_to, response).await;
                     }
                     // Wake transactions that were waiting on locks this
-                    // commit just released.
-                    wake_ready(&mut manager, freed).await;
+                    // commit just released -- including when forwarding the
+                    // commit downstream failed, since the local commit still
+                    // freed them and anything parked on them would otherwise
+                    // wait on a lock nobody holds.
+                    wake_ready(&mut manager, committed.freed).await;
                 }
                 MeerkatMessage::Abort {
                     request_id,
                     txn_id,
                     reply_to,
                 } => {
-                    let freed = manager.abort_participant(&txn_id).await;
+                    manager.abort_participant(&txn_id).await;
+                    let freed = manager.take_freed_awaiting_wake();
                     // Drop this transaction's own parked requests so they
                     // do not later wake for an abandoned transaction.
                     manager.purge_parked_txn(&txn_id);
@@ -997,7 +1035,7 @@ async fn run_server(
 async fn run_client(
     full_ast: Vec<Stmt>,
     prog: Vec<Stmt>,
-    input_file: &str,
+    _input_file: &str,
     remote_url_map: std::collections::HashMap<String, String>,
     local: bool,
     watch: bool,
@@ -1045,6 +1083,59 @@ async fn run_client(
     // stable for the life of the process.
     if let Some(addr) = local_full_addr {
         manager.set_local_address(addr);
+    }
+
+    // Services declared by this program itself. An import must not instantiate
+    // these: they are created by the `Stmt::Service` arm below, in program order.
+    let local_service_names: HashSet<_> = prog
+        .iter()
+        .filter_map(|s| match s {
+            Stmt::Service { name, .. } => Some(*name),
+            _ => None,
+        })
+        .collect();
+
+    // Register every configured remote service up front, before any import is
+    // processed. Doing it lazily as each root `Stmt::Import` is reached makes
+    // instantiation order-dependent: an earlier local import walks the whole
+    // unified AST, and a remote service it finds there would be built locally
+    // as a phantom copy. A remote service reached only transitively has no root
+    // `Stmt::Import` at all, so it would never be registered and every read and
+    // action would silently target that local copy instead of the owning node.
+    for (svc, url) in &remote_url_map {
+        let sym = manager.interner.insert(svc);
+        manager
+            .remote_services
+            .insert(sym, Address::new(url.as_str()));
+        println!("Remote service '{}' registered at {}", svc, url);
+    }
+
+    // Instantiate every locally resolved import before any of this program's
+    // own services, in `unified_ast` order (which is dependency order). The
+    // grammar allows `import` to appear after the service that uses it, and
+    // static checks accept that because the unified AST is reordered, so
+    // creating imports only when their `Stmt::Import` is reached would build
+    // `app` before the `dep` it reads and fail with `ServiceNotFound`.
+    let imported: Vec<(_, _)> = manager
+        .unified_ast
+        .iter()
+        .filter_map(|s| match s {
+            Stmt::Service { name, decls } => Some((*name, decls.clone())),
+            _ => None,
+        })
+        .filter(|(name, _)| {
+            !local_service_names.contains(name) && !manager.remote_services.contains_key(name)
+        })
+        .collect();
+    for (name, decls) in imported {
+        if manager.services.contains_key(&name) {
+            continue;
+        }
+        manager
+            .create_service(name, decls)
+            .await
+            .map_err(|e| format!("Import service error: {}", e))?;
+        println!("Imported service '{}'", manager.interner.get(name));
     }
 
     for stmt in &prog {
@@ -1098,37 +1189,10 @@ async fn run_client(
                     println!("@test({}) passed", manager.interner.get(service_name));
                 }
             }
-            &Stmt::Import {
-                ref path,
-                service_name,
-            } => {
-                if let Some(url) = remote_url_map.get(manager.interner.get(service_name)) {
-                    manager
-                        .remote_services
-                        .insert(service_name, Address::new(url.as_str()));
-                    println!(
-                        "Remote service '{}' registered at {}",
-                        manager.interner.get(service_name),
-                        url
-                    );
-                } else {
-                    let base_dir = std::path::Path::new(input_file)
-                        .parent()
-                        .unwrap_or(std::path::Path::new("."));
-                    let import_path = base_dir.join(path);
-                    let import_stmts =
-                        parser::parse_file(import_path.to_str().unwrap(), &mut manager.interner)
-                            .map_err(|e| format!("Import parse error: {}", e))?;
-                    for import_stmt in &import_stmts {
-                        if let &Stmt::Service { name, ref decls } = import_stmt {
-                            manager
-                                .create_service(name, decls.clone())
-                                .await
-                                .map_err(|e| format!("Import service error: {}", e))?;
-                            println!("Imported service '{}'", manager.interner.get(name));
-                        }
-                    }
-                }
+            Stmt::Import { path, .. } => {
+                // Remote services were registered, and local imports
+                // instantiated, before this loop started.
+                let _ = path;
             }
             &Stmt::ActionStmt(_) | &Stmt::Connect { .. } | &Stmt::Watch { .. } => {}
         }
@@ -1569,6 +1633,187 @@ mod tests {
         })
         .expect_err("message-sent replies are not a Listen success");
         assert_eq!(message_sent_err.to_string(), "Unexpected reply");
+    }
+
+    /// Build a single-node `Manager` from source, with no network layer.
+    async fn manager_from(code: &str) -> Manager {
+        let mut interner = Interner::new();
+        let ast = parser::parse_string(code, &mut interner).expect("valid syntax");
+        let mut node = Node::new();
+        node.interner = interner;
+        node.unified_ast = ast.clone();
+        node.static_checks().expect("static checks must pass");
+        let local_ast = node.unified_ast.clone();
+        node.on_manager_startup(true, None, HashMap::new(), &local_ast)
+            .await
+            .expect("service init must succeed")
+    }
+
+    /// A participant action that fails terminally releases its locks, so
+    /// whatever was parked behind them has to be woken.
+    ///
+    /// `execute_action_participant` discards the failed transaction through
+    /// `discard_failed_participant_txn`, which releases every lock it held. A
+    /// request parked on one of those keys is only ever re-dispatched by
+    /// `wake_ready`, so if the failure path does not wake it, it sits in the
+    /// queue for the life of the process waiting on a lock nobody holds.
+    ///
+    /// Reachable from ordinary programs since defs are recomputed inside the
+    /// transaction: a recompute that fails turns an assignment on a participant
+    /// into exactly this terminal error.
+    #[tokio::test]
+    async fn test_terminal_participant_action_wakes_parked_requests() {
+        let mut manager = manager_from(
+            "
+            service foo {
+                var x = 0;
+                pub def d = x + 1;
+            }
+            ",
+        )
+        .await;
+
+        let foo = manager.interner.insert("foo");
+        let x = manager.interner.insert("x");
+        let key = WaitKey::Member(manager.service_net_id_for_name(foo), x);
+
+        // Someone is waiting on `foo.x`.
+        manager.park_request_key(
+            key.clone(),
+            ParkedRequest::Lookup {
+                request_id: 1,
+                reply_to: String::new(),
+                service: foo,
+                member: x,
+                tid: TxnId::new(manager.node_id),
+            },
+        );
+
+        // A composed action that write-locks `foo.x` and then fails terminally.
+        let action_tid = TxnId::new(manager.node_id);
+        let stmts = vec![
+            meerkat_lib::runtime::ast::ActionStmt::Assign {
+                name: x,
+                expr: meerkat_lib::runtime::ast::Expr::Literal {
+                    val: meerkat_lib::runtime::ast::Value::Int { val: 1 },
+                },
+            },
+            meerkat_lib::runtime::ast::ActionStmt::Assert(
+                meerkat_lib::runtime::ast::Expr::Literal {
+                    val: meerkat_lib::runtime::ast::Value::Bool { val: false },
+                },
+                "always fails".to_string(),
+            ),
+        ];
+        run_and_reply_or_park(
+            &mut manager,
+            ParkedRequest::Action {
+                request_id: 2,
+                reply_to: String::new(),
+                service: foo,
+                stmts,
+                env: Vec::new(),
+                tid: action_tid,
+            },
+        )
+        .await;
+
+        assert!(
+            manager
+                .wait_queue
+                .get(&key)
+                .is_none_or(|waiters| waiters.is_empty()),
+            "the failed action released the lock on `foo.x`, so the request parked \
+             on it must have been re-dispatched, not left waiting forever"
+        );
+    }
+
+    /// The same must hold for a read that dies under wait-die.
+    ///
+    /// `remote_read_participant` goes through the same discard path and had the
+    /// same hole, on a different branch of the dispatcher: the transaction had
+    /// already locked one member before the read that killed it, and that lock
+    /// is released without waking what was parked on it.
+    #[tokio::test]
+    async fn test_terminal_participant_lookup_wakes_parked_requests() {
+        use meerkat_lib::runtime::txn::{Transaction, VarLock};
+
+        let mut manager = manager_from(
+            "
+            service foo {
+                var x = 0;
+                var y = 0;
+            }
+            ",
+        )
+        .await;
+
+        let foo = manager.interner.insert("foo");
+        let x = manager.interner.insert("x");
+        let y = manager.interner.insert("y");
+        let foo_sid = manager.service_net_id_for_name(foo);
+
+        // An older transaction holds `foo.x`, so a younger reader dies on it.
+        let older = TxnId {
+            timestamp: 1,
+            node_id: manager.node_id,
+            iteration: 0,
+        };
+        manager
+            .services
+            .get_mut(&foo)
+            .unwrap()
+            .vars
+            .get_mut(&x)
+            .unwrap()
+            .lock = VarLock::WriteLocked(older);
+
+        // Our transaction already holds `foo.y` from an earlier statement.
+        let mine = TxnId::new(manager.node_id);
+        let mut txn = Transaction::new(mine.clone());
+        txn.locked.insert((foo_sid.clone(), y));
+        manager
+            .services
+            .get_mut(&foo)
+            .unwrap()
+            .vars
+            .get_mut(&y)
+            .unwrap()
+            .lock = VarLock::WriteLocked(mine.clone());
+        manager.pending_txns.insert(mine.clone(), txn);
+
+        let key = WaitKey::Member(foo_sid, y);
+        manager.park_request_key(
+            key.clone(),
+            ParkedRequest::Lookup {
+                request_id: 1,
+                reply_to: String::new(),
+                service: foo,
+                member: y,
+                tid: TxnId::new(manager.node_id),
+            },
+        );
+
+        run_and_reply_or_park(
+            &mut manager,
+            ParkedRequest::Lookup {
+                request_id: 2,
+                reply_to: String::new(),
+                service: foo,
+                member: x,
+                tid: mine,
+            },
+        )
+        .await;
+
+        assert!(
+            manager
+                .wait_queue
+                .get(&key)
+                .is_none_or(|waiters| waiters.is_empty()),
+            "the dead read released the lock this transaction held on `foo.y`, so \
+             the request parked on it must have been re-dispatched"
+        );
     }
 
     #[test]

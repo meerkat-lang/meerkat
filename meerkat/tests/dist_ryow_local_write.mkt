@@ -1,0 +1,14 @@
+import ryow_a
+
+service loc_write {
+    var lx = 0;
+    pub def z = lx + ryow_a.x;
+}
+
+@test(loc_write) {
+    assert(z == 2);
+    do ryow_a.bump_a;
+    assert(z == 12);
+    lx = 100;
+    assert(z == 112);
+}

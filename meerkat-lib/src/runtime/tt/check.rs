@@ -591,31 +591,28 @@ impl<'a, 'b> Context<'a, 'b> {
                         }
                     }
                     local_env.bind(params[0].name, (**expected_param).clone());
-                } else {
-                    if let Type::Tuple(ts) = expected_param.as_ref() {
-                        if params.len() != ts.len() {
-                            return Err(Error::InvalidTupleArity);
-                        }
-                        for (i, param) in params.iter().enumerate() {
-                            if let Some(param_ty) = &param.ty {
-                                if param_ty != &ts[i] {
-                                    return Err(Error::TypeMismatch {
-                                        expected: Box::new(ts[i].clone()),
-                                        found: Box::new(param_ty.clone()),
-                                    });
-                                }
-                            }
-                            local_env.bind(param.name, ts[i].clone());
-                        }
-                    } else {
-                        let types = params.iter().map(|_| Type::Unit).collect();
-                        let tuple_ty =
-                            TupleType::new(types).map_err(|_| Error::InvalidTupleArity)?;
-                        return Err(Error::TypeMismatch {
-                            expected: Box::new((**expected_param).clone()),
-                            found: Box::new(Type::Tuple(tuple_ty)),
-                        });
+                } else if let Type::Tuple(ts) = expected_param.as_ref() {
+                    if params.len() != ts.len() {
+                        return Err(Error::InvalidTupleArity);
                     }
+                    for (i, param) in params.iter().enumerate() {
+                        if let Some(param_ty) = &param.ty {
+                            if param_ty != &ts[i] {
+                                return Err(Error::TypeMismatch {
+                                    expected: Box::new(ts[i].clone()),
+                                    found: Box::new(param_ty.clone()),
+                                });
+                            }
+                        }
+                        local_env.bind(param.name, ts[i].clone());
+                    }
+                } else {
+                    let types = params.iter().map(|_| Type::Unit).collect();
+                    let tuple_ty = TupleType::new(types).map_err(|_| Error::InvalidTupleArity)?;
+                    return Err(Error::TypeMismatch {
+                        expected: Box::new((**expected_param).clone()),
+                        found: Box::new(Type::Tuple(tuple_ty)),
+                    });
                 }
                 self.dep_set_stack.push(std::collections::HashSet::new());
                 let actual_ret = self.check_expr(body, expected_ret, &mut local_env)?;
@@ -815,32 +812,30 @@ impl<'a, 'b> Context<'a, 'b> {
                                 type_depth,
                             )?;
                         }
-                    } else {
-                        if let Type::Tuple(ts) = &*param_ty {
-                            if args.len() != ts.len() {
-                                return Err(Error::InvalidTupleArity);
-                            }
-                            let mut actual_arg_types = Vec::new();
-                            for (i, arg) in args.iter().enumerate() {
-                                actual_arg_types.push(self.check_expr(arg, &ts[i], env)?);
-                            }
-                            if actual_arg_types.iter().any(|ty| self.type_has_deps(ty)) {
-                                re_ty_opt = self.contextual_re_inference(
-                                    func,
-                                    &actual_arg_types,
-                                    env,
-                                    type_depth,
-                                )?;
-                            }
-                        } else {
-                            let types = args.iter().map(|_| Type::Unit).collect();
-                            let tuple_ty =
-                                TupleType::new(types).map_err(|_| Error::InvalidTupleArity)?;
-                            return Err(Error::TypeMismatch {
-                                expected: Box::new((*param_ty).clone()),
-                                found: Box::new(Type::Tuple(tuple_ty)),
-                            });
+                    } else if let Type::Tuple(ts) = &*param_ty {
+                        if args.len() != ts.len() {
+                            return Err(Error::InvalidTupleArity);
                         }
+                        let mut actual_arg_types = Vec::new();
+                        for (i, arg) in args.iter().enumerate() {
+                            actual_arg_types.push(self.check_expr(arg, &ts[i], env)?);
+                        }
+                        if actual_arg_types.iter().any(|ty| self.type_has_deps(ty)) {
+                            re_ty_opt = self.contextual_re_inference(
+                                func,
+                                &actual_arg_types,
+                                env,
+                                type_depth,
+                            )?;
+                        }
+                    } else {
+                        let types = args.iter().map(|_| Type::Unit).collect();
+                        let tuple_ty =
+                            TupleType::new(types).map_err(|_| Error::InvalidTupleArity)?;
+                        return Err(Error::TypeMismatch {
+                            expected: Box::new((*param_ty).clone()),
+                            found: Box::new(Type::Tuple(tuple_ty)),
+                        });
                     }
                     if let Some(re_ty) = re_ty_opt {
                         Ok(re_ty)

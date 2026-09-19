@@ -76,6 +76,22 @@ impl ParkedRequest {
     }
 }
 
+/// What a participant's `Commit` left behind: the locks it released, and any
+/// failure forwarding that commit to the nodes below it.
+///
+/// Kept apart rather than folded into a `Result` because the caller needs both
+/// on the failing path. The local commit is irreversible once the writes are
+/// stored, so a forwarding failure is something to report upward, not a reason
+/// to skip waking whatever was parked on the locks this just freed.
+#[derive(Debug, Default)]
+pub struct ParticipantCommit {
+    /// Locks released by this commit, to wake anything parked on them
+    pub freed: HashSet<WaitKey>,
+    /// Failure forwarding `Commit` to a sub-participant, reported to the
+    /// originator once the local commit has finished
+    pub forward_error: Option<EvalError>,
+}
+
 pub struct Manager {
     pub services: HashMap<Symbol, Service>,
     /// Maps service name to remote address (for distributed services)
@@ -2482,32 +2498,44 @@ impl Manager {
     }
 
     /// Participant side: apply and release a held transaction on `Commit`
-    pub async fn commit_participant(&mut self, tid: &TxnId) -> Result<HashSet<WaitKey>, EvalError> {
-        if let Some(txn) = self.pending_txns.remove(tid) {
-            let freed = self.all_locked_keys(&txn);
-            // Same order as the originator in `execute_action_with_txn`, and
-            // for the same reason: a node in the middle of a chain has written
-            // locally *and* composed an action onto a node below it, and
-            // `mid.view = mv + below.member` derives from both. Propagating
-            // first recomputes that def while the node below is still holding
-            // its write buffered, storing a value that was never true and
-            // leaving it there until an asynchronous update happened to repair
-            // it. Store, commit downward, then recompute.
-            self.store_committed_writes(&txn);
-            self.release_locks(&freed, &txn.id);
-            let mut forward_err = None;
-            for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
-                if let Err(e) = self.send_commit(addr, tid).await {
-                    forward_err = Some(e);
-                }
+    ///
+    /// Reports the locks it released and any failure forwarding the commit to a
+    /// node below as two separate things, because they are independent: the
+    /// local commit is done either way, and whatever is parked on those locks
+    /// has to be woken even when the forward failed. Returning only the error
+    /// left parked requests waiting on a lock nothing holds any more.
+    pub async fn commit_participant(&mut self, tid: &TxnId) -> ParticipantCommit {
+        let Some(txn) = self.pending_txns.remove(tid) else {
+            return ParticipantCommit::default();
+        };
+        let freed = self.all_locked_keys(&txn);
+        // Same order as the originator in `execute_action_with_txn`, and
+        // for the same reason: a node in the middle of a chain has written
+        // locally *and* composed an action onto a node below it, and
+        // `mid.view = mv + below.member` derives from both. Propagating
+        // first recomputes that def while the node below is still holding
+        // its write buffered, storing a value that was never true and
+        // leaving it there until an asynchronous update happened to repair
+        // it. Store, commit downward, then recompute.
+        self.store_committed_writes(&txn);
+        let mut forward_error = None;
+        for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
+            if let Err(e) = self.send_commit(addr, tid).await {
+                forward_error = Some(e);
             }
-            self.propagate_committed_writes(&txn).await;
-            match forward_err {
-                Some(e) => Err(e),
-                None => Ok(freed),
-            }
-        } else {
-            Ok(HashSet::new())
+        }
+        self.propagate_committed_writes(&txn).await;
+        // Held until here, like the originator holds its own. Today the event
+        // loop is blocked for the whole of this call, so nothing else on this
+        // node can apply a write in the meantime and the earlier release was
+        // harmless. That stops being true under the background message loop
+        // `send_and_await_reply` is waiting on, at which point releasing before
+        // the nodes below have committed exposes half of a distributed
+        // transaction to whoever takes the lock next.
+        self.release_locks(&freed, &txn.id);
+        ParticipantCommit {
+            freed,
+            forward_error,
         }
     }
 

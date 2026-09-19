@@ -152,11 +152,16 @@ async fn test_participant_commits_sub_participants_before_propagating() {
         }
     };
 
-    tokio::select! {
+    let committed = tokio::select! {
         biased;
-        r = m.commit_participant(&tid) => { r.expect("commit must succeed"); }
+        c = m.commit_participant(&tid) => c,
         _ = rc_loop => unreachable!("the stand-in for rc runs until the commit is done"),
-    }
+    };
+    assert!(
+        committed.forward_error.is_none(),
+        "forwarding the commit to rc must succeed: {:?}",
+        committed.forward_error
+    );
 
     assert_eq!(
         m.services[&mid].vars[&mv].value,

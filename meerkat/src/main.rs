@@ -831,22 +831,21 @@ async fn run_server(
                     txn_id,
                     reply_to,
                 } => {
-                    let result = manager.commit_participant(&txn_id).await;
-                    let freed = match &result {
-                        Ok(f) => f.clone(),
-                        Err(_) => HashSet::new(),
-                    };
+                    let committed = manager.commit_participant(&txn_id).await;
                     let response = MeerkatMessage::CommitResponse {
                         request_id,
-                        success: result.is_ok(),
-                        error: result.err().map(|e| e.to_string()),
+                        success: committed.forward_error.is_none(),
+                        error: committed.forward_error.as_ref().map(|e| e.to_string()),
                     };
                     if let Some(net) = manager.network.as_mut() {
                         send_net_msg(net, &reply_to, response).await;
                     }
                     // Wake transactions that were waiting on locks this
-                    // commit just released.
-                    wake_ready(&mut manager, freed).await;
+                    // commit just released -- including when forwarding the
+                    // commit downstream failed, since the local commit still
+                    // freed them and anything parked on them would otherwise
+                    // wait on a lock nobody holds.
+                    wake_ready(&mut manager, committed.freed).await;
                 }
                 MeerkatMessage::Abort {
                     request_id,

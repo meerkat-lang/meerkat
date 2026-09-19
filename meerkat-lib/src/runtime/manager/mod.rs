@@ -11,7 +11,7 @@ use crate::net::{
     NetworkReply, ServiceNetId,
 };
 use crate::runtime::interner::{Interner, Symbol};
-use crate::runtime::txn::{Transaction, TxnId, VarState, WaitKey};
+use crate::runtime::txn::{ComposedCall, Transaction, TxnId, VarState, WaitKey};
 use std::collections::{HashMap, HashSet};
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
@@ -1974,6 +1974,33 @@ impl Manager {
         }
     }
 
+    /// Remember what a composed action touched, for the rest of the
+    /// transaction: any later recomputation of a def over one of these
+    /// services has to re-read from its owner rather than from a cache. The
+    /// participant reports the transitive set, so a node it composed onto in
+    /// turn is included even though this node never spoke to it.
+    ///
+    /// Shared by the dispatching path and the replay path, which have to agree
+    /// on the scope: a replay that recorded a narrower set than the first
+    /// attempt would refresh fewer defs and read a stale value.
+    fn record_touched_services(
+        touched_services: &[String],
+        slug: &str,
+        interner: &mut Interner,
+        txn: &mut Transaction,
+    ) {
+        if touched_services.is_empty() {
+            // A participant that reports nothing (an older peer, or an action
+            // that named nothing) is covered by assuming the service we
+            // contacted.
+            txn.remote_writes.insert(interner.insert(slug));
+        } else {
+            for name in touched_services {
+                txn.remote_writes.insert(interner.insert(name));
+            }
+        }
+    }
+
     pub async fn remote_action(
         &mut self,
         service_net_id: &ServiceNetId,
@@ -2007,6 +2034,49 @@ impl Manager {
             if let Some(t) = txn.as_deref_mut() {
                 t.participants.insert(addr.clone());
             }
+        }
+
+        // Claim this dispatch's position in the transaction's composed-action
+        // order, and stop here if the position is already filled.
+        //
+        // A participant action that parks is re-dispatched from its first
+        // statement (`dispatch_parked`), so a composed action that already
+        // completed is reached a second time. It must not be sent again: the
+        // other node executed it under this same transaction id and holds its
+        // writes buffered, so a second request applies on top of them --
+        // `do rc.{cv = cv + 1}` would commit `cv` two higher than the program
+        // asked for, with nothing reporting an error. The park rewinds
+        // `composed_seq`, so the replayed dispatch lands on the position the
+        // first attempt used and finds its record here.
+        let replay = match txn.as_deref_mut() {
+            Some(t) if shared_tid.is_some() => {
+                let seq = t.composed_seq;
+                t.composed_seq += 1;
+                t.composed_done.get(&seq).cloned().map(|done| (seq, done))
+            }
+            _ => None,
+        };
+        if let Some((seq, done)) = replay {
+            if &done.target != service_net_id {
+                // The replay reached a different composed action at this
+                // position, so execution did not re-run the way the record
+                // assumes and there is no safe way to line the two up. Failing
+                // is recoverable; guessing would double-apply or skip a write.
+                return Err(EvalError::LocalDispatchFailed(format!(
+                    "replayed transaction dispatched a different composed action at \
+                     position {}: recorded '{}', now '{}'",
+                    seq, done.target.0, service_net_id.0
+                )));
+            }
+            // Re-apply what the completed dispatch contributed, without the
+            // round trip. The refresh has to run again even so: the park rolled
+            // back `read_cache`, so the defs over these services need
+            // recomputing against the participant's buffered state.
+            if let Some(t) = txn.as_deref_mut() {
+                Self::record_touched_services(&done.touched_services, &slug, &mut self.interner, t);
+                self.refresh_remote_cross_deps_in_txn(t).await?;
+            }
+            return Ok(());
         }
 
         let mut net_stmts = Vec::new();
@@ -2056,25 +2126,26 @@ impl Manager {
                     // those writes live in the participant's buffered state, so
                     // refresh those defs before the transaction reads them.
                     if let Some(t) = txn {
-                        // Remember what this action touched for the rest of the
-                        // transaction: any later recomputation of a def over one
-                        // of these services has to re-read from its owner rather
-                        // than from a cache. The participant reports the
-                        // transitive set, so a node it composed onto in turn is
-                        // included even though this node never spoke to it.
                         codec::validate_touched_services(&touched_services)
                             .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?;
-                        if touched_services.is_empty() {
-                            // A participant that reports nothing (an older peer,
-                            // or an action that named nothing) is covered by
-                            // assuming the service we contacted.
-                            t.remote_writes.insert(self.interner.insert(&slug));
-                        } else {
-                            for name in &touched_services {
-                                let sym = self.interner.insert(name);
-                                t.remote_writes.insert(sym);
-                            }
-                        }
+                        // Record the completed dispatch before anything below
+                        // can fail: it has already run on the other node, so a
+                        // later replay must skip it whatever happens next here.
+                        // `composed_seq` was advanced when the position was
+                        // claimed, so the record belongs to the slot before it.
+                        t.composed_done.insert(
+                            t.composed_seq - 1,
+                            ComposedCall {
+                                target: service_net_id.clone(),
+                                touched_services: touched_services.clone(),
+                            },
+                        );
+                        Self::record_touched_services(
+                            &touched_services,
+                            &slug,
+                            &mut self.interner,
+                            t,
+                        );
                         self.refresh_remote_cross_deps_in_txn(t).await?;
                     }
                     Ok(())
@@ -2651,7 +2722,16 @@ impl Manager {
         // function: an originator can compose two actions onto the same
         // participant under one transaction id, and the second must not discard
         // what the first wrote.
+        //
+        // `composed_done` is kept for the same reason the locks are, and
+        // `composed_seq` is rewound rather than kept: a composed action this
+        // run already completed is still done on the other node, and the
+        // replay has to land on the position that recorded it instead of
+        // dispatching afresh. Rewinding to where this run started is what
+        // lines the two up, and it leaves a composed action dispatched after a
+        // successful run to claim a fresh position.
         let buffered_before = (txn.written.clone(), txn.read_cache.clone());
+        let composed_seq_before = txn.composed_seq;
         let mut env: Vec<(Symbol, Value)> = initial_env.to_vec();
         let mut exec_error: Option<EvalError> = None;
         for stmt in stmts {
@@ -2667,6 +2747,7 @@ impl Manager {
         if let Some(e) = exec_error {
             if matches!(e, EvalError::WaitOn(_)) {
                 (txn.written, txn.read_cache) = buffered_before;
+                txn.composed_seq = composed_seq_before;
                 self.pending_txns.insert(tid, txn);
                 return Err(e);
             }

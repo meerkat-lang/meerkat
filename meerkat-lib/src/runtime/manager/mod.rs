@@ -111,6 +111,17 @@ pub struct Manager {
     /// holder (wait-die wait), keyed by the contended WaitKey. Drained
     /// oldest-first when that lock frees on commit or abort.
     pub wait_queue: HashMap<WaitKey, Vec<ParkedRequest>>,
+    /// Locks released by a transaction that failed and was discarded, waiting
+    /// for the event loop to wake whatever is parked on them.
+    ///
+    /// A commit hands its freed keys straight back to the caller, which wakes
+    /// them on the spot. A failure cannot: it is raised deep inside evaluation
+    /// and surfaces as an `EvalError` through call paths that have nowhere to
+    /// put a key set -- and one of them, `handle_lock_request` under
+    /// `dispatch_network_events`, has no dispatcher to hand them to at all.
+    /// Collecting them here instead means no failure path can forget, and the
+    /// loop drains this with `take_freed_awaiting_wake`.
+    freed_awaiting_wake: HashSet<WaitKey>,
     /// This node's canonical, dialable address, set once after the network is
     /// listening. Service identities are derived from it, so they are stable for
     /// the life of the process (never empty-then-populated) and match the URL
@@ -143,6 +154,7 @@ impl Manager {
             node_id: Self::random_node_id(),
             pending_txns: HashMap::new(),
             wait_queue: HashMap::new(),
+            freed_awaiting_wake: HashSet::new(),
             local_address: None,
             local: false,
             interner,
@@ -156,6 +168,12 @@ impl Manager {
     /// Park a request on the wait queue for the contended `WaitKey`
     pub fn park_request_key(&mut self, key: WaitKey, parked: ParkedRequest) {
         self.wait_queue.entry(key).or_default().push(parked);
+    }
+
+    /// Take the locks released by failed transactions since the last call, to
+    /// wake whatever is parked on them. Empty on a quiet loop iteration.
+    pub fn take_freed_awaiting_wake(&mut self) -> HashSet<WaitKey> {
+        std::mem::take(&mut self.freed_awaiting_wake)
     }
 
     /// Park a request on the wait queue for the contended `(service, var)`
@@ -2613,27 +2631,34 @@ impl Manager {
     ///
     /// Releases local locks and aborts all sub-participants before dropping the transaction
     ///
+    /// The freed keys go to `freed_awaiting_wake` rather than to the caller.
+    /// Every path that reaches here does so by raising an `EvalError` back
+    /// through `execute_action_participant`, `remote_read_participant` or
+    /// `handle_lock_request`, none of which has room in its return type for a
+    /// key set -- which is why all three used to drop it, leaving requests
+    /// parked on locks nobody held any more.
+    ///
     /// Args:
     ///     txn (Transaction): The transaction context
-    ///
-    /// Returns:
-    ///     HashSet<WaitKey>: The set of freed wait keys
-    async fn discard_failed_participant_txn(&mut self, txn: Transaction) -> HashSet<WaitKey> {
+    async fn discard_failed_participant_txn(&mut self, txn: Transaction) {
         let freed = self.all_locked_keys(&txn);
         self.release_locks(&freed, &txn.id);
+        self.freed_awaiting_wake.extend(freed);
         for addr in txn.participants {
             self.send_abort(addr, &txn.id).await;
         }
-        freed
     }
 
     /// Participant side: discard and release a held transaction on `Abort`, and
     /// forward the abort down the chain to any sub-participants
-    pub async fn abort_participant(&mut self, tid: &TxnId) -> HashSet<WaitKey> {
+    ///
+    /// The locks it releases go to `freed_awaiting_wake` like every other
+    /// discarded transaction's, so the caller wakes them with
+    /// `take_freed_awaiting_wake` rather than from a return value. One channel
+    /// for every failure path, so a new one cannot quietly drop them.
+    pub async fn abort_participant(&mut self, tid: &TxnId) {
         if let Some(txn) = self.pending_txns.remove(tid) {
-            self.discard_failed_participant_txn(txn).await
-        } else {
-            HashSet::new()
+            self.discard_failed_participant_txn(txn).await;
         }
     }
 
@@ -3024,8 +3049,10 @@ impl Manager {
         };
         // We await the ack so that in the normal case the participant's locks
         // are released before we return. If the ack times out the participant
-        // may still hold locks; durable abort retries and error reporting are
-        // tracked under issue #54.
+        // may still hold locks, and nothing here can tell: `AbortResponse`
+        // carries no outcome and this reply is discarded. Reporting the failure
+        // is issue #54; retrying the abort until it lands is issue #191, which
+        // covers the same gap on the commit side.
         let _ = self
             .send_and_await_reply(
                 addr,
@@ -4472,8 +4499,11 @@ mod tests {
             },
         );
 
-        // The younger holder aborts, freeing `x`
-        let freed = tc.manager.abort_participant(&younger).await;
+        // The younger holder aborts, freeing `x`. The keys it released reach
+        // the caller through `take_freed_awaiting_wake`, the single channel
+        // every discarded transaction reports on.
+        tc.manager.abort_participant(&younger).await;
+        let freed = tc.manager.take_freed_awaiting_wake();
         assert!(matches!(
             tc.manager
                 .services

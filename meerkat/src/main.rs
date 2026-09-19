@@ -342,10 +342,19 @@ async fn run_and_reply_or_park(manager: &mut Manager, parked: ParkedRequest) {
                     );
                 }
                 other => {
+                    // Report what this transaction has touched here and
+                    // downstream, so the originator can refresh the derived
+                    // members that depend on those services.
+                    let touched_services = if other.is_ok() {
+                        manager.touched_services_for_txn(&tid)
+                    } else {
+                        Vec::new()
+                    };
                     let response = MeerkatMessage::ActionResponse {
                         request_id,
                         success: other.is_ok(),
                         error: other.err().map(|e| e.to_string()),
+                        touched_services,
                     };
                     if let Some(net) = manager.network.as_mut() {
                         send_net_msg(net, &reply_to, response).await;
@@ -735,6 +744,7 @@ async fn run_server(
                             request_id,
                             success: false,
                             error: Some(e.to_string()),
+                            touched_services: Vec::new(),
                         };
                         if let Some(net) = manager.network.as_mut() {
                             send_net_msg(net, &reply_to, response).await;
@@ -773,6 +783,7 @@ async fn run_server(
                             request_id,
                             success: false,
                             error: error_msg,
+                            touched_services: Vec::new(),
                         };
                         if let Some(net) = manager.network.as_mut() {
                             send_net_msg(net, &reply_to, response).await;
@@ -805,6 +816,9 @@ async fn run_server(
                                 request_id,
                                 success: result.is_ok(),
                                 error: result.err().map(|e| e.to_string()),
+                                // Standalone action: committed already, so
+                                // there is no shared transaction to report to.
+                                touched_services: Vec::new(),
                             };
                             if let Some(net) = manager.network.as_mut() {
                                 send_net_msg(net, &reply_to, response).await;
@@ -1072,6 +1086,34 @@ async fn run_client(
         println!("Remote service '{}' registered at {}", svc, url);
     }
 
+    // Instantiate every locally resolved import before any of this program's
+    // own services, in `unified_ast` order (which is dependency order). The
+    // grammar allows `import` to appear after the service that uses it, and
+    // static checks accept that because the unified AST is reordered, so
+    // creating imports only when their `Stmt::Import` is reached would build
+    // `app` before the `dep` it reads and fail with `ServiceNotFound`.
+    let imported: Vec<(_, _)> = manager
+        .unified_ast
+        .iter()
+        .filter_map(|s| match s {
+            Stmt::Service { name, decls } => Some((*name, decls.clone())),
+            _ => None,
+        })
+        .filter(|(name, _)| {
+            !local_service_names.contains(name) && !manager.remote_services.contains_key(name)
+        })
+        .collect();
+    for (name, decls) in imported {
+        if manager.services.contains_key(&name) {
+            continue;
+        }
+        manager
+            .create_service(name, decls)
+            .await
+            .map_err(|e| format!("Import service error: {}", e))?;
+        println!("Imported service '{}'", manager.interner.get(name));
+    }
+
     for stmt in &prog {
         match stmt {
             &Stmt::Service { name, ref decls } => {
@@ -1123,40 +1165,10 @@ async fn run_client(
                     println!("@test({}) passed", manager.interner.get(service_name));
                 }
             }
-            &Stmt::Import {
-                ref path,
-                service_name,
-            } => {
-                if manager.remote_services.contains_key(&service_name) {
-                    // Already registered above, before any import ran.
-                } else {
-                    // Locally resolved import. `unified_ast` already holds the
-                    // full transitive closure in dependency order, so take the
-                    // services from there rather than re-parsing just the named
-                    // file: that file may itself import others, and those have
-                    // to exist before it can be instantiated.
-                    let _ = path;
-                    let pending: Vec<(_, _)> = manager
-                        .unified_ast
-                        .iter()
-                        .filter_map(|s| match s {
-                            Stmt::Service { name, decls } => Some((*name, decls.clone())),
-                            _ => None,
-                        })
-                        .filter(|(name, _)| {
-                            !local_service_names.contains(name)
-                                && !manager.services.contains_key(name)
-                                && !manager.remote_services.contains_key(name)
-                        })
-                        .collect();
-                    for (name, decls) in pending {
-                        manager
-                            .create_service(name, decls)
-                            .await
-                            .map_err(|e| format!("Import service error: {}", e))?;
-                        println!("Imported service '{}'", manager.interner.get(name));
-                    }
-                }
+            Stmt::Import { path, .. } => {
+                // Remote services were registered, and local imports
+                // instantiated, before this loop started.
+                let _ = path;
             }
             &Stmt::ActionStmt(_) | &Stmt::Connect { .. } | &Stmt::Watch { .. } => {}
         }

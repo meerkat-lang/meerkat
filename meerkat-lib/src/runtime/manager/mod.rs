@@ -854,6 +854,29 @@ impl Manager {
         Ok(())
     }
 
+    /// Services whose state a prepared (not yet committed) transaction has
+    /// touched on this node, plus everything it touched further downstream.
+    ///
+    /// Reported back to whoever composed the action so they can refresh the
+    /// derived members that depend on those services. The downstream half
+    /// matters: this node may itself have composed actions onto other nodes,
+    /// and the originator has no other way to learn about them.
+    pub fn touched_services_for_txn(&self, tid: &TxnId) -> Vec<String> {
+        let Some(txn) = self.pending_txns.get(tid) else {
+            return Vec::new();
+        };
+        let mut names: HashSet<Symbol> = txn.remote_writes.clone();
+        for (sid, _) in txn.written.keys() {
+            if let Some(name) = self.service_name_for_net_id(sid) {
+                names.insert(name);
+            }
+        }
+        names
+            .into_iter()
+            .map(|n| self.interner.get(n).to_string())
+            .collect()
+    }
+
     /// Originator side: after a composed action has run on another node under
     /// this transaction, refresh the local defs derived from remote state.
     ///
@@ -881,18 +904,22 @@ impl Manager {
         &mut self,
         txn: &mut Transaction,
     ) -> Result<(), EvalError> {
-        // Local defs (never vars -- they are not reactive) with at least one
-        // dependency owned by a service this node does not host.
+        // Local defs (never vars -- they are not reactive) that depend on a
+        // service this transaction has actually touched. Scoping to the
+        // reported set matters for more than efficiency: refreshing every
+        // remote dependency would make a transaction fail whenever some
+        // unrelated service it happens to import is unavailable, since these
+        // recomputations read over the network and their errors abort.
         let mut targets: Vec<(Symbol, Symbol)> = Vec::new();
         for (svc_name, svc) in &self.services {
             for (member_name, deps) in &svc.graphs.cross_deps {
                 if !svc.defs.contains_key(member_name) {
                     continue;
                 }
-                let has_remote_dep = deps.iter().any(|(owner, _)| {
-                    self.remote_services.contains_key(owner) || txn.remote_writes.contains(owner)
-                });
-                if has_remote_dep {
+                if deps
+                    .iter()
+                    .any(|(owner, _)| txn.remote_writes.contains(owner))
+                {
                     targets.push((*svc_name, *member_name));
                 }
             }
@@ -1018,33 +1045,25 @@ impl Manager {
         // awaits a remote read while the cache is installed.
         let outer_cache = self.reactive_cache.take();
         self.reactive_cache = Some(cache);
-        // With nothing live every dependency is seeded, so evaluation never
-        // reaches `lookup` and takes no locks. With something live the
-        // transaction has to be threaded through, so the re-read carries the
-        // shared id (which also registers the owner as a participant).
-        let result = if live.is_empty() {
-            eval(
-                &expr,
-                &env,
-                &mut EvalContext {
-                    manager: self,
-                    service_name: svc,
-                    txn: None,
-                },
-            )
-            .await
-        } else {
-            eval(
-                &expr,
-                &env,
-                &mut EvalContext {
-                    manager: self,
-                    service_name: svc,
-                    txn: Some(txn),
-                },
-            )
-            .await
-        };
+        // Always evaluate under the transaction. Seeding decides what does not
+        // need to be read at all: a same-service dependency resolves from `env`
+        // and a seeded cross-service one from the reactive cache, so neither
+        // reaches `lookup` and neither takes a lock. What is left is exactly
+        // the set that must be read -- a live remote dependency, or a
+        // cross-service one nothing has cached yet -- and those reads belong to
+        // this transaction. Reading them without it would skip the lock and let
+        // a concurrent transaction change a dependency underneath a derived
+        // value that is about to be committed.
+        let result = eval(
+            &expr,
+            &env,
+            &mut EvalContext {
+                manager: self,
+                service_name: svc,
+                txn: Some(txn),
+            },
+        )
+        .await;
         self.reactive_cache = outer_cache;
 
         // Unlike commit-time propagation, which is best-effort because the
@@ -1459,6 +1478,22 @@ impl Manager {
     }
 
     /// shared by remote_lookup and remote_action.
+    /// Rebuild a structured error from a failure a remote node reported.
+    ///
+    /// Errors cross the wire as their `Display` text, so a wait-die abort comes
+    /// back as an ordinary string. Flattening it to `LocalDispatchFailed` turns
+    /// ordinary lock contention into a terminal failure, because
+    /// `execute_action_with_txn` retries `WaitDieAbort` and nothing else. Every
+    /// reply that can carry a lock outcome goes through here so lock requests,
+    /// reads and composed actions all behave the same way.
+    fn remote_error(err: String) -> EvalError {
+        if err.contains("Wait-die abort") {
+            EvalError::WaitDieAbort(err)
+        } else {
+            EvalError::LocalDispatchFailed(err)
+        }
+    }
+
     pub async fn send_and_await_reply(
         &mut self,
         addr: Address,
@@ -1789,7 +1824,7 @@ impl Manager {
                     .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?;
                 Ok(val)
             }
-            MeerkatMessage::LookupError { error, .. } => Err(EvalError::LocalDispatchFailed(error)),
+            MeerkatMessage::LookupError { error, .. } => Err(Self::remote_error(error)),
             MeerkatMessage::Ping { .. }
             | MeerkatMessage::Pong { .. }
             | MeerkatMessage::Announce { .. }
@@ -1921,23 +1956,42 @@ impl Manager {
             .await?;
 
         match reply {
-            MeerkatMessage::ActionResponse { success, error, .. } => {
+            MeerkatMessage::ActionResponse {
+                success,
+                error,
+                touched_services,
+                ..
+            } => {
                 if success {
                     // Participant already registered above. The action may have
                     // written members this node derives local defs from, and
                     // those writes live in the participant's buffered state, so
                     // refresh those defs before the transaction reads them.
                     if let Some(t) = txn {
-                        let remote_svc = self.interner.insert(&slug);
-                        // Remember it for the rest of the transaction: any
-                        // later recomputation of a def over this service has to
-                        // re-read from the owner, not from a cache.
-                        t.remote_writes.insert(remote_svc);
+                        // Remember what this action touched for the rest of the
+                        // transaction: any later recomputation of a def over one
+                        // of these services has to re-read from its owner rather
+                        // than from a cache. The participant reports the
+                        // transitive set, so a node it composed onto in turn is
+                        // included even though this node never spoke to it.
+                        codec::validate_touched_services(&touched_services)
+                            .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?;
+                        if touched_services.is_empty() {
+                            // A participant that reports nothing (an older peer,
+                            // or an action that named nothing) is covered by
+                            // assuming the service we contacted.
+                            t.remote_writes.insert(self.interner.insert(&slug));
+                        } else {
+                            for name in &touched_services {
+                                let sym = self.interner.insert(name);
+                                t.remote_writes.insert(sym);
+                            }
+                        }
                         self.refresh_remote_cross_deps_in_txn(t).await?;
                     }
                     Ok(())
                 } else {
-                    Err(EvalError::LocalDispatchFailed(
+                    Err(Self::remote_error(
                         error.unwrap_or_else(|| "Remote action failed".to_string()),
                     ))
                 }
@@ -2308,10 +2362,17 @@ impl Manager {
             }
 
             if exec_error.is_none() {
-                self.apply_committed_writes(&txn).await;
+                // Store locally, then commit the participants, and only then
+                // recompute what is derived from the writes. Propagating first
+                // would recompute a def over a remote member while that
+                // member's node is still holding the write buffered, storing a
+                // value that was never true and leaving it there until an
+                // asynchronous update happened to repair it.
+                self.store_committed_writes(&txn);
                 for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
                     let _ = self.send_commit(addr, &txn.id).await;
                 }
+                self.propagate_committed_writes(&txn).await;
             } else {
                 for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
                     self.send_abort(addr, &txn.id).await;
@@ -2337,13 +2398,16 @@ impl Manager {
     /// Infallible: once we are applying writes the transaction is
     /// committed, so there is no going back. Propagation is best-effort
     async fn apply_committed_writes(&mut self, txn: &Transaction) {
-        let writes: Vec<((ServiceNetId, Symbol), Value)> = txn
-            .written
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        self.store_committed_writes(txn);
+        self.propagate_committed_writes(txn).await;
+    }
+
+    /// Store a committed transaction's buffered writes into the owning
+    /// services, without propagating. Split out so an originator can commit its
+    /// participants before recomputing anything derived from them.
+    fn store_committed_writes(&mut self, txn: &Transaction) {
         let txn_id = txn.id.clone();
-        for ((sid, var), value) in &writes {
+        for ((sid, var), value) in txn.written.iter() {
             if let Some(service) = self.service_by_net_id_mut(sid) {
                 if let Some(var_state) = service.vars.get_mut(var) {
                     var_state.value = value.clone();
@@ -2351,7 +2415,15 @@ impl Manager {
                 }
             }
         }
-        for ((sid, var), _) in &writes {
+    }
+
+    /// Recompute the members derived from a committed transaction's writes.
+    ///
+    /// Best-effort by the same logic as `apply_committed_writes`: the
+    /// transaction has committed and there is no way back.
+    async fn propagate_committed_writes(&mut self, txn: &Transaction) {
+        let written: Vec<(ServiceNetId, Symbol)> = txn.written.keys().cloned().collect();
+        for (sid, var) in &written {
             if let Some(name) = self.service_name_for_net_id(sid) {
                 self.propagate(name, *var).await;
             }
@@ -2745,10 +2817,7 @@ impl Manager {
                     if !success {
                         let err_str = error
                             .unwrap_or_else(|| "Lock request rejected by remote node".to_string());
-                        if err_str.contains("Wait-die abort") {
-                            return Err(EvalError::WaitDieAbort(err_str));
-                        }
-                        return Err(EvalError::LocalDispatchFailed(err_str));
+                        return Err(Self::remote_error(err_str));
                     }
                 }
                 _ => {
@@ -3352,6 +3421,139 @@ mod tests {
             },
             "derived value is stale".to_string(),
         )
+    }
+
+    /// A wait-die abort raised on a participant must still be a wait-die abort
+    /// once it has crossed the wire.
+    ///
+    /// Errors travel as `Display` text, and `execute_action_with_txn` retries
+    /// `WaitDieAbort` and nothing else, so flattening the reply to
+    /// `LocalDispatchFailed` would turn ordinary lock contention into a
+    /// terminal failure. This walks the round trip: the participant's error,
+    /// serialized the way the reply does it, then rebuilt on the originator.
+    #[tokio::test]
+    async fn test_remote_wait_die_survives_the_round_trip() {
+        let mut tc = manager_with_x_and_def_y().await;
+
+        // An older transaction holds `x` exclusively.
+        let older = TxnId {
+            timestamp: 1,
+            node_id: 1,
+            iteration: 0,
+        };
+        tc.manager
+            .services
+            .get_mut(&tc.foo)
+            .unwrap()
+            .vars
+            .get_mut(&tc.x)
+            .unwrap()
+            .lock = crate::runtime::txn::VarLock::WriteLocked(older);
+
+        // A younger transaction reads it as a participant would: wait-die says die.
+        let younger = TxnId::new(tc.manager.node_id);
+        let err = tc
+            .manager
+            .remote_read_participant(tc.foo, tc.x, younger)
+            .await
+            .expect_err("a younger transaction must die against an older holder");
+        assert!(matches!(err, EvalError::WaitDieAbort(_)));
+
+        // This is exactly what the reply carries and what the originator gets.
+        let on_the_wire = err.to_string();
+        let rebuilt = Manager::remote_error(on_the_wire);
+        assert!(
+            matches!(rebuilt, EvalError::WaitDieAbort(_)),
+            "the originator must see a retryable wait-die abort, not a terminal dispatch failure"
+        );
+    }
+
+    /// Refreshing after a remote action must only touch the services that
+    /// action actually wrote, not every remote service in scope.
+    ///
+    /// These recomputations read over the network and their failures abort the
+    /// transaction, so pulling in unrelated remotes would couple every
+    /// distributed action to the availability of services it never used.
+    #[tokio::test]
+    async fn test_refresh_is_scoped_to_touched_services() {
+        let mut tc = TestContext::new();
+        let reachable = tc.manager.interner.insert("reachable");
+        let dead = tc.manager.interner.insert("dead");
+        let holder = tc.manager.interner.insert("holder");
+        let gp = tc.manager.interner.insert("gp");
+        let gy = tc.manager.interner.insert("gy");
+        let za = tc.manager.interner.insert("za");
+        let zb = tc.manager.interner.insert("zb");
+
+        let leaf = |name: Symbol, member: Symbol| {
+            vec![
+                Decl::VarDecl {
+                    name,
+                    ty: None,
+                    val: Expr::Literal {
+                        val: Value::Int { val: 1 },
+                    },
+                },
+                Decl::DefDecl {
+                    name: member,
+                    ty: None,
+                    val: Expr::Variable { name },
+                    is_pub: true,
+                },
+            ]
+        };
+        tc.manager
+            .create_service(reachable, leaf(tc.x, gp))
+            .await
+            .unwrap();
+        tc.manager
+            .create_service(dead, leaf(tc.y, gy))
+            .await
+            .unwrap();
+
+        // One def over each of the two services.
+        tc.manager
+            .create_service(
+                holder,
+                vec![
+                    Decl::DefDecl {
+                        name: za,
+                        ty: None,
+                        val: Expr::MemberAccess {
+                            service_name: reachable,
+                            member_name: gp,
+                        },
+                        is_pub: true,
+                    },
+                    Decl::DefDecl {
+                        name: zb,
+                        ty: None,
+                        val: Expr::MemberAccess {
+                            service_name: dead,
+                            member_name: gy,
+                        },
+                        is_pub: true,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        // `dead` now lives on a node that is not there; there is no network
+        // layer at all, so any read of it fails.
+        tc.manager.remote_services.insert(
+            dead,
+            crate::net::Address::new("/ip4/127.0.0.1/tcp/1/p2p/12D3KooWTest"),
+        );
+
+        // An action touched only `reachable`.
+        let mut txn = Transaction::new(TxnId::new(tc.manager.node_id));
+        txn.remote_writes.insert(reachable);
+
+        tc.manager
+            .refresh_remote_cross_deps_in_txn(&mut txn)
+            .await
+            .expect("an action on one service must not drag in an unrelated remote");
     }
 
     /// Recomputing a def must restore whatever reactive cache was already

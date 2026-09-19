@@ -159,6 +159,23 @@ pub fn validate_action_request(service: &str) -> Result<()> {
     validate_identifier(service)
 }
 
+/// Validate the service names an `ActionResponse` reports as touched
+///
+/// Args:
+///     services (&[String]): Service names reported by the participant
+///
+/// Returns:
+///     Result<()>: Ok if every name is a valid identifier
+///
+/// Raises:
+///     Error::LimitExceeded: If any identifier is invalid or exceeds max length
+pub fn validate_touched_services(services: &[String]) -> Result<()> {
+    for svc in services {
+        validate_identifier(svc)?;
+    }
+    Ok(())
+}
+
 /// Validate identifier fields of a `LockRequest` message arriving over
 /// the wire
 ///

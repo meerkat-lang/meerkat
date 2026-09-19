@@ -309,3 +309,63 @@ async fn test_remote_dependency_is_never_served_from_dep_cache() {
     let p = m.interner.insert("p");
     assert_eq!(m.lookup(p, q, None).await.unwrap(), Value::Int { val: 1 });
 }
+
+/// Recomputing a def inside a transaction must read its dependencies under
+/// that transaction, so a dependency nobody has cached yet is still locked.
+///
+/// With every dependency seeded, evaluation never reaches `lookup` and no lock
+/// is needed. But a cross-service dependency that is in neither `dep_cache` nor
+/// the transaction's own reads does reach `lookup`, and reading it without the
+/// transaction skips the lock entirely: the value can be changed by a
+/// concurrent transaction while this derived value is being built from it.
+#[tokio::test]
+async fn test_uncached_cross_service_dependency_is_read_under_the_transaction() {
+    let (mut m, tests) = setup(
+        "
+        service p {
+            var n = 1;
+            pub def get_n = n;
+        }
+        service q {
+            var w = 0;
+            pub def mm = w + p.get_n;
+        }
+        @test(q) {
+            w = 5;
+        }
+        ",
+    )
+    .await;
+
+    let p = m.interner.insert("p");
+    let get_n = m.interner.insert("get_n");
+    let q = m.interner.insert("q");
+
+    // An older transaction holds `p.get_n` exclusively. Ours is younger, so
+    // wait-die says it must die rather than read through.
+    let holder = TxnId {
+        timestamp: 1,
+        node_id: 1,
+        iteration: 0,
+    };
+    m.services
+        .get_mut(&p)
+        .unwrap()
+        .vars
+        .get_mut(&get_n)
+        .unwrap()
+        .lock = meerkat_lib::runtime::txn::VarLock::WriteLocked(holder);
+
+    let (svc, stmts) = &tests[0];
+    let err = run_test_block(&mut m, svc, stmts)
+        .await
+        .expect_err("recomputing `mm` must contend for the lock on `p.get_n`, not read through it");
+    assert!(
+        !err.to_string().is_empty(),
+        "expected a lock-contention failure"
+    );
+
+    // Nothing committed.
+    let w = m.interner.insert("w");
+    assert_eq!(m.lookup(w, q, None).await.unwrap(), Value::Int { val: 0 });
+}

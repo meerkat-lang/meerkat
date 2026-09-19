@@ -32,6 +32,15 @@ Expected: @test(s1) passed.
 Each server prints a line "Service URL: <addr>/<service>" on startup. Copy the
 URL for the service you need and pass it to the client with -i.
 
+Note: the dist_s* scenarios below do not run as written. `import s2` asks the
+serving node for `s2.mkt` -- the import path is derived from the service name
+(`Imports::resolve_import`) -- but these fixtures are named dist_s2_server.mkt,
+dist_s2_mid.mkt and dist_s3_server.mkt, so every import fails to resolve. Making
+them runnable means naming each file after the service it declares, which the
+two files declaring `s2` cannot both do in one directory; the ryow_* scenarios
+further down follow that convention and do run. Until the fixtures are
+renamed, the equivalent coverage lives in `cargo test` (see Unit tests below).
+
 1. Start the s2 server (owns w and the bump action):
 
     cargo run -- -f meerkat/tests/dist_s2_server.mkt -s -p 9100
@@ -56,6 +65,7 @@ lock (a subsequent dist_s1_client.mkt run still succeeds, i.e. no leaked lock).
 ## Transitive (three nodes)
 
 Demonstrates s1 -> s2 -> s3, where s2's composed action itself composes s3.
+Subject to the same fixture-naming problem as the two-node scenario above.
 
 1. Start s3:
 
@@ -128,3 +138,10 @@ transaction, `var`s staying non-reactive, a failed recompute aborting) have
 their own suite:
 
     cargo test --test txn_reactivity_test
+
+Commit ordering for a node in the middle of a chain -- it must commit the nodes
+it composed onto before recomputing its own derived members from them -- is
+covered by a test that stands in for the node below with a bare network peer,
+so the ordering is observable rather than timing-dependent:
+
+    cargo test --test participant_commit_order_test

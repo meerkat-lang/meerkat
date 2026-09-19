@@ -1,7 +1,9 @@
 use super::ast::{ActionStmt, Decl, Expr, Stmt, Value};
 use super::env::Env;
 use super::graphs::{analysis::compute_dependencies, free_var::cross_service_deps, ServiceGraphs};
-use super::interpreter::{eval, execute, EvalContext, EvalError, ExecuteEffect};
+use super::interpreter::{
+    eval, execute, EvalContext, EvalError, ExecuteEffect, WAIT_DIE_DISPLAY_PREFIX,
+};
 use super::tt::types::ServiceType;
 use crate::net::network_layer::NetworkLayer;
 use crate::net::{
@@ -1486,8 +1488,15 @@ impl Manager {
     /// `execute_action_with_txn` retries `WaitDieAbort` and nothing else. Every
     /// reply that can carry a lock outcome goes through here so lock requests,
     /// reads and composed actions all behave the same way.
+    ///
+    /// Matched on the prefix `EvalError`'s `Display` writes, not on the phrase
+    /// appearing anywhere. Error text quotes user input -- an assertion carries
+    /// its own source text, for one -- so a message that merely mentions
+    /// wait-die would otherwise be retried through the whole budget and then
+    /// reported as a lock conflict that never happened, hiding the real
+    /// failure.
     fn remote_error(err: String) -> EvalError {
-        if err.contains("Wait-die abort") {
+        if err.starts_with(WAIT_DIE_DISPLAY_PREFIX) {
             EvalError::WaitDieAbort(err)
         } else {
             EvalError::LocalDispatchFailed(err)
@@ -2392,8 +2401,10 @@ impl Manager {
     /// Apply a transaction's buffered writes to the owning services, record
     /// the writing transaction, and propagate to dependent definitions
     ///
-    /// Shared by local commit and by a participant committing on a remote
-    /// `Commit` message
+    /// Only for a transaction with nothing below it to commit first. Both
+    /// commit paths that can have participants (`execute_action_with_txn` and
+    /// `commit_participant`) call the two halves separately so they can commit
+    /// those participants in between; see `store_committed_writes`
     ///
     /// Infallible: once we are applying writes the transaction is
     /// committed, so there is no going back. Propagation is best-effort
@@ -2403,8 +2414,8 @@ impl Manager {
     }
 
     /// Store a committed transaction's buffered writes into the owning
-    /// services, without propagating. Split out so an originator can commit its
-    /// participants before recomputing anything derived from them.
+    /// services, without propagating. Split out so a node can commit the
+    /// participants below it before recomputing anything derived from them.
     fn store_committed_writes(&mut self, txn: &Transaction) {
         let txn_id = txn.id.clone();
         for ((sid, var), value) in txn.written.iter() {
@@ -2474,7 +2485,15 @@ impl Manager {
     pub async fn commit_participant(&mut self, tid: &TxnId) -> Result<HashSet<WaitKey>, EvalError> {
         if let Some(txn) = self.pending_txns.remove(tid) {
             let freed = self.all_locked_keys(&txn);
-            self.apply_committed_writes(&txn).await;
+            // Same order as the originator in `execute_action_with_txn`, and
+            // for the same reason: a node in the middle of a chain has written
+            // locally *and* composed an action onto a node below it, and
+            // `mid.view = mv + below.member` derives from both. Propagating
+            // first recomputes that def while the node below is still holding
+            // its write buffered, storing a value that was never true and
+            // leaving it there until an asynchronous update happened to repair
+            // it. Store, commit downward, then recompute.
+            self.store_committed_writes(&txn);
             self.release_locks(&freed, &txn.id);
             let mut forward_err = None;
             for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
@@ -2482,6 +2501,7 @@ impl Manager {
                     forward_err = Some(e);
                 }
             }
+            self.propagate_committed_writes(&txn).await;
             match forward_err {
                 Some(e) => Err(e),
                 None => Ok(freed),
@@ -3465,6 +3485,44 @@ mod tests {
         assert!(
             matches!(rebuilt, EvalError::WaitDieAbort(_)),
             "the originator must see a retryable wait-die abort, not a terminal dispatch failure"
+        );
+    }
+
+    /// A remote failure that merely mentions wait-die must stay a failure.
+    ///
+    /// The reply carries `Display` text, so the prefix `WaitDieAbort` writes is
+    /// the only thing that marks a lock conflict. Error messages quote user
+    /// input -- an assertion carries its own source text, so a program that
+    /// compares against the phrase produces one -- and accepting the phrase
+    /// anywhere would send `execute_action_with_txn` through the whole wait-die
+    /// retry budget and then report a lock conflict that never happened,
+    /// instead of the assertion that actually failed.
+    #[tokio::test]
+    async fn test_remote_error_matches_the_wait_die_prefix_not_the_phrase() {
+        let mut tc = TestContext::new();
+
+        // `assert` carries the source text of its condition, so this is the
+        // message a real program produces, not a hand-built string.
+        let stmt = ActionStmt::Assert(
+            Expr::Literal {
+                val: Value::Bool { val: false },
+            },
+            "note == \"Wait-die abort: seen in the log\"".to_string(),
+        );
+        let on_the_wire = match execute(&stmt, &[], &mut tc.manager, tc.foo, None).await {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a false assertion must fail"),
+        };
+        assert!(
+            on_the_wire.contains("Wait-die abort"),
+            "this test is only meaningful if the message mentions the phrase, got: {on_the_wire}"
+        );
+        assert!(
+            matches!(
+                Manager::remote_error(on_the_wire),
+                EvalError::LocalDispatchFailed(_)
+            ),
+            "a failure that only quotes the phrase must stay terminal, not become retryable"
         );
     }
 

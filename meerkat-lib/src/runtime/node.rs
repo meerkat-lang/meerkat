@@ -315,6 +315,20 @@ impl Node {
         Ok((imports.finalize(), buffered_events))
     }
 
+    /// Assemble `unified_ast` from a program and its resolved imports.
+    ///
+    /// Imported services come first. `tt::check` walks the unified AST in order
+    /// and tracks initialized members in a single flat set, so a member is only
+    /// usable once its declaration has been checked. A program depends on what
+    /// it imports, never the reverse, so imports-first is the order the checker
+    /// needs; `Imports::finalize` has already ordered the imports among
+    /// themselves. Both entry points that build a unified AST go through here,
+    /// so neither can drift back to appending imports last.
+    fn set_unified_ast(&mut self, local_prog: &[Stmt], imported_ast: Vec<Stmt>) {
+        self.unified_ast = imported_ast;
+        self.unified_ast.extend_from_slice(local_prog);
+    }
+
     /// Orchestrates the network boot sequence and resolves imports
     ///
     /// Args:
@@ -352,8 +366,7 @@ impl Node {
             self.resolve_local_imports(&local_prog, base_dir)?
         };
 
-        self.unified_ast = local_prog.clone();
-        self.unified_ast.extend(imported_ast);
+        self.set_unified_ast(&local_prog, imported_ast);
 
         self.static_checks()?;
 
@@ -420,8 +433,7 @@ impl Node {
             stmts
         };
 
-        self.unified_ast = local_prog;
-        self.unified_ast.extend(imported_ast);
+        self.set_unified_ast(&local_prog, imported_ast);
         Ok(self)
     }
 

@@ -33,6 +33,17 @@ pub struct PendingRequest {
 /// URL, and retry attempt count
 pub type ImportCommand = (NetworkCommand, String, String, u8);
 
+/// One imported file, kept whole so the resolved AST can be emitted in
+/// dependency order rather than in the order replies happened to arrive.
+struct ImportedModule {
+    /// Services this file declares.
+    declares: Vec<Symbol>,
+    /// Services this file imports.
+    imports: Vec<Symbol>,
+    /// The file's parsed statements.
+    stmts: Vec<Stmt>,
+}
+
 /// State machine for resolving module import dependencies
 pub struct Imports<'a> {
     interner: &'a mut Interner,
@@ -40,7 +51,7 @@ pub struct Imports<'a> {
     pending_network: HashMap<MessageId, PendingRequest>,
     pending_services: HashSet<String>,
     remote_url_map: HashMap<String, String>,
-    accumulated_ast: Vec<Stmt>,
+    modules: Vec<ImportedModule>,
     request_counter: u64,
     my_addr: String,
 }
@@ -83,7 +94,7 @@ impl<'a> Imports<'a> {
             pending_network: HashMap::new(),
             pending_services: HashSet::new(),
             remote_url_map,
-            accumulated_ast: Vec::new(),
+            modules: Vec::new(),
             request_counter: 0,
             my_addr: my_addr.to_string(),
         };
@@ -196,7 +207,27 @@ impl<'a> Imports<'a> {
             }
         }
 
-        self.accumulated_ast.extend(parsed_stmts.clone());
+        // Keep the file as a unit. It is appended in arrival order, which is
+        // not a dependency order: a file's own imports are only resolved after
+        // it is recorded, so a dependency always lands *after* its dependent.
+        // `finalize` sorts this out.
+        self.modules.push(ImportedModule {
+            declares: parsed_stmts
+                .iter()
+                .filter_map(|s| match s {
+                    Stmt::Service { name, .. } => Some(*name),
+                    _ => None,
+                })
+                .collect(),
+            imports: parsed_stmts
+                .iter()
+                .filter_map(|s| match s {
+                    Stmt::Import { service_name, .. } => Some(*service_name),
+                    _ => None,
+                })
+                .collect(),
+            stmts: parsed_stmts.clone(),
+        });
 
         let mut new_cmds = Vec::new();
         for stmt in &parsed_stmts {
@@ -322,12 +353,70 @@ impl<'a> Imports<'a> {
         self.pending_services.iter().cloned().collect()
     }
 
-    /// Consumes the Imports state machine and returns resolved AST
+    /// Consumes the Imports state machine and returns the resolved AST in
+    /// dependency order: a module always precedes every module that imports it
+    ///
+    /// `tt::check` walks services in AST order against a single flat set of
+    /// initialized members, so a service is only checkable once everything it
+    /// reads has been declared. Modules are recorded as they arrive, which is
+    /// the reverse of what the checker needs for a transitive chain
+    /// (`main -> a -> b` records `[a, b]`, but `a` reads `b`), so emit them in
+    /// post-order over the import graph instead.
     ///
     /// Returns:
-    ///   `Vec<Stmt>`: Concatenated AST of all imported services
+    ///   `Vec<Stmt>`: Dependency-ordered AST of all imported services
     pub fn finalize(self) -> Vec<Stmt> {
-        self.accumulated_ast
+        // Which module declares each service, so an import edge can be
+        // followed to the module that satisfies it.
+        let mut owner: HashMap<Symbol, usize> = HashMap::new();
+        for (idx, module) in self.modules.iter().enumerate() {
+            for svc in &module.declares {
+                owner.entry(*svc).or_insert(idx);
+            }
+        }
+
+        // Iterative DFS post-order. `done` marks emitted modules; `on_stack`
+        // breaks import cycles, which the type checker reports properly once
+        // it sees the services (better than looping here).
+        let mut ordered: Vec<Stmt> = Vec::new();
+        let mut done = vec![false; self.modules.len()];
+        let mut on_stack = vec![false; self.modules.len()];
+        let mut modules: Vec<Option<Vec<Stmt>>> =
+            self.modules.iter().map(|m| Some(m.stmts.clone())).collect();
+
+        for root in 0..self.modules.len() {
+            if done[root] {
+                continue;
+            }
+            // (module, whether its dependencies have been pushed already)
+            let mut stack: Vec<(usize, bool)> = vec![(root, false)];
+            while let Some((idx, expanded)) = stack.pop() {
+                if done[idx] {
+                    continue;
+                }
+                if expanded {
+                    done[idx] = true;
+                    on_stack[idx] = false;
+                    if let Some(stmts) = modules[idx].take() {
+                        ordered.extend(stmts);
+                    }
+                    continue;
+                }
+                on_stack[idx] = true;
+                stack.push((idx, true));
+                for dep_svc in &self.modules[idx].imports {
+                    // An import naming a service declared by the root program
+                    // has no module here; nothing to order against.
+                    if let Some(&dep) = owner.get(dep_svc) {
+                        if dep != idx && !done[dep] && !on_stack[dep] {
+                            stack.push((dep, false));
+                        }
+                    }
+                }
+            }
+        }
+
+        ordered
     }
 
     /// Private helper to resolve a single import symbol

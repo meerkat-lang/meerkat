@@ -119,6 +119,14 @@ pub enum MeerkatMessage {
         request_id: u64,
         success: bool,
         error: Option<String>,
+        /// Services whose state this action left buffered under the shared
+        /// transaction, including those written by actions it composed onto
+        /// further nodes. The originator needs the transitive set to know which
+        /// of its derived members are now out of date; nothing else on its side
+        /// can tell it that a node it never contacted was written.
+        /// Empty for a standalone (non-transactional) action.
+        #[serde(default)]
+        touched_services: Vec<String>,
     },
 
     /// Tell a participant node to commit a distributed transaction:

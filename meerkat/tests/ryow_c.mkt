@@ -1,0 +1,5 @@
+service ryow_c {
+    var cv = 1;
+    pub def gc = cv;
+    pub def bump_c = action { cv = cv + 10; };
+}

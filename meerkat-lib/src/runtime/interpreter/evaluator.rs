@@ -19,6 +19,14 @@ pub enum EvalError {
     RuntimeError(String),
 }
 
+/// The text `EvalError::WaitDieAbort` displays itself with.
+///
+/// Errors cross the wire as `Display` text, so this prefix is the only thing
+/// that tells the originator a remote failure was a lock conflict rather than a
+/// terminal error (see `Manager::remote_error`). Kept next to the `Display`
+/// impl so the two cannot drift apart.
+pub const WAIT_DIE_DISPLAY_PREFIX: &str = "Wait-die abort: ";
+
 /// Implement the `Display` trait for the `EvalError` type
 ///
 /// This prints user-facing descriptions of evaluator errors
@@ -38,7 +46,7 @@ impl std::fmt::Display for EvalError {
             EvalError::LocalDispatchFailed(s) => write!(f, "Local dispatch failed: {}", s),
             EvalError::RemoteDispatchFailed(s) => write!(f, "Remote dispatch failed: {}", s),
             EvalError::NotImplemented => write!(f, "Not implemented"),
-            EvalError::WaitDieAbort(s) => write!(f, "Wait-die abort: {}", s),
+            EvalError::WaitDieAbort(s) => write!(f, "{}{}", WAIT_DIE_DISPLAY_PREFIX, s),
             EvalError::WaitOn(key) => {
                 write!(f, "Wait-die wait on {:?}", key)
             }

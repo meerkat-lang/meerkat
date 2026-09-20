@@ -1,0 +1,9 @@
+import ryow_c
+
+service ryow_mid {
+    var mv = 0;
+    pub def bump_mid = action {
+        mv = mv + 1;
+        do ryow_c.bump_c;
+    };
+}

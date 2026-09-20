@@ -301,3 +301,230 @@ fn test_imports_max_imported_services_limit() {
     let res = imports.on_recv_source("service Overflow {}", "Overflow", Path::new(""));
     assert!(res.is_err());
 }
+
+/// The unified AST must place imported services before the importing program.
+///
+/// `tt::check` walks services in AST order and tracks initialized members in a
+/// single flat set, so a member is only usable once its declaration has been
+/// checked. An importing service depends on what it imports, never the reverse.
+/// When imports were appended after the local program instead, any imported
+/// service deriving a `def` from its own `var` failed static checks with a
+/// spurious `IllegalDependency` -- which blocked every distributed CLI test.
+#[tokio::test]
+async fn test_imports_precede_local_program_in_unified_ast() {
+    let dir = std::env::temp_dir().join(format!(
+        "meerkat_import_order_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // The imported service derives a `def` from its own `var`.
+    std::fs::write(
+        dir.join("dep.mkt"),
+        "service dep {\n    var x = 0;\n    pub def y = x + 1;\n}\n",
+    )
+    .unwrap();
+    let main_path = dir.join("main.mkt");
+    std::fs::write(
+        &main_path,
+        "import dep\n\nservice app {\n    pub def z = dep.y * 2;\n}\n",
+    )
+    .unwrap();
+
+    let mut node = meerkat_lib::runtime::Node::new();
+    node.resolve_imports_with_net(main_path.to_str().unwrap(), HashMap::new(), None, None)
+        .await
+        .expect("imports resolve");
+
+    let order: Vec<String> = node
+        .unified_ast
+        .iter()
+        .filter_map(|s| match s {
+            Stmt::Service { name, .. } => Some(node.interner.get(*name).to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        order,
+        vec!["dep".to_string(), "app".to_string()],
+        "imported services must be checked before the program that imports them"
+    );
+
+    // And the ordering is what makes the static checks pass.
+    node.static_checks()
+        .expect("a def over the imported service's own var must type check");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Transitive imports must be ordered by dependency, not by arrival.
+///
+/// `Imports::on_recv_source` records a file before resolving that file's own
+/// imports, so `main -> a -> b` accumulates as `[a, b]` -- the reverse of what
+/// `tt::check` needs when `a` reads `b.y`. `finalize` therefore emits modules
+/// in post-order over the import graph.
+#[tokio::test]
+async fn test_transitive_imports_are_dependency_ordered() {
+    let dir = std::env::temp_dir().join(format!(
+        "meerkat_nested_import_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // b is the leaf; a reads b; main reads a.
+    std::fs::write(
+        dir.join("b.mkt"),
+        "service b {\n    var n = 1;\n    pub def y = n + 1;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("a.mkt"),
+        "import b\n\nservice a {\n    pub def q = b.y * 10;\n}\n",
+    )
+    .unwrap();
+    let main_path = dir.join("main.mkt");
+    std::fs::write(
+        &main_path,
+        "import a\n\nservice main_s {\n    pub def r = a.q + 1;\n}\n",
+    )
+    .unwrap();
+
+    let mut node = meerkat_lib::runtime::Node::new();
+    node.resolve_imports_with_net(main_path.to_str().unwrap(), HashMap::new(), None, None)
+        .await
+        .expect("imports resolve");
+
+    let order: Vec<String> = node
+        .unified_ast
+        .iter()
+        .filter_map(|s| match s {
+            Stmt::Service { name, .. } => Some(node.interner.get(*name).to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        order,
+        vec!["b".to_string(), "a".to_string(), "main_s".to_string()],
+        "a transitive dependency must precede the module that imports it"
+    );
+
+    node.static_checks()
+        .expect("a chain of imports must type check in dependency order");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Both entry points that assemble a unified AST must order imports first.
+///
+/// `resolve_imports_with_net` and `on_node_startup` build it separately, and
+/// `run_static_checks_with_imports` runs the checks through the latter. Fixing
+/// only one left the other rejecting the same programs.
+#[tokio::test]
+async fn test_on_node_startup_also_orders_imports_first() {
+    let dir = std::env::temp_dir().join(format!(
+        "meerkat_startup_order_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("dep.mkt"),
+        "service dep {\n    var x = 0;\n    pub def y = x + 1;\n}\n",
+    )
+    .unwrap();
+    let main_path = dir.join("main.mkt");
+    std::fs::write(
+        &main_path,
+        "import dep\n\nservice app {\n    pub def z = dep.y * 2;\n}\n",
+    )
+    .unwrap();
+
+    let mut node = meerkat_lib::runtime::Node::new();
+    let result = node
+        .run_static_checks_with_imports(main_path.to_str().unwrap(), &HashMap::new())
+        .await;
+    std::fs::remove_dir_all(&dir).ok();
+    result.expect("static checks through on_node_startup must accept an imported def over a var");
+}
+
+/// The same ordering must hold when the modules arrive over the network.
+///
+/// Local disk resolution recurses through `on_recv_source`, so the disk test
+/// above already exercises the arrival order indirectly. Over the network the
+/// replies arrive as separate events, which is the case `Imports` was actually
+/// reported for: `main -> a -> b` is recorded as `[a, b]` because a file's own
+/// imports are only resolved once that file has been recorded.
+#[test]
+fn test_network_imports_are_dependency_ordered_regardless_of_arrival() {
+    let mut node = meerkat_lib::runtime::node::Node::new();
+    let sym_a = node.interner.insert("a");
+    let base_ast = vec![
+        Stmt::Import {
+            path: "a.mkt".to_string(),
+            service_name: sym_a,
+        },
+        Stmt::Service {
+            name: node.interner.insert("main_s"),
+            decls: Vec::new(),
+        },
+    ];
+
+    let mut remote_map = HashMap::new();
+    remote_map.insert("a".to_string(), "/ip4/127.0.0.1/tcp/9000".to_string());
+    remote_map.insert("b".to_string(), "/ip4/127.0.0.1/tcp/9001".to_string());
+
+    let (mut imports, initial_cmds) = Imports::new(
+        &mut node.interner,
+        remote_map,
+        &base_ast,
+        Path::new(""),
+        "/ip4/127.0.0.1/tcp/8000/p2p/peer_main",
+    )
+    .expect("Imports::new success");
+    assert_eq!(initial_cmds.len(), 1, "only `a` is known at the start");
+
+    // `a` arrives first and only then reveals that it imports `b`.
+    let cmds = imports
+        .on_recv_source(
+            "import b\n\nservice a {\n    pub def q = b.y * 10;\n}",
+            "a",
+            Path::new(""),
+        )
+        .expect("on_recv_source a");
+    assert_eq!(cmds.len(), 1, "receiving `a` must request `b`");
+
+    let cmds = imports
+        .on_recv_source(
+            "service b {\n    var n = 1;\n    pub def y = n + 1;\n}",
+            "b",
+            Path::new(""),
+        )
+        .expect("on_recv_source b");
+    assert!(cmds.is_empty());
+    assert!(imports.is_done());
+
+    let order: Vec<String> = imports
+        .finalize()
+        .iter()
+        .filter_map(|s| match s {
+            Stmt::Service { name, .. } => Some(node.interner.get(*name).to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        order,
+        vec!["b".to_string(), "a".to_string()],
+        "`b` arrived second but `a` reads it, so it must be checked first"
+    );
+}

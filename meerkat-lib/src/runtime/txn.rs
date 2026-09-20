@@ -262,6 +262,54 @@ pub struct Transaction {
     /// Remote nodes that joined this transaction (executed a composed action
     /// under this `id` and are holding locks or buffered writes until commit or abort)
     pub participants: HashSet<Address>,
+    /// Remote services this transaction has run a composed action on, so their
+    /// members may hold writes that are buffered on the owning node and visible
+    /// nowhere else.
+    ///
+    /// A member of one of these services can only be read correctly by going
+    /// back to its owner under this transaction's id: `remote_lookup`
+    /// deliberately does not cache on the requesting side, so neither
+    /// `read_cache` here nor a service's `dep_cache` ever holds the buffered
+    /// value. Recomputing a derived member therefore has to treat every one of
+    /// these services as live, not just the one most recently acted on.
+    ///
+    /// This over-approximates: an action that only reads still lands here. The
+    /// cost is a redundant read, never a wrong value.
+    pub remote_writes: HashSet<Symbol>,
+    /// Composed actions already executed under this transaction, keyed by
+    /// their position in this transaction's dispatch order, holding the
+    /// `ServiceNetId` dispatched to and the touched services reported back.
+    ///
+    /// A participant action that parks on a lock is re-dispatched from its
+    /// first statement, so everything before the park point runs again. A
+    /// composed action cannot simply run again: it already executed on the
+    /// other node under this same id and its writes are buffered there, where
+    /// this node cannot roll them back. Re-sending it applies a second time on
+    /// top of that. Recording the ones that completed lets the replay skip the
+    /// round trip and reuse what the first attempt learned.
+    pub composed_done: HashMap<u64, ComposedCall>,
+    /// Position the next composed action dispatched under this transaction
+    /// takes in `composed_done`.
+    ///
+    /// Rewound to where the parked run started, so a replayed dispatch lands
+    /// on the same position it had the first time and finds its record. A
+    /// composed action dispatched *after* the parked run succeeds takes a
+    /// fresh position, so two separate actions onto the same node under one
+    /// transaction stay distinct.
+    pub composed_seq: u64,
+}
+
+/// A composed action that completed under a transaction: where it was sent,
+/// and what the participant reported touching.
+#[derive(Debug, Clone)]
+pub struct ComposedCall {
+    /// The node and service it was dispatched to. Checked on replay: if the
+    /// re-run reaches a different target at this position, execution did not
+    /// replay the way the record assumes and reusing it would be a guess.
+    pub target: ServiceNetId,
+    /// `touched_services` from the participant's response, replayed into
+    /// `remote_writes` so the refresh that follows sees the same scope.
+    pub touched_services: Vec<String>,
 }
 
 impl Transaction {
@@ -274,6 +322,9 @@ impl Transaction {
             read_cache: HashMap::new(),
             written: HashMap::new(),
             participants: HashSet::new(),
+            remote_writes: HashSet::new(),
+            composed_done: HashMap::new(),
+            composed_seq: 0,
         }
     }
 }

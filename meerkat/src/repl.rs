@@ -52,6 +52,30 @@ async fn check_watches(watches: &mut [Watch], manager: &mut Manager, repl_env: &
     }
 }
 
+async fn init_network(manager: &mut Manager) -> Result<(), Box<dyn std::error::Error>> {
+    let mut n =
+        meerkat_lib::net::NetworkActor::new(meerkat_lib::net::types::NodeType::Server).await?;
+    let listen_ip = if manager.local {
+        "127.0.0.1"
+    } else {
+        "0.0.0.0"
+    };
+    let listen_addr = meerkat_lib::net::Address::new(format!("/ip4/{}/tcp/0", listen_ip));
+    let reply = n
+        .handle_command(meerkat_lib::net::NetworkCommand::Listen { addr: listen_addr })
+        .await;
+    let addr = crate::listen_success_addr(reply)?;
+    let node_ip = manager.get_node_ip();
+    let peer_id = n.local_peer_id();
+    let addr_str = addr
+        .0
+        .replace("0.0.0.0", &node_ip)
+        .replace("127.0.0.1", &node_ip);
+    manager.network = Some(n);
+    manager.set_local_address(format!("{}/p2p/{}", addr_str, peer_id));
+    Ok(())
+}
+
 /// Run the `REPL` loop for interactive execution
 pub async fn run_repl(
     mut manager: Manager,
@@ -79,28 +103,12 @@ pub async fn run_repl(
         println!();
     }
 
-    if !remote_url_map.is_empty() {
-        let mut n = meerkat_lib::net::NetworkActor::new(meerkat_lib::net::types::NodeType::Server)
-            .await
-            .map_err(|e| format!("Network error: {}", e))?;
-        let listen_ip = if manager.local {
-            "127.0.0.1"
-        } else {
-            "0.0.0.0"
-        };
-        let listen_addr = meerkat_lib::net::Address::new(format!("/ip4/{}/tcp/0", listen_ip));
-        let reply = n
-            .handle_command(meerkat_lib::net::NetworkCommand::Listen { addr: listen_addr })
-            .await;
-        let addr = crate::listen_success_addr(reply)?;
-        let node_ip = manager.get_node_ip();
-        let peer_id = n.local_peer_id();
-        let addr_str = addr
-            .0
-            .replace("0.0.0.0", &node_ip)
-            .replace("127.0.0.1", &node_ip);
-        manager.network = Some(n);
-        manager.set_local_address(format!("{}/p2p/{}", addr_str, peer_id));
+    //Have the repl always try to start with network support for the sake of url imports
+    if let Err(e) = init_network(&mut manager).await {
+        if is_tty {
+            println!("Network error: {}", e);
+            println!("Continuing without network support. Some features may not work.");
+        }
     }
 
     let mut repl_env: Vec<(Symbol, Value)> = Vec::new();
@@ -217,29 +225,45 @@ async fn exec_stmt(
                 manager.interner.get(service_name)
             )))
         }
-        Stmt::Import { path, service_name } => {
+        Stmt::Import {
+            path,
+            service_name,
+            is_explicit,
+        } => {
             let svc_name_str = manager.interner.get(service_name);
-            if let Some(url) = remote_url_map.get(svc_name_str) {
+            // Check if it was imported before (command line args)
+            let address = if is_explicit && path.starts_with("/ip4/") {
+                Some(&path)
+            } else if !is_explicit {
+                remote_url_map.get(svc_name_str)
+            } else {
+                None
+            };
+            if let Some(url) = address {
                 manager
                     .remote_services
                     .insert(service_name, meerkat_lib::net::Address::new(url.as_str()));
-                return Ok(Some(format!(
+                Ok(Some(format!(
                     "Remote service '{}' registered at {}.",
                     svc_name_str, url
-                )));
-            }
-            let import_stmts = parse_file(&path, &mut manager.interner)
-                .map_err(|e| format!("Import '{}': {}", path, e))?;
-            let mut loaded = Vec::new();
-            for s in import_stmts {
-                if let Stmt::Service { name, decls } = s {
-                    manager.create_service(name, decls).await.map_err(|e| {
-                        format!("Imported service '{}': {}", manager.interner.get(name), e)
-                    })?;
-                    loaded.push(manager.interner.get(name).to_string());
+                )))
+            } else {
+                // Check if this is a file or an ip address
+                let import_stmts = parse_file(&path, &mut manager.interner)
+                    .map_err(|e| format!("Import '{}': {}", path, e))?;
+                let mut loaded = Vec::new();
+                for s in import_stmts {
+                    if let Stmt::Service { name, decls } = s {
+                        manager.create_service(name, decls).await.map_err(|e| {
+                            format!("Imported service '{}': {}", manager.interner.get(name), e)
+                        })?;
+                        loaded.push(manager.interner.get(name).to_string());
+                    }
+                    // ignore all that are not Imports
+                    // TODO: What if it is an import? We should recurse on that.
                 }
+                Ok(Some(format!("Imported service(s): {}.", loaded.join(", "))))
             }
-            Ok(Some(format!("Imported service(s): {}.", loaded.join(", "))))
         }
         Stmt::ActionStmt(action_stmt) => {
             let effect = execute(&action_stmt, repl_env, manager, Symbol::empty(), None)

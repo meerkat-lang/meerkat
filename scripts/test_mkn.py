@@ -491,6 +491,7 @@ def integration_tests():
         ("dense_mesh",                make_mkn_test(f"{IDIR}/imports/dense_mesh/dense_mesh.json")),
         ("action_cross_node",         make_mkn_test(f"{IDIR}/imports/action/action.json")),
         ("file_imports",              make_mkn_test(f"{IDIR}/imports/file_imports/file_imports.json")),
+        ("explicit_file_imports",     make_mkn_test(f"{IDIR}/imports/explicit_file_imports/explicit_file_imports.json")),
         ("mixed_imports",             make_mkn_test(f"{IDIR}/imports/mixed_imports/mixed_imports.json")),
         ("rejection_imports",         make_mkn_test(f"{IDIR}/imports/rejection_imports/rejection_imports.json",
                                                     expect_fail="Unknown identifier")),

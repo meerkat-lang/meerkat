@@ -1101,16 +1101,21 @@ async fn run_client(
             &Stmt::Import {
                 ref path,
                 service_name,
+                is_explicit,
             } => {
-                if let Some(url) = remote_url_map.get(manager.interner.get(service_name)) {
+                let svc_name_str = manager.interner.get(service_name);
+                let address = if is_explicit && path.starts_with("/ip4/") {
+                    Some(path)
+                } else if !is_explicit {
+                    remote_url_map.get(svc_name_str)
+                } else {
+                    None
+                };
+                if let Some(url) = address {
                     manager
                         .remote_services
                         .insert(service_name, Address::new(url.as_str()));
-                    println!(
-                        "Remote service '{}' registered at {}",
-                        manager.interner.get(service_name),
-                        url
-                    );
+                    println!("Remote service '{}' registered at {}", svc_name_str, url);
                 } else {
                     let base_dir = std::path::Path::new(input_file)
                         .parent()

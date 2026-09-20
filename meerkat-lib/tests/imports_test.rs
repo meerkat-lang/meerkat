@@ -7,6 +7,7 @@ use meerkat_lib::runtime::ast::Stmt;
 use meerkat_lib::runtime::imports::Imports;
 use meerkat_lib::runtime::interner::Interner;
 use meerkat_lib::runtime::parser;
+use meerkat_lib::runtime::Node;
 
 /// Test that local imports resolve transitively and circular
 /// imports terminate cleanly without infinite recursion
@@ -19,6 +20,7 @@ fn test_imports_local_resolution_and_circular_prevention() {
         Stmt::Import {
             path: "B.mkt".to_string(),
             service_name: sym_b,
+            is_explicit: false,
         },
         Stmt::Service {
             name: sym_a,
@@ -44,7 +46,7 @@ fn test_imports_local_resolution_and_circular_prevention() {
     // Feed remote source B which imports A (circular dependency)
     let source_b = "import A\nservice B {\n    var y = 0;\n}";
     let new_cmds = imports
-        .on_recv_source(source_b, "B", Path::new(""))
+        .on_recv_source(source_b, "B", Path::new(""), false)
         .expect("on_recv_source success");
 
     // Since A was registered in base_ast, circular import for A generates 0 new commands
@@ -72,6 +74,7 @@ fn test_imports_remote_queuing() {
     let base_ast = vec![Stmt::Import {
         path: "B.mkt".to_string(),
         service_name: sym_b,
+        is_explicit: false,
     }];
 
     let mut remote_map = HashMap::new();
@@ -117,6 +120,7 @@ fn test_imports_on_recv_source_merges_and_resolves() {
     let base_ast = vec![Stmt::Import {
         path: "B.mkt".to_string(),
         service_name: sym_b,
+        is_explicit: false,
     }];
 
     let mut remote_map = HashMap::new();
@@ -133,7 +137,7 @@ fn test_imports_on_recv_source_merges_and_resolves() {
 
     let remote_source = "service B {\n    pub def count = 100;\n}";
     let new_cmds = imports
-        .on_recv_source(remote_source, "B", Path::new(""))
+        .on_recv_source(remote_source, "B", Path::new(""), false)
         .expect("on_recv_source success");
 
     assert!(new_cmds.is_empty());
@@ -198,6 +202,7 @@ fn test_imports_pending_cleanup() {
     let base_ast = vec![Stmt::Import {
         path: "B.mkt".to_string(),
         service_name: sym_b,
+        is_explicit: false,
     }];
 
     let mut remote_map = HashMap::new();
@@ -238,7 +243,7 @@ fn test_imports_pending_cleanup() {
     // Receive source for B; should remove pending entries for B
     let remote_source = "service B {\n    pub def count = 100;\n}";
     let _ = imports
-        .on_recv_source(remote_source, "B", Path::new(""))
+        .on_recv_source(remote_source, "B", Path::new(""), false)
         .expect("on_recv_source success");
 
     // Stale failure notifications for completed service yield None
@@ -294,10 +299,46 @@ fn test_imports_max_imported_services_limit() {
     // Populate visited_services up to the limit
     for i in 0..MAX_IMPORTED_SERVICES {
         let src = format!("service S{} {{}}", i);
-        let _ = imports.on_recv_source(&src, &format!("S{}", i), Path::new(""));
+        let _ = imports.on_recv_source(&src, &format!("S{}", i), Path::new(""), false);
     }
 
     // Exceeding the limit should return Error::LimitExceeded
-    let res = imports.on_recv_source("service Overflow {}", "Overflow", Path::new(""));
+    let res = imports.on_recv_source("service Overflow {}", "Overflow", Path::new(""), false);
     assert!(res.is_err());
+}
+
+//Verify that that imports with an explicit file path are properly resolved
+#[tokio::test]
+async fn test_explicit_path_import() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "meerkat-explicit-import-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let main_path = temp_dir.join("main.mkt");
+    let imported_path = temp_dir.join("import.mkt");
+    std::fs::write(&imported_path, "service s2 { var x = 7; }").unwrap();
+    std::fs::write(
+        &main_path,
+        "import s2 from \"./import.mkt\"\nservice s1 { pub def y = s2.x; }",
+    )
+    .unwrap();
+    let mut node = Node::new();
+    let ss2 = node.interner.insert("s2");
+    let _ = node
+        .on_node_startup(main_path.to_str().unwrap(), HashMap::new(), None)
+        .await
+        .unwrap();
+    let imported_s2 = node.unified_ast.iter().any(|stmt| {
+        if let Stmt::Service { name, .. } = stmt {
+            *name == ss2
+        } else {
+            false
+        }
+    });
+    assert!(imported_s2, "Import of service s2 was not resolved.");
 }

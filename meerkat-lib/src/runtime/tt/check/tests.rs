@@ -956,6 +956,7 @@ fn test_import_member_access_resolves_with_unified_ast() {
         Stmt::Import {
             path: "na".to_string(),
             service_name: remote_svc,
+            is_explicit: false,
         },
         Stmt::Service {
             name: remote_svc,

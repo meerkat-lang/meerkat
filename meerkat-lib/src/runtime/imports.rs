@@ -207,8 +207,12 @@ impl<'a> Imports<'a> {
                                 decls: decls.to_vec(),
                             });
                             Some(())
-                        } else { None } // This is not the service you are looking for.
-                    } else { None } // This is not a service.
+                        } else {
+                            None
+                        } // This is not the service you are looking for.
+                    } else {
+                        None
+                    } // This is not a service.
                 })
                 .is_some();
 
@@ -379,13 +383,14 @@ impl<'a> Imports<'a> {
         let service_name = self.interner.get(service_sym).to_string();
 
         if !self.my_addr.is_empty() {
-            if let Some(target_url) = if is_explicit {
+            let address = if is_explicit && path.starts_with("/ip4/") {
                 Some(path.clone())
-            } else {
+            } else if !is_explicit {
                 self.remote_url_map.get(&service_name).cloned()
-            } 
-            
-            {
+            } else {
+                None
+            };
+            if let Some(target_url) = address {
                 self.pending_services.insert(service_name.clone());
                 self.request_counter = self.request_counter.wrapping_add(1);
                 let req_id = self.request_counter;

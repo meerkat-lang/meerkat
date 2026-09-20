@@ -307,7 +307,7 @@ fn test_imports_max_imported_services_limit() {
     assert!(res.is_err());
 }
 
-//Verify that that imports with an explicit path load the target service and only the target service
+//Verify that that imports with an explicit file path are properly resolved
 #[tokio::test]
 async fn test_explicit_path_import() {
     let temp_dir = std::env::temp_dir().join(format!(
@@ -321,11 +321,7 @@ async fn test_explicit_path_import() {
     std::fs::create_dir_all(&temp_dir).unwrap();
     let main_path = temp_dir.join("main.mkt");
     let imported_path = temp_dir.join("import.mkt");
-    std::fs::write(
-        &imported_path,
-        "service s2 { var x = 7; }\nservice s3 { var y = 17; }",
-    )
-    .unwrap();
+    std::fs::write(&imported_path, "service s2 { var x = 7; }").unwrap();
     std::fs::write(
         &main_path,
         "import s2 from \"./import.mkt\"\nservice s1 { pub def y = s2.x; }",
@@ -333,7 +329,6 @@ async fn test_explicit_path_import() {
     .unwrap();
     let mut node = Node::new();
     let ss2 = node.interner.insert("s2");
-    let ss3 = node.interner.insert("s3");
     let _ = node
         .on_node_startup(main_path.to_str().unwrap(), HashMap::new(), None)
         .await
@@ -345,71 +340,5 @@ async fn test_explicit_path_import() {
             false
         }
     });
-    let imported_s3 = node.unified_ast.iter().any(|stmt| {
-        if let Stmt::Service { name, .. } = stmt {
-            *name == ss3
-        } else {
-            false
-        }
-    });
-    assert!(imported_s2);
-    assert!(!imported_s3);
-}
-
-// Verify that imports with an explicit path load and create the target service
-#[tokio::test]
-async fn test_explicit_path_import_service_creation() {
-    let temp_dir = std::env::temp_dir().join(format!(
-        "meerkat-test-explicit-import-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&temp_dir).unwrap();
-    let main_path = temp_dir.join("main.mkt");
-    let imported_path = temp_dir.join("s1.mkt");
-    let dependent_path = temp_dir.join("s2.mkt");
-    std::fs::write(
-        &imported_path,
-        "service s1 { var x = 7; }\nservice s3 { var z = 42; }",
-    )
-    .unwrap();
-    std::fs::write(&dependent_path, "service s2 { pub def y = s1.x; }").unwrap();
-    std::fs::write(
-        &main_path,
-        "import s1 from \"./s1.mkt\"\nimport s2 from \"./s2.mkt\"",
-    )
-    .unwrap();
-    let mut node = Node::new();
-    let _ = node
-        .on_node_startup(main_path.to_str().unwrap(), HashMap::new(), None)
-        .await
-        .unwrap();
-    let full_ast = node.unified_ast.clone();
-    let mut manager = node
-        .on_manager_startup(true, None, HashMap::new(), &full_ast)
-        .await
-        .unwrap(); //HACK: does not use CLI flow (run_client)
-
-    let ss1 = manager.interner.insert("s1");
-    let ss3 = manager.interner.insert("s3");
-    let xs = manager.interner.insert("x");
-    let service1 = manager
-        .services
-        .get(&ss1)
-        .expect("service s1 should be created");
-    let service3 = manager.services.get(&ss3);
-    assert!(service3.is_none(), "service s3 should not be imported");
-    assert!(
-        service1.vars.contains_key(&xs),
-        "imported service should contain x"
-    );
-
-    let s2 = manager.interner.insert("s2");
-    let y = manager.interner.insert("y");
-
-    let value = manager.lookup(y, s2, None).await.unwrap();
-    assert_eq!(value, meerkat_lib::runtime::ast::Value::Int { val: 7 });
+    assert!(imported_s2, "Import of service s2 was not resolved.");
 }

@@ -18,6 +18,13 @@ across separate network nodes. A transaction starting in one service can run
 an action defined in another service atomically; commit and abort coordinate
 across all participating nodes.
 
+**Transaction boundaries in `@test`.** As of PR #201 an `@test` block is not
+itself a transaction. Each `do` in the block runs in its own transaction and
+commits before the next statement, while a `do` nested inside an action that is
+already in a transaction joins that one. So a composed action is still atomic
+end to end, but an assertion written at the `@test` level runs *after* the
+preceding `do` has committed and cannot roll it back.
+
 ## Local (single process)
 
 test_cross_service_txn.mkt runs two services in one process where an action in
@@ -49,9 +56,13 @@ URL for the service you need and pass it to the client with -i.
 
    Expected: @test(chk) passed (reads s2.w_val == 15).
 
-dist_abort.mkt is the same composition but with a failing assertion; running it
-against the s2 server shows the transaction aborting and releasing the remote
-lock (a subsequent dist_s1_client.mkt run still succeeds, i.e. no leaked lock).
+dist_abort.mkt is the same composition but with a failing assertion. As of PR
+#201 that assertion no longer aborts the composition: it sits at the `@test`
+level, after `do update_both`, so the composed action -- including the remote
+write to s2 -- commits before the assertion runs and fails. Nothing is left to
+abort, and s2.w stays at 15. To exercise abort and remote lock release, the
+failing assertion has to move *inside* the action, into the same transaction as
+the write.
 
 ## Transitive (three nodes)
 
@@ -80,6 +91,8 @@ Demonstrates s1 -> s2 -> s3, where s2's composed action itself composes s3.
 ## Unit tests
 
 The transaction logic also has Rust unit tests (cross-service composition,
-read-then-write lock upgrade, nested do, no partial writes on failure):
+read-then-write lock upgrade, nested do, and no partial writes on failure
+*within a single transaction* -- note that an `@test` block is not one, so a
+`do` that already committed survives a later failure in the block):
 
     cargo test --lib

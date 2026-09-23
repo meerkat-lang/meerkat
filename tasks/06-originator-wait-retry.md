@@ -19,10 +19,11 @@ lock frees. An **originator has no queue to park in** — it is driving its own
 transaction on its own stack. On `main`, `WaitOn` simply escapes
 `execute_action_with_txn` and fails the action.
 
-Two visible consequences: an `@test` block (which runs as a single transaction)
-fails outright over contention that was supposed to resolve itself, and it is
-reported as a raw `WaitKey` — a `ServiceNetId` plus an interned `Symbol`, whose
-`Debug` form means nothing outside the node that produced it.
+Two visible consequences: a `do` in an `@test` block (as of PR #201 each one runs
+as its own transaction) fails outright over contention that was supposed to
+resolve itself, and it is reported as a raw `WaitKey` — a `ServiceNetId` plus an
+interned `Symbol`, whose `Debug` form means nothing outside the node that
+produced it.
 
 This is a latent bug today, since any cross-service read inside a transaction
 can produce it. Task 12 makes it a routine path, which is why it lands first.

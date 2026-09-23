@@ -209,7 +209,7 @@ async fn exec_stmt(
             stmts,
         } => {
             manager
-                .execute_action(service_name, &stmts)
+                .execute_test_block(service_name, &stmts)
                 .await
                 .map_err(|e| format!("@test({}): {}", manager.interner.get(service_name), e))?;
             Ok(Some(format!(

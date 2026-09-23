@@ -1,9 +1,7 @@
 use super::ast::{ActionStmt, Decl, Expr, Stmt, Value};
 use super::env::Env;
 use super::graphs::{analysis::compute_dependencies, free_var::cross_service_deps, ServiceGraphs};
-use super::interpreter::{
-    eval, execute, EvalContext, EvalError, ExecuteEffect, WAIT_DIE_DISPLAY_PREFIX,
-};
+use super::interpreter::{eval, execute_seq, EvalContext, EvalError, WAIT_DIE_DISPLAY_PREFIX};
 use super::tt::types::ServiceType;
 use crate::net::network_layer::NetworkLayer;
 use crate::net::{
@@ -2135,17 +2133,9 @@ impl Manager {
             let mut txn = Transaction::new(txn_id.clone());
 
             let mut env: Vec<(Symbol, Value)> = initial_env.to_vec();
-            let mut exec_error: Option<EvalError> = None;
-            for stmt in stmts {
-                match execute(stmt, &env, self, service_name, Some(&mut txn)).await {
-                    Ok(ExecuteEffect::Binding(name, val)) => env.push((name, val)),
-                    Ok(_) => {}
-                    Err(e) => {
-                        exec_error = Some(e);
-                        break;
-                    }
-                }
-            }
+            let exec_error = execute_seq(stmts, &mut env, self, service_name, Some(&mut txn))
+                .await
+                .err();
 
             if matches!(exec_error, Some(EvalError::WaitDieAbort(_))) {
                 for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
@@ -2228,17 +2218,9 @@ impl Manager {
             .remove(&tid)
             .unwrap_or_else(|| Transaction::new(tid.clone()));
         let mut env: Vec<(Symbol, Value)> = initial_env.to_vec();
-        let mut exec_error: Option<EvalError> = None;
-        for stmt in stmts {
-            match execute(stmt, &env, self, service_name, Some(&mut txn)).await {
-                Ok(ExecuteEffect::Binding(name, val)) => env.push((name, val)),
-                Ok(_) => {}
-                Err(e) => {
-                    exec_error = Some(e);
-                    break;
-                }
-            }
-        }
+        let exec_error = execute_seq(stmts, &mut env, self, service_name, Some(&mut txn))
+            .await
+            .err();
         if let Some(e) = exec_error {
             if matches!(e, EvalError::WaitOn(_)) {
                 self.pending_txns.insert(tid, txn);
@@ -2716,6 +2698,26 @@ impl Manager {
         self.execute_action_with_txn(service_name, stmts, initial_env)
             .await
     }
+
+    /// Execute a `@test` block's statements outside any transaction
+    ///
+    /// The block as a whole is not a transaction. Each statement runs against
+    /// committed state, so reads see the latest values and assignments apply
+    /// and propagate immediately rather than being buffered until the end of
+    /// the block. Only `do` statements are transactional, and each one opens a
+    /// fresh transaction of its own (see `executor::execute`).
+    ///
+    /// The first statement to fail ends the block. Because there is no
+    /// enclosing transaction, the effects of the statements that already ran
+    /// -- including any `do` that already committed -- stay in place.
+    pub async fn execute_test_block(
+        &mut self,
+        service_name: Symbol,
+        stmts: &[ActionStmt],
+    ) -> Result<(), EvalError> {
+        let mut env: Vec<(Symbol, Value)> = Vec::new();
+        execute_seq(stmts, &mut env, self, service_name, None).await
+    }
 }
 
 impl Default for Manager {
@@ -2728,6 +2730,7 @@ impl Default for Manager {
 mod tests {
     use super::*;
     use crate::ast::{Decl, Expr, Value};
+    use crate::runtime::interpreter::execute;
 
     // #24: cross_service_deps pulls out exactly the (service, member) symbols
     // referenced via MemberAccess, and nothing for a purely local expression.
@@ -3454,6 +3457,43 @@ mod tests {
         let result = tc.manager.lookup(tc.x, tc.foo, None).await.unwrap();
         // and the lock was released
         assert_eq!(result, Value::Int { val: 1 });
+        assert_x_unlocked(&tc);
+    }
+
+    #[tokio::test]
+    async fn test_test_block_commits_each_do_separately() {
+        // A `@test` block is not itself a transaction: each `do` opens and
+        // commits a transaction of its own, so a failure later in the block
+        // cannot roll back a `do` that already committed. Contrast with
+        // `test_txn_failed_transaction_leaves_no_partial_writes`, where the
+        // whole statement list is one transaction
+        let mut tc = manager_with_x().await;
+        let bump = Expr::Action(vec![ActionStmt::Assign {
+            name: tc.x,
+            expr: Expr::Binop {
+                op: crate::ast::BinOp::Add,
+                expr1: Box::new(Expr::Variable { name: tc.x }),
+                expr2: Box::new(Expr::Literal {
+                    val: Value::Int { val: 1 },
+                }),
+            },
+        }]);
+        let stmts = vec![
+            ActionStmt::Do(bump.clone()),
+            ActionStmt::Do(bump),
+            ActionStmt::Assert(
+                Expr::Literal {
+                    val: Value::Bool { val: false },
+                },
+                "forced failure".to_string(),
+            ),
+        ];
+
+        let result = tc.manager.execute_test_block(tc.foo, &stmts).await;
+
+        assert!(matches!(result, Err(EvalError::AssertionError(_))));
+        // Each `do` committed as it ran, and the failing assert left them be
+        assert_eq!(x_state(&tc).value, Value::Int { val: 2 });
         assert_x_unlocked(&tc);
     }
 

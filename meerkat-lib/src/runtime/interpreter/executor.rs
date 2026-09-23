@@ -14,6 +14,33 @@ pub enum ExecuteEffect {
     ExprValue(Value),
 }
 
+/// Execute a statement list in order, threading `let` bindings through `env`
+///
+/// Every caller that runs a sequence of `ActionStmt`s shares this shape: a
+/// `let` extends the environment seen by the statements after it, any other
+/// statement runs for its effect, and the first error ends the sequence.
+///
+/// Returns at the first error, leaving `env` holding the bindings made before
+/// it. Callers that need that error as a value rather than as an early return
+/// -- the transactional paths, which must still commit or abort before they
+/// return it -- take it with `.await.err()`.
+pub async fn execute_seq(
+    stmts: &[ActionStmt],
+    env: &mut Vec<(Symbol, Value)>,
+    manager: &mut Manager,
+    service_name: Symbol,
+    mut txn: Option<&mut Transaction>,
+) -> Result<(), EvalError> {
+    for stmt in stmts {
+        if let ExecuteEffect::Binding(name, val) =
+            execute(stmt, env, manager, service_name, txn.as_deref_mut()).await?
+        {
+            env.push((name, val));
+        }
+    }
+    Ok(())
+}
+
 #[async_recursion::async_recursion]
 pub async fn execute(
     stmt: &ActionStmt,
@@ -76,14 +103,14 @@ pub async fn execute(
                     match manager.service_name_for_net_id(&service_net_id) {
                         Some(svc_name) => {
                             let mut exec_env = closure_env.clone();
-                            for s in &stmts {
-                                if let ExecuteEffect::Binding(name, val) =
-                                    execute(s, &exec_env, manager, svc_name, txn.as_deref_mut())
-                                        .await?
-                                {
-                                    exec_env.push((name, val));
-                                }
-                            }
+                            execute_seq(
+                                &stmts,
+                                &mut exec_env,
+                                manager,
+                                svc_name,
+                                txn.as_deref_mut(),
+                            )
+                            .await?;
                         }
                         None => {
                             // Ship to its owning node under the shared
@@ -187,13 +214,14 @@ pub async fn execute(
             for elem in elements {
                 loop_env.truncate(base_len);
                 loop_env.push((*var, elem));
-                for s in body {
-                    if let ExecuteEffect::Binding(name, val) =
-                        execute(s, &loop_env, manager, service_name, txn.as_deref_mut()).await?
-                    {
-                        loop_env.push((name, val));
-                    }
-                }
+                execute_seq(
+                    body,
+                    &mut loop_env,
+                    manager,
+                    service_name,
+                    txn.as_deref_mut(),
+                )
+                .await?;
             }
             Ok(ExecuteEffect::None)
         }

@@ -1,9 +1,7 @@
 use super::ast::{ActionStmt, Decl, Expr, Stmt, Value};
 use super::env::Env;
 use super::graphs::{analysis::compute_dependencies, free_var::cross_service_deps, ServiceGraphs};
-use super::interpreter::{
-    eval, execute, EvalContext, EvalError, ExecuteEffect, WAIT_DIE_DISPLAY_PREFIX,
-};
+use super::interpreter::{eval, execute_seq, EvalContext, EvalError, WAIT_DIE_DISPLAY_PREFIX};
 use super::tt::types::ServiceType;
 use crate::net::network_layer::NetworkLayer;
 use crate::net::{
@@ -2135,17 +2133,9 @@ impl Manager {
             let mut txn = Transaction::new(txn_id.clone());
 
             let mut env: Vec<(Symbol, Value)> = initial_env.to_vec();
-            let mut exec_error: Option<EvalError> = None;
-            for stmt in stmts {
-                match execute(stmt, &env, self, service_name, Some(&mut txn)).await {
-                    Ok(ExecuteEffect::Binding(name, val)) => env.push((name, val)),
-                    Ok(_) => {}
-                    Err(e) => {
-                        exec_error = Some(e);
-                        break;
-                    }
-                }
-            }
+            let exec_error = execute_seq(stmts, &mut env, self, service_name, Some(&mut txn))
+                .await
+                .err();
 
             if matches!(exec_error, Some(EvalError::WaitDieAbort(_))) {
                 for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
@@ -2228,17 +2218,9 @@ impl Manager {
             .remove(&tid)
             .unwrap_or_else(|| Transaction::new(tid.clone()));
         let mut env: Vec<(Symbol, Value)> = initial_env.to_vec();
-        let mut exec_error: Option<EvalError> = None;
-        for stmt in stmts {
-            match execute(stmt, &env, self, service_name, Some(&mut txn)).await {
-                Ok(ExecuteEffect::Binding(name, val)) => env.push((name, val)),
-                Ok(_) => {}
-                Err(e) => {
-                    exec_error = Some(e);
-                    break;
-                }
-            }
-        }
+        let exec_error = execute_seq(stmts, &mut env, self, service_name, Some(&mut txn))
+            .await
+            .err();
         if let Some(e) = exec_error {
             if matches!(e, EvalError::WaitOn(_)) {
                 self.pending_txns.insert(tid, txn);
@@ -2734,14 +2716,7 @@ impl Manager {
         stmts: &[ActionStmt],
     ) -> Result<(), EvalError> {
         let mut env: Vec<(Symbol, Value)> = Vec::new();
-        for stmt in stmts {
-            if let ExecuteEffect::Binding(name, val) =
-                execute(stmt, &env, self, service_name, None).await?
-            {
-                env.push((name, val));
-            }
-        }
-        Ok(())
+        execute_seq(stmts, &mut env, self, service_name, None).await
     }
 }
 
@@ -2755,6 +2730,7 @@ impl Default for Manager {
 mod tests {
     use super::*;
     use crate::ast::{Decl, Expr, Value};
+    use crate::runtime::interpreter::execute;
 
     // #24: cross_service_deps pulls out exactly the (service, member) symbols
     // referenced via MemberAccess, and nothing for a purely local expression.

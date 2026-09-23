@@ -39,11 +39,12 @@ pub async fn execute(
         }
         ActionStmt::Do(expr) => {
             // A `do` reached with no transaction in progress -- one written
-            // directly in a `@test` block, which is not itself a transaction --
-            // runs in a fresh transaction of its own and commits before the
-            // next statement. A `do` reached from inside an action that is
-            // already under a transaction joins that one instead, so composed
-            // and cross-service actions stay atomic.
+            // directly in a `@test` block, which is not itself a transaction,
+            // or typed as a bare statement at the REPL -- runs in a fresh
+            // transaction of its own and commits before the next statement. A
+            // `do` reached from inside an action that is already under a
+            // transaction joins that one instead, so composed and cross-service
+            // actions stay atomic.
             if txn.is_none() {
                 return manager
                     .execute_action_with_txn(service_name, std::slice::from_ref(stmt), env)

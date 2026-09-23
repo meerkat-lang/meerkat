@@ -2716,6 +2716,33 @@ impl Manager {
         self.execute_action_with_txn(service_name, stmts, initial_env)
             .await
     }
+
+    /// Execute a `@test` block's statements outside any transaction
+    ///
+    /// The block as a whole is not a transaction. Each statement runs against
+    /// committed state, so reads see the latest values and assignments apply
+    /// and propagate immediately rather than being buffered until the end of
+    /// the block. Only `do` statements are transactional, and each one opens a
+    /// fresh transaction of its own (see `executor::execute`).
+    ///
+    /// The first statement to fail ends the block. Because there is no
+    /// enclosing transaction, the effects of the statements that already ran
+    /// -- including any `do` that already committed -- stay in place.
+    pub async fn execute_test_block(
+        &mut self,
+        service_name: Symbol,
+        stmts: &[ActionStmt],
+    ) -> Result<(), EvalError> {
+        let mut env: Vec<(Symbol, Value)> = Vec::new();
+        for stmt in stmts {
+            if let ExecuteEffect::Binding(name, val) =
+                execute(stmt, &env, self, service_name, None).await?
+            {
+                env.push((name, val));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for Manager {
@@ -3454,6 +3481,43 @@ mod tests {
         let result = tc.manager.lookup(tc.x, tc.foo, None).await.unwrap();
         // and the lock was released
         assert_eq!(result, Value::Int { val: 1 });
+        assert_x_unlocked(&tc);
+    }
+
+    #[tokio::test]
+    async fn test_test_block_commits_each_do_separately() {
+        // A `@test` block is not itself a transaction: each `do` opens and
+        // commits a transaction of its own, so a failure later in the block
+        // cannot roll back a `do` that already committed. Contrast with
+        // `test_txn_failed_transaction_leaves_no_partial_writes`, where the
+        // whole statement list is one transaction
+        let mut tc = manager_with_x().await;
+        let bump = Expr::Action(vec![ActionStmt::Assign {
+            name: tc.x,
+            expr: Expr::Binop {
+                op: crate::ast::BinOp::Add,
+                expr1: Box::new(Expr::Variable { name: tc.x }),
+                expr2: Box::new(Expr::Literal {
+                    val: Value::Int { val: 1 },
+                }),
+            },
+        }]);
+        let stmts = vec![
+            ActionStmt::Do(bump.clone()),
+            ActionStmt::Do(bump),
+            ActionStmt::Assert(
+                Expr::Literal {
+                    val: Value::Bool { val: false },
+                },
+                "forced failure".to_string(),
+            ),
+        ];
+
+        let result = tc.manager.execute_test_block(tc.foo, &stmts).await;
+
+        assert!(matches!(result, Err(EvalError::AssertionError(_))));
+        // Each `do` committed as it ran, and the failing assert left them be
+        assert_eq!(x_state(&tc).value, Value::Int { val: 2 });
         assert_x_unlocked(&tc);
     }
 

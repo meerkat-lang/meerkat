@@ -1157,7 +1157,7 @@ async fn run_client(
                 // Watch mode only observes; it does not run @test actions.
                 if !watch {
                     manager
-                        .execute_action(service_name, stmts)
+                        .execute_test_block(service_name, stmts)
                         .await
                         .map_err(|e| {
                             format!(

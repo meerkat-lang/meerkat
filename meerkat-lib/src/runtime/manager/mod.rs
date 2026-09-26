@@ -15,7 +15,47 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tokio::sync::oneshot;
 
+/// How many times an originator re-runs a transaction that died or was told
+/// to wait before giving up.
+///
+/// An originator has no queue to park in, so it waits by retrying (see
+/// `execute_action_with_txn`). That makes this budget the originator's wait
+/// **timeout** as well: an older transaction -- one wait-die says should win --
+/// is killed after roughly `MAX_WAIT_DIE_RETRIES * WAIT_ON_RETRY_BACKOFF_MS`
+/// (about 200ms) of contention. The bound is inherent to retrying instead of
+/// parking, not a tuning accident; lifting it needs the background message
+/// loop of #28.
 pub const MAX_WAIT_DIE_RETRIES: u32 = 10;
+
+/// Pause before re-running a transaction that died (`WaitDieAbort`). A die
+/// re-runs promptly.
+pub const WAIT_DIE_RETRY_BACKOFF_MS: u64 = 2;
+
+/// Pause before re-running a transaction that was told to wait (`WaitOn`). A
+/// wait must give the holder time to commit, so this is longer than a die's.
+pub const WAIT_ON_RETRY_BACKOFF_MS: u64 = 20;
+
+/// Pause between two attempts of a transaction in `execute_action_with_txn`.
+///
+/// Without it all `MAX_WAIT_DIE_RETRIES` attempts run back to back. A
+/// transaction with no participants awaits nothing on the retry path -- there
+/// is no `send_abort` to make -- so the budget would be spent within
+/// microseconds, before the lock holder had any chance to commit, and ordinary
+/// contention would be reported as an exhausted wait.
+///
+/// This is a yield point, not a fix for the case where the only thing that
+/// could release the lock is a message this node cannot receive while inside
+/// the retry loop; that needs the background message loop of #28.
+///
+/// Platform-split like the timeout in `send_and_await_reply`: wasm has no tokio
+/// timer driver in the browser, and `SendWrapper` keeps the (browser-thread
+/// only) timer future usable from the `Send`-bounded eval path.
+async fn retry_backoff(ms: u64) {
+    #[cfg(not(target_arch = "wasm32"))]
+    tokio::time::sleep(Duration::from_millis(ms)).await;
+    #[cfg(target_arch = "wasm32")]
+    send_wrapper::SendWrapper::new(gloo_timers::future::TimeoutFuture::new(ms as u32)).await;
+}
 
 pub struct Service {
     /// Globally unique identity of this service (address-based when networked).
@@ -1292,7 +1332,7 @@ impl Manager {
     /// Errors cross the wire as their `Display` text, so a wait-die abort comes
     /// back as an ordinary string. Flattening it to `LocalDispatchFailed` turns
     /// ordinary lock contention into a terminal failure, because
-    /// `execute_action_with_txn` retries `WaitDieAbort` and nothing else. Every
+    /// `execute_action_with_txn` retries only wait-die outcomes. Every
     /// reply that can carry a lock outcome goes through here so lock requests,
     /// reads and composed actions all behave the same way.
     ///
@@ -2137,7 +2177,11 @@ impl Manager {
                 .await
                 .err();
 
-            if matches!(exec_error, Some(EvalError::WaitDieAbort(_))) {
+            // Both wait-die outcomes retry the whole transaction. A participant
+            // told to wait parks on `wait_queue`, but an originator drives its
+            // own transaction and has no queue to park in, so retrying is how
+            // it waits.
+            if let Some(EvalError::WaitDieAbort(_) | EvalError::WaitOn(_)) = &exec_error {
                 for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
                     self.send_abort(addr, &txn.id).await;
                 }
@@ -2145,9 +2189,23 @@ impl Manager {
                 self.release_locks(&freed, &txn.id);
                 if txn_id.iteration < MAX_WAIT_DIE_RETRIES {
                     txn_id = txn_id.retry();
+                    let backoff = match exec_error {
+                        Some(EvalError::WaitOn(_)) => WAIT_ON_RETRY_BACKOFF_MS,
+                        _ => WAIT_DIE_RETRY_BACKOFF_MS,
+                    };
+                    retry_backoff(backoff).await;
                     continue;
                 }
-                return Err(exec_error.unwrap());
+                // Out of retries. `WaitOn` never leaves this loop as itself:
+                // its `WaitKey` holds ids only this node can read back.
+                return Err(match exec_error.unwrap() {
+                    EvalError::WaitOn(key) => EvalError::WaitDieAbort(format!(
+                        "gave up waiting for {} after {} retries",
+                        self.describe_wait_key(&key),
+                        MAX_WAIT_DIE_RETRIES
+                    )),
+                    other => other,
+                });
             }
 
             if exec_error.is_none() {
@@ -2168,6 +2226,23 @@ impl Manager {
                 Some(e) => Err(e),
                 None => Ok(()),
             };
+        }
+    }
+
+    /// Render a contended lock key in program terms: `service '<name>'` or
+    /// `'<service>.<member>'`, falling back to the raw `ServiceNetId` when the
+    /// service is not local.
+    fn describe_wait_key(&self, key: &WaitKey) -> String {
+        let name_of = |sid: &ServiceNetId| {
+            self.service_name_for_net_id(sid)
+                .map(|n| self.interner.get(n).to_string())
+                .unwrap_or_else(|| sid.0.clone())
+        };
+        match key {
+            WaitKey::Service(sid) => format!("service '{}'", name_of(sid)),
+            WaitKey::Member(sid, member) => {
+                format!("'{}.{}'", name_of(sid), self.interner.get(*member))
+            }
         }
     }
 
@@ -3833,6 +3908,66 @@ mod tests {
                 .lock,
             crate::runtime::txn::VarLock::WriteLocked(_)
         ));
+    }
+
+    /// The retry loop must pause between attempts, and for as long as the
+    /// outcome calls for: a die re-runs after `WAIT_DIE_RETRY_BACKOFF_MS`, a
+    /// wait after the longer `WAIT_ON_RETRY_BACKOFF_MS`.
+    ///
+    /// The upper bound on the die run is what catches wiring one backoff to
+    /// both outcomes: it would either make the die as slow as a wait or the
+    /// wait as quick as a die (and the wait bound catches the latter).
+    #[tokio::test]
+    async fn test_wait_die_retries_are_paced() {
+        async fn run_against_holder(timestamp: u128) -> Duration {
+            let mut tc = manager_with_x().await;
+            let holder = crate::runtime::txn::TxnId {
+                timestamp,
+                node_id: tc.manager.node_id,
+                iteration: 0,
+            };
+            tc.manager
+                .services
+                .get_mut(&tc.foo)
+                .unwrap()
+                .vars
+                .get_mut(&tc.x)
+                .unwrap()
+                .lock = crate::runtime::txn::VarLock::WriteLocked(holder);
+            let stmts = vec![ActionStmt::Assign {
+                name: tc.x,
+                expr: Expr::Variable { name: tc.x },
+            }];
+            let started = std::time::Instant::now();
+            let err = tc
+                .manager
+                .execute_action(tc.foo, &stmts)
+                .await
+                .expect_err("`x` is held for the whole run");
+            assert!(matches!(err, EvalError::WaitDieAbort(_)), "got {err:?}");
+            started.elapsed()
+        }
+        let retries = u64::from(MAX_WAIT_DIE_RETRIES);
+
+        // Holder is older: every attempt dies.
+        let die = run_against_holder(1).await;
+        let die_min = Duration::from_millis(WAIT_DIE_RETRY_BACKOFF_MS * retries);
+        let wait_min = Duration::from_millis(WAIT_ON_RETRY_BACKOFF_MS * retries);
+        assert!(
+            die >= die_min,
+            "a die must pause before each retry: {die:?}"
+        );
+        assert!(
+            die < wait_min,
+            "a die must use the short backoff, not the wait's: {die:?}"
+        );
+
+        // Holder is younger: every attempt is told to wait.
+        let wait = run_against_holder(u128::MAX).await;
+        assert!(
+            wait >= wait_min,
+            "a wait must use the long backoff before each retry: {wait:?}"
+        );
     }
 
     /// A wait-die abort raised on a participant must still be a wait-die abort

@@ -161,6 +161,11 @@ impl Setup {
 
     /// `do rc.{cv = cv + by}`, dispatched to the child.
     fn bump_by(&self, by: i32) -> ActionStmt {
+        self.bump_on("rc", by)
+    }
+
+    /// `do <service>.{cv = cv + by}`, dispatched to the child's node.
+    fn bump_on(&self, service: &str, by: i32) -> ActionStmt {
         ActionStmt::Do(Expr::Literal {
             val: Value::ActionClosure {
                 stmts: vec![ActionStmt::Assign {
@@ -174,7 +179,7 @@ impl Setup {
                     },
                 }],
                 env: Vec::new(),
-                service_net_id: ServiceNetId::new(format!("{}/rc", self.peer_addr.0)),
+                service_net_id: ServiceNetId::new(format!("{}/{}", self.peer_addr.0, service)),
             },
         })
     }
@@ -376,8 +381,35 @@ async fn test_a_replay_that_dispatches_a_different_action_to_the_same_target_fai
 
     match replay {
         Err(EvalError::LocalDispatchFailed(msg)) => assert!(
-            msg.contains("different composed action") && msg.contains("than it had before"),
+            msg.contains("differs from the one it dispatched there before"),
             "the error must say the action changed, not just name the target: {msg}"
+        ),
+        other => panic!("a diverging replay must fail the transaction, got: {other:?}"),
+    }
+    assert_eq!(s.served.len(), 1, "the diverging action must not be sent");
+    assert!(!s.mid.pending_txns.contains_key(&tid));
+    assert_eq!(s.child_cv(&tid), 1, "the child was told to abort");
+}
+
+/// A replay that reaches a composed action on a different target fails the
+/// transaction, and says which targets the two runs dispatched to.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_replay_that_dispatches_to_a_different_target_fails() {
+    let mut s = Setup::new().await;
+    let tid = TxnId::new(s.mid.node_id);
+    s.run_until_parked(&[s.bump(), s.touch_guard()], &tid).await;
+
+    s.release_guard();
+    let replay = s
+        .run_action(&[s.bump_on("other", 1), s.touch_guard()], &tid)
+        .await;
+
+    let rc = format!("'{}/rc'", s.peer_addr.0);
+    let other = format!("'{}/other'", s.peer_addr.0);
+    match replay {
+        Err(EvalError::LocalDispatchFailed(msg)) => assert!(
+            msg.contains(&format!("to {other} where it had dispatched one to {rc}")),
+            "the error must name both targets: {msg}"
         ),
         other => panic!("a diverging replay must fail the transaction, got: {other:?}"),
     }

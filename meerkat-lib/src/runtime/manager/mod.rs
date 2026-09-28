@@ -1787,28 +1787,36 @@ impl Manager {
 
         // Claim this dispatch's position in the transaction's dispatch order,
         // and stop here if a parked run already completed it (`composed_done`)
-        let fingerprint = Self::fingerprint(&net_stmts, &net_env)?;
-        let replay = match txn.as_deref_mut() {
-            Some(t) => {
-                let seq = t.composed_seq;
-                t.composed_seq += 1;
-                t.composed_done.get(&seq).cloned().map(|done| (seq, done))
+        let mut claim = None;
+        if let Some(t) = txn.as_deref_mut() {
+            let seq = t.composed_seq;
+            t.composed_seq += 1;
+            let call = ComposedCall {
+                target: service_net_id.clone(),
+                fingerprint: Self::fingerprint(&net_stmts, &net_env)?,
+            };
+            if let Some(done) = t.composed_done.get(&seq) {
+                // Target alone is not identity: a replay can branch into a
+                // different action on the same service. The recorded effect is
+                // already buffered on the other node and cannot be rolled back
+                // from here, so failing is the only honest outcome
+                if done.target != call.target {
+                    return Err(EvalError::LocalDispatchFailed(format!(
+                        "replayed transaction dispatched a composed action to '{}' \
+                         at position {}, where it had dispatched one to '{}'",
+                        call.target.0, seq, done.target.0
+                    )));
+                }
+                if done.fingerprint != call.fingerprint {
+                    return Err(EvalError::LocalDispatchFailed(format!(
+                        "replayed transaction dispatched a different composed action \
+                         to '{}' at position {} than it had before",
+                        call.target.0, seq
+                    )));
+                }
+                return Ok(());
             }
-            None => None,
-        };
-        if let Some((seq, done)) = replay {
-            // Target alone is not identity: a replay can branch into a
-            // different action on the same service. The recorded effect is
-            // already buffered on the other node and cannot be rolled back
-            // from here, so failing is the only honest outcome
-            if &done.target != service_net_id || done.fingerprint != fingerprint {
-                return Err(EvalError::LocalDispatchFailed(format!(
-                    "replayed transaction dispatched a different composed action at \
-                     position {}: recorded '{}', now '{}'",
-                    seq, done.target.0, service_net_id.0
-                )));
-            }
-            return Ok(());
+            claim = Some((seq, call));
         }
 
         let msg = MeerkatMessage::ActionRequest {
@@ -1836,14 +1844,8 @@ impl Manager {
                     // completed dispatch first, before anything added here can
                     // fail: it has already run on the other node, so a replay
                     // must skip it whatever happens next
-                    if let Some(t) = txn {
-                        t.composed_done.insert(
-                            t.composed_seq - 1,
-                            ComposedCall {
-                                target: service_net_id.clone(),
-                                fingerprint,
-                            },
-                        );
+                    if let (Some(t), Some((seq, call))) = (txn, claim) {
+                        t.composed_done.insert(seq, call);
                     }
                     Ok(())
                 } else {
@@ -2346,12 +2348,15 @@ impl Manager {
             .err();
         // Positions are dense, so a completed run that did not reach every
         // recorded one branched past a composed action the parked run made,
-        // whose effect is buffered on the other node all the same
+        // whose effect is buffered on the other node all the same. Positions
+        // below `start` belong to earlier actions under this transaction id
+        let start = before.2 as usize;
         if exec_error.is_none() && (txn.composed_seq as usize) < txn.composed_done.len() {
             exec_error = Some(EvalError::LocalDispatchFailed(format!(
-                "replayed transaction dispatched {} composed actions, but {} had already run",
-                txn.composed_seq,
-                txn.composed_done.len()
+                "replayed action dispatched {} composed actions, but its parked run \
+                 had completed {}",
+                txn.composed_seq as usize - start,
+                txn.composed_done.len() - start
             )));
         }
         if let Some(e) = exec_error {

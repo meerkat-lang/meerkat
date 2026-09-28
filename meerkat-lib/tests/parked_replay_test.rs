@@ -374,11 +374,13 @@ async fn test_a_replay_that_dispatches_a_different_action_to_the_same_target_fai
     s.release_guard();
     let replay = s.run_action(&[s.bump_by(10), s.touch_guard()], &tid).await;
 
-    assert!(
-        matches!(replay, Err(EvalError::LocalDispatchFailed(_))),
-        "a diverging replay must fail the transaction, got: {:?}",
-        replay
-    );
+    match replay {
+        Err(EvalError::LocalDispatchFailed(msg)) => assert!(
+            msg.contains("different composed action") && msg.contains("than it had before"),
+            "the error must say the action changed, not just name the target: {msg}"
+        ),
+        other => panic!("a diverging replay must fail the transaction, got: {other:?}"),
+    }
     assert_eq!(s.served.len(), 1, "the diverging action must not be sent");
     assert!(!s.mid.pending_txns.contains_key(&tid));
     assert_eq!(s.child_cv(&tid), 1, "the child was told to abort");
@@ -388,20 +390,28 @@ async fn test_a_replay_that_dispatches_a_different_action_to_the_same_target_fai
 /// made fails the transaction: that action's effect is buffered on the other
 /// node all the same, and committing it would apply a write the surviving run
 /// never asked for.
+///
+/// An earlier action under the same transaction id already dispatched one, so
+/// the error's counts must be this action's, not the transaction's.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_a_replay_that_skips_a_recorded_dispatch_fails() {
     let mut s = Setup::new().await;
     let tid = TxnId::new(s.mid.node_id);
+    s.run_action(&[s.bump()], &tid)
+        .await
+        .expect("an uncontended composed action must succeed");
     s.run_until_parked(&[s.bump(), s.touch_guard()], &tid).await;
 
     s.release_guard();
     let replay = s.run_action(&[s.touch_guard()], &tid).await;
 
-    assert!(
-        matches!(replay, Err(EvalError::LocalDispatchFailed(_))),
-        "a replay that skips a recorded dispatch must fail, got: {:?}",
-        replay
-    );
+    match replay {
+        Err(EvalError::LocalDispatchFailed(msg)) => assert!(
+            msg.contains("dispatched 0 composed actions, but its parked run had completed 1"),
+            "the counts must be this action's: {msg}"
+        ),
+        other => panic!("a replay that skips a recorded dispatch must fail, got: {other:?}"),
+    }
     assert!(!s.mid.pending_txns.contains_key(&tid));
     assert_eq!(s.child_cv(&tid), 1, "the child was told to abort");
 }

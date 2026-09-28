@@ -1803,15 +1803,15 @@ impl Manager {
                 if done.target != call.target {
                     return Err(EvalError::LocalDispatchFailed(format!(
                         "replayed transaction dispatched a composed action to '{}' \
-                         at position {}, where it had dispatched one to '{}'",
-                        call.target.0, seq, done.target.0
+                         where it had dispatched one to '{}'",
+                        call.target.0, done.target.0
                     )));
                 }
                 if done.fingerprint != call.fingerprint {
                     return Err(EvalError::LocalDispatchFailed(format!(
-                        "replayed transaction dispatched a different composed action \
-                         to '{}' at position {} than it had before",
-                        call.target.0, seq
+                        "replayed transaction's composed action to '{}' differs \
+                         from the one it dispatched there before",
+                        call.target.0
                     )));
                 }
                 return Ok(());

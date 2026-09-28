@@ -405,10 +405,12 @@ async fn test_a_replay_that_dispatches_to_a_different_target_fails() {
         .await;
 
     let rc = format!("'{}/rc'", s.peer_addr.0);
-    let other = format!("'{}/other'", s.peer_addr.0);
+    let other_target = format!("'{}/other'", s.peer_addr.0);
     match replay {
         Err(EvalError::LocalDispatchFailed(msg)) => assert!(
-            msg.contains(&format!("to {other} where it had dispatched one to {rc}")),
+            msg.contains(&format!(
+                "to {other_target} in place of the one it had dispatched to {rc}"
+            )),
             "the error must name both targets: {msg}"
         ),
         other => panic!("a diverging replay must fail the transaction, got: {other:?}"),

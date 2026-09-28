@@ -1803,7 +1803,7 @@ impl Manager {
                 if done.target != call.target {
                     return Err(EvalError::LocalDispatchFailed(format!(
                         "replayed transaction dispatched a composed action to '{}' \
-                         where it had dispatched one to '{}'",
+                         in place of the one it had dispatched to '{}'",
                         call.target.0, done.target.0
                     )));
                 }

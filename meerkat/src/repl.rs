@@ -79,7 +79,7 @@ pub async fn run_repl(
         println!();
     }
 
-    if !remote_url_map.is_empty() {
+    if manager.network.is_none() && !remote_url_map.is_empty() {
         let mut n = meerkat_lib::net::NetworkActor::new(meerkat_lib::net::types::NodeType::Server)
             .await
             .map_err(|e| format!("Network error: {}", e))?;

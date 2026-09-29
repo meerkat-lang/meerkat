@@ -142,6 +142,11 @@ struct Args {
     #[arg(long = "watch", default_value_t = false)]
     watch: bool,
 
+    /// Interactive mode: enter a repl environment after loading the services
+    /// and establishing the network connections
+    #[arg(long = "interactive", default_value_t = false)]
+    interactive: bool,
+
     /// Run lock group cascade test client (debug builds only).
     /// Accepts a test case name; requires -i flags to resolve
     /// remote service addresses.
@@ -298,6 +303,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                     remote_url_map,
                     args.local,
                     args.watch,
+                    args.interactive,
                     interner,
                 )
                 .await
@@ -1073,6 +1079,7 @@ async fn run_client(
     remote_url_map: std::collections::HashMap<String, String>,
     local: bool,
     watch: bool,
+    interactive: bool,
     interner: Interner,
 ) -> Result<(), Box<dyn Error>> {
     let mut manager = Manager::new(interner);
@@ -1086,7 +1093,7 @@ async fn run_client(
     // (watch needs the network to receive change notifications).
     let mut net: Option<NetworkActor> = None;
     let mut local_full_addr: Option<String> = None;
-    if watch || !remote_url_map.is_empty() {
+    if watch || interactive || !remote_url_map.is_empty() {
         let mut n = NetworkActor::new(NodeType::Server)
             .await
             .map_err(|e| format!("Network error: {}", e))?;
@@ -1186,6 +1193,9 @@ async fn run_client(
         }
     }
 
+    if interactive {
+        return crate::repl::run_repl(manager, remote_url_map).await;
+    }
     if watch {
         println!("Watching for changes, press Ctrl+C to stop...");
         loop {

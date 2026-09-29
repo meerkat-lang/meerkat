@@ -783,7 +783,15 @@ impl Manager {
         Ok(())
     }
 
-    pub(crate) async fn propagate(&mut self, service_name: Symbol, changed_var: Symbol) {
+    /// Returns every local `(service, def)` whose recomputed value actually
+    /// changed, in the order the cascade reached them, so a caller with
+    /// visibility into the trigger (e.g. a console watcher) can report the
+    /// whole cascade rather than only the def it directly recomputed.
+    pub(crate) async fn propagate(
+        &mut self,
+        service_name: Symbol,
+        changed_var: Symbol,
+    ) -> Vec<(Symbol, Symbol)> {
         // #24: event-driven reactivity over the listener graph. A change to a
         // member notifies its listeners. For each listener we resolve its
         // service id to a local service: Some means a local listener, which we
@@ -792,6 +800,7 @@ impl Manager {
         // listener lives on another node, which we notify over the wire via
         // emit_update.
         let mut worklist: Vec<(Symbol, Symbol)> = vec![(service_name, changed_var)];
+        let mut changed: Vec<(Symbol, Symbol)> = Vec::new();
 
         while let Some((svc, member)) = worklist.pop() {
             let listeners: Vec<(ServiceNetId, Symbol)> = self
@@ -812,6 +821,7 @@ impl Manager {
                     Some(lsvc) => {
                         if self.recompute_def(lsvc, listener_def).await {
                             worklist.push((lsvc, listener_def));
+                            changed.push((lsvc, listener_def));
                         }
                     }
                     None => {
@@ -821,6 +831,8 @@ impl Manager {
                 }
             }
         }
+
+        changed
     }
 
     /// #24: recompute `def` in `svc` from current values, seeding the reactive
@@ -1077,6 +1089,11 @@ impl Manager {
 
     /// #24 listener side: a remote member changed (or its initial value). Cache
     /// it, recompute the dependent def from cache, and cascade to its listeners.
+    ///
+    /// Returns every local `(service, def)` that actually changed as a result,
+    /// starting with `listener_def_sym` itself (if it changed) followed by
+    /// whatever `propagate` cascaded to beyond it -- a caller that only reads
+    /// `listener_def_sym`'s own new value misses anything further downstream.
     pub async fn handle_update(
         &mut self,
         listener_id: ServiceNetId,
@@ -1084,10 +1101,10 @@ impl Manager {
         source_sym: Symbol,
         member_sym: Symbol,
         value: crate::net::ast::NetValue,
-    ) {
+    ) -> Vec<(Symbol, Symbol)> {
         let value = match codec::decode_value(value, &mut self.interner) {
             Ok(v) => v,
-            Err(_) => return,
+            Err(_) => return Vec::new(),
         };
 
         let listener_svc = self
@@ -1097,7 +1114,7 @@ impl Manager {
             .map(|(name, _)| *name);
         let listener_svc = match listener_svc {
             Some(n) => n,
-            None => return,
+            None => return Vec::new(),
         };
 
         if let Some(svc) = self.services.get_mut(&listener_svc) {
@@ -1107,9 +1124,12 @@ impl Manager {
                 .insert((source_sym, member_sym), value);
         }
 
+        let mut changed = Vec::new();
         if self.recompute_def(listener_svc, listener_def_sym).await {
-            self.propagate(listener_svc, listener_def_sym).await;
+            changed.push((listener_svc, listener_def_sym));
+            changed.extend(self.propagate(listener_svc, listener_def_sym).await);
         }
+        changed
     }
 
     /// Drain all pending network events and dispatch each to the matching
@@ -2988,6 +3008,112 @@ mod tests {
                 .value,
             Value::Int { val: 12 }
         );
+    }
+
+    // A remote Update should report every local def its cascade actually
+    // changed, not only the def it directly recomputed -- otherwise a caller
+    // with only the direct def's new value (e.g. a console watcher) misses
+    // anything one hop further downstream that reacted to it in turn.
+    #[tokio::test]
+    async fn test_handle_update_reports_the_whole_local_cascade() {
+        let mut tc = TestContext::new();
+        let z = tc.manager.interner.insert("z");
+        let s3 = tc.manager.interner.insert("s3");
+        let w2 = tc.manager.interner.insert("w2");
+
+        let s1_decls = vec![
+            Decl::VarDecl {
+                name: tc.x,
+                ty: None,
+                val: Expr::Literal {
+                    val: Value::Int { val: 1 },
+                },
+            },
+            Decl::DefDecl {
+                name: tc.y,
+                ty: None,
+                val: Expr::Binop {
+                    op: crate::ast::BinOp::Add,
+                    expr1: Box::new(Expr::Variable { name: tc.x }),
+                    expr2: Box::new(Expr::Literal {
+                        val: Value::Int { val: 1 },
+                    }),
+                },
+                is_pub: true,
+            },
+        ];
+        tc.manager.create_service(tc.s1, s1_decls).await.unwrap();
+
+        // s2.z listens directly on the remote s1.y.
+        let s2_decls = vec![Decl::DefDecl {
+            name: z,
+            ty: None,
+            val: Expr::Binop {
+                op: crate::ast::BinOp::Add,
+                expr1: Box::new(Expr::MemberAccess {
+                    service_name: tc.s1,
+                    member_name: tc.y,
+                }),
+                expr2: Box::new(Expr::Literal {
+                    val: Value::Int { val: 2 },
+                }),
+            },
+            is_pub: true,
+        }];
+        tc.manager.create_service(tc.s2, s2_decls).await.unwrap();
+
+        // s3.w2 depends on s2.z -- purely local, one hop further than the
+        // remote Update's direct listener.
+        let s3_decls = vec![Decl::DefDecl {
+            name: w2,
+            ty: None,
+            val: Expr::Binop {
+                op: crate::ast::BinOp::Add,
+                expr1: Box::new(Expr::MemberAccess {
+                    service_name: tc.s2,
+                    member_name: z,
+                }),
+                expr2: Box::new(Expr::Literal {
+                    val: Value::Int { val: 100 },
+                }),
+            },
+            is_pub: true,
+        }];
+        tc.manager.create_service(s3, s3_decls).await.unwrap();
+
+        let s2_id = tc.manager.services.get(&tc.s2).unwrap().id.0.clone();
+        let net_val = codec::encode_value(&Value::Int { val: 10 }, &tc.manager.interner).unwrap();
+
+        // simulate a remote Update saying s1.y = 10
+        let changed = tc
+            .manager
+            .handle_update(ServiceNetId(s2_id), z, tc.s1, tc.y, net_val)
+            .await;
+
+        // s2.z: 10 + 2 = 12; cascades locally to s3.w2: 12 + 100 = 112.
+        assert_eq!(
+            tc.manager
+                .services
+                .get(&tc.s2)
+                .unwrap()
+                .vars
+                .get(&z)
+                .unwrap()
+                .value,
+            Value::Int { val: 12 }
+        );
+        assert_eq!(
+            tc.manager
+                .services
+                .get(&s3)
+                .unwrap()
+                .vars
+                .get(&w2)
+                .unwrap()
+                .value,
+            Value::Int { val: 112 }
+        );
+        assert_eq!(changed, vec![(tc.s2, z), (s3, w2)]);
     }
 
     // #24: handle_request_updates registers a remote listener and records its

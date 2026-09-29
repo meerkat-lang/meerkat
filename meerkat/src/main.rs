@@ -1219,12 +1219,21 @@ async fn run_client(
                     Ok(syms) => syms,
                     Err(_) => continue,
                 };
-                manager
+                let changed = manager
                     .handle_update(lid.clone(), def_sym, source_sym, member_sym, value)
                     .await;
-                if let Some((_, svc)) = manager.services.iter().find(|(_, s)| s.id == lid) {
-                    if let Some(vs) = svc.vars.get(&def_sym) {
-                        println!("          -> {} = {:?}", listener_def, vs.value);
+                for (svc_name, def_name) in changed {
+                    if let Some(vs) = manager
+                        .services
+                        .get(&svc_name)
+                        .and_then(|s| s.vars.get(&def_name))
+                    {
+                        println!(
+                            "          -> {}.{} = {:?}",
+                            manager.interner.get(svc_name),
+                            manager.interner.get(def_name),
+                            vs.value
+                        );
                     }
                 }
             }

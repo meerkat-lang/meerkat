@@ -602,6 +602,9 @@ impl Manager {
                     }
                 }
                 for (def_name, cross_set) in &service.graphs.cross_deps {
+                    if !service.defs.contains_key(def_name) {
+                        continue;
+                    }
                     for (owner, member) in cross_set {
                         edges.push((*owner, *member, *def_name));
                     }

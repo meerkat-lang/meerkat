@@ -188,8 +188,42 @@ to completion to spawning it; the loop itself stays.
 
 **Step 4: make execution suspendable.**  A park becomes a wait on a lock-grant
 channel, and a remote call becomes a wait on its reply channel with the
-`Manager` released.  #209's rollback and position records, task 09's
-re-dispatch, and #202's wait retry all go away.
+`Manager` released.  #209's rollback and position records, and task 09's
+re-dispatch, go away.  This step is tracked in #213.
+
+## Cleanup
+
+Parking, replay and retrying are workarounds for execution that cannot be
+suspended.  Each step above makes some of them unnecessary, and removing them
+is part of that step, not follow-up work.  Otherwise the runtime ends up with
+two mechanisms for the same thing, and the old one keeps constraining changes
+to the new.
+
+**After step 3**, when there is one event loop and originators park:
+
+- #202's wait retry, which the originator no longer needs.  Its die retry
+  stays: that is wait-die itself.
+- `send_and_await_reply` processing network events itself.
+- The separate places that handle network messages outside the loop: the
+  `--watch` loop and the server loop in `main.rs`, and the REPL's lack of
+  any.
+- Task 12's guard that makes a read of an originator's in-flight transaction
+  fail, since that transaction becomes reachable by id.
+
+**After step 4**, when execution is suspendable:
+
+- #209's replay machinery: the rollback of buffers on a park, the records of
+  completed composed actions, and the checks that a replay matches them, along
+  with their tests.  Task 12's additions to it go too.
+- Task 09's re-dispatch of parked requests, which becomes waking suspended
+  actions.
+- `reactive_cache` as a field on the `Manager`, which moves into each
+  execution's context.
+
+The itemised checklists, with the names of functions, constants and tests, are
+on #28 for step 3 and on #213 for step 4.  Code that is scaffolding for a later
+step should say so in a comment naming the issue that removes it, as #202's
+comments on `MAX_WAIT_DIE_RETRIES` already do.
 
 ## Open questions
 

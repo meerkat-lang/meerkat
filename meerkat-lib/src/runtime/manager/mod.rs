@@ -2336,7 +2336,8 @@ impl Manager {
         // Locks and participants are kept: they hold this transaction's place
         // in line and still need committing or aborting with it.
         // `composed_seq` is rewound so a replayed composed action finds the
-        // record the parked run left in `composed_done`
+        // record the parked run left in `composed_done`. All of this goes
+        // away once a parked action is suspended instead of re-run (#213)
         let before = (
             txn.written.clone(),
             txn.read_cache.clone(),

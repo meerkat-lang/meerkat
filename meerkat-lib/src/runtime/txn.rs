@@ -269,6 +269,9 @@ pub struct Transaction {
     /// a composed action it completed is reached again. It must not be sent
     /// again: the other node already ran it under this id and holds its writes
     /// buffered, where this node cannot roll them back
+    ///
+    /// Scaffolding: once a parked action is suspended and resumed rather than
+    /// re-run (#213), this and `composed_seq` go away
     pub composed_done: HashMap<u64, ComposedCall>,
     /// Position the next composed action dispatched under this transaction
     /// takes. A park rewinds it, so a replayed dispatch lands on the position

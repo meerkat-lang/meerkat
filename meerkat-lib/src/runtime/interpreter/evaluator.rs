@@ -301,6 +301,11 @@ pub async fn eval(
             service_name,
             member_name,
         } => {
+            for (var_name, var_val) in env.iter().rev() {
+                if *var_name == service_name {
+                    return record_field(var_val, member_name);
+                }
+            }
             // #24: during a reactive update we check the cache first. If this
             // (service, member) was already fetched for the def being recomputed,
             // use the cached value instead of doing a lookup (which for a remote
@@ -320,11 +325,26 @@ pub async fn eval(
                 .lookup(member_name, service_name, ctx.txn.as_deref_mut())
                 .await
         }
-        Expr::Tuple { .. }
-        | Expr::KeyVal { .. }
-        | Expr::Select { .. }
-        | Expr::Table { .. }
-        | Expr::Fold { .. } => Err(EvalError::NotImplemented),
+        Expr::Tuple { val } => eval_tuple(val, env, ctx).await,
+        Expr::KeyVal { name, value } => {
+            let v = eval(value, env, ctx).await?;
+            Ok(Value::Record {
+                fields: vec![(*name, v)],
+            })
+        }
+        Expr::Select { .. } | Expr::Table { .. } => Err(EvalError::NotImplemented),
+        Expr::Fold {
+            table_name,
+            column_name,
+            operation,
+            identity,
+        } => eval_fold(*table_name, *column_name, operation, identity, env, ctx).await,
+        Expr::Map {
+            var,
+            table_name,
+            where_clause,
+            body,
+        } => eval_map(*var, *table_name, where_clause, body, env, ctx).await,
         Expr::List(exprs) => {
             let mut vals = Vec::new();
             for expr in exprs {
@@ -345,6 +365,177 @@ pub async fn eval(
             }
         }
     }
+}
+
+fn record_field(val: &Value, field: Symbol) -> Result<Value, EvalError> {
+    match val {
+        Value::Record { fields } => fields
+            .iter()
+            .find(|(k, _)| *k == field)
+            .map(|(_, v)| v.clone())
+            .ok_or_else(|| EvalError::TypeError("unknown record field".to_string())),
+        _ => Err(EvalError::TypeError(
+            "member access on a non-record value".to_string(),
+        )),
+    }
+}
+
+async fn eval_tuple(
+    elems: &[Expr],
+    env: &[(Symbol, Value)],
+    ctx: &mut EvalContext<'_>,
+) -> Result<Value, EvalError> {
+    let all_keyvals = elems.iter().all(|e| matches!(e, Expr::KeyVal { .. }));
+    if all_keyvals && !elems.is_empty() {
+        let mut fields = Vec::new();
+        for e in elems {
+            let Expr::KeyVal { name, value } = e else {
+                unreachable!();
+            };
+            fields.push((*name, eval(value, env, ctx).await?));
+        }
+        return Ok(Value::Record { fields });
+    }
+    let mut vals = Vec::new();
+    for e in elems {
+        vals.push(eval(e, env, ctx).await?);
+    }
+    Ok(Value::List { vals })
+}
+
+async fn eval_table(
+    table_name: Symbol,
+    env: &[(Symbol, Value)],
+    ctx: &mut EvalContext<'_>,
+) -> Result<Value, EvalError> {
+    for (n, v) in env.iter().rev() {
+        if *n == table_name {
+            return Ok(v.clone());
+        }
+    }
+    match ctx
+        .manager
+        .lookup(table_name, ctx.service_name, ctx.txn.as_deref_mut())
+        .await
+    {
+        Ok(v) => Ok(v),
+        Err(EvalError::VarNotFound(_)) => {
+            let owner = ctx
+                .manager
+                .service_for_table(table_name)
+                .ok_or_else(|| EvalError::VarNotFound("table not found".to_string()))?;
+            ctx.manager
+                .lookup(table_name, owner, ctx.txn.as_deref_mut())
+                .await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn apply_fn(
+    func: Value,
+    args: Vec<Value>,
+    ctx: &mut EvalContext<'_>,
+) -> Result<Value, EvalError> {
+    match func {
+        Value::Closure {
+            params,
+            body,
+            env: mut closure_env,
+            service_name: closure_svc,
+            ..
+        } => {
+            for (param, arg_val) in params.iter().zip(args) {
+                closure_env.push((param.name, arg_val));
+            }
+            eval(
+                &body,
+                &closure_env,
+                &mut EvalContext {
+                    manager: ctx.manager,
+                    service_name: closure_svc,
+                    txn: ctx.txn.as_deref_mut(),
+                },
+            )
+            .await
+        }
+        _ => Err(EvalError::TypeError(
+            "Attempting to call a non-function value".to_string(),
+        )),
+    }
+}
+
+async fn eval_fold(
+    table_name: Symbol,
+    column_name: Symbol,
+    operation: &Expr,
+    identity: &Expr,
+    env: &[(Symbol, Value)],
+    ctx: &mut EvalContext<'_>,
+) -> Result<Value, EvalError> {
+    let table = eval_table(table_name, env, ctx).await?;
+    let rows = match table {
+        Value::List { vals } => vals,
+        _ => {
+            return Err(EvalError::TypeError(
+                "fold expects a table (list of rows)".to_string(),
+            ))
+        }
+    };
+    let op = eval(operation, env, ctx).await?;
+    let mut acc = eval(identity, env, ctx).await?;
+    for row in rows {
+        let item = record_field(&row, column_name)?;
+        acc = match &op {
+            Value::Closure { params, .. } if params.len() >= 2 => {
+                apply_fn(op.clone(), vec![acc, item], ctx).await?
+            }
+            Value::Closure { params, .. } if params.len() == 1 => {
+                let inner = apply_fn(op.clone(), vec![acc], ctx).await?;
+                apply_fn(inner, vec![item], ctx).await?
+            }
+            _ => {
+                return Err(EvalError::TypeError(
+                    "fold operation must be a function".to_string(),
+                ))
+            }
+        };
+    }
+    Ok(acc)
+}
+
+async fn eval_map(
+    var: Symbol,
+    table_name: Symbol,
+    where_clause: &Expr,
+    body: &Expr,
+    env: &[(Symbol, Value)],
+    ctx: &mut EvalContext<'_>,
+) -> Result<Value, EvalError> {
+    let table = eval_table(table_name, env, ctx).await?;
+    let rows = match table {
+        Value::List { vals } => vals,
+        _ => {
+            return Err(EvalError::TypeError(
+                "map expects a table (list of rows)".to_string(),
+            ))
+        }
+    };
+    let mut out = Vec::new();
+    for row in rows {
+        let mut row_env = env.to_vec();
+        row_env.push((var, row));
+        match eval(where_clause, &row_env, ctx).await? {
+            Value::Bool { val: true } => out.push(eval(body, &row_env, ctx).await?),
+            Value::Bool { val: false } => {}
+            _ => {
+                return Err(EvalError::TypeError(
+                    "map where clause must be boolean".to_string(),
+                ))
+            }
+        }
+    }
+    Ok(Value::List { vals: out })
 }
 
 /// Unit tests for the evaluator

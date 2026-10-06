@@ -601,7 +601,7 @@ fn test_placeholder_expressions() {
             },
             Decl::VarDecl {
                 name: interner.insert("fld"),
-                ty: Some(Type::Unit),
+                ty: Some(Type::Int),
                 val: Expr::Fold {
                     table_name: interner.insert("t"),
                     column_name: interner.insert("c"),

@@ -151,6 +151,7 @@ pub async fn execute(
                 | Value::Closure { .. }
                 | Value::ActionClosure { .. }
                 | Value::List { .. }
+                | Value::Record { .. }
                 | Value::Range { .. } => {
                     Err(EvalError::TypeError("assert expects a boolean".to_string()))
                 }
@@ -182,7 +183,44 @@ pub async fn execute(
             .await?;
             Ok(ExecuteEffect::ExprValue(val))
         }
-        ActionStmt::Insert { .. } => Err(EvalError::NotImplemented),
+        ActionStmt::Insert { row, table_name } => {
+            let row_val = eval(
+                row,
+                env,
+                &mut EvalContext {
+                    manager,
+                    service_name,
+                    txn: txn.as_deref_mut(),
+                },
+            )
+            .await?;
+            let owner = if manager
+                .services
+                .get(&service_name)
+                .is_some_and(|s| s.vars.contains_key(table_name))
+            {
+                service_name
+            } else {
+                manager
+                    .service_for_table(*table_name)
+                    .ok_or_else(|| EvalError::VarNotFound("table not found".to_string()))?
+            };
+            let names = manager.table_field_names(*table_name).unwrap_or_default();
+            let record = row_to_record(row_val, &names)?;
+            let mut table = manager
+                .lookup(*table_name, owner, txn.as_deref_mut())
+                .await?;
+            match &mut table {
+                Value::List { vals } => vals.push(Value::Record { fields: record }),
+                _ => {
+                    return Err(EvalError::TypeError(
+                        "insert target is not a table".to_string(),
+                    ))
+                }
+            }
+            manager.assign(owner, *table_name, table, txn).await?;
+            Ok(ExecuteEffect::None)
+        }
         ActionStmt::For {
             var,
             iterable,
@@ -225,6 +263,24 @@ pub async fn execute(
             }
             Ok(ExecuteEffect::None)
         }
+    }
+}
+
+fn row_to_record(row: Value, names: &[Symbol]) -> Result<Vec<(Symbol, Value)>, EvalError> {
+    match row {
+        Value::Record { fields } => Ok(fields),
+        Value::List { vals } => {
+            if vals.len() != names.len() {
+                return Err(EvalError::TypeError(
+                    "insert row does not match table schema".to_string(),
+                ));
+            }
+            Ok(names.iter().copied().zip(vals).collect())
+        }
+        other if names.len() == 1 => Ok(vec![(names[0], other)]),
+        _ => Err(EvalError::TypeError(
+            "insert row must be a record or a positional tuple".to_string(),
+        )),
     }
 }
 

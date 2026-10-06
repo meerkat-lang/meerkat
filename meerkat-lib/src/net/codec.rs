@@ -611,6 +611,15 @@ pub fn encode_value(val: &Value, interner: &Interner) -> Result<NetValue> {
             }
             Ok(NetValue::List { vals: encoded })
         }
+        Value::Record { fields } => {
+            let mut encoded = Vec::new();
+            for (k, v) in fields {
+                let k_str = interner.get(*k);
+                validate_identifier(k_str)?;
+                encoded.push((k_str.to_string(), encode_value(v, interner)?));
+            }
+            Ok(NetValue::Record { fields: encoded })
+        }
         Value::Range { start, end } => Ok(NetValue::Range {
             start: *start,
             end: *end,
@@ -688,6 +697,14 @@ pub fn decode_value(val: NetValue, interner: &mut Interner) -> Result<Value> {
                 decoded.push(decode_value(v, interner)?);
             }
             Ok(Value::List { vals: decoded })
+        }
+        NetValue::Record { fields } => {
+            let mut decoded = Vec::new();
+            for (k, v) in fields {
+                validate_identifier(&k)?;
+                decoded.push((interner.insert(&k), decode_value(v, interner)?));
+            }
+            Ok(Value::Record { fields: decoded })
         }
         NetValue::Range { start, end } => Ok(Value::Range { start, end }),
     }
@@ -845,6 +862,23 @@ pub fn encode_expr(expr: &Expr, interner: &Interner) -> Result<NetExpr> {
                 identity: Box::new(encode_expr(identity, interner)?),
             })
         }
+        Expr::Map {
+            var,
+            table_name,
+            where_clause,
+            body,
+        } => {
+            let var_str = interner.get(*var);
+            let table_str = interner.get(*table_name);
+            validate_identifier(var_str)?;
+            validate_identifier(table_str)?;
+            Ok(NetExpr::Map {
+                var: var_str.to_string(),
+                table_name: table_str.to_string(),
+                where_clause: Box::new(encode_expr(where_clause, interner)?),
+                body: Box::new(encode_expr(body, interner)?),
+            })
+        }
         Expr::List(exprs) => {
             let mut encoded = Vec::new();
             for e in exprs {
@@ -998,6 +1032,21 @@ pub fn decode_expr(expr: NetExpr, interner: &mut Interner) -> Result<Expr> {
                 column_name: interner.insert(&column_name),
                 operation: Box::new(decode_expr(*operation, interner)?),
                 identity: Box::new(decode_expr(*identity, interner)?),
+            })
+        }
+        NetExpr::Map {
+            var,
+            table_name,
+            where_clause,
+            body,
+        } => {
+            validate_identifier(&var)?;
+            validate_identifier(&table_name)?;
+            Ok(Expr::Map {
+                var: interner.insert(&var),
+                table_name: interner.insert(&table_name),
+                where_clause: Box::new(decode_expr(*where_clause, interner)?),
+                body: Box::new(decode_expr(*body, interner)?),
             })
         }
         NetExpr::List(exprs) => {
@@ -1577,6 +1626,24 @@ mod tests {
             }),
         };
         run_expr_test(&fold_expr, &interner);
+
+        // 4. Map
+        let mut interner = Interner::new();
+        let var = interner.insert("m");
+        let table_name = interner.insert("tbl");
+        let col = interner.insert("col");
+        let map_expr = Expr::Map {
+            var,
+            table_name,
+            where_clause: Box::new(Expr::Literal {
+                val: Value::Bool { val: true },
+            }),
+            body: Box::new(Expr::MemberAccess {
+                service_name: var,
+                member_name: col,
+            }),
+        };
+        run_expr_test(&map_expr, &interner);
     }
 
     /// Verify round-trip encoding and decoding for Expr,

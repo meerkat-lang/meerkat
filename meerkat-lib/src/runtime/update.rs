@@ -547,6 +547,7 @@ pub fn format_expr(expr: &Expr, interner: &Interner) -> String {
             Value::Closure { .. }
             | Value::ActionClosure { .. }
             | Value::List { .. }
+            | Value::Record { .. }
             | Value::Range { .. } => val.to_string(),
         },
         Expr::Html(_) => "<html>".to_string(),
@@ -629,6 +630,7 @@ pub fn format_expr(expr: &Expr, interner: &Interner) -> String {
             format!("[{}]", records_str.join(", "))
         }
         Expr::Fold { .. } => "fold".to_string(),
+        Expr::Map { .. } => "map".to_string(),
         Expr::List(exprs) => {
             let elems: Vec<String> = exprs.iter().map(|e| format_expr(e, interner)).collect();
             format!("[{}]", elems.join(", "))

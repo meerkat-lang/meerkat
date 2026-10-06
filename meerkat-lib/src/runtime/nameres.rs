@@ -5,13 +5,9 @@
 //! When called with a unified AST (local + all imported service source),
 //! cross-service member accesses and @test blocks are fully resolved.
 //!
-//! The currently skipped operations are listed below
-//! - `TableDecl` declarations
-//! - `Insert` statements
-//! - `Select` expressions
-//! - `Fold` expressions
+//! `Select` expressions are still skipped (no `select` in demo-3).
 
-use crate::runtime::ast::{ActionStmt, Decl, Expr, Stmt, Value};
+use crate::runtime::ast::{ActionStmt, Decl, Expr, Field, Stmt, Value};
 use crate::runtime::interner::Symbol;
 use crate::runtime::limits::MAX_SCOPE_DEPTH;
 use crate::runtime::Env;
@@ -106,6 +102,9 @@ pub enum Binding<'a> {
 pub struct Resolver<'a> {
     local_services: HashMap<Symbol, Vec<&'a Decl>>,
     current_context: Option<Symbol>,
+    /// Binder of the `map` row currently in scope (`m` in `m.done`)
+    row_var: Option<Symbol>,
+    row_fields: Option<&'a [Field]>,
 }
 
 impl<'a> Default for Resolver<'a> {
@@ -123,9 +122,24 @@ impl<'a> Resolver<'a> {
         let resolver = Self {
             local_services: HashMap::new(),
             current_context: None,
+            row_var: None,
+            row_fields: None,
         };
         debug_assert!(resolver.current_context.is_none());
         resolver
+    }
+
+    fn find_table(&self, table_name: Symbol) -> Option<(Symbol, &'a [Field])> {
+        for (svc, decls) in &self.local_services {
+            for d in decls {
+                if let Decl::TableDecl { name, fields } = d {
+                    if *name == table_name {
+                        return Some((*svc, fields.as_slice()));
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Resolves name bindings for a program represented as a slice
@@ -282,8 +296,8 @@ impl<'a> Resolver<'a> {
 
     /// Resolves service-level declarations sequentially
     ///
-    /// Note that `TableDecl` is registered but its schema is not verified
-    ///
+    /// Table names are bound as values. Column checks happen when a
+    /// `map`, `fold`, or `insert` refers to the table.
     /// Args:
     ///     `decls` (`&'a [Decl]`): The declarations in the service
     ///     `env` (`&mut Env<'b, Binding<'a>>`): The environment
@@ -311,10 +325,6 @@ impl<'a> Resolver<'a> {
                     env.bind(*name, Binding::Value);
                 }
                 Decl::TableDecl { name, fields: _ } => {
-                    println!(
-                        "warning: nameres: ignoring 'table' schema \
-                         checks as not yet implemented"
-                    );
                     env.bind(*name, Binding::Value);
                 }
             }
@@ -391,15 +401,15 @@ impl<'a> Resolver<'a> {
                 }
                 self.resolve_expr(expr, env, depth + 1)
             }
-            ActionStmt::Insert {
-                row: _,
-                table_name: _,
-            } => {
-                println!(
-                    "warning: nameres: ignoring 'insert' checks \
-                     as not yet implemented"
-                );
-                Ok(())
+            ActionStmt::Insert { row, table_name } => {
+                if self.find_table(*table_name).is_none() {
+                    return Err(Error::UnknownIdentifier {
+                        name: *table_name,
+                        expected: ExpectedSort::Table,
+                        context_name: self.current_context,
+                    });
+                }
+                self.resolve_expr(row, env, depth + 1)
             }
             ActionStmt::For {
                 var,
@@ -513,6 +523,19 @@ impl<'a> Resolver<'a> {
                 service_name,
                 member_name,
             } => {
+                if self.row_var == Some(*service_name) {
+                    let ok = self
+                        .row_fields
+                        .is_some_and(|fs| fs.iter().any(|f| f.name == *member_name));
+                    if !ok {
+                        return Err(Error::UnknownIdentifier {
+                            name: *member_name,
+                            expected: ExpectedSort::Variable,
+                            context_name: self.row_var,
+                        });
+                    }
+                    return Ok(());
+                }
                 if let Some(decls) = self.local_services.get(service_name) {
                     let has_member = decls.iter().any(|decl| match decl {
                         Decl::VarDecl { name: mem, .. }
@@ -553,16 +576,53 @@ impl<'a> Resolver<'a> {
                 Ok(())
             }
             Expr::Fold {
-                table_name: _,
-                column_name: _,
-                operation: _,
-                identity: _,
+                table_name,
+                column_name,
+                operation,
+                identity,
             } => {
-                println!(
-                    "warning: nameres: ignoring 'fold' checks \
-                     as not yet implemented"
-                );
-                Ok(())
+                let Some((_, fields)) = self.find_table(*table_name) else {
+                    return Err(Error::UnknownIdentifier {
+                        name: *table_name,
+                        expected: ExpectedSort::Table,
+                        context_name: self.current_context,
+                    });
+                };
+                if !fields.iter().any(|f| f.name == *column_name) {
+                    return Err(Error::UnknownIdentifier {
+                        name: *column_name,
+                        expected: ExpectedSort::Variable,
+                        context_name: Some(*table_name),
+                    });
+                }
+                self.resolve_expr(operation, env, depth + 1)?;
+                self.resolve_expr(identity, env, depth + 1)
+            }
+            Expr::Map {
+                var,
+                table_name,
+                where_clause,
+                body,
+            } => {
+                let Some((_, fields)) = self.find_table(*table_name) else {
+                    return Err(Error::UnknownIdentifier {
+                        name: *table_name,
+                        expected: ExpectedSort::Table,
+                        context_name: self.current_context,
+                    });
+                };
+                let mut row_env = Env::new(Some(env));
+                row_env.bind(*var, Binding::Value);
+                let prev_var = self.row_var;
+                let prev_fields = self.row_fields;
+                self.row_var = Some(*var);
+                self.row_fields = Some(fields);
+                let res = self
+                    .resolve_expr(where_clause, &row_env, depth + 1)
+                    .and_then(|()| self.resolve_expr(body, &row_env, depth + 1));
+                self.row_var = prev_var;
+                self.row_fields = prev_fields;
+                res
             }
             Expr::List(exprs) => {
                 for expr in exprs {
@@ -624,6 +684,12 @@ impl<'a> Resolver<'a> {
             }
             Value::List { vals } => {
                 for val in vals {
+                    self.resolve_value(val, env, depth + 1)?;
+                }
+                Ok(())
+            }
+            Value::Record { fields } => {
+                for (_, val) in fields {
                     self.resolve_value(val, env, depth + 1)?;
                 }
                 Ok(())
@@ -1286,6 +1352,144 @@ mod tests {
                 assert_eq!(context_name, None);
             }
             _ => panic!("Expected UnknownIdentifier error"),
+        }
+    }
+
+    #[test]
+    fn test_map_fold_insert_resolve_against_table() {
+        use crate::runtime::ast::{Field, TableType};
+
+        let mut interner = Interner::new();
+        let board = interner.insert("board");
+        let tasks = interner.insert("tasks");
+        let id = interner.insert("id");
+        let done = interner.insert("done");
+        let m = interner.insert("m");
+        let open = interner.insert("open");
+        let total = interner.insert("total");
+
+        let table = Decl::TableDecl {
+            name: tasks,
+            fields: vec![
+                Field {
+                    name: id,
+                    ty: TableType::Int,
+                },
+                Field {
+                    name: done,
+                    ty: TableType::Bool,
+                },
+            ],
+        };
+        let map_def = Decl::DefDecl {
+            name: open,
+            ty: None,
+            val: Expr::Map {
+                var: m,
+                table_name: tasks,
+                where_clause: Box::new(Expr::Unop {
+                    op: crate::runtime::ast::UnOp::Not,
+                    expr: Box::new(Expr::MemberAccess {
+                        service_name: m,
+                        member_name: done,
+                    }),
+                }),
+                body: Box::new(Expr::Tuple {
+                    val: vec![Expr::KeyVal {
+                        name: id,
+                        value: Box::new(Expr::MemberAccess {
+                            service_name: m,
+                            member_name: id,
+                        }),
+                    }],
+                }),
+            },
+            is_pub: true,
+        };
+        let fold_def = Decl::DefDecl {
+            name: total,
+            ty: None,
+            val: Expr::Fold {
+                table_name: tasks,
+                column_name: id,
+                operation: Box::new(Expr::Literal {
+                    val: Value::Int { val: 0 },
+                }),
+                identity: Box::new(Expr::Literal {
+                    val: Value::Int { val: 0 },
+                }),
+            },
+            is_pub: true,
+        };
+
+        let stmt = Stmt::Service {
+            name: board,
+            decls: vec![table, map_def, fold_def],
+        };
+        assert!(resolve(std::slice::from_ref(&stmt)).is_ok());
+
+        let insert = Stmt::Test {
+            service_name: board,
+            stmts: vec![ActionStmt::Insert {
+                table_name: tasks,
+                row: Expr::Tuple {
+                    val: vec![
+                        Expr::Literal {
+                            val: Value::Int { val: 1 },
+                        },
+                        Expr::Literal {
+                            val: Value::Bool { val: false },
+                        },
+                    ],
+                },
+            }],
+        };
+        assert!(resolve(&[stmt, insert]).is_ok());
+    }
+
+    #[test]
+    fn test_map_unknown_column_fails() {
+        use crate::runtime::ast::{Field, TableType};
+
+        let mut interner = Interner::new();
+        let board = interner.insert("board");
+        let tasks = interner.insert("tasks");
+        let id = interner.insert("id");
+        let m = interner.insert("m");
+        let missing = interner.insert("missing");
+        let open = interner.insert("open");
+
+        let table = Decl::TableDecl {
+            name: tasks,
+            fields: vec![Field {
+                name: id,
+                ty: TableType::Int,
+            }],
+        };
+        let map_def = Decl::DefDecl {
+            name: open,
+            ty: None,
+            val: Expr::Map {
+                var: m,
+                table_name: tasks,
+                where_clause: Box::new(Expr::Literal {
+                    val: Value::Bool { val: true },
+                }),
+                body: Box::new(Expr::MemberAccess {
+                    service_name: m,
+                    member_name: missing,
+                }),
+            },
+            is_pub: true,
+        };
+        let stmt = Stmt::Service {
+            name: board,
+            decls: vec![table, map_def],
+        };
+        let err = resolve(&[stmt]).unwrap_err();
+        match err {
+            Error::UnknownIdentifier { name, .. } => assert_eq!(name, missing),
+            other => panic!("expected UnknownIdentifier, got {:?}", other),
         }
     }
 }

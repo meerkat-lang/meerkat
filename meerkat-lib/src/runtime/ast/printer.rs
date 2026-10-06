@@ -369,6 +369,20 @@ impl<'a> AstPrinter<'a> {
                 self.print_expr(operation, indent + 1);
                 self.print_expr(identity, indent + 1);
             }
+            Expr::Map {
+                var,
+                table_name,
+                where_clause,
+                body,
+            } => {
+                println!(
+                    "Map: {{ var: {}, table_name: {} }}",
+                    self.format_symbol(*var),
+                    self.format_symbol(*table_name)
+                );
+                self.print_expr(where_clause, indent + 1);
+                self.print_expr(body, indent + 1);
+            }
             Expr::List(exprs) => {
                 println!("List:");
                 for expr in exprs {
@@ -444,6 +458,14 @@ impl<'a> AstPrinter<'a> {
                 println!("List:");
                 for val in vals {
                     self.print_value(val, indent + 1);
+                }
+            }
+            Value::Record { fields } => {
+                println!("Record:");
+                for (name, val) in fields {
+                    self.print_indent(indent + 1);
+                    println!("{}", self.format_symbol(*name));
+                    self.print_value(val, indent + 2);
                 }
             }
             Value::Range { start, end } => {

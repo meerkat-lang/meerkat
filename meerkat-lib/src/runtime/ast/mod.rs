@@ -127,6 +127,9 @@ pub enum Value {
     List {
         vals: Vec<Value>,
     },
+    Record {
+        fields: Vec<(Symbol, Value)>,
+    },
     Range {
         start: i32,
         end: i32,
@@ -232,6 +235,12 @@ pub enum Expr {
         operation: Box<Expr>,
         identity: Box<Expr>,
     },
+    Map {
+        var: Symbol,
+        table_name: Symbol,
+        where_clause: Box<Expr>,
+        body: Box<Expr>,
+    },
     List(Vec<Expr>),
     Range {
         start: Box<Expr>,
@@ -266,6 +275,9 @@ impl Expr {
             Expr::Html(template) => template.embedded_exprs().collect(),
             Expr::Action(stmts) => stmts.iter().flat_map(ActionStmt::exprs).collect(),
             Expr::Select { where_clause, .. } => vec![where_clause],
+            Expr::Map {
+                where_clause, body, ..
+            } => vec![where_clause, body],
         }
     }
 }
@@ -419,6 +431,16 @@ impl Display for Value {
                 }
                 write!(f, "]")
             }
+            Value::Record { fields } => {
+                write!(f, "{{")?;
+                for (i, (name, val)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{:?}: {}", name, val)?;
+                }
+                write!(f, "}}")
+            }
             Value::Range { start, end } => write!(f, "{}..{}", start, end),
         }
     }
@@ -508,6 +530,7 @@ impl Display for Expr {
                 write!(f, "]")
             }
             Expr::Fold { .. } => write!(f, "fold"),
+            Expr::Map { .. } => write!(f, "map"),
             Expr::List(exprs) => {
                 write!(f, "[")?;
                 for (i, expr) in exprs.iter().enumerate() {

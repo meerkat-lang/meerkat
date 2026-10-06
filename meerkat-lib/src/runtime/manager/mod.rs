@@ -1133,8 +1133,15 @@ impl Manager {
                     Decl::VarDecl { name, val, .. } | Decl::DefDecl { name, val, .. } => {
                         (name, val)
                     }
-                    Decl::TableDecl { .. } => {
-                        return Err(EvalError::NotImplemented);
+                    Decl::TableDecl { name, .. } => {
+                        let value = Value::List { vals: vec![] };
+                        env.push((name, value.clone()));
+                        if let Some(service) = self.services.get_mut(&svc_name) {
+                            let mut table_value = VarState::new(value);
+                            table_value.latest_write_txn = Some(txn.id.clone());
+                            service.vars.insert(name, table_value);
+                        }
+                        continue;
                     }
                 };
                 // Defs resolve service members through their transactional snapshots;
@@ -1445,6 +1452,37 @@ impl Manager {
             }
         };
         Ok((value, clock, sources))
+    }
+
+    /// Owning service of a table declared in `unified_ast`.
+    pub(crate) fn service_for_table(&self, table_name: Symbol) -> Option<Symbol> {
+        for stmt in &self.unified_ast {
+            if let Stmt::Service { name, decls } = stmt {
+                if decls
+                    .iter()
+                    .any(|d| matches!(d, Decl::TableDecl { name: t, .. } if *t == table_name))
+                {
+                    return Some(*name);
+                }
+            }
+        }
+        None
+    }
+
+    /// Column names of a table declared in `unified_ast`, in schema order.
+    pub(crate) fn table_field_names(&self, table_name: Symbol) -> Option<Vec<Symbol>> {
+        for stmt in &self.unified_ast {
+            if let Stmt::Service { decls, .. } = stmt {
+                for d in decls {
+                    if let Decl::TableDecl { name, fields } = d {
+                        if *name == table_name {
+                            return Some(fields.iter().map(|f| f.name).collect());
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Assign a value to a service variable
@@ -4963,6 +5001,87 @@ mod tests {
         tc.manager.create_service(tc.foo, decls).await.unwrap();
         let result = tc.manager.lookup(tc.f, tc.foo, None).await.unwrap();
         assert_eq!(result, Value::Int { val: 5 });
+    }
+
+    #[tokio::test]
+    async fn test_insert_recomputes_fold() {
+        use crate::ast::{ActionStmt, Field, TableType};
+        use crate::runtime::tt::Param;
+
+        let mut tc = TestContext::new();
+        let tasks = tc.manager.interner.insert("tasks");
+        let minutes = tc.manager.interner.insert("minutes");
+        let acc = tc.manager.interner.insert("acc");
+        let item = tc.manager.interner.insert("item");
+        let total = tc.manager.interner.insert("total");
+        let decls = vec![
+            Decl::TableDecl {
+                name: tasks,
+                fields: vec![Field {
+                    name: minutes,
+                    ty: TableType::Int,
+                }],
+            },
+            Decl::DefDecl {
+                name: total,
+                ty: None,
+                val: Expr::Fold {
+                    table_name: tasks,
+                    column_name: minutes,
+                    operation: Box::new(Expr::Func {
+                        params: vec![
+                            Param {
+                                name: acc,
+                                ty: Some(crate::runtime::tt::Type::Int),
+                            },
+                            Param {
+                                name: item,
+                                ty: Some(crate::runtime::tt::Type::Int),
+                            },
+                        ],
+                        body: Box::new(Expr::Binop {
+                            op: crate::ast::BinOp::Add,
+                            expr1: Box::new(Expr::Variable { name: acc }),
+                            expr2: Box::new(Expr::Variable { name: item }),
+                        }),
+                        return_ty: None,
+                    }),
+                    identity: Box::new(Expr::Literal {
+                        val: Value::Int { val: 0 },
+                    }),
+                },
+                is_pub: true,
+            },
+        ];
+        tc.manager.create_service(tc.foo, decls).await.unwrap();
+        assert_eq!(
+            tc.manager.lookup(total, tc.foo, None).await.unwrap(),
+            Value::Int { val: 0 }
+        );
+        tc.manager
+            .execute_test_block(
+                tc.foo,
+                &[
+                    ActionStmt::Insert {
+                        table_name: tasks,
+                        row: Expr::Literal {
+                            val: Value::Int { val: 10 },
+                        },
+                    },
+                    ActionStmt::Insert {
+                        table_name: tasks,
+                        row: Expr::Literal {
+                            val: Value::Int { val: 33 },
+                        },
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tc.manager.lookup(total, tc.foo, None).await.unwrap(),
+            Value::Int { val: 43 }
+        );
     }
 
     /// Recomputing a def must leave the inputs of an evaluation already in

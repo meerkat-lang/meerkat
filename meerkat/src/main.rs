@@ -317,7 +317,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
             }
             let mut manager = node.start();
             manager.local = args.local;
-            repl::run_repl(manager, remote_url_map).await
+            repl::run_repl(manager, remote_url_map, args.watch).await
         }
     }
 }
@@ -1194,55 +1194,69 @@ async fn run_client(
     }
 
     if interactive {
-        return crate::repl::run_repl(manager, remote_url_map).await;
+        return crate::repl::run_repl(manager, remote_url_map, watch).await;
     }
     if watch {
         println!("Watching for changes, press Ctrl+C to stop...");
         loop {
-            let msg = manager
-                .network
-                .as_mut()
-                .and_then(|n| n.try_recv_event())
-                .and_then(|ev| match ev {
-                    NetworkEvent::MessageReceived { msg, .. } => Some(msg),
-                    _ => None,
-                });
-            if let Some(MeerkatMessage::Update {
-                listener_service,
-                listener_def,
-                source_service,
-                member,
-                value,
-            }) = msg
-            {
-                if let Ok(parsed) = codec::decode_value(value.clone(), &mut manager.interner) {
-                    println!("[update] {}.{} = {:?}", source_service, member, parsed);
-                }
-                let lid = ServiceNetId(listener_service);
-                // #24: validate + intern wire names through codec; skip on bad input.
-                let (def_sym, source_sym, member_sym) = match codec::decode_update(
-                    &listener_def,
-                    &source_service,
-                    &member,
-                    &mut manager.interner,
-                ) {
-                    Ok(syms) => syms,
-                    Err(_) => continue,
-                };
-                manager
-                    .handle_update(lid.clone(), def_sym, source_sym, member_sym, value)
-                    .await;
-                if let Some((_, svc)) = manager.services.iter().find(|(_, s)| s.id == lid) {
-                    if let Some(vs) = svc.vars.get(&def_sym) {
-                        println!("          -> {} = {:?}", listener_def, vs.value);
-                    }
-                }
-            }
+            poll_and_print_update(&mut manager, |line| println!("{}", line)).await;
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         }
     }
 
     Ok(())
+}
+
+/// Poll one pending network event and, if it is an `Update`, apply it via
+/// `Manager::handle_update` and report what happened through `print`.
+/// `print` is called zero, one, or two times: once for the raw
+/// `[update] source.member = value` notification, and once more for the
+/// `-> listener_def = value` line if the update's target service/def still
+/// exist locally. Factored out of the `--watch` loop so interactive mode
+/// (`repl::run_repl`) can drive the same logic alongside reading stdin.
+async fn poll_and_print_update(manager: &mut Manager, mut print: impl FnMut(String)) {
+    let msg = manager
+        .network
+        .as_mut()
+        .and_then(|n| n.try_recv_event())
+        .and_then(|ev| match ev {
+            NetworkEvent::MessageReceived { msg, .. } => Some(msg),
+            _ => None,
+        });
+    if let Some(MeerkatMessage::Update {
+        listener_service,
+        listener_def,
+        source_service,
+        member,
+        value,
+    }) = msg
+    {
+        if let Ok(parsed) = codec::decode_value(value.clone(), &mut manager.interner) {
+            print(format!(
+                "[update] {}.{} = {:?}",
+                source_service, member, parsed
+            ));
+        }
+        let lid = ServiceNetId(listener_service);
+        // #24: validate + intern wire names through codec; skip on bad input.
+        let (def_sym, source_sym, member_sym) = match codec::decode_update(
+            &listener_def,
+            &source_service,
+            &member,
+            &mut manager.interner,
+        ) {
+            Ok(syms) => syms,
+            Err(_) => return,
+        };
+        manager
+            .handle_update(lid.clone(), def_sym, source_sym, member_sym, value)
+            .await;
+        if let Some((_, svc)) = manager.services.iter().find(|(_, s)| s.id == lid) {
+            if let Some(vs) = svc.vars.get(&def_sym) {
+                print(format!("          -> {} = {:?}", listener_def, vs.value));
+            }
+        }
+    }
 }
 
 /// Lock group cascade integration test client (debug builds only).

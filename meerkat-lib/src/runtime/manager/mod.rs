@@ -383,6 +383,15 @@ impl Manager {
         // evaluating any declarations, so action closures built during
         // initialization are stamped with the correct `ServiceNetId`
         // instead of `service_net_id_for_name`'s bare-name fallback
+
+        // pre: The service should not exist
+        if self.services.contains_key(&name) {
+            return Err(EvalError::RuntimeError(format!(
+                "service '{}' already exists",
+                self.interner.get(name)
+            )));
+        }
+
         let exists = self.unified_ast.iter().any(|s| {
             if let Stmt::Service { name: existing, .. } = s {
                 *existing == name

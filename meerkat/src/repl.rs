@@ -7,7 +7,7 @@ use meerkat_lib::runtime::Manager;
 
 use directories::ProjectDirs;
 use rustyline::error::ReadlineError;
-use rustyline::DefaultEditor;
+use rustyline::{DefaultEditor, ExternalPrinter};
 use std::io::{self, IsTerminal};
 
 const PROMPT: &str = "meerkat> ";
@@ -52,10 +52,37 @@ async fn check_watches(watches: &mut [Watch], manager: &mut Manager, repl_env: &
     }
 }
 
-/// Run the `REPL` loop for interactive execution
+/// Read one line on a blocking thread so it can be raced against other
+/// async work (the `--watch` network poll) via `tokio::select!`. Moves the
+/// editor into the blocking task and hands it back out alongside the
+/// result, since `DefaultEditor` isn't `Clone` and `readline()` isn't safe
+/// to call from two places at once.
+fn spawn_blocking_readline(
+    mut reader: DefaultEditor,
+    prompt: &'static str,
+) -> tokio::task::JoinHandle<(DefaultEditor, Result<String, ReadlineError>)> {
+    tokio::task::spawn_blocking(move || {
+        let result = reader.readline(prompt);
+        (reader, result)
+    })
+}
+
+fn spawn_next_readline(
+    reader: DefaultEditor,
+    continuation: bool,
+) -> tokio::task::JoinHandle<(DefaultEditor, Result<String, ReadlineError>)> {
+    let prompt = if continuation { PROMPT_CONT } else { PROMPT };
+    spawn_blocking_readline(reader, prompt)
+}
+
+/// Run the `REPL` loop for interactive execution. When `watch` is set, the
+/// loop also polls for incoming network updates between keystrokes and
+/// prints them via an external printer, so they don't corrupt the line
+/// currently being edited.
 pub async fn run_repl(
     mut manager: Manager,
     remote_url_map: std::collections::HashMap<String, String>,
+    watch: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut reader = DefaultEditor::new()?;
     use std::path::PathBuf;
@@ -79,7 +106,7 @@ pub async fn run_repl(
         println!();
     }
 
-    if !remote_url_map.is_empty() {
+    if manager.network.is_none() && !remote_url_map.is_empty() {
         let mut n = meerkat_lib::net::NetworkActor::new(meerkat_lib::net::types::NodeType::Server)
             .await
             .map_err(|e| format!("Network error: {}", e))?;
@@ -109,73 +136,103 @@ pub async fn run_repl(
     let mut buffer = String::new();
     let mut continuation = false;
 
+    // Only try to get an external printer when it's actually needed: it
+    // unconditionally errors with ENOTTY when stdin/stdout isn't a real tty
+    // (e.g. piped input), which must not break plain `--interactive` or a
+    // `--watch` session running non-interactively. Fall back to a plain
+    // `println!` (via `None`) rather than propagating that error.
+    let mut printer: Option<Box<dyn ExternalPrinter + Send>> = if watch {
+        reader
+            .create_external_printer()
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn ExternalPrinter + Send>)
+    } else {
+        None
+    };
+    let mut watch_tick = tokio::time::interval(std::time::Duration::from_millis(10));
+    let mut read_fut = spawn_next_readline(reader, continuation);
+
     loop {
-        let readline = if continuation {
-            reader.readline(PROMPT_CONT)
-        } else {
-            reader.readline(PROMPT)
-        };
+        tokio::select! {
+            res = &mut read_fut => {
+                let (returned_reader, readline) = res?;
+                reader = returned_reader;
 
-        let line = match readline {
-            Ok(l) => l,
-            Err(ReadlineError::Interrupted) => {
-                buffer.clear();
-                if is_tty {
-                    println!("Interrupt");
+                let line = match readline {
+                    Ok(l) => l,
+                    Err(ReadlineError::Interrupted) => {
+                        buffer.clear();
+                        if is_tty {
+                            println!("Interrupt");
+                        }
+                        continuation = false;
+                        read_fut = spawn_next_readline(reader, continuation);
+                        continue;
+                    }
+                    Err(ReadlineError::Eof) => break,
+                    Err(e) => return Err(e.into()),
+                };
+
+                buffer.push_str(&line);
+                buffer.push('\n');
+
+                // Empty line: just check watches and re-prompt
+                if buffer.trim().is_empty() {
+                    buffer.clear();
+                    continuation = false;
+                    check_watches(&mut watches, &mut manager, &repl_env).await;
+                    read_fut = spawn_next_readline(reader, continuation);
+                    continue;
                 }
-                continuation = false;
-                continue;
-            }
-            Err(ReadlineError::Eof) => break,
-            Err(e) => return Err(e.into()),
-        };
 
-        buffer.push_str(&line);
-        buffer.push('\n');
-
-        // Empty line: just check watches and re-prompt
-        if buffer.trim().is_empty() {
-            buffer.clear();
-            continuation = false;
-            check_watches(&mut watches, &mut manager, &repl_env).await;
-            continue;
-        }
-
-        match parse_repl(&buffer, &mut manager.interner) {
-            ReplParseResult::Incomplete => {
-                continuation = true;
-            }
-            ReplParseResult::Error(msg) => {
-                if let Err(e) = reader.add_history_entry(buffer.trim_end()) {
-                    eprintln!("Warning: failed to save history: {}", e);
-                }
-                eprintln!("Parse error: {}", msg);
-                buffer.clear();
-                continuation = false;
-            }
-            ReplParseResult::Complete(stmts) => {
-                if let Err(e) = reader.add_history_entry(buffer.trim_end()) {
-                    eprintln!("Warning: failed to save history: {}", e);
-                }
-                for stmt in stmts {
-                    match exec_stmt(
-                        stmt,
-                        &mut manager,
-                        &mut repl_env,
-                        &mut watches,
-                        &remote_url_map,
-                    )
-                    .await
-                    {
-                        Ok(Some(output)) => println!("{}", output),
-                        Ok(None) => {}
-                        Err(e) => eprintln!("Error: {}", e),
+                match parse_repl(&buffer, &mut manager.interner) {
+                    ReplParseResult::Incomplete => {
+                        continuation = true;
+                    }
+                    ReplParseResult::Error(msg) => {
+                        if let Err(e) = reader.add_history_entry(buffer.trim_end()) {
+                            eprintln!("Warning: failed to save history: {}", e);
+                        }
+                        eprintln!("Parse error: {}", msg);
+                        buffer.clear();
+                        continuation = false;
+                    }
+                    ReplParseResult::Complete(stmts) => {
+                        if let Err(e) = reader.add_history_entry(buffer.trim_end()) {
+                            eprintln!("Warning: failed to save history: {}", e);
+                        }
+                        for stmt in stmts {
+                            match exec_stmt(
+                                stmt,
+                                &mut manager,
+                                &mut repl_env,
+                                &mut watches,
+                                &remote_url_map,
+                            )
+                            .await
+                            {
+                                Ok(Some(output)) => println!("{}", output),
+                                Ok(None) => {}
+                                Err(e) => eprintln!("Error: {}", e),
+                            }
+                        }
+                        // Check watches after every complete input
+                        check_watches(&mut watches, &mut manager, &repl_env).await;
+                        buffer.clear();
+                        continuation = false;
                     }
                 }
-                // Check watches after every complete input
-                check_watches(&mut watches, &mut manager, &repl_env).await;
-                buffer.clear();
-                continuation = false;
+
+                read_fut = spawn_next_readline(reader, continuation);
+            }
+            _ = watch_tick.tick(), if watch => {
+                crate::poll_and_print_update(&mut manager, |line| match printer.as_mut() {
+                    Some(p) => {
+                        let _ = p.print(line);
+                    }
+                    None => println!("{}", line),
+                })
+                .await;
             }
         }
     }

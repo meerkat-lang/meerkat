@@ -602,7 +602,7 @@ impl Manager {
                     }
                 }
                 for (def_name, cross_set) in &service.graphs.cross_deps {
-                    if !service.defs.contains_key(def_name) {
+                    if !service.graphs.defs.contains(def_name) {
                         continue;
                     }
                     for (owner, member) in cross_set {
@@ -820,8 +820,11 @@ impl Manager {
                 match listener_svc {
                     Some(lsvc) => {
                         if self.recompute_def(lsvc, listener_def).await {
-                            worklist.push((lsvc, listener_def));
-                            changed.push((lsvc, listener_def));
+                            let def = (lsvc, listener_def);
+                            worklist.push(def);
+                            if !changed.contains(&def) {
+                                changed.push(def);
+                            }
                         }
                     }
                     None => {

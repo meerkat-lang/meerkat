@@ -1,0 +1,7 @@
+import board
+
+service desk {
+    pub def open = board.open;
+    pub def backlog_min = board.backlog_min;
+    pub def long_night = backlog_min > 40;
+}

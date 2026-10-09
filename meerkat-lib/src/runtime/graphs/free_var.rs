@@ -103,12 +103,30 @@ fn populate_free_var_graph(
             }
         }
         Expr::Fold {
+            table_name,
             operation,
             identity,
             ..
         } => {
             populate_free_var_graph(operation, var_binded, graph);
             populate_free_var_graph(identity, var_binded, graph);
+            if !var_binded.contains(table_name) {
+                graph.add_node(*table_name);
+            }
+        }
+        Expr::Map {
+            var,
+            table_name,
+            where_clause,
+            body,
+        } => {
+            if !var_binded.contains(table_name) {
+                graph.add_node(*table_name);
+            }
+            let mut row_binds = var_binded.clone();
+            row_binds.insert(*var);
+            populate_free_var_graph(where_clause, &row_binds, graph);
+            populate_free_var_graph(body, &row_binds, graph);
         }
         Expr::List(val) => {
             for item in val {
@@ -175,45 +193,64 @@ fn populate_free_var_graph_action_stmt(
 ///
 /// Returns:
 ///   `HashSet<(Symbol, Symbol)>`: Set of `(service, member)` pairs
+/// Extract all cross-service dependency pairs `(service, member)` from an expression
+///
+/// Args:
+///   `expr` (`&Expr`): The expression AST node
+///
+/// Returns:
+///   `HashSet<(Symbol, Symbol)>`: Set of `(service, member)` pairs
 pub fn cross_service_deps(expr: &Expr) -> HashSet<(Symbol, Symbol)> {
+    cross_service_deps_hiding(expr, None)
+}
+
+/// Like [`cross_service_deps`], but `MemberAccess` whose left ident is `hide`
+/// is treated as a row field (`m.done`), not a service member.
+fn cross_service_deps_hiding(expr: &Expr, hide: Option<Symbol>) -> HashSet<(Symbol, Symbol)> {
     match expr {
         Expr::Literal { .. } | Expr::Variable { .. } | Expr::Table { .. } => HashSet::new(),
         Expr::MemberAccess {
             service_name,
             member_name,
-        } => HashSet::from([(*service_name, *member_name)]),
-        Expr::KeyVal { value, .. } => cross_service_deps(value),
+        } => {
+            if hide == Some(*service_name) {
+                HashSet::new()
+            } else {
+                HashSet::from([(*service_name, *member_name)])
+            }
+        }
+        Expr::KeyVal { value, .. } => cross_service_deps_hiding(value, hide),
         Expr::Tuple { val } => {
             let mut deps = HashSet::new();
             for item in val {
-                deps.extend(cross_service_deps(item));
+                deps.extend(cross_service_deps_hiding(item, hide));
             }
             deps
         }
-        Expr::Unop { expr, .. } => cross_service_deps(expr),
+        Expr::Unop { expr, .. } => cross_service_deps_hiding(expr, hide),
         Expr::Binop { expr1, expr2, .. } => {
-            let mut deps = cross_service_deps(expr1);
-            deps.extend(cross_service_deps(expr2));
+            let mut deps = cross_service_deps_hiding(expr1, hide);
+            deps.extend(cross_service_deps_hiding(expr2, hide));
             deps
         }
         Expr::If { cond, expr1, expr2 } => {
-            let mut deps = cross_service_deps(cond);
-            deps.extend(cross_service_deps(expr1));
-            deps.extend(cross_service_deps(expr2));
+            let mut deps = cross_service_deps_hiding(cond, hide);
+            deps.extend(cross_service_deps_hiding(expr1, hide));
+            deps.extend(cross_service_deps_hiding(expr2, hide));
             deps
         }
-        Expr::Func { body, .. } => cross_service_deps(body),
+        Expr::Func { body, .. } => cross_service_deps_hiding(body, hide),
         Expr::Html(template) => {
             let mut deps = HashSet::new();
             for e in template.embedded_exprs() {
-                deps.extend(cross_service_deps(e));
+                deps.extend(cross_service_deps_hiding(e, hide));
             }
             deps
         }
         Expr::Call { func, args } => {
-            let mut deps = cross_service_deps(func);
+            let mut deps = cross_service_deps_hiding(func, hide);
             for arg in args {
-                deps.extend(cross_service_deps(arg));
+                deps.extend(cross_service_deps_hiding(arg, hide));
             }
             deps
         }
@@ -224,26 +261,37 @@ pub fn cross_service_deps(expr: &Expr) -> HashSet<(Symbol, Symbol)> {
             }
             deps
         }
-        Expr::Select { where_clause, .. } => cross_service_deps(where_clause),
+        Expr::Select { where_clause, .. } => cross_service_deps_hiding(where_clause, hide),
         Expr::Fold {
             operation,
             identity,
             ..
         } => {
-            let mut deps = cross_service_deps(operation);
-            deps.extend(cross_service_deps(identity));
+            let mut deps = cross_service_deps_hiding(operation, hide);
+            deps.extend(cross_service_deps_hiding(identity, hide));
+            deps
+        }
+        Expr::Map {
+            var,
+            where_clause,
+            body,
+            ..
+        } => {
+            let hide_row = Some(*var);
+            let mut deps = cross_service_deps_hiding(where_clause, hide_row);
+            deps.extend(cross_service_deps_hiding(body, hide_row));
             deps
         }
         Expr::List(exprs) => {
             let mut deps = HashSet::new();
             for expr in exprs {
-                deps.extend(cross_service_deps(expr));
+                deps.extend(cross_service_deps_hiding(expr, hide));
             }
             deps
         }
         Expr::Range { start, end } => {
-            let mut deps = cross_service_deps(start);
-            deps.extend(cross_service_deps(end));
+            let mut deps = cross_service_deps_hiding(start, hide);
+            deps.extend(cross_service_deps_hiding(end, hide));
             deps
         }
     }
@@ -402,6 +450,23 @@ mod tests {
             }),
         };
         assert!(free_var(&fold_expr, &HashSet::new()).contains(&x));
+        assert!(free_var(&fold_expr, &HashSet::new()).contains(&tbl));
+
+        let map_expr = Expr::Map {
+            var: x,
+            table_name: tbl,
+            where_clause: Box::new(Expr::MemberAccess {
+                service_name: x,
+                member_name: p,
+            }),
+            body: Box::new(Expr::MemberAccess {
+                service_name: x,
+                member_name: p,
+            }),
+        };
+        let map_vars = free_var(&map_expr, &HashSet::new());
+        assert!(map_vars.contains(&tbl));
+        assert!(!map_vars.contains(&x));
     }
 
     #[test]

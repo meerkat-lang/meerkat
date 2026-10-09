@@ -1,0 +1,13 @@
+service board {
+    table tasks {
+        id: int,
+        title: string,
+        minutes: int,
+        done: bool,
+    };
+
+    pub def open =
+        map (m in tasks where !m.done) { id: m.id, title: m.title, minutes: m.minutes };
+    pub def backlog_min =
+        fold(tasks.minutes, fn (acc: int, item: int) => acc + item, 0);
+}

@@ -99,11 +99,18 @@ impl<'a> AstPrinter<'a> {
             }
             Stmt::Import { path, service_name } => {
                 let service_name = *service_name;
-                println!(
-                    "Import: {{ path: \"{}\", service_name: {} }}",
-                    path,
-                    self.format_symbol(service_name)
-                );
+                if path.is_some() {
+                    println!(
+                        "Import: {{ path: \"{}\", service_name: {} }}",
+                        path.clone().unwrap(),
+                        self.format_symbol(service_name)
+                    );
+                } else {
+                    println!(
+                        "Import: {{ service_name: {} }}",
+                        self.format_symbol(service_name)
+                    );
+                }
             }
             Stmt::Service { name, decls } => {
                 let name = *name;

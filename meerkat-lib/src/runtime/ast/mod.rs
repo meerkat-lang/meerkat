@@ -72,7 +72,7 @@ pub enum Stmt {
         addr: String,
     },
     Import {
-        path: String,
+        path: Option<String>,
         service_name: Symbol,
     },
     Service {

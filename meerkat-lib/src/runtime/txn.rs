@@ -211,6 +211,7 @@ impl VarLock {
         }
     }
 }
+pub type VClock = HashMap<(Symbol, Symbol), u64>;
 
 /// Composite state for a single variable represented by `VarState`
 ///
@@ -224,6 +225,11 @@ pub struct VarState {
     pub lock: VarLock,
     /// Most recent transaction to write this variable
     pub latest_write_txn: Option<TxnId>,
+    // we represent a vector clock as a map from a (service, var) pair to a counter
+    // the counter should always be non zero. We interpret the lack of a key to be counter = 0.
+    // we shouldn't need to deal with any complicated removal semantics since the clock
+    // should be monotonically increasing?
+    pub vector_clock: VClock,
 }
 
 impl VarState {
@@ -233,6 +239,7 @@ impl VarState {
             value,
             lock: VarLock::new(),
             latest_write_txn: None,
+            vector_clock: HashMap::new(),
         }
     }
 }

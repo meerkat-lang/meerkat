@@ -335,22 +335,20 @@ impl Transaction {
                 self.state = TransactionState::Evaluated;
                 self.commit(manager);
 
-                let updated_svc_names: HashSet<Symbol> = self
+                let updated_services: Vec<_> = self
                     .updates
                     .iter()
                     .filter_map(|stmt| match stmt {
-                        Stmt::Service { name, .. } => Some(*name),
-                        Stmt::Update {
-                            service_name: name, ..
-                        } => Some(*name),
-                        Stmt::ActionStmt(_)
-                        | Stmt::Atomic { .. }
-                        | Stmt::Connect { .. }
-                        | Stmt::Import { .. }
-                        | Stmt::Test { .. }
-                        | Stmt::Watch { .. } => None,
+                        Stmt::Service { name, decls }
+                        | Stmt::Update {
+                            service_name: name,
+                            decls,
+                        } => Some((name, decls)),
+                        _ => None,
                     })
                     .collect();
+                let updated_svc_names: HashSet<_> =
+                    updated_services.iter().map(|(name, _)| **name).collect();
 
                 for updated_svc_name in updated_svc_names {
                     if let Some(dep) = self.deps.remove(&updated_svc_name) {
@@ -361,20 +359,20 @@ impl Transaction {
                     }
                 }
 
-                for stmt in &self.updates {
-                    let (svc_name, decls) = match stmt {
-                        Stmt::Service { name, decls } => (name, decls),
-                        Stmt::Update {
-                            service_name: name,
-                            decls,
-                        } => (name, decls),
-                        Stmt::ActionStmt(_)
-                        | Stmt::Atomic { .. }
-                        | Stmt::Connect { .. }
-                        | Stmt::Import { .. }
-                        | Stmt::Test { .. }
-                        | Stmt::Watch { .. } => continue,
-                    };
+                let updated_members = updated_services
+                    .iter()
+                    .flat_map(|(svc, decls)| {
+                        decls.iter().filter_map(move |decl| match decl {
+                            Decl::VarDecl { name, .. } | Decl::DefDecl { name, .. } => {
+                                Some((**svc, *name))
+                            }
+                            Decl::TableDecl { .. } => None,
+                        })
+                    })
+                    .collect();
+                manager.mark_source_updates(updated_members);
+
+                for (svc_name, decls) in updated_services {
                     if manager.services.contains_key(svc_name) {
                         for decl in decls {
                             match decl {
@@ -386,8 +384,9 @@ impl Transaction {
                                 Decl::DefDecl {
                                     name: decl_name, ..
                                 } => {
-                                    manager.recompute_def(*svc_name, *decl_name).await;
-                                    manager.propagate(*svc_name, *decl_name).await;
+                                    if manager.recompute_def(*svc_name, *decl_name).await {
+                                        manager.propagate(*svc_name, *decl_name).await;
+                                    }
                                 }
                                 Decl::TableDecl { .. } => {}
                             }
@@ -444,7 +443,7 @@ impl Transaction {
     ///     `manager` (`&mut Manager`): The active runtime manager
     fn commit(&mut self, manager: &mut Manager) {
         debug_assert_eq!(self.state, TransactionState::Evaluated);
-        manager.unified_ast = std::mem::take(&mut self.ast);
+        manager.install_analyzed_ast(std::mem::take(&mut self.ast), &mut self.deps);
         manager.local_services = std::mem::replace(&mut self.types, Env::new(None));
 
         for ((svc_name, var_name), val) in std::mem::take(&mut self.values) {
@@ -459,6 +458,7 @@ impl Transaction {
                             value: val,
                             lock: VarLock::Unlocked,
                             latest_write_txn: None,
+                            vector_clock: HashMap::new(),
                         },
                     );
                 }

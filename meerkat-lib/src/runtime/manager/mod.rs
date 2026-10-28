@@ -3202,7 +3202,7 @@ mod tests {
         let dep = interner.insert("dep");
         let prog = vec![
             Stmt::Import {
-                path: "dep.mkt".to_string(),
+                path: None,
                 service_name: dep,
             },
             service_stmt(&mut interner, "app", 0),

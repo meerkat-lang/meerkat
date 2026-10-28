@@ -1717,12 +1717,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "json"
-version = "0.12.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "078e285eafdfb6c4b434e0d31e8cfcb5115b651496faca5749b88fafd4f23bfd"
-
-[[package]]
 name = "kameo"
 version = "0.22.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2358,7 +2352,6 @@ dependencies = [
  "getrandom 0.3.4",
  "gloo-timers",
  "inline_colorization",
- "json",
  "kameo",
  "lalrpop",
  "lalrpop-util",

@@ -487,7 +487,7 @@ async fn eval_fold(
     for row in rows {
         let item = record_field(&row, column_name)?;
         acc = match &op {
-            Value::Closure { params, .. } if params.len() >= 2 => {
+            Value::Closure { params, .. } if params.len() == 2 => {
                 apply_fn(op.clone(), vec![acc, item], ctx).await?
             }
             Value::Closure { params, .. } if params.len() == 1 => {
@@ -522,9 +522,11 @@ async fn eval_map(
         }
     };
     let mut out = Vec::new();
+    let mut row_env = env.to_vec();
+    row_env.push((var, Value::Int { val: 0 }));
+    let row_idx = row_env.len() - 1;
     for row in rows {
-        let mut row_env = env.to_vec();
-        row_env.push((var, row));
+        row_env[row_idx] = (var, row);
         match eval(where_clause, &row_env, ctx).await? {
             Value::Bool { val: true } => out.push(eval(body, &row_env, ctx).await?),
             Value::Bool { val: false } => {}

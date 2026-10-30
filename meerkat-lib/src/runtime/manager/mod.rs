@@ -1,6 +1,10 @@
 use super::ast::{ActionStmt, Decl, Expr, Stmt, Value};
 use super::env::Env;
-use super::graphs::{analysis::compute_dependencies, free_var::cross_service_deps, ServiceGraphs};
+use super::graphs::{
+    analysis::compute_dependencies,
+    free_var::{cross_service_deps, service_names},
+    ServiceGraphs,
+};
 use super::interpreter::{eval, execute_seq, EvalContext, EvalError, WAIT_DIE_DISPLAY_PREFIX};
 use super::tt::types::ServiceType;
 use crate::net::network_layer::NetworkLayer;
@@ -2555,6 +2559,8 @@ impl Manager {
             }
         }
 
+        let known_services = service_names(&self.unified_ast);
+
         while let Some((svc_sym, mem_sym, is_write)) = queue.pop() {
             if self.services.contains_key(&svc_sym) {
                 // Acquire the local lock (or upgrade it to a write lock
@@ -2590,7 +2596,9 @@ impl Manager {
 
                         // Cross-service dependencies
                         if let Some(expr) = service.defs.get(&mem_sym) {
-                            for (remote_svc, remote_mem) in cross_service_deps(expr) {
+                            for (remote_svc, remote_mem) in
+                                cross_service_deps(expr, &known_services)
+                            {
                                 if self.remote_services.contains_key(&remote_svc) {
                                     // Track remote dependencies for a
                                     // remote service to request them
@@ -2840,7 +2848,7 @@ mod tests {
             }),
         };
         assert_eq!(
-            cross_service_deps(&z_expr),
+            cross_service_deps(&z_expr, &std::collections::HashSet::from([tc.s1])),
             std::collections::HashSet::from([(tc.s1, tc.y)])
         );
         // y = x + 1  ->  {} (no cross-service references)
@@ -2851,7 +2859,7 @@ mod tests {
                 val: Value::Int { val: 1 },
             }),
         };
-        assert!(cross_service_deps(&y_expr).is_empty());
+        assert!(cross_service_deps(&y_expr, &std::collections::HashSet::from([tc.s1])).is_empty());
     }
 
     // #24: a def in s2 that reads s1.y updates eagerly when s1.x changes,

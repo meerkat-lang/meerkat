@@ -1,6 +1,6 @@
 //! Free variable and cross-service dependency extraction services using `petgraph`
 
-use crate::ast::{ActionStmt, Expr};
+use crate::ast::{ActionStmt, Expr, Stmt};
 use crate::runtime::interner::Symbol;
 use petgraph::graphmap::DiGraphMap;
 use std::collections::HashSet;
@@ -186,112 +186,118 @@ fn populate_free_var_graph_action_stmt(
     new_binds
 }
 
-/// Extract all cross-service dependency pairs `(service, member)` from an expression
+/// Service names bound by name analysis (`service` and `import` statements).
 ///
-/// Args:
-///   `expr` (`&Expr`): The expression AST node
-///
-/// Returns:
-///   `HashSet<(Symbol, Symbol)>`: Set of `(service, member)` pairs
-/// Extract all cross-service dependency pairs `(service, member)` from an expression
-///
-/// Args:
-///   `expr` (`&Expr`): The expression AST node
-///
-/// Returns:
-///   `HashSet<(Symbol, Symbol)>`: Set of `(service, member)` pairs
-pub fn cross_service_deps(expr: &Expr) -> HashSet<(Symbol, Symbol)> {
-    cross_service_deps_hiding(expr, None)
+/// `MemberAccess` uses the same syntax for `s1.y` (a service member) and
+/// `row.done` (a record field). Only the former is a cross-service dependency;
+/// the latter is distinguished by whether the left ident is a known service.
+pub fn service_names(program: &[Stmt]) -> HashSet<Symbol> {
+    program
+        .iter()
+        .filter_map(|stmt| match stmt {
+            Stmt::Service { name, .. }
+            | Stmt::Import {
+                service_name: name, ..
+            } => Some(*name),
+            _ => None,
+        })
+        .collect()
 }
 
-/// Like [`cross_service_deps`], but `MemberAccess` whose left ident is `hide`
-/// is treated as a row field (`m.done`), not a service member.
-fn cross_service_deps_hiding(expr: &Expr, hide: Option<Symbol>) -> HashSet<(Symbol, Symbol)> {
+/// Extract all cross-service dependency pairs `(service, member)` from an expression.
+///
+/// `services` is the set of identifiers name analysis bound as services.
+/// A `MemberAccess` whose left ident is not in that set is a record field
+/// access and is ignored.
+///
+/// Args:
+///   `expr` (`&Expr`): The expression AST node
+///   `services` (`&HashSet<Symbol>`): Service names from name analysis
+///
+/// Returns:
+///   `HashSet<(Symbol, Symbol)>`: Set of `(service, member)` pairs
+pub fn cross_service_deps(expr: &Expr, services: &HashSet<Symbol>) -> HashSet<(Symbol, Symbol)> {
     match expr {
         Expr::Literal { .. } | Expr::Variable { .. } | Expr::Table { .. } => HashSet::new(),
         Expr::MemberAccess {
             service_name,
             member_name,
         } => {
-            if hide == Some(*service_name) {
-                HashSet::new()
-            } else {
+            if services.contains(service_name) {
                 HashSet::from([(*service_name, *member_name)])
+            } else {
+                HashSet::new()
             }
         }
-        Expr::KeyVal { value, .. } => cross_service_deps_hiding(value, hide),
+        Expr::KeyVal { value, .. } => cross_service_deps(value, services),
         Expr::Tuple { val } => {
             let mut deps = HashSet::new();
             for item in val {
-                deps.extend(cross_service_deps_hiding(item, hide));
+                deps.extend(cross_service_deps(item, services));
             }
             deps
         }
-        Expr::Unop { expr, .. } => cross_service_deps_hiding(expr, hide),
+        Expr::Unop { expr, .. } => cross_service_deps(expr, services),
         Expr::Binop { expr1, expr2, .. } => {
-            let mut deps = cross_service_deps_hiding(expr1, hide);
-            deps.extend(cross_service_deps_hiding(expr2, hide));
+            let mut deps = cross_service_deps(expr1, services);
+            deps.extend(cross_service_deps(expr2, services));
             deps
         }
         Expr::If { cond, expr1, expr2 } => {
-            let mut deps = cross_service_deps_hiding(cond, hide);
-            deps.extend(cross_service_deps_hiding(expr1, hide));
-            deps.extend(cross_service_deps_hiding(expr2, hide));
+            let mut deps = cross_service_deps(cond, services);
+            deps.extend(cross_service_deps(expr1, services));
+            deps.extend(cross_service_deps(expr2, services));
             deps
         }
-        Expr::Func { body, .. } => cross_service_deps_hiding(body, hide),
+        Expr::Func { body, .. } => cross_service_deps(body, services),
         Expr::Html(template) => {
             let mut deps = HashSet::new();
             for e in template.embedded_exprs() {
-                deps.extend(cross_service_deps_hiding(e, hide));
+                deps.extend(cross_service_deps(e, services));
             }
             deps
         }
         Expr::Call { func, args } => {
-            let mut deps = cross_service_deps_hiding(func, hide);
+            let mut deps = cross_service_deps(func, services);
             for arg in args {
-                deps.extend(cross_service_deps_hiding(arg, hide));
+                deps.extend(cross_service_deps(arg, services));
             }
             deps
         }
         Expr::Action(stmts) => {
             let mut deps = HashSet::new();
             for stmt in stmts {
-                deps.extend(cross_service_deps_in_action_stmt(stmt));
+                deps.extend(cross_service_deps_in_action_stmt(stmt, services));
             }
             deps
         }
-        Expr::Select { where_clause, .. } => cross_service_deps_hiding(where_clause, hide),
+        Expr::Select { where_clause, .. } => cross_service_deps(where_clause, services),
         Expr::Fold {
             operation,
             identity,
             ..
         } => {
-            let mut deps = cross_service_deps_hiding(operation, hide);
-            deps.extend(cross_service_deps_hiding(identity, hide));
+            let mut deps = cross_service_deps(operation, services);
+            deps.extend(cross_service_deps(identity, services));
             deps
         }
         Expr::Map {
-            var,
-            where_clause,
-            body,
-            ..
+            where_clause, body, ..
         } => {
-            let hide_row = Some(*var);
-            let mut deps = cross_service_deps_hiding(where_clause, hide_row);
-            deps.extend(cross_service_deps_hiding(body, hide_row));
+            let mut deps = cross_service_deps(where_clause, services);
+            deps.extend(cross_service_deps(body, services));
             deps
         }
         Expr::List(exprs) => {
             let mut deps = HashSet::new();
             for expr in exprs {
-                deps.extend(cross_service_deps_hiding(expr, hide));
+                deps.extend(cross_service_deps(expr, services));
             }
             deps
         }
         Expr::Range { start, end } => {
-            let mut deps = cross_service_deps_hiding(start, hide);
-            deps.extend(cross_service_deps_hiding(end, hide));
+            let mut deps = cross_service_deps(start, services);
+            deps.extend(cross_service_deps(end, services));
             deps
         }
     }
@@ -301,21 +307,25 @@ fn cross_service_deps_hiding(expr: &Expr, hide: Option<Symbol>) -> HashSet<(Symb
 ///
 /// Args:
 ///   `stmt` (`&ActionStmt`): The action statement AST node
+///   `services` (`&HashSet<Symbol>`): Service names from name analysis
 ///
 /// Returns:
 ///   `HashSet<(Symbol, Symbol)>`: Set of `(service, member)` pairs
-fn cross_service_deps_in_action_stmt(stmt: &ActionStmt) -> HashSet<(Symbol, Symbol)> {
+fn cross_service_deps_in_action_stmt(
+    stmt: &ActionStmt,
+    services: &HashSet<Symbol>,
+) -> HashSet<(Symbol, Symbol)> {
     match stmt {
-        ActionStmt::Let { expr, .. } => cross_service_deps(expr),
-        ActionStmt::Expr(expr) => cross_service_deps(expr),
-        ActionStmt::Do(expr) => cross_service_deps(expr),
-        ActionStmt::Assert(expr, _) => cross_service_deps(expr),
-        ActionStmt::Assign { expr, .. } => cross_service_deps(expr),
-        ActionStmt::Insert { row, .. } => cross_service_deps(row),
+        ActionStmt::Let { expr, .. } => cross_service_deps(expr, services),
+        ActionStmt::Expr(expr) => cross_service_deps(expr, services),
+        ActionStmt::Do(expr) => cross_service_deps(expr, services),
+        ActionStmt::Assert(expr, _) => cross_service_deps(expr, services),
+        ActionStmt::Assign { expr, .. } => cross_service_deps(expr, services),
+        ActionStmt::Insert { row, .. } => cross_service_deps(row, services),
         ActionStmt::For { iterable, body, .. } => {
-            let mut deps = cross_service_deps(iterable);
+            let mut deps = cross_service_deps(iterable, services);
             for s in body {
-                deps.extend(cross_service_deps_in_action_stmt(s));
+                deps.extend(cross_service_deps_in_action_stmt(s, services));
             }
             deps
         }
@@ -325,7 +335,7 @@ fn cross_service_deps_in_action_stmt(stmt: &ActionStmt) -> HashSet<(Symbol, Symb
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{BinOp, UnOp, Value};
+    use crate::ast::{BinOp, Stmt, UnOp, Value};
     use crate::runtime::html::HtmlTemplateBuilder;
     use crate::runtime::interner::Interner;
     use crate::runtime::tt::Param;
@@ -513,25 +523,26 @@ mod tests {
         let m1 = interner.insert("m1");
         let tbl = interner.insert("tbl");
         let i = interner.insert("i");
+        let services = HashSet::from([s1]);
 
         let ma = Expr::MemberAccess {
             service_name: s1,
             member_name: m1,
         };
-        let deps = cross_service_deps(&ma);
+        let deps = cross_service_deps(&ma, &services);
         assert_eq!(deps.len(), 1);
         assert!(deps.contains(&(s1, m1)));
 
         let tuple_ma = Expr::Tuple {
             val: vec![ma.clone()],
         };
-        assert_eq!(cross_service_deps(&tuple_ma).len(), 1);
+        assert_eq!(cross_service_deps(&tuple_ma, &services).len(), 1);
 
         let unop_ma = Expr::Unop {
             op: UnOp::Neg,
             expr: Box::new(ma.clone()),
         };
-        assert_eq!(cross_service_deps(&unop_ma).len(), 1);
+        assert_eq!(cross_service_deps(&unop_ma, &services).len(), 1);
 
         let binop_ma = Expr::Binop {
             op: BinOp::Add,
@@ -540,39 +551,39 @@ mod tests {
                 val: Value::Int { val: 1 },
             }),
         };
-        assert_eq!(cross_service_deps(&binop_ma).len(), 1);
+        assert_eq!(cross_service_deps(&binop_ma, &services).len(), 1);
 
         let if_ma = Expr::If {
             cond: Box::new(ma.clone()),
             expr1: Box::new(ma.clone()),
             expr2: Box::new(ma.clone()),
         };
-        assert_eq!(cross_service_deps(&if_ma).len(), 1);
+        assert_eq!(cross_service_deps(&if_ma, &services).len(), 1);
 
         let func_ma = Expr::Func {
             params: vec![],
             body: Box::new(ma.clone()),
             return_ty: None,
         };
-        assert_eq!(cross_service_deps(&func_ma).len(), 1);
+        assert_eq!(cross_service_deps(&func_ma, &services).len(), 1);
 
         let mut builder2 = HtmlTemplateBuilder::new();
         builder2.push_text("test");
         let html_ma = Expr::Html(builder2.build());
-        assert!(cross_service_deps(&html_ma).is_empty());
+        assert!(cross_service_deps(&html_ma, &services).is_empty());
 
         let call_ma = Expr::Call {
             func: Box::new(ma.clone()),
             args: vec![ma.clone()],
         };
-        assert_eq!(cross_service_deps(&call_ma).len(), 1);
+        assert_eq!(cross_service_deps(&call_ma, &services).len(), 1);
 
         let select_ma = Expr::Select {
             table_name: tbl,
             where_clause: Box::new(ma.clone()),
             column_names: vec![],
         };
-        assert_eq!(cross_service_deps(&select_ma).len(), 1);
+        assert_eq!(cross_service_deps(&select_ma, &services).len(), 1);
 
         let fold_ma = Expr::Fold {
             table_name: tbl,
@@ -580,16 +591,16 @@ mod tests {
             operation: Box::new(ma.clone()),
             identity: Box::new(ma.clone()),
         };
-        assert_eq!(cross_service_deps(&fold_ma).len(), 1);
+        assert_eq!(cross_service_deps(&fold_ma, &services).len(), 1);
 
         let list_ma = Expr::List(vec![ma.clone()]);
-        assert_eq!(cross_service_deps(&list_ma).len(), 1);
+        assert_eq!(cross_service_deps(&list_ma, &services).len(), 1);
 
         let range_ma = Expr::Range {
             start: Box::new(ma.clone()),
             end: Box::new(ma.clone()),
         };
-        assert_eq!(cross_service_deps(&range_ma).len(), 1);
+        assert_eq!(cross_service_deps(&range_ma, &services).len(), 1);
 
         let action_ma = Expr::Action(vec![
             ActionStmt::Let {
@@ -614,6 +625,45 @@ mod tests {
                 body: vec![ActionStmt::Expr(ma.clone())],
             },
         ]);
-        assert_eq!(cross_service_deps(&action_ma).len(), 1);
+        assert_eq!(cross_service_deps(&action_ma, &services).len(), 1);
+
+        // Record field access (`row.done`) is the same AST as `s1.y`, but the
+        // left ident is not a service, so it is not a cross-service dep.
+        let row = interner.insert("row");
+        let done = interner.insert("done");
+        let field = Expr::MemberAccess {
+            service_name: row,
+            member_name: done,
+        };
+        assert!(cross_service_deps(&field, &services).is_empty());
+
+        let map_expr = Expr::Map {
+            var: row,
+            table_name: tbl,
+            where_clause: Box::new(field.clone()),
+            body: Box::new(field),
+        };
+        assert!(cross_service_deps(&map_expr, &services).is_empty());
+    }
+
+    #[test]
+    fn test_service_names_from_program() {
+        let mut interner = Interner::new();
+        let s1 = interner.insert("s1");
+        let s2 = interner.insert("s2");
+        let program = vec![
+            Stmt::Service {
+                name: s1,
+                decls: vec![],
+            },
+            Stmt::Import {
+                path: "s2.mkt".to_string(),
+                service_name: s2,
+            },
+        ];
+        let names = service_names(&program);
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&s1));
+        assert!(names.contains(&s2));
     }
 }

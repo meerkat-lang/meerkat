@@ -7,7 +7,7 @@
 //!
 //! `Select` expressions are still skipped (no `select` in demo-3).
 
-use crate::runtime::ast::{ActionStmt, Decl, Expr, Field, Stmt, Value};
+use crate::runtime::ast::{table_decl_fields, ActionStmt, Decl, Expr, Field, Stmt, Value};
 use crate::runtime::interner::Symbol;
 use crate::runtime::limits::MAX_SCOPE_DEPTH;
 use crate::runtime::Env;
@@ -129,17 +129,9 @@ impl<'a> Resolver<'a> {
         resolver
     }
 
-    fn find_table(&self, table_name: Symbol) -> Option<(Symbol, &'a [Field])> {
-        for (svc, decls) in &self.local_services {
-            for d in decls {
-                if let Decl::TableDecl { name, fields } = d {
-                    if *name == table_name {
-                        return Some((*svc, fields.as_slice()));
-                    }
-                }
-            }
-        }
-        None
+    fn find_table(&self, table_name: Symbol) -> Option<&'a [Field]> {
+        let svc = self.current_context?;
+        table_decl_fields(self.local_services.get(&svc)?.iter().copied(), table_name)
     }
 
     /// Resolves name bindings for a program represented as a slice
@@ -581,7 +573,7 @@ impl<'a> Resolver<'a> {
                 operation,
                 identity,
             } => {
-                let Some((_, fields)) = self.find_table(*table_name) else {
+                let Some(fields) = self.find_table(*table_name) else {
                     return Err(Error::UnknownIdentifier {
                         name: *table_name,
                         expected: ExpectedSort::Table,
@@ -604,7 +596,7 @@ impl<'a> Resolver<'a> {
                 where_clause,
                 body,
             } => {
-                let Some((_, fields)) = self.find_table(*table_name) else {
+                let Some(fields) = self.find_table(*table_name) else {
                     return Err(Error::UnknownIdentifier {
                         name: *table_name,
                         expected: ExpectedSort::Table,

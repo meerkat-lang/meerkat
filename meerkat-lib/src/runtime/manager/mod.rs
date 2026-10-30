@@ -1,4 +1,4 @@
-use super::ast::{ActionStmt, Decl, Expr, Stmt, Value};
+use super::ast::{table_decl_in_service, ActionStmt, Decl, Expr, Stmt, Value};
 use super::env::Env;
 use super::graphs::{
     analysis::compute_dependencies,
@@ -705,35 +705,14 @@ impl Manager {
         )))
     }
 
-    /// Owning service of a table declared in `unified_ast`.
-    pub(crate) fn service_for_table(&self, table_name: Symbol) -> Option<Symbol> {
-        for stmt in &self.unified_ast {
-            if let Stmt::Service { name, decls } = stmt {
-                if decls
-                    .iter()
-                    .any(|d| matches!(d, Decl::TableDecl { name: t, .. } if *t == table_name))
-                {
-                    return Some(*name);
-                }
-            }
-        }
-        None
-    }
-
-    /// Column names of a table declared in `unified_ast`, in schema order.
-    pub(crate) fn table_field_names(&self, table_name: Symbol) -> Option<Vec<Symbol>> {
-        for stmt in &self.unified_ast {
-            if let Stmt::Service { decls, .. } = stmt {
-                for d in decls {
-                    if let Decl::TableDecl { name, fields } = d {
-                        if *name == table_name {
-                            return Some(fields.iter().map(|f| f.name).collect());
-                        }
-                    }
-                }
-            }
-        }
-        None
+    /// Column names of a table on `service_name`, in schema order.
+    pub(crate) fn table_field_names(
+        &self,
+        service_name: Symbol,
+        table_name: Symbol,
+    ) -> Option<Vec<Symbol>> {
+        table_decl_in_service(&self.unified_ast, service_name, table_name)
+            .map(|fields| fields.iter().map(|f| f.name).collect())
     }
 
     /// Assign a value to a service variable

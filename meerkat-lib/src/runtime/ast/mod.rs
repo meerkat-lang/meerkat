@@ -268,6 +268,37 @@ pub struct Field {
     pub ty: TableType,
 }
 
+/// Schema of `table_name` if it is declared in `decls`.
+pub fn table_decl_fields<'a, I>(decls: I, table_name: Symbol) -> Option<&'a [Field]>
+where
+    I: IntoIterator<Item = &'a Decl>,
+{
+    for d in decls {
+        if let Decl::TableDecl { name, fields } = d {
+            if *name == table_name {
+                return Some(fields.as_slice());
+            }
+        }
+    }
+    None
+}
+
+/// Schema of `table_name` on `service_name` in `program`.
+pub fn table_decl_in_service(
+    program: &[Stmt],
+    service_name: Symbol,
+    table_name: Symbol,
+) -> Option<&[Field]> {
+    for stmt in program {
+        if let Stmt::Service { name, decls } = stmt {
+            if *name == service_name {
+                return table_decl_fields(decls, table_name);
+            }
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TableType {
     String,

@@ -194,21 +194,12 @@ pub async fn execute(
                 },
             )
             .await?;
-            let owner = if manager
-                .services
-                .get(&service_name)
-                .is_some_and(|s| s.vars.contains_key(table_name))
-            {
-                service_name
-            } else {
-                manager
-                    .service_for_table(*table_name)
-                    .ok_or_else(|| EvalError::VarNotFound("table not found".to_string()))?
-            };
-            let names = manager.table_field_names(*table_name).unwrap_or_default();
+            let names = manager
+                .table_field_names(service_name, *table_name)
+                .unwrap_or_default();
             let record = row_to_record(row_val, &names)?;
             let mut table = manager
-                .lookup(*table_name, owner, txn.as_deref_mut())
+                .lookup(*table_name, service_name, txn.as_deref_mut())
                 .await?;
             match &mut table {
                 Value::List { vals } => vals.push(Value::Record { fields: record }),
@@ -218,7 +209,9 @@ pub async fn execute(
                     ))
                 }
             }
-            manager.assign(owner, *table_name, table, txn).await?;
+            manager
+                .assign(service_name, *table_name, table, txn)
+                .await?;
             Ok(ExecuteEffect::None)
         }
         ActionStmt::For {

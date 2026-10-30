@@ -104,45 +104,10 @@ pub async fn eval(
             for arg in args {
                 arg_vals.push(eval(arg, env, ctx).await?);
             }
-            match func_val {
-                Value::Closure {
-                    params,
-                    body,
-                    env: closure_env,
-                    service_name: closure_svc,
-                    ..
-                } => {
-                    let mut new_env = closure_env.clone();
-                    for (param, arg_val) in params.iter().zip(arg_vals) {
-                        new_env.push((param.name, arg_val));
-                    }
-                    eval(
-                        &body,
-                        &new_env,
-                        &mut EvalContext {
-                            manager: ctx.manager,
-                            service_name: closure_svc,
-                            txn: ctx.txn.as_deref_mut(),
-                        },
-                    )
-                    .await
-                }
-                _ => Err(EvalError::TypeError(
-                    "Attempting to call a non-function value".to_string(),
-                )),
-            }
+            call_closure(func_val, arg_vals, ctx).await
         }
 
-        &Expr::Variable { name } => {
-            for (var_name, var_val) in env.iter().rev() {
-                if *var_name == name {
-                    return Ok(var_val.clone());
-                }
-            }
-            ctx.manager
-                .lookup(name, ctx.service_name, ctx.txn.as_deref_mut())
-                .await
-        }
+        &Expr::Variable { name } => lookup_name(name, env, ctx).await,
 
         Expr::Binop { op, expr1, expr2 } => {
             let val1 = eval(expr1, env, ctx).await?;
@@ -403,36 +368,22 @@ async fn eval_tuple(
     Ok(Value::List { vals })
 }
 
-async fn eval_table(
-    table_name: Symbol,
+async fn lookup_name(
+    name: Symbol,
     env: &[(Symbol, Value)],
     ctx: &mut EvalContext<'_>,
 ) -> Result<Value, EvalError> {
-    for (n, v) in env.iter().rev() {
-        if *n == table_name {
-            return Ok(v.clone());
+    for (var_name, var_val) in env.iter().rev() {
+        if *var_name == name {
+            return Ok(var_val.clone());
         }
     }
-    match ctx
-        .manager
-        .lookup(table_name, ctx.service_name, ctx.txn.as_deref_mut())
+    ctx.manager
+        .lookup(name, ctx.service_name, ctx.txn.as_deref_mut())
         .await
-    {
-        Ok(v) => Ok(v),
-        Err(EvalError::VarNotFound(_)) => {
-            let owner = ctx
-                .manager
-                .service_for_table(table_name)
-                .ok_or_else(|| EvalError::VarNotFound("table not found".to_string()))?;
-            ctx.manager
-                .lookup(table_name, owner, ctx.txn.as_deref_mut())
-                .await
-        }
-        Err(e) => Err(e),
-    }
 }
 
-async fn apply_fn(
+async fn call_closure(
     func: Value,
     args: Vec<Value>,
     ctx: &mut EvalContext<'_>,
@@ -473,7 +424,7 @@ async fn eval_fold(
     env: &[(Symbol, Value)],
     ctx: &mut EvalContext<'_>,
 ) -> Result<Value, EvalError> {
-    let table = eval_table(table_name, env, ctx).await?;
+    let table = lookup_name(table_name, env, ctx).await?;
     let rows = match table {
         Value::List { vals } => vals,
         _ => {
@@ -488,11 +439,11 @@ async fn eval_fold(
         let item = record_field(&row, column_name)?;
         acc = match &op {
             Value::Closure { params, .. } if params.len() == 2 => {
-                apply_fn(op.clone(), vec![acc, item], ctx).await?
+                call_closure(op.clone(), vec![acc, item], ctx).await?
             }
             Value::Closure { params, .. } if params.len() == 1 => {
-                let inner = apply_fn(op.clone(), vec![acc], ctx).await?;
-                apply_fn(inner, vec![item], ctx).await?
+                let inner = call_closure(op.clone(), vec![acc], ctx).await?;
+                call_closure(inner, vec![item], ctx).await?
             }
             _ => {
                 return Err(EvalError::TypeError(
@@ -512,7 +463,7 @@ async fn eval_map(
     env: &[(Symbol, Value)],
     ctx: &mut EvalContext<'_>,
 ) -> Result<Value, EvalError> {
-    let table = eval_table(table_name, env, ctx).await?;
+    let table = lookup_name(table_name, env, ctx).await?;
     let rows = match table {
         Value::List { vals } => vals,
         _ => {

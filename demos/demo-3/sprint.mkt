@@ -3,7 +3,7 @@ import desk
 
 service sprint {}
 
-@test(sprint) {
+@test(board) {
     insert {1, "water basil plant", 3, false} into tasks
     insert {2, "respond to email", 10, false} into tasks
     insert {3, "fix lamp", 30, false} into tasks

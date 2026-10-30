@@ -47,8 +47,9 @@ async fn listening_node() -> (NetworkActor, Address) {
 /// The node under test, with `rc` redirected to the peer at `rc_addr`.
 /// `mid_view` derives from both its own `mv` and `rc.gc`; `mid_own` derives
 /// from `mv` alone. What each holds after a commit says which state the
-/// recompute actually saw.
-async fn middle_node(net: NetworkActor, rc_addr: &Address) -> Manager {
+/// recompute actually saw. `mid` subscribes to `rc.gc` and holds its first
+/// `Update` before the test goes on.
+async fn middle_node(net: NetworkActor, rc_net: &mut NetworkActor, rc_addr: &Address) -> Manager {
     let code = "
         service rc {
             var cv = 1;
@@ -74,6 +75,10 @@ async fn middle_node(net: NetworkActor, rc_addr: &Address) -> Manager {
     let rc = m.interner.insert("rc");
     m.remote_services
         .insert(rc, Address::new(format!("{}/rc", rc_addr.0)));
+    let [mid, mid_view, gc] = ["mid", "mid_view", "gc"].map(|n| m.interner.insert(n));
+    let mid_id = m.services[&mid].id.clone();
+    m.subscribe_remote(rc, gc, mid_id, mid_view).await;
+    await_gc_update(&mut m, rc_net).await;
     m
 }
 
@@ -88,7 +93,8 @@ async fn reply(net: &mut NetworkActor, reply_to: &str, msg: MeerkatMessage) {
 
 /// Stand in for `rc`: accept a composed action, refuse every `Commit` with
 /// `reason` after recording in `got_commit` that it arrived, and so go on
-/// serving the `gc = 1` it had committed before. Runs forever.
+/// serving reads of and subscriptions to the `gc = 1` it had committed before.
+/// Runs forever.
 async fn refuse_commits(net: &mut NetworkActor, reason: &str, got_commit: &Cell<bool>) {
     loop {
         match net.event_rx.try_recv() {
@@ -99,7 +105,29 @@ async fn refuse_commits(net: &mut NetworkActor, reason: &str, got_commit: &Cell<
                     ..
                 } => {
                     let value = NetValue::Int { val: 1 };
-                    let msg = MeerkatMessage::LookupResponse { request_id, value };
+                    let msg = MeerkatMessage::LookupResponse {
+                        request_id,
+                        value,
+                        clock: Some(Vec::new()),
+                        sources: Some(vec![("rc".into(), "cv".into())]),
+                    };
+                    reply(net, &reply_to, msg).await;
+                }
+                MeerkatMessage::RequestUpdates {
+                    listener_service,
+                    listener_def,
+                    reply_to,
+                    ..
+                } => {
+                    let msg = MeerkatMessage::Update {
+                        listener_service,
+                        listener_def,
+                        source_service: "rc".to_string(),
+                        member: "gc".to_string(),
+                        value: NetValue::Int { val: 1 },
+                        clock: Vec::new(),
+                        sources: Some(vec![("rc".into(), "cv".into())]),
+                    };
                     reply(net, &reply_to, msg).await;
                 }
                 MeerkatMessage::ActionRequest {
@@ -131,6 +159,33 @@ async fn refuse_commits(net: &mut NetworkActor, reason: &str, got_commit: &Cell<
             },
             Ok(_) => {}
             Err(_) => tokio::time::sleep(std::time::Duration::from_millis(1)).await,
+        }
+    }
+}
+
+/// Run the stand-in for `rc` until `mid` holds an `Update` of `rc.gc`. A
+/// commit drops the one it held, `rc` having taken part, and subscribes again
+async fn await_gc_update(m: &mut Manager, rc_net: &mut NetworkActor) {
+    let [mid, mid_view, rc, gc] = ["mid", "mid_view", "rc", "gc"].map(|n| m.interner.insert(n));
+    let cached = |m: &Manager| {
+        let deps = m.services[&mid].dep_cache.get(&mid_view);
+        deps.and_then(|deps| deps.get(&(rc, gc)))
+            .is_some_and(|entry| entry.1.is_some())
+    };
+    let pump = async {
+        while !cached(m) {
+            m.dispatch_network_events().await;
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    };
+    let got_commit = Cell::new(false);
+    tokio::select! {
+        biased;
+        r = tokio::time::timeout(std::time::Duration::from_secs(10), pump) => {
+            r.expect("rc must answer mid's subscription")
+        }
+        _ = refuse_commits(rc_net, REASON, &got_commit) => {
+            unreachable!("the stand-in for rc runs forever")
         }
     }
 }
@@ -198,7 +253,7 @@ fn hold_participant_txn(
 async fn test_originator_surfaces_a_participant_commit_failure() {
     let (mid_net, _mid_addr) = listening_node().await;
     let (mut rc_net, rc_addr) = listening_node().await;
-    let mut m = middle_node(mid_net, &rc_addr).await;
+    let mut m = middle_node(mid_net, &mut rc_net, &rc_addr).await;
 
     // `mid` originates `mv = 1; do <action on rc>`, so `rc` joins as a
     // participant.
@@ -237,6 +292,7 @@ async fn test_originator_surfaces_a_participant_commit_failure() {
         err.to_string().contains(REASON),
         "the participant's reason must reach the caller, got: {err}"
     );
+    await_gc_update(&mut m, &mut rc_net).await;
     assert_committed_locally(&mut m);
 }
 
@@ -250,7 +306,7 @@ async fn test_originator_surfaces_a_participant_commit_failure() {
 async fn test_participant_reports_a_failed_commit_forward_and_still_propagates() {
     let (mid_net, _mid_addr) = listening_node().await;
     let (mut rc_net, rc_addr) = listening_node().await;
-    let mut m = middle_node(mid_net, &rc_addr).await;
+    let mut m = middle_node(mid_net, &mut rc_net, &rc_addr).await;
 
     let (tid, (sid, mv)) = hold_participant_txn(&mut m, &[&rc_addr]);
     let key = WaitKey::Member(sid, mv);
@@ -282,6 +338,7 @@ async fn test_participant_reports_a_failed_commit_forward_and_still_propagates()
         m.take_freed_awaiting_wake().contains(&key),
         "the freed lock must be reported so what is parked on it gets woken"
     );
+    await_gc_update(&mut m, &mut rc_net).await;
     assert_committed_locally(&mut m);
 }
 
@@ -292,7 +349,7 @@ async fn test_every_participant_is_committed_after_one_refuses() {
     let (mid_net, _mid_addr) = listening_node().await;
     let (mut rc_net, rc_addr) = listening_node().await;
     let (mut other_net, other_addr) = listening_node().await;
-    let mut m = middle_node(mid_net, &rc_addr).await;
+    let mut m = middle_node(mid_net, &mut rc_net, &rc_addr).await;
     let (tid, _) = hold_participant_txn(&mut m, &[&rc_addr, &other_addr]);
 
     // Both refuse, so whichever is sent `Commit` first, the other is only
@@ -324,5 +381,6 @@ async fn test_every_participant_is_committed_after_one_refuses() {
         err.contains("rc refused") || err.contains("other refused"),
         "the error must be one of the participants' reasons, got: {err}"
     );
+    await_gc_update(&mut m, &mut rc_net).await;
     assert_committed_locally(&mut m);
 }

@@ -211,6 +211,11 @@ impl VarLock {
         }
     }
 }
+pub type VClock = HashMap<(Symbol, Symbol), u64>;
+pub type Sources = HashSet<(Symbol, Symbol)>;
+
+/// A read value and its committed clock. Buffered writes have no clock yet.
+pub type ReadEntry = (Value, Option<VClock>, Option<Sources>);
 
 /// Composite state for a single variable represented by `VarState`
 ///
@@ -224,6 +229,13 @@ pub struct VarState {
     pub lock: VarLock,
     /// Most recent transaction to write this variable
     pub latest_write_txn: Option<TxnId>,
+    // we represent a vector clock as a map from a (service, var) pair to a counter
+    // the counter should always be non zero. We interpret the lack of a key to be counter = 0.
+    // we shouldn't need to deal with any complicated removal semantics since the clock
+    // should be monotonically increasing?
+    pub vector_clock: VClock,
+    /// Sources paired with this value and clock; None means not yet known.
+    pub sources: Option<Sources>,
 }
 
 impl VarState {
@@ -233,6 +245,8 @@ impl VarState {
             value,
             lock: VarLock::new(),
             latest_write_txn: None,
+            vector_clock: HashMap::new(),
+            sources: None,
         }
     }
 }
@@ -252,9 +266,12 @@ pub struct Transaction {
     pub locked: HashSet<(ServiceNetId, Symbol)>,
     /// Services this transaction currently holds a whole-service lock on
     pub service_locked: HashSet<ServiceNetId>,
-    /// Values already read in this transaction, keyed by (service, variable)
-    /// (avoids re-fetching, including redundant network round-trips)
-    pub read_cache: HashMap<(ServiceNetId, Symbol), Value>,
+    /// Read snapshots keyed by (service, member). Local reads reuse the pair.
+    /// Initialization also records remote pairs without skipping later RPCs.
+    pub read_cache: HashMap<(ServiceNetId, Symbol), ReadEntry>,
+    /// Collect the current def's inputs during initialization. Ordinary
+    /// transactions do not need this per-evaluation set.
+    pub(crate) observed_reads: Option<HashSet<(Symbol, Symbol)>>,
     /// Values written by this transaction, keyed by (service, variable),
     /// buffered and applied only on successful commit (so a failed
     /// transaction leaves no partial writes)
@@ -272,6 +289,7 @@ impl Transaction {
             locked: HashSet::new(),
             service_locked: HashSet::new(),
             read_cache: HashMap::new(),
+            observed_reads: None,
             written: HashMap::new(),
             participants: HashSet::new(),
         }

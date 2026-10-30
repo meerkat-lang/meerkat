@@ -388,11 +388,17 @@ async fn dispatch_parked(manager: &mut Manager, parked: ParkedRequest) {
                         },
                     );
                 }
-                Ok(val) => {
+                Ok((val, clock, sources)) => {
                     let response = match codec::encode_value(&val, &manager.interner) {
                         Ok(enc_val) => MeerkatMessage::LookupResponse {
                             request_id,
                             value: enc_val,
+                            clock: clock
+                                .as_ref()
+                                .map(|clock| codec::encode_clock(clock, &manager.interner)),
+                            sources: sources
+                                .as_ref()
+                                .map(|sources| codec::encode_sources(sources, &manager.interner)),
                         },
                         Err(e) => MeerkatMessage::LookupError {
                             request_id,
@@ -510,7 +516,7 @@ async fn init_server_services(
 ) -> Result<(), Box<dyn Error>> {
     // `register_and_instantiate_imports` walks this, and runtime updates
     // against remote services resolve their targets through it.
-    manager.unified_ast = full_ast;
+    manager.install_unified_ast(full_ast);
 
     manager
         .register_and_instantiate_imports(prog, remote_url_map)
@@ -550,7 +556,7 @@ async fn init_server_services(
 fn advertised_services(manager: &Manager) -> Vec<Symbol> {
     let mut seen = HashSet::new();
     manager
-        .unified_ast
+        .unified_ast()
         .iter()
         .filter_map(|stmt| match stmt {
             Stmt::Service { name, .. } => Some(*name),
@@ -776,12 +782,14 @@ async fn run_server(
                         }
                         // Plain unlocked read: reply immediately
                         None => {
-                            let result = manager.lookup(mem_sym, svc_sym, None).await;
+                            let result = manager.lookup_with_clock(mem_sym, svc_sym, None).await;
                             let response = match result {
-                                Ok(val) => match codec::encode_value(&val, &manager.interner) {
+                                Ok((val, clock, sources)) => match codec::encode_value(&val, &manager.interner) {
                                     Ok(enc_val) => MeerkatMessage::LookupResponse {
                                         request_id,
                                         value: enc_val,
+                                        clock: clock.as_ref().map(|clock| codec::encode_clock(clock, &manager.interner)),
+                                        sources: sources.as_ref().map(|sources| codec::encode_sources(sources, &manager.interner)),
                                     },
                                     Err(e) => MeerkatMessage::LookupError {
                                         request_id,
@@ -998,24 +1006,32 @@ async fn run_server(
                     source_service,
                     member,
                     value,
+                    clock,
+                    sources,
                 } => {
                     // #24: validate + intern wire names through codec; skip on bad input.
-                    let (listener_def_sym, source_sym, member_sym) = match codec::decode_update(
-                        &listener_def,
-                        &source_service,
-                        &member,
-                        &mut manager.interner,
-                    ) {
-                        Ok(syms) => syms,
-                        Err(_) => continue,
-                    };
+                    // Vector-clock PR: the clock's dimension names are interned here
+                    // too, so a bad one drops the whole message.
+                    let (listener_def_sym, source_sym, member_sym, vclock, sources) =
+                        match codec::decode_update(
+                            &listener_def,
+                            &source_service,
+                            &member,
+                            &mut manager.interner,
+                            clock,
+                            sources,
+                        ) {
+                            Ok(syms) => syms,
+                            Err(_) => continue,
+                        };
                     manager
                         .handle_update(
                             ServiceNetId(listener_service),
                             listener_def_sym,
-                            source_sym,
-                            member_sym,
+                            (source_sym, member_sym),
                             value,
+                            vclock,
+                            sources,
                         )
                         .await;
                 }
@@ -1080,7 +1096,7 @@ async fn run_client(
     // Pre-populate unified_ast with the full AST (including remote imports)
     // so that runtime updates against remote services can successfully find
     // the target service definitions to patch against and type-check.
-    manager.unified_ast = full_ast;
+    manager.install_unified_ast(full_ast);
 
     // Start the network if we have remote imports, or always in watch mode
     // (watch needs the network to receive change notifications).
@@ -1203,6 +1219,8 @@ async fn run_client(
                 source_service,
                 member,
                 value,
+                clock,
+                sources,
             }) = msg
             {
                 if let Ok(parsed) = codec::decode_value(value.clone(), &mut manager.interner) {
@@ -1210,17 +1228,28 @@ async fn run_client(
                 }
                 let lid = ServiceNetId(listener_service);
                 // #24: validate + intern wire names through codec; skip on bad input.
-                let (def_sym, source_sym, member_sym) = match codec::decode_update(
+                // Vector-clock PR: the clock's dimension names are interned here
+                // too, so a bad one drops the whole message.
+                let (def_sym, source_sym, member_sym, vclock, sources) = match codec::decode_update(
                     &listener_def,
                     &source_service,
                     &member,
                     &mut manager.interner,
+                    clock,
+                    sources,
                 ) {
                     Ok(syms) => syms,
                     Err(_) => continue,
                 };
                 manager
-                    .handle_update(lid.clone(), def_sym, source_sym, member_sym, value)
+                    .handle_update(
+                        lid.clone(),
+                        def_sym,
+                        (source_sym, member_sym),
+                        value,
+                        vclock,
+                        sources,
+                    )
                     .await;
                 if let Some((_, svc)) = manager.services.iter().find(|(_, s)| s.id == lid) {
                     if let Some(vs) = svc.vars.get(&def_sym) {

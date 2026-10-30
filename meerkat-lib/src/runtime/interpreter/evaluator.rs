@@ -3,7 +3,7 @@ use crate::runtime::graphs::free_var::free_var;
 use crate::runtime::interner::Symbol;
 use crate::runtime::txn::{Transaction, WaitKey};
 use crate::runtime::Manager;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug)]
 pub enum EvalError {
@@ -17,6 +17,7 @@ pub enum EvalError {
     WaitOn(WaitKey),
     AssertionError(String),
     RuntimeError(String),
+    InputNotReady((Symbol, Symbol)),
 }
 
 /// The text `EvalError::WaitDieAbort` displays itself with.
@@ -52,6 +53,7 @@ impl std::fmt::Display for EvalError {
             }
             EvalError::AssertionError(s) => write!(f, "Assertion failed: {}", s),
             EvalError::RuntimeError(s) => write!(f, "Runtime error: {}", s),
+            EvalError::InputNotReady(input) => write!(f, "Reactive input {:?} is not ready", input),
         }
     }
 }
@@ -72,13 +74,35 @@ pub struct EvalContext<'a> {
     pub txn: Option<&'a mut Transaction>,
 }
 
-// async_recursion adds a bare #[must_use] to a fn that returns a boxed Future.
-#[allow(clippy::double_must_use)]
-#[async_recursion::async_recursion]
 pub async fn eval(
     expr: &Expr,
     env: &[(Symbol, Value)],
     ctx: &mut EvalContext<'_>,
+) -> Result<Value, EvalError> {
+    eval_with_inputs(expr, env, ctx, None).await
+}
+
+async fn lookup_input(
+    input: (Symbol, Symbol),
+    ctx: &mut EvalContext<'_>,
+    inputs: Option<&HashMap<(Symbol, Symbol), Option<Value>>>,
+) -> Result<Value, EvalError> {
+    if let Some(value) = inputs.and_then(|inputs| inputs.get(&input)) {
+        return value.clone().ok_or(EvalError::InputNotReady(input));
+    }
+    ctx.manager
+        .lookup(input.1, input.0, ctx.txn.as_deref_mut())
+        .await
+}
+
+// async_recursion adds a bare #[must_use] to a fn that returns a boxed Future.
+#[allow(clippy::double_must_use)]
+#[async_recursion::async_recursion]
+pub(crate) async fn eval_with_inputs(
+    expr: &Expr,
+    env: &[(Symbol, Value)],
+    ctx: &mut EvalContext<'_>,
+    inputs: Option<&HashMap<(Symbol, Symbol), Option<Value>>>,
 ) -> Result<Value, EvalError> {
     match expr {
         Expr::Literal { val } => Ok(val.clone()),
@@ -93,7 +117,7 @@ pub async fn eval(
             // recomputed by propagation when a dependency changes.
             let mut values = Vec::new();
             for e in template.embedded_exprs() {
-                values.push(eval(e, env, ctx).await?);
+                values.push(eval_with_inputs(e, env, ctx, inputs).await?);
             }
             template.render(&values).map(Value::Html).ok_or_else(|| {
                 EvalError::RuntimeError("html render: value count mismatch".to_string())
@@ -101,10 +125,10 @@ pub async fn eval(
         }
 
         Expr::Call { func, args } => {
-            let func_val = eval(func, env, ctx).await?;
+            let func_val = eval_with_inputs(func, env, ctx, inputs).await?;
             let mut arg_vals = Vec::new();
             for arg in args {
-                arg_vals.push(eval(arg, env, ctx).await?);
+                arg_vals.push(eval_with_inputs(arg, env, ctx, inputs).await?);
             }
             match func_val {
                 Value::Closure {
@@ -118,7 +142,7 @@ pub async fn eval(
                     for (param, arg_val) in params.iter().zip(arg_vals) {
                         new_env.push((param.name, arg_val));
                     }
-                    eval(
+                    eval_with_inputs(
                         &body,
                         &new_env,
                         &mut EvalContext {
@@ -126,6 +150,7 @@ pub async fn eval(
                             service_name: closure_svc,
                             txn: ctx.txn.as_deref_mut(),
                         },
+                        inputs,
                     )
                     .await
                 }
@@ -141,14 +166,12 @@ pub async fn eval(
                     return Ok(var_val.clone());
                 }
             }
-            ctx.manager
-                .lookup(name, ctx.service_name, ctx.txn.as_deref_mut())
-                .await
+            lookup_input((ctx.service_name, name), ctx, inputs).await
         }
 
         Expr::Binop { op, expr1, expr2 } => {
-            let val1 = eval(expr1, env, ctx).await?;
-            let val2 = eval(expr2, env, ctx).await?;
+            let val1 = eval_with_inputs(expr1, env, ctx, inputs).await?;
+            let val2 = eval_with_inputs(expr2, env, ctx, inputs).await?;
             if *op == BinOp::Eq {
                 match (&val1, &val2) {
                     (Value::List { vals: v1 }, Value::List { vals: v2 }) => {
@@ -219,7 +242,7 @@ pub async fn eval(
         }
 
         Expr::Unop { op, expr } => {
-            let val = eval(expr, env, ctx).await?;
+            let val = eval_with_inputs(expr, env, ctx, inputs).await?;
             match (op, val) {
                 (UnOp::Neg, Value::Int { val: v }) => Ok(Value::Int { val: -v }),
                 (UnOp::Not, Value::Bool { val: v }) => Ok(Value::Bool { val: !v }),
@@ -230,10 +253,10 @@ pub async fn eval(
         }
 
         Expr::If { cond, expr1, expr2 } => {
-            let cond_val = eval(cond, env, ctx).await?;
+            let cond_val = eval_with_inputs(cond, env, ctx, inputs).await?;
             match cond_val {
-                Value::Bool { val: true } => eval(expr1, env, ctx).await,
-                Value::Bool { val: false } => eval(expr2, env, ctx).await,
+                Value::Bool { val: true } => eval_with_inputs(expr1, env, ctx, inputs).await,
+                Value::Bool { val: false } => eval_with_inputs(expr2, env, ctx, inputs).await,
                 _ => Err(EvalError::TypeError(
                     "Condition must be boolean".to_string(),
                 )),
@@ -302,26 +325,7 @@ pub async fn eval(
         &Expr::MemberAccess {
             service_name,
             member_name,
-        } => {
-            // #24: during a reactive update we check the cache first. If this
-            // (service, member) was already fetched for the def being recomputed,
-            // use the cached value instead of doing a lookup (which for a remote
-            // service would be a network round-trip).
-            if let Some(v) = ctx
-                .manager
-                .reactive_cache
-                .as_ref()
-                .and_then(|c| c.get(&(service_name, member_name)))
-                .cloned()
-            {
-                return Ok(v);
-            }
-            // The `Manager` determines whether the service is local or
-            // remote
-            ctx.manager
-                .lookup(member_name, service_name, ctx.txn.as_deref_mut())
-                .await
-        }
+        } => lookup_input((service_name, member_name), ctx, inputs).await,
         Expr::Tuple { .. }
         | Expr::KeyVal { .. }
         | Expr::Select { .. }
@@ -330,13 +334,13 @@ pub async fn eval(
         Expr::List(exprs) => {
             let mut vals = Vec::new();
             for expr in exprs {
-                vals.push(eval(expr, env, ctx).await?);
+                vals.push(eval_with_inputs(expr, env, ctx, inputs).await?);
             }
             Ok(Value::List { vals })
         }
         Expr::Range { start, end } => {
-            let start_val = eval(start, env, ctx).await?;
-            let end_val = eval(end, env, ctx).await?;
+            let start_val = eval_with_inputs(start, env, ctx, inputs).await?;
+            let end_val = eval_with_inputs(end, env, ctx, inputs).await?;
             match (start_val, end_val) {
                 (Value::Int { val: s }, Value::Int { val: e }) => {
                     Ok(Value::Range { start: s, end: e })

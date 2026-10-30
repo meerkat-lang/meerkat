@@ -268,7 +268,8 @@ mod tests {
                 | EvalError::NotImplemented
                 | EvalError::WaitDieAbort(_)
                 | EvalError::WaitOn(_)
-                | EvalError::RuntimeError(_) => {
+                | EvalError::RuntimeError(_)
+                | EvalError::InputNotReady(_) => {
                     panic!("Expected EvalError::AssertionError")
                 }
             },

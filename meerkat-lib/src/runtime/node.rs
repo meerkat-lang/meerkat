@@ -18,7 +18,6 @@ use crate::net::{
     codec, Address, MessageId, NetworkActor, NetworkCommand, NetworkEvent, NetworkReply, NodeType,
 };
 use crate::runtime::ast::{apply_updates_to_ast, Stmt};
-use crate::runtime::graphs::analysis::compute_dependencies;
 use crate::runtime::imports::Imports;
 use crate::runtime::interner::Interner;
 use crate::runtime::limits::{IMPORT_POLL_INTERVAL_MS, IMPORT_RETRY_DELAY_MS};
@@ -496,7 +495,7 @@ impl Node {
         let mut manager = Manager::new(self.interner);
         manager.local = local;
         manager.network = network;
-        manager.unified_ast = self.unified_ast.clone();
+        manager.install_unified_ast(self.unified_ast);
         manager.local_services = self.local_services;
 
         // Register the `-i` remotes and instantiate every locally resolved
@@ -568,7 +567,7 @@ impl Node {
     ///   `Result<()>`: Ok if static checks pass, or error
     ///
     /// Errors:
-    ///   `Error`: If name resolution, type checking, or graph analysis fails
+    ///   `Error`: If name resolution or type checking fails
     pub fn static_checks(&mut self) -> Result<()> {
         let mut service_ast: Vec<Stmt> = Vec::new();
         let mut top_level_stmts: Vec<Stmt> = Vec::new();
@@ -601,8 +600,6 @@ impl Node {
                 .map_err(|e| self.format_tt_error(e))?;
             self.local_services = local_services;
 
-            compute_dependencies(&self.unified_ast, None);
-
             return Ok(());
         }
 
@@ -610,7 +607,6 @@ impl Node {
         nameres::resolve(&service_ast).map_err(|e| self.format_nameres_error(e))?;
         let mut initial_services = Env::new(None);
         tt::check(&service_ast, &mut initial_services).map_err(|e| self.format_tt_error(e))?;
-        compute_dependencies(&service_ast, None);
 
         let last_batch = update_batches.pop().unwrap();
 
@@ -626,7 +622,6 @@ impl Node {
             nameres::resolve(&service_ast).map_err(|e| self.format_nameres_error(e))?;
             let mut step_services = Env::new(None);
             tt::check(&service_ast, &mut step_services).map_err(|e| self.format_tt_error(e))?;
-            compute_dependencies(&service_ast, None);
         }
 
         // Process final atomic transaction batch
@@ -643,10 +638,9 @@ impl Node {
         nameres::resolve(&final_ast).map_err(|e| self.format_nameres_error(e))?;
         let mut final_services = Env::new(None);
         tt::check(&final_ast, &mut final_services).map_err(|e| self.format_tt_error(e))?;
-        compute_dependencies(&final_ast, None);
-
         self.local_services = final_services;
-        self.unified_ast = final_ast;
+        // Validate future updates without installing their declarations.
+        // The runtime transaction installs each update only after evaluation.
 
         Ok(())
     }

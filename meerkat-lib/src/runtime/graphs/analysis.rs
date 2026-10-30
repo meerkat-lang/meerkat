@@ -56,3 +56,30 @@ pub fn compute_dependencies(
     }
     all_graphs
 }
+
+/// Effective service declarations: later declarations replace earlier imports.
+pub(crate) fn service_declarations(program: &[Stmt]) -> HashMap<Symbol, &Stmt> {
+    program
+        .iter()
+        .filter_map(|stmt| match stmt {
+            Stmt::Service { name, .. } => Some((*name, stmt)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Analyze only the selected effective declarations.
+pub(crate) fn declaration_graphs(
+    program: &[Stmt],
+    include: impl Fn(Symbol, &Stmt) -> bool,
+) -> HashMap<Symbol, ServiceGraphs> {
+    service_declarations(program)
+        .into_iter()
+        .filter(|(name, stmt)| include(*name, stmt))
+        .filter_map(|(name, stmt)| {
+            compute_dependencies(std::slice::from_ref(stmt), None)
+                .pop()
+                .map(|graph| (name, graph))
+        })
+        .collect()
+}

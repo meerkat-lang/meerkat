@@ -703,7 +703,7 @@ impl<'a, 'b> Context<'a, 'b> {
                 | Value::String { .. }
                 | Value::Html(..)
                 | Value::List { .. }
-                | Value::Range { .. } => self.infer_value(val, type_depth),
+                | Value::Range { .. } => Self::infer_value(val, type_depth),
             },
             Expr::Html(_) => Ok(Type::String),
             Expr::Variable { name } => {
@@ -948,7 +948,7 @@ impl<'a, 'b> Context<'a, 'b> {
     ///
     /// Returns:
     ///     Result<Type, Error>: Inferred type
-    fn infer_value(&mut self, val: &Value, type_depth: usize) -> Result<Type, Error> {
+    fn infer_value(val: &Value, type_depth: usize) -> Result<Type, Error> {
         if type_depth > crate::runtime::limits::MAX_TYPE_DEPTH {
             return Err(Error::DepthLimitExceeded);
         }
@@ -961,9 +961,9 @@ impl<'a, 'b> Context<'a, 'b> {
                 if vals.is_empty() {
                     Err(Error::CannotInferType)
                 } else {
-                    let inner = self.infer_value(&vals[0], type_depth + 1)?;
+                    let inner = Self::infer_value(&vals[0], type_depth + 1)?;
                     for v in vals {
-                        let v_ty = self.infer_value(v, type_depth + 1)?;
+                        let v_ty = Self::infer_value(v, type_depth + 1)?;
                         if v_ty != inner {
                             return Err(Error::TypeMismatch {
                                 expected: Box::new(inner),

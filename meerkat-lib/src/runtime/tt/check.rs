@@ -44,7 +44,7 @@
 //! - Recursion depth limit: Enforces `limits::MAX_SCOPE_DEPTH`
 //! - Type structure depth limit: Enforces `limits::MAX_TYPE_DEPTH`
 
-use crate::runtime::ast::{ActionStmt, BinOp, Decl, Expr, Stmt, UnOp, Value};
+use crate::runtime::ast::{ActionStmt, BinOp, Decl, Expr, Field, Stmt, TableType, UnOp, Value};
 use crate::runtime::interner::Symbol;
 use crate::runtime::tt::types::{Param, ServiceType, TupleType, Type};
 use crate::runtime::Env;
@@ -79,6 +79,24 @@ fn check_type(ty: &Type, depth: usize) -> Result<(), Error> {
         }
         Type::List(inner) => check_type(inner, depth + 1),
     }
+}
+
+fn table_field_type(ty: &TableType) -> Type {
+    match ty {
+        TableType::Int => Type::Int,
+        TableType::String => Type::String,
+        TableType::Bool => Type::Bool,
+    }
+}
+
+fn table_list_type(fields: &[Field]) -> Type {
+    let col_tys: Vec<Type> = fields.iter().map(|f| table_field_type(&f.ty)).collect();
+    let row_ty = match col_tys.len() {
+        0 => Type::Unit,
+        1 => col_tys.into_iter().next().unwrap(),
+        _ => Type::Tuple(TupleType::new(col_tys).unwrap()),
+    };
+    Type::List(Box::new(row_ty))
 }
 
 /// Type checking errors in Meerkat
@@ -360,7 +378,7 @@ impl<'a, 'b> Context<'a, 'b> {
                     self.infer(val, &mut env, 1)?
                 }
             }
-            Decl::TableDecl { .. } => Type::Unit,
+            Decl::TableDecl { fields, .. } => table_list_type(fields),
         };
 
         if let Some(mut st) = self.local_services.remove(service_name) {
@@ -387,13 +405,8 @@ impl<'a, 'b> Context<'a, 'b> {
                     self.initialized.insert(*name);
                 }
                 Decl::TableDecl { name, .. } => {
+                    self.type_of_member(service_name, *name)?;
                     self.initialized.insert(*name);
-                    // TODO(Issue #156): Implement Table type schema
-                    // validation (deferred per Issue #34)
-                    println!(
-                        "warning: tt/check: ignoring 'table' \
-                         schema checks as not yet implemented"
-                    );
                 }
             }
         }
@@ -477,12 +490,6 @@ impl<'a, 'b> Context<'a, 'b> {
                 Ok(())
             }
             ActionStmt::Insert { row, .. } => {
-                // TODO(Issue #156): Validate inserted row against
-                // table schema (deferred per Issue #34)
-                println!(
-                    "warning: tt/check: ignoring 'insert' \
-                     checks as not yet implemented"
-                );
                 self.infer(row, env, 1)?;
                 Ok(())
             }
@@ -703,6 +710,7 @@ impl<'a, 'b> Context<'a, 'b> {
                 | Value::String { .. }
                 | Value::Html(..)
                 | Value::List { .. }
+                | Value::Record { .. }
                 | Value::Range { .. } => self.infer_value(val, type_depth),
             },
             Expr::Html(_) => Ok(Type::String),
@@ -865,7 +873,15 @@ impl<'a, 'b> Context<'a, 'b> {
             } => self.type_of_member(*service_name, *member_name),
             Expr::Select { .. } => Ok(Type::List(Box::new(Type::Unit))),
             Expr::Table { .. } => Ok(Type::Unit),
-            Expr::Fold { .. } => Ok(Type::Unit),
+            Expr::Fold {
+                operation,
+                identity,
+                ..
+            } => {
+                self.infer(operation, env, type_depth + 1)?;
+                self.infer(identity, env, type_depth + 1)
+            }
+            Expr::Map { .. } => Ok(Type::List(Box::new(Type::Unit))),
             Expr::List(elems) => {
                 if elems.is_empty() {
                     Err(Error::CannotInferType)
@@ -974,6 +990,7 @@ impl<'a, 'b> Context<'a, 'b> {
                     Ok(Type::List(Box::new(inner)))
                 }
             }
+            Value::Record { .. } => Ok(Type::Unit),
             Value::Range { .. } => Ok(Type::List(Box::new(Type::Int))),
             Value::ActionClosure { .. } => Ok(Type::Unit),
             Value::Closure {

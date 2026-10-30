@@ -1,6 +1,10 @@
-use super::ast::{ActionStmt, Decl, Expr, Stmt, Value};
+use super::ast::{table_decl_in_service, ActionStmt, Decl, Expr, Stmt, Value};
 use super::env::Env;
-use super::graphs::{analysis::compute_dependencies, free_var::cross_service_deps, ServiceGraphs};
+use super::graphs::{
+    analysis::compute_dependencies,
+    free_var::{cross_service_deps, service_names},
+    ServiceGraphs,
+};
 use super::interpreter::{eval, execute_seq, EvalContext, EvalError, WAIT_DIE_DISPLAY_PREFIX};
 use super::tt::types::ServiceType;
 use crate::net::network_layer::NetworkLayer;
@@ -497,11 +501,14 @@ impl Manager {
                         service.defs.insert(name, val); // store original expr
                     }
                 }
-                Decl::TableDecl { .. } => {
-                    // we still need to release locks, so no longer return directly after
-                    // encountering a TableDecl
-                    init_error = Some(EvalError::NotImplemented);
-                    break;
+                Decl::TableDecl { name, fields: _ } => {
+                    let value = Value::List { vals: vec![] };
+                    env.push((name, value.clone()));
+                    if let Some(service) = self.services.get_mut(&svc_name) {
+                        let mut var_value = VarState::new(value);
+                        var_value.latest_write_txn = Some(txn.id.clone());
+                        service.vars.insert(name, var_value);
+                    }
                 }
             }
         }
@@ -696,6 +703,16 @@ impl Manager {
             self.interner.get(var_name),
             self.interner.get(service_name)
         )))
+    }
+
+    /// Column names of a table on `service_name`, in schema order.
+    pub(crate) fn table_field_names(
+        &self,
+        service_name: Symbol,
+        table_name: Symbol,
+    ) -> Option<Vec<Symbol>> {
+        table_decl_in_service(&self.unified_ast, service_name, table_name)
+            .map(|fields| fields.iter().map(|f| f.name).collect())
     }
 
     /// Assign a value to a service variable
@@ -2521,6 +2538,8 @@ impl Manager {
             }
         }
 
+        let known_services = service_names(&self.unified_ast);
+
         while let Some((svc_sym, mem_sym, is_write)) = queue.pop() {
             if self.services.contains_key(&svc_sym) {
                 // Acquire the local lock (or upgrade it to a write lock
@@ -2556,7 +2575,9 @@ impl Manager {
 
                         // Cross-service dependencies
                         if let Some(expr) = service.defs.get(&mem_sym) {
-                            for (remote_svc, remote_mem) in cross_service_deps(expr) {
+                            for (remote_svc, remote_mem) in
+                                cross_service_deps(expr, &known_services)
+                            {
                                 if self.remote_services.contains_key(&remote_svc) {
                                     // Track remote dependencies for a
                                     // remote service to request them
@@ -2806,7 +2827,7 @@ mod tests {
             }),
         };
         assert_eq!(
-            cross_service_deps(&z_expr),
+            cross_service_deps(&z_expr, &std::collections::HashSet::from([tc.s1])),
             std::collections::HashSet::from([(tc.s1, tc.y)])
         );
         // y = x + 1  ->  {} (no cross-service references)
@@ -2817,7 +2838,7 @@ mod tests {
                 val: Value::Int { val: 1 },
             }),
         };
-        assert!(cross_service_deps(&y_expr).is_empty());
+        assert!(cross_service_deps(&y_expr, &std::collections::HashSet::from([tc.s1])).is_empty());
     }
 
     // #24: a def in s2 that reads s1.y updates eagerly when s1.x changes,
@@ -3128,6 +3149,87 @@ mod tests {
         tc.manager.create_service(tc.foo, decls).await.unwrap();
         let result = tc.manager.lookup(tc.f, tc.foo, None).await.unwrap();
         assert_eq!(result, Value::Int { val: 5 });
+    }
+
+    #[tokio::test]
+    async fn test_insert_recomputes_fold() {
+        use crate::ast::{ActionStmt, Field, TableType};
+        use crate::runtime::tt::Param;
+
+        let mut tc = TestContext::new();
+        let tasks = tc.manager.interner.insert("tasks");
+        let minutes = tc.manager.interner.insert("minutes");
+        let acc = tc.manager.interner.insert("acc");
+        let item = tc.manager.interner.insert("item");
+        let total = tc.manager.interner.insert("total");
+        let decls = vec![
+            Decl::TableDecl {
+                name: tasks,
+                fields: vec![Field {
+                    name: minutes,
+                    ty: TableType::Int,
+                }],
+            },
+            Decl::DefDecl {
+                name: total,
+                ty: None,
+                val: Expr::Fold {
+                    table_name: tasks,
+                    column_name: minutes,
+                    operation: Box::new(Expr::Func {
+                        params: vec![
+                            Param {
+                                name: acc,
+                                ty: Some(crate::runtime::tt::Type::Int),
+                            },
+                            Param {
+                                name: item,
+                                ty: Some(crate::runtime::tt::Type::Int),
+                            },
+                        ],
+                        body: Box::new(Expr::Binop {
+                            op: crate::ast::BinOp::Add,
+                            expr1: Box::new(Expr::Variable { name: acc }),
+                            expr2: Box::new(Expr::Variable { name: item }),
+                        }),
+                        return_ty: None,
+                    }),
+                    identity: Box::new(Expr::Literal {
+                        val: Value::Int { val: 0 },
+                    }),
+                },
+                is_pub: true,
+            },
+        ];
+        tc.manager.create_service(tc.foo, decls).await.unwrap();
+        assert_eq!(
+            tc.manager.lookup(total, tc.foo, None).await.unwrap(),
+            Value::Int { val: 0 }
+        );
+        tc.manager
+            .execute_test_block(
+                tc.foo,
+                &[
+                    ActionStmt::Insert {
+                        table_name: tasks,
+                        row: Expr::Literal {
+                            val: Value::Int { val: 10 },
+                        },
+                    },
+                    ActionStmt::Insert {
+                        table_name: tasks,
+                        row: Expr::Literal {
+                            val: Value::Int { val: 33 },
+                        },
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tc.manager.lookup(total, tc.foo, None).await.unwrap(),
+            Value::Int { val: 43 }
+        );
     }
 
     /// Recomputing a def must restore whatever reactive cache was already

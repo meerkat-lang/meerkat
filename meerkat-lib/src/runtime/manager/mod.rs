@@ -4679,8 +4679,40 @@ impl Default for Manager {
 mod tests {
     use super::*;
     use crate::ast::{Decl, Expr, Value};
+    use crate::runtime::graphs::free_var::cross_service_deps;
     use crate::runtime::interpreter::execute;
     use crate::runtime::{parser::parse_string, update::Transaction as CodeUpdate, Node};
+
+    // #24: cross_service_deps pulls out exactly the (service, member) symbols
+    // referenced via MemberAccess, and nothing for a purely local expression.
+    #[test]
+    fn test_cross_service_deps_extraction() {
+        let tc = TestContext::new();
+        // z = s1.y + 2  ->  {(s1, y)}
+        let z_expr = Expr::Binop {
+            op: crate::ast::BinOp::Add,
+            expr1: Box::new(Expr::MemberAccess {
+                service_name: tc.s1,
+                member_name: tc.y,
+            }),
+            expr2: Box::new(Expr::Literal {
+                val: Value::Int { val: 2 },
+            }),
+        };
+        assert_eq!(
+            cross_service_deps(&z_expr, &std::collections::HashSet::from([tc.s1])),
+            std::collections::HashSet::from([(tc.s1, tc.y)])
+        );
+        // y = x + 1  ->  {} (no cross-service references)
+        let y_expr = Expr::Binop {
+            op: crate::ast::BinOp::Add,
+            expr1: Box::new(Expr::Variable { name: tc.x }),
+            expr2: Box::new(Expr::Literal {
+                val: Value::Int { val: 1 },
+            }),
+        };
+        assert!(cross_service_deps(&y_expr, &std::collections::HashSet::from([tc.s1])).is_empty());
+    }
 
     // #24: a def in s2 that reads s1.y updates eagerly when s1.x changes,
     // driven by the listener cascade rather than a lazy re-lookup.

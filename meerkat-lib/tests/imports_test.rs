@@ -759,12 +759,10 @@ fn test_import_retry_exhaustion_reports_the_cause() {
     use meerkat_lib::net::MessageId;
     use meerkat_lib::runtime::limits::MAX_IMPORT_RETRIES;
 
+    // Parsed rather than built, so the test doesn't depend on the shape of
+    // `Stmt::Import`
     let mut interner = Interner::new();
-    let sym_b = interner.insert("B");
-    let base_ast = vec![Stmt::Import {
-        path: "B.mkt".to_string(),
-        service_name: sym_b,
-    }];
+    let base_ast = parser::parse_string("import B\n", &mut interner).expect("parse import");
     let mut remote_map = HashMap::new();
     remote_map.insert("B".to_string(), "/ip4/127.0.0.1/tcp/9000".to_string());
     let (mut imports, _initial_cmds) = Imports::new(

@@ -736,6 +736,119 @@ async fn test_update_adds_new_cross_service_listener_edge() {
     assert_eq!(y_val, Value::Int { val: 200 });
 }
 
+/// Start a manager on `initial_code`, then apply `update_code` to it
+async fn manager_after_update(
+    initial_code: &str,
+    update_code: &str,
+) -> meerkat_lib::runtime::Manager {
+    let mut interner = Interner::new();
+    let initial_ast = parse_string(initial_code, &mut interner).unwrap();
+    let mut node = Node::new();
+    node.interner = interner;
+    node.unified_ast = initial_ast;
+    node.static_checks().unwrap();
+
+    let local_ast = node.unified_ast.clone();
+    let mut manager = node
+        .on_manager_startup(true, None, HashMap::new(), &local_ast)
+        .await
+        .unwrap();
+
+    let update_ast = parse_string(update_code, &mut manager.interner).unwrap();
+    let mut txn = Transaction::new(update_ast);
+    let poll_res = txn.poll(&mut manager).await;
+    assert!(poll_res.is_ok(), "poll error: {:?}", poll_res);
+    manager
+}
+
+/// Verify an update that turns a def into a var stops it listening to the
+/// member the def read in the same service
+///
+/// The old def stays in `service.defs` after the update, so a listener guard
+/// that consults it wires the var, and the next change to `x` re-runs the old
+/// expression `x + 1` over the var's own value
+#[tokio::test]
+async fn test_update_def_to_var_unwires_same_service_listener() {
+    let mut manager = manager_after_update(
+        "
+        service s1 {
+            var x = 1;
+            pub def d = x + 1;
+        }
+        ",
+        "
+        update s1 {
+            var d: int = x;
+        }
+        ",
+    )
+    .await;
+
+    let s1_sym = manager.interner.insert("s1");
+    let x_sym = manager.interner.insert("x");
+    let d_sym = manager.interner.insert("d");
+
+    manager
+        .assign(s1_sym, d_sym, Value::Int { val: 50 }, None)
+        .await
+        .unwrap();
+    manager
+        .assign(s1_sym, x_sym, Value::Int { val: 11 }, None)
+        .await
+        .unwrap();
+
+    let d_val = manager.lookup(d_sym, s1_sym, None).await.unwrap();
+    assert_eq!(
+        d_val,
+        Value::Int { val: 50 },
+        "12 means the var was recomputed from the old def expression"
+    );
+}
+
+/// Verify an update that turns a def into a var stops it listening to the
+/// member the def read in another service
+#[tokio::test]
+async fn test_update_def_to_var_unwires_cross_service_listener() {
+    let mut manager = manager_after_update(
+        "
+        service b {
+            var m = 1;
+            pub def mm = m;
+        }
+        service a {
+            pub def d = b.mm + 1;
+        }
+        ",
+        "
+        update a {
+            var d: int = b.mm;
+        }
+        ",
+    )
+    .await;
+
+    let a_sym = manager.interner.insert("a");
+    let b_sym = manager.interner.insert("b");
+    let m_sym = manager.interner.insert("m");
+    let d_sym = manager.interner.insert("d");
+
+    manager
+        .assign(a_sym, d_sym, Value::Int { val: 50 }, None)
+        .await
+        .unwrap();
+    manager
+        .assign(b_sym, m_sym, Value::Int { val: 11 }, None)
+        .await
+        .unwrap();
+
+    let d_val = manager.lookup(d_sym, a_sym, None).await.unwrap();
+    assert_eq!(
+        d_val,
+        Value::Int { val: 50 },
+        "12 means the var was recomputed from the old def expression"
+    );
+}
+
 /// Verify empty statement lists do not panic and complete cleanly
 #[tokio::test]
 async fn test_update_empty_statements_no_panic() {

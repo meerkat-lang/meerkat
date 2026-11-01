@@ -155,7 +155,7 @@ Read-your-own-writes inside a transaction (a def read after a write it depends
 on sees the new value, `var`s stay non-reactive, a failed recompute aborts the
 transaction) is specified by its own suite. Its tests are ignored until
 compute-on-read lands (tasks/12-compute-on-read.md), except one that waits on
-#210; `--ignored` runs them and shows the current gaps:
+#230; `--ignored` runs them and shows the current gaps:
 
     cargo test --test txn_reactivity_test -- --ignored
 

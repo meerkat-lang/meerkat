@@ -289,6 +289,10 @@ async fn test_participant_transactional_read_sees_buffered_def() {
 /// follow from the `var` it is derived from. (It would also drop a
 /// `WaitDieAbort` raised by a live cross-node re-read, defeating the retry
 /// loop in `execute_action_with_txn`.)
+///
+/// `y` is read after the write, because an unread def is never recomputed. The
+/// read expects the stale `100`, so an implementation that swallowed the error
+/// and served the stored value would commit, and `expect_err` would catch it.
 #[tokio::test]
 #[ignore = "requires compute-on-read: see tasks/12-compute-on-read.md"]
 async fn test_failed_recompute_aborts_the_transaction() {
@@ -301,6 +305,7 @@ async fn test_failed_recompute_aborts_the_transaction() {
         @test(s) {
             assert(y == 100);
             d = 0;
+            assert(y == 100);
         }
         ",
     )
@@ -308,7 +313,7 @@ async fn test_failed_recompute_aborts_the_transaction() {
     let (svc, stmts) = &tests[0];
     let err = run_test_block(&mut m, svc, stmts)
         .await
-        .expect_err("writing d = 0 makes `y` uncomputable and must fail the transaction");
+        .expect_err("reading `y` after d = 0 cannot recompute it and must fail the transaction");
     assert!(
         err.to_string().contains("Division by zero"),
         "expected the recompute failure to surface, got: {err}"
@@ -335,6 +340,11 @@ async fn test_failed_recompute_aborts_the_transaction() {
 /// The service is pointed at a remote address with no network layer behind it,
 /// so a real read fails in a way the test can see. Serving the seeded cache
 /// value instead would let the transaction succeed with a stale number.
+///
+/// `z` is read after the write, because an unread def is never recomputed, and
+/// the read expects the value the cache would give. Served from the cache, the
+/// assertion passes and the transaction commits, which `expect_err` catches;
+/// the error must then be the failed remote read, not an assertion.
 #[tokio::test]
 #[ignore = "requires compute-on-read: see tasks/12-compute-on-read.md"]
 async fn test_remote_dependency_is_never_served_from_dep_cache() {
@@ -350,6 +360,7 @@ async fn test_remote_dependency_is_never_served_from_dep_cache() {
         }
         @test(q) {
             p = 5;
+            assert(z == 105);
         }
         ",
     )
@@ -381,8 +392,8 @@ async fn test_remote_dependency_is_never_served_from_dep_cache() {
         .await
         .expect_err("recomputing `z` must attempt a real read of the remote dependency");
     assert!(
-        !err.to_string().is_empty(),
-        "expected the failed remote read to surface"
+        !matches!(err, EvalError::AssertionError(_)),
+        "expected the failed remote read to surface, got: {err}"
     );
 
     // The write was rolled back with the rest of the transaction.
@@ -398,6 +409,10 @@ async fn test_remote_dependency_is_never_served_from_dep_cache() {
 /// the transaction's own reads does reach `lookup`, and reading it without the
 /// transaction skips the lock entirely: the value can be changed by a
 /// concurrent transaction while this derived value is being built from it.
+///
+/// `mm` is read after the write, because an unread def is never recomputed.
+/// The error must be the wait-die outcome: a stale `mm` fails the assertion,
+/// and that failure must not count as contention.
 #[tokio::test]
 #[ignore = "requires compute-on-read: see tasks/12-compute-on-read.md"]
 async fn test_uncached_cross_service_dependency_is_read_under_the_transaction() {
@@ -413,6 +428,7 @@ async fn test_uncached_cross_service_dependency_is_read_under_the_transaction() 
         }
         @test(q) {
             w = 5;
+            assert(mm == 6);
         }
         ",
     )
@@ -442,8 +458,8 @@ async fn test_uncached_cross_service_dependency_is_read_under_the_transaction() 
         .await
         .expect_err("recomputing `mm` must contend for the lock on `p.get_n`, not read through it");
     assert!(
-        !err.to_string().is_empty(),
-        "expected a lock-contention failure"
+        matches!(err, EvalError::WaitDieAbort(_)),
+        "expected a lock-contention failure, got: {err}"
     );
 
     // Nothing committed.
@@ -483,27 +499,41 @@ async fn test_recompute_in_txn_read_locks_same_service_dependencies() {
     let x = m.interner.insert("x");
     let b = m.interner.insert("b");
 
-    // An older transaction writes `x`, which recomputes `def y = x + b` and so
-    // reads `b`. Run it as a participant so it stays prepared, holding whatever
-    // locks it took.
+    // An older transaction writes `x` and then reads `def y = x + b`, which
+    // recomputes `y` and so reads `b`. An unread def is never recomputed, so the
+    // read is what puts `b` in this transaction's view. Run it as a participant
+    // so it stays prepared, holding whatever locks it took.
     let older = TxnId {
         timestamp: 1,
         node_id: m.node_id,
         iteration: 0,
     };
+    let y = m.interner.insert("y");
     m.execute_action_participant(
         s,
-        &[ActionStmt::Assign {
-            name: x,
-            expr: Expr::Literal {
-                val: Value::Int { val: 1 },
+        &[
+            ActionStmt::Assign {
+                name: x,
+                expr: Expr::Literal {
+                    val: Value::Int { val: 1 },
+                },
             },
-        }],
+            ActionStmt::Assert(
+                Expr::Binop {
+                    op: meerkat_lib::runtime::ast::BinOp::Eq,
+                    expr1: Box::new(Expr::Variable { name: y }),
+                    expr2: Box::new(Expr::Literal {
+                        val: Value::Int { val: 6 },
+                    }),
+                },
+                "y == 6".to_string(),
+            ),
+        ],
         &[],
         older.clone(),
     )
     .await
-    .expect("the write and its recompute must succeed");
+    .expect("the write, and the read of `y` that recomputes it, must succeed");
 
     assert!(
         m.pending_txns

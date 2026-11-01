@@ -3,13 +3,14 @@ use super::env::Env;
 use super::graphs::{analysis::compute_dependencies, free_var::cross_service_deps, ServiceGraphs};
 use super::interpreter::{eval, execute_seq, EvalContext, EvalError, WAIT_DIE_DISPLAY_PREFIX};
 use super::tt::types::ServiceType;
+use crate::net::ast::{NetActionStmt, NetValue};
 use crate::net::network_layer::NetworkLayer;
 use crate::net::{
     codec, Address, LockGroup, MeerkatMessage, NetworkActor, NetworkCommand, NetworkEvent,
     NetworkReply, ServiceNetId,
 };
 use crate::runtime::interner::{Interner, Symbol};
-use crate::runtime::txn::{Transaction, TxnId, VarState, WaitKey};
+use crate::runtime::txn::{ComposedCall, Transaction, TxnId, VarState, WaitKey};
 use std::collections::{HashMap, HashSet};
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
@@ -1333,6 +1334,17 @@ impl Manager {
         }
     }
 
+    /// Identify a composed action by what its dispatch ships, so a replay can
+    /// tell whether it reached the same action as the recorded one
+    fn fingerprint(stmts: &[NetActionStmt], env: &[(String, NetValue)]) -> Result<u64, EvalError> {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let bytes = serde_json::to_vec(&(stmts, env))
+            .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?;
+        let mut hasher = DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        Ok(hasher.finish())
+    }
+
     /// shared by remote_lookup and remote_action.
     pub async fn send_and_await_reply(
         &mut self,
@@ -1729,7 +1741,7 @@ impl Manager {
         service_net_id: &ServiceNetId,
         stmts: Vec<ActionStmt>,
         env: Vec<(Symbol, Value)>,
-        txn: Option<&mut Transaction>,
+        mut txn: Option<&mut Transaction>,
     ) -> Result<(), EvalError> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT_ACTION_ID: AtomicU64 = AtomicU64::new(1);
@@ -1753,10 +1765,8 @@ impl Manager {
         // `txn.participants` and reaches this node to release them. If
         // the remote never received the request, the `Abort` it gets is a
         // harmless no-op
-        if shared_tid.is_some() {
-            if let Some(t) = txn {
-                t.participants.insert(addr.clone());
-            }
+        if let Some(t) = txn.as_deref_mut() {
+            t.participants.insert(addr.clone());
         }
 
         let mut net_stmts = Vec::new();
@@ -1773,6 +1783,40 @@ impl Manager {
             let enc_val = codec::encode_value(&val, &self.interner)
                 .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?;
             net_env.push((key_str, enc_val));
+        }
+
+        // Claim this dispatch's position in the transaction's dispatch order,
+        // and stop here if a parked run already completed it (`composed_done`)
+        let mut claim = None;
+        if let Some(t) = txn.as_deref_mut() {
+            let seq = t.composed_seq;
+            t.composed_seq += 1;
+            let call = ComposedCall {
+                target: service_net_id.clone(),
+                fingerprint: Self::fingerprint(&net_stmts, &net_env)?,
+            };
+            if let Some(done) = t.composed_done.get(&seq) {
+                // Target alone is not identity: a replay can branch into a
+                // different action on the same service. The recorded effect is
+                // already buffered on the other node and cannot be rolled back
+                // from here, so failing is the only honest outcome
+                if done.target != call.target {
+                    return Err(EvalError::LocalDispatchFailed(format!(
+                        "replayed transaction dispatched a composed action to '{}' \
+                         in place of the one it had dispatched to '{}'",
+                        call.target.0, done.target.0
+                    )));
+                }
+                if done.fingerprint != call.fingerprint {
+                    return Err(EvalError::LocalDispatchFailed(format!(
+                        "replayed transaction's composed action to '{}' differs \
+                         from the one it dispatched there before",
+                        call.target.0
+                    )));
+                }
+                return Ok(());
+            }
+            claim = Some((seq, call));
         }
 
         let msg = MeerkatMessage::ActionRequest {
@@ -1796,7 +1840,13 @@ impl Manager {
         match reply {
             MeerkatMessage::ActionResponse { success, error, .. } => {
                 if success {
-                    // Participant already registered above; nothing more to do.
+                    // Participant already registered above. Record the
+                    // completed dispatch first, before anything added here can
+                    // fail: it has already run on the other node, so a replay
+                    // must skip it whatever happens next
+                    if let (Some(t), Some((seq, call))) = (txn, claim) {
+                        t.composed_done.insert(seq, call);
+                    }
                     Ok(())
                 } else {
                     Err(Self::remote_error(
@@ -2278,12 +2328,41 @@ impl Manager {
             .pending_txns
             .remove(&tid)
             .unwrap_or_else(|| Transaction::new(tid.clone()));
+        // A `WaitOn` parks the whole action and re-runs it from the first
+        // statement, so a run that parks must leave the buffers as it found
+        // them, or `x = x + 1` reads its own buffered `1` on replay and
+        // commits `2`. Restored rather than cleared, because an earlier action
+        // under the same transaction id may have buffered writes here too.
+        // Locks and participants are kept: they hold this transaction's place
+        // in line and still need committing or aborting with it.
+        // `composed_seq` is rewound so a replayed composed action finds the
+        // record the parked run left in `composed_done`. All of this goes
+        // away once a parked action is suspended instead of re-run (#213)
+        let before = (
+            txn.written.clone(),
+            txn.read_cache.clone(),
+            txn.composed_seq,
+        );
         let mut env: Vec<(Symbol, Value)> = initial_env.to_vec();
-        let exec_error = execute_seq(stmts, &mut env, self, service_name, Some(&mut txn))
+        let mut exec_error = execute_seq(stmts, &mut env, self, service_name, Some(&mut txn))
             .await
             .err();
+        // Positions are dense, so a completed run that did not reach every
+        // recorded one branched past a composed action the parked run made,
+        // whose effect is buffered on the other node all the same. Positions
+        // below `start` belong to earlier actions under this transaction id
+        let start = before.2 as usize;
+        if exec_error.is_none() && (txn.composed_seq as usize) < txn.composed_done.len() {
+            exec_error = Some(EvalError::LocalDispatchFailed(format!(
+                "replayed action dispatched {} composed actions, but its parked run \
+                 had completed {}",
+                txn.composed_seq as usize - start,
+                txn.composed_done.len() - start
+            )));
+        }
         if let Some(e) = exec_error {
             if matches!(e, EvalError::WaitOn(_)) {
+                (txn.written, txn.read_cache, txn.composed_seq) = before;
                 self.pending_txns.insert(tid, txn);
                 return Err(e);
             }
@@ -4837,5 +4916,113 @@ mod tests {
             "the attempt released the lock it had taken on `a`, so the request \
              parked on it must be reported for waking"
         );
+    }
+
+    /// A participant run that parks must leave its own writes unbuffered.
+    ///
+    /// The whole action is re-run from its first statement when the lock
+    /// frees, so a write left behind would be read back by the re-run:
+    /// `x = x + 1` would be applied twice and commit `2`
+    #[tokio::test]
+    async fn test_parked_participant_run_rolls_back_what_it_buffered() {
+        let mut tc = manager_with_a_and_x().await;
+        let a = tc.manager.interner.insert("a");
+        let sid = tc.manager.service_net_id_for_name(tc.foo);
+
+        // A younger transaction holds `a`, so the older one below waits on it
+        let lock_a = |tc: &mut TestContext, lock| {
+            tc.manager
+                .services
+                .get_mut(&tc.foo)
+                .unwrap()
+                .vars
+                .get_mut(&a)
+                .unwrap()
+                .lock = lock;
+        };
+        let younger = TxnId {
+            timestamp: u128::MAX,
+            node_id: tc.manager.node_id,
+            iteration: 0,
+        };
+        lock_a(&mut tc, crate::runtime::txn::VarLock::WriteLocked(younger));
+        let older = TxnId {
+            timestamp: 1,
+            node_id: tc.manager.node_id,
+            iteration: 0,
+        };
+        let stmts = vec![
+            incr_x(&tc),
+            ActionStmt::Assign {
+                name: a,
+                expr: Expr::Literal {
+                    val: Value::Int { val: 1 },
+                },
+            },
+        ];
+
+        // First attempt: `x` is buffered, then the write to `a` parks
+        let parked = tc
+            .manager
+            .execute_action_participant(tc.foo, &stmts, &[], older.clone())
+            .await;
+        assert!(
+            matches!(parked, Err(EvalError::WaitOn(_))),
+            "writing `a` must wait, got {parked:?}"
+        );
+        let txn = &tc.manager.pending_txns[&older];
+        assert_eq!(txn.written.get(&(sid.clone(), tc.x)), None);
+        assert_eq!(txn.read_cache.get(&(sid.clone(), tc.x)), None);
+        // The write lock on `x` is kept: it holds this transaction's place
+        assert!(matches!(
+            tc.manager.services[&tc.foo].vars[&tc.x].lock,
+            crate::runtime::txn::VarLock::WriteLocked(_)
+        ));
+
+        // `a` frees and the parked action is re-run from the top
+        lock_a(&mut tc, crate::runtime::txn::VarLock::Unlocked);
+        tc.manager
+            .execute_action_participant(tc.foo, &stmts, &[], older.clone())
+            .await
+            .expect("with `a` free the action completes");
+        assert_eq!(
+            tc.manager.pending_txns[&older].written[&(sid, tc.x)],
+            Value::Int { val: 1 },
+            "2 means the re-run read the value the parked attempt buffered"
+        );
+    }
+
+    /// A second action composed onto the same participant under one
+    /// transaction id must keep what the first one wrote, which is why a
+    /// parked run restores its buffers rather than clearing them
+    #[tokio::test]
+    async fn test_second_action_under_one_txn_keeps_the_first_write() {
+        let mut tc = manager_with_a_and_x().await;
+        let a = tc.manager.interner.insert("a");
+        let sid = tc.manager.service_net_id_for_name(tc.foo);
+        let tid = TxnId::new(tc.manager.node_id);
+
+        tc.manager
+            .execute_action_participant(
+                tc.foo,
+                &[ActionStmt::Assign {
+                    name: a,
+                    expr: Expr::Literal {
+                        val: Value::Int { val: 7 },
+                    },
+                }],
+                &[],
+                tid.clone(),
+            )
+            .await
+            .unwrap();
+        tc.manager
+            .execute_action_participant(tc.foo, &[incr_x(&tc)], &[], tid.clone())
+            .await
+            .unwrap();
+
+        let written = &tc.manager.pending_txns[&tid].written;
+        assert_eq!(written[&(sid.clone(), a)], Value::Int { val: 7 });
+        assert_eq!(written[&(sid, tc.x)], Value::Int { val: 1 });
     }
 }

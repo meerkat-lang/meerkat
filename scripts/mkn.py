@@ -24,6 +24,21 @@ import json
 import shutil
 from datetime import datetime
 
+
+def _safe_print(*args, **kwargs):
+    """Print, but never raise.
+
+    Used on every shutdown path. When the process reading this script's output
+    has gone (for example `test_mkn.py` stopped with Ctrl-C), printing raises
+    `BrokenPipeError`, and a print that raises before the nodes are terminated
+    leaves them running on their fixed ports, where they break later runs
+    (#204).
+    """
+    try:
+        print(*args, **kwargs)
+    except (OSError, ValueError):
+        pass
+
 def purge_mkn_logs(clean: bool, log_dir_session: str = None, success: bool = False):
     """Purges session log files or the entire mkn log directory.
 
@@ -670,29 +685,29 @@ class NetworkOrchestrator:
         self._cleaned_up = True
 
         if self.nodes_by_alias:
-            print("\nShutting down all Meerkat nodes...")
+            _safe_print("\nShutting down all Meerkat nodes...")
             for node in self.nodes_by_alias.values():
                 if node.proc:
                     proc = node.proc
                     status = proc.poll()
                     if status is not None:
-                        print(f"Node '{node.alias}' (PID: {proc.pid}) has already exited with code {status}.")
+                        _safe_print(f"Node '{node.alias}' (PID: {proc.pid}) has already exited with code {status}.")
                     else:
-                        print(f"Stopping node '{node.alias}' (PID: {proc.pid}) with terminate()...")
+                        _safe_print(f"Stopping node '{node.alias}' (PID: {proc.pid}) with terminate()...")
                         try:
                             proc.terminate()
                             try:
                                 exit_code = proc.wait(timeout=self.terminate_timeout)
-                                print(f"Node '{node.alias}' (PID: {proc.pid}) stopped cleanly (Exit code: {exit_code}).")
+                                _safe_print(f"Node '{node.alias}' (PID: {proc.pid}) stopped cleanly (Exit code: {exit_code}).")
                             except subprocess.TimeoutExpired:
-                                print(f"Warning: Node '{node.alias}' (PID: {proc.pid}) did not terminate in time. Killing...")
+                                _safe_print(f"Warning: Node '{node.alias}' (PID: {proc.pid}) did not terminate in time. Killing...")
                                 proc.kill()
                                 exit_code = proc.wait()
-                                print(f"Node '{node.alias}' (PID: {proc.pid}) killed (Exit code: {exit_code}).")
+                                _safe_print(f"Node '{node.alias}' (PID: {proc.pid}) killed (Exit code: {exit_code}).")
                         except Exception as e:
-                            print(f"Error: Failed to stop node '{node.alias}' (PID: {proc.pid}): {e}", file=sys.stderr)
+                            _safe_print(f"Error: Failed to stop node '{node.alias}' (PID: {proc.pid}): {e}", file=sys.stderr)
             self.nodes_by_alias.clear()
-            print("Cleanup complete.")
+            _safe_print("Cleanup complete.")
 
         # Handle log directories cleanup
         purge_mkn_logs(clean=self.clean, log_dir_session=self.log_dir_session, success=self.success)
@@ -763,9 +778,9 @@ Manifest file format (JSON):
 
     def exception_hook(exc_type, exc_value, exc_traceback):
         if issubclass(exc_type, KeyboardInterrupt):
-            print("\nOrchestrator exiting: Terminated by user (KeyboardInterrupt)")
+            _safe_print("\nOrchestrator exiting: Terminated by user (KeyboardInterrupt)")
         else:
-            print(f"\nOrchestrator crashed due to unhandled exception: {exc_type.__name__}: {exc_value}")
+            _safe_print(f"\nOrchestrator crashed due to unhandled exception: {exc_type.__name__}: {exc_value}")
         orchestrator.cleanup()
         sys.__excepthook__(exc_type, exc_value, exc_traceback)
 
@@ -777,7 +792,7 @@ Manifest file format (JSON):
             sig_name = signal.Signals(sig).name
         except Exception:
             sig_name = f"Signal {sig}"
-        print(f"\nOrchestrator exiting: Terminated by signal: {sig_name}")
+        _safe_print(f"\nOrchestrator exiting: Terminated by signal: {sig_name}")
         orchestrator.cleanup()
         sys.exit(128 + sig)
 
@@ -801,7 +816,7 @@ Manifest file format (JSON):
     try:
         exit_code = orchestrator.run()
     except Exception as e:
-        print(f"Orchestration run encountered an error: {e}")
+        _safe_print(f"Orchestration run encountered an error: {e}")
         orchestrator.cleanup()
 
     if args.dump_state:

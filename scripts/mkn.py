@@ -123,7 +123,11 @@ class Node:
         self.proc = None
         self.log_file = None
         self.log_path = None
+        # Monotonic, for timeouts: the wall clock can step, which WSL2 is known
+        # to do, and a forward step looks like a timeout (#205)
         self.start_time = None
+        # Wall clock at the same moment, reported only when a client times out
+        self.start_wall_time = None
 
         # The Three Namespaces
         self.local_services = {}   # Dict[svc_name, Service]
@@ -417,7 +421,8 @@ class NetworkOrchestrator:
         node.log_file = log_file
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         node.proc = proc
-        node.start_time = time.time()
+        node.start_time = time.monotonic()
+        node.start_wall_time = time.time()
         node.is_started = True
 
         t = threading.Thread(target=self._reader_thread_func, args=(node,))
@@ -550,7 +555,7 @@ class NetworkOrchestrator:
             RuntimeError: If a server node terminates unexpectedly.
             TimeoutError: If a node times out during startup or execution.
         """
-        now = time.time()
+        now = time.monotonic()
         for node in self.nodes_by_alias.values():
             if not node.is_started or node.is_finished:
                 continue
@@ -583,6 +588,10 @@ class NetworkOrchestrator:
                 node_timeout = node.timeout if node.timeout > 0 else self.client_node_timeout
                 if now - node.start_time > node_timeout:
                     print(f"\nError: Client node '{node.alias}' execution timed out after {node_timeout} seconds.")
+                    print(
+                        f"Elapsed since spawn: {now - node.start_time:.2f}s monotonic, "
+                        f"{time.time() - node.start_wall_time:.2f}s wall clock."
+                    )
                     self.dump_node_log(node)
                     raise TimeoutError(f"Client node '{node.alias}' execution timed out")
 

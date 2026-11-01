@@ -72,6 +72,8 @@ pub struct EvalContext<'a> {
     pub txn: Option<&'a mut Transaction>,
 }
 
+// async_recursion adds a bare #[must_use] to a fn that returns a boxed Future.
+#[allow(clippy::double_must_use)]
 #[async_recursion::async_recursion]
 pub async fn eval(
     expr: &Expr,

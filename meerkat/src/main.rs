@@ -11,7 +11,6 @@ use meerkat_lib::runtime::ast::{AstPrinter, Stmt};
 use meerkat_lib::runtime::interner::{Interner, Symbol};
 use meerkat_lib::runtime::interpreter::EvalError;
 use meerkat_lib::runtime::manager::ParkedRequest;
-use meerkat_lib::runtime::txn::WaitKey;
 use meerkat_lib::runtime::{parser, Manager, Node};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
@@ -317,11 +316,17 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
-/// Run a participant request (initial dispatch or a woken waiter) and either
-/// send its reply, or, if the requesting transaction is older than a current
-/// lock holder (wait-die), park it on the contended variable's queue to be
-/// re-run when that lock frees.
+/// Run a participant request (initial dispatch or a woken waiter), then wake
+/// whatever is parked on locks it released
 async fn run_and_reply_or_park(manager: &mut Manager, parked: ParkedRequest) {
+    dispatch_parked(manager, parked).await;
+    wake_freed(manager).await;
+}
+
+/// Run a participant request and either send its reply, or, if the requesting
+/// transaction is older than a current lock holder (wait-die), park it on the
+/// contended variable's queue to be re-run when that lock frees.
+async fn dispatch_parked(manager: &mut Manager, parked: ParkedRequest) {
     match parked {
         ParkedRequest::Action {
             request_id,
@@ -454,11 +459,13 @@ async fn run_and_reply_or_park(manager: &mut Manager, parked: ParkedRequest) {
     }
 }
 
-/// After a holder releases its locks on commit or abort, re-dispatch the parked
-/// requests waiting on the freed variables, oldest first.
-async fn wake_ready(manager: &mut Manager, freed: HashSet<WaitKey>) {
+/// Re-dispatch the requests parked on locks released since the last call
+/// (`Manager::take_freed_awaiting_wake`), oldest first
+async fn wake_freed(manager: &mut Manager) {
+    let freed = manager.take_freed_awaiting_wake();
     for parked in manager.take_ready_waiters(&freed) {
-        run_and_reply_or_park(manager, parked).await;
+        // Boxed: this and `run_and_reply_or_park` are mutually recursive
+        Box::pin(run_and_reply_or_park(manager, parked)).await;
     }
 }
 
@@ -663,6 +670,11 @@ async fn run_server(
 
     let mut last_keepalive = tokio::time::Instant::now();
     loop {
+        // Wake what is parked on locks released with no dispatcher to hand the
+        // keys to, e.g. by a `LockRequest` served inline while
+        // `send_and_await_reply` pumped events during the last iteration
+        wake_freed(&mut manager).await;
+
         // Defer pending service updates so that network events can be processed
         // without blocking the server loop during multi-step updates
         if let Some((request_id, txn_id, source, reply_to, peer)) = pending_updates.pop_front() {
@@ -883,10 +895,6 @@ async fn run_server(
                     reply_to,
                 } => {
                     let result = manager.commit_participant(&txn_id).await;
-                    let freed = match &result {
-                        Ok(f) => f.clone(),
-                        Err(_) => HashSet::new(),
-                    };
                     let response = MeerkatMessage::CommitResponse {
                         request_id,
                         success: result.is_ok(),
@@ -896,15 +904,15 @@ async fn run_server(
                         send_net_msg(net, &reply_to, response).await;
                     }
                     // Wake transactions that were waiting on locks this
-                    // commit just released.
-                    wake_ready(&mut manager, freed).await;
+                    // commit just released, even if forwarding it failed.
+                    wake_freed(&mut manager).await;
                 }
                 MeerkatMessage::Abort {
                     request_id,
                     txn_id,
                     reply_to,
                 } => {
-                    let freed = manager.abort_participant(&txn_id).await;
+                    manager.abort_participant(&txn_id).await;
                     // Drop this transaction's own parked requests so they
                     // do not later wake for an abandoned transaction.
                     manager.purge_parked_txn(&txn_id);
@@ -918,7 +926,7 @@ async fn run_server(
                     }
                     // Wake transactions that were waiting on locks this
                     // abort just released.
-                    wake_ready(&mut manager, freed).await;
+                    wake_freed(&mut manager).await;
                 }
                 // Incoming LockRequest from a remote originator node.
                 // Wraps the request as a `ParkedRequest::Lock` and
@@ -1157,7 +1165,7 @@ async fn run_client(
                 // Watch mode only observes; it does not run @test actions.
                 if !watch {
                     manager
-                        .execute_action(service_name, stmts)
+                        .execute_test_block(service_name, stmts)
                         .await
                         .map_err(|e| {
                             format!(
@@ -1577,6 +1585,7 @@ fn exceeds_pending_update_limit(
 mod tests {
     use super::*;
     use meerkat_lib::net::MessageId;
+    use meerkat_lib::runtime::txn::{TxnId, WaitKey};
 
     #[test]
     fn listen_success_addr_returns_bound_address() {
@@ -1781,6 +1790,134 @@ mod tests {
         assert!(
             manager.services.contains_key(&dep),
             "an unrelated -i flag must not strip the program's imports"
+        );
+    }
+
+    /// Build a single-node `Manager` from source, with no network layer.
+    async fn manager_from(code: &str) -> Manager {
+        let mut interner = Interner::new();
+        let ast = parser::parse_string(code, &mut interner).expect("valid syntax");
+        let mut node = Node::new();
+        node.interner = interner;
+        node.unified_ast = ast.clone();
+        node.static_checks().expect("static checks must pass");
+        let local_ast = node.unified_ast.clone();
+        node.on_manager_startup(true, None, HashMap::new(), &local_ast)
+            .await
+            .expect("service init must succeed")
+    }
+
+    /// A read of `service.member` by some transaction, as it sits on the queue
+    fn parked_lookup(manager: &Manager, service: Symbol, member: Symbol) -> ParkedRequest {
+        ParkedRequest::Lookup {
+            request_id: 1,
+            reply_to: String::new(),
+            service,
+            member,
+            tid: TxnId::new(manager.node_id),
+        }
+    }
+
+    fn nothing_parked_on(manager: &Manager, key: &WaitKey) -> bool {
+        manager.wait_queue.get(key).is_none_or(|w| w.is_empty())
+    }
+
+    /// A participant action that fails terminally releases its locks, so
+    /// whatever was parked behind them has to be woken.
+    ///
+    /// The failure surfaces as an `EvalError`, with nowhere to return the freed
+    /// keys; without the deferred queue the parked request would wait for the
+    /// life of the process on a lock nobody holds.
+    #[tokio::test]
+    async fn test_terminal_participant_action_wakes_parked_requests() {
+        use meerkat_lib::runtime::ast::{ActionStmt, Expr, Value};
+
+        let mut manager = manager_from("service foo { var x = 0; }").await;
+        let foo = manager.interner.insert("foo");
+        let x = manager.interner.insert("x");
+        let key = WaitKey::Member(manager.service_net_id_for_name(foo), x);
+        let parked = parked_lookup(&manager, foo, x);
+        manager.park_request_key(key.clone(), parked);
+
+        // A composed action that write-locks `foo.x` and then fails terminally.
+        let stmts = vec![
+            ActionStmt::Assign {
+                name: x,
+                expr: Expr::Literal {
+                    val: Value::Int { val: 1 },
+                },
+            },
+            ActionStmt::Assert(
+                Expr::Literal {
+                    val: Value::Bool { val: false },
+                },
+                "always fails".to_string(),
+            ),
+        ];
+        let tid = TxnId::new(manager.node_id);
+        let action = ParkedRequest::Action {
+            request_id: 2,
+            reply_to: String::new(),
+            service: foo,
+            stmts,
+            env: Vec::new(),
+            tid,
+        };
+        run_and_reply_or_park(&mut manager, action).await;
+
+        assert!(
+            nothing_parked_on(&manager, &key),
+            "the failed action released `foo.x`, so the request parked on it must \
+             have been re-dispatched"
+        );
+    }
+
+    /// The same for a read that dies under wait-die, on a different branch of
+    /// the dispatcher: the transaction had already locked `foo.y` before the
+    /// read of `foo.x` that killed it.
+    #[tokio::test]
+    async fn test_terminal_participant_lookup_wakes_parked_requests() {
+        use meerkat_lib::runtime::txn::{Transaction, VarLock};
+
+        let mut manager = manager_from("service foo { var x = 0; var y = 0; }").await;
+        let foo = manager.interner.insert("foo");
+        let x = manager.interner.insert("x");
+        let y = manager.interner.insert("y");
+        let foo_sid = manager.service_net_id_for_name(foo);
+
+        // An older transaction holds `foo.x`, so a younger reader dies on it.
+        let older = TxnId {
+            timestamp: 1,
+            node_id: manager.node_id,
+            iteration: 0,
+        };
+        let vars = &mut manager.services.get_mut(&foo).unwrap().vars;
+        vars.get_mut(&x).unwrap().lock = VarLock::WriteLocked(older);
+
+        // Our transaction already holds `foo.y` from an earlier statement.
+        let mine = TxnId::new(manager.node_id);
+        vars.get_mut(&y).unwrap().lock = VarLock::WriteLocked(mine.clone());
+        let mut txn = Transaction::new(mine.clone());
+        txn.locked.insert((foo_sid.clone(), y));
+        manager.pending_txns.insert(mine.clone(), txn);
+
+        let key = WaitKey::Member(foo_sid, y);
+        let parked = parked_lookup(&manager, foo, y);
+        manager.park_request_key(key.clone(), parked);
+
+        let read = ParkedRequest::Lookup {
+            request_id: 2,
+            reply_to: String::new(),
+            service: foo,
+            member: x,
+            tid: mine,
+        };
+        run_and_reply_or_park(&mut manager, read).await;
+
+        assert!(
+            nothing_parked_on(&manager, &key),
+            "the dead read released `foo.y`, so the request parked on it must have \
+             been re-dispatched"
         );
     }
 }

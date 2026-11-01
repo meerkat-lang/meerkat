@@ -40,10 +40,17 @@ forwarding failure is something to report upward — not a reason to skip waking
 whatever was parked on the locks this commit just freed. A `Result` forces the
 caller to choose one, and it will choose wrong.
 
-In `execute_action_with_txn`, the commit loop records the **first** failure and
-keeps going (every participant still needs its `Commit`), then still runs
-`propagate_committed_writes`, and finally returns the recorded error in place of
-`Ok(())`.
+The three commit paths (`create_service`, `execute_action_with_txn`,
+`commit_participant`) repeat the same store / commit / propagate sequence, and
+each handles the commit loop's errors differently. They share one function,
+`commit_txn`, into which `store_committed_writes` and
+`propagate_committed_writes` are folded. Its commit loop,
+`commit_participants`, records the **first** failure and keeps going (every
+participant still needs its `Commit`). "First" is in the participant set's
+iteration order, which is arbitrary. `commit_txn` then still propagates, and
+returns the recorded error, which `execute_action_with_txn` returns in place
+of `Ok(())`. The live-update path in `update.rs` also calls
+`commit_participants`, but ignores its result (#180).
 
 ### The originator's side of a refused commit
 

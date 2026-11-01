@@ -424,9 +424,7 @@ impl Transaction {
                     }
                 }
                 if let Some(lock_txn) = &self.lock_txn {
-                    for addr in lock_txn.participants.iter().cloned().collect::<Vec<_>>() {
-                        let _ = manager.send_commit(addr, &lock_txn.id).await;
-                    }
+                    let _ = manager.commit_participants(lock_txn).await;
                 }
                 self.release_lock_txn(manager);
 

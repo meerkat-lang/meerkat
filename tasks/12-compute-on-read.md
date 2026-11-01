@@ -16,7 +16,7 @@ PR #189 solved it by **pushing**: `assign` walked the listener graph and
 recomputed every dependent def into `txn.read_cache`. That was rejected. Its
 entire durable product is cache entries and read locks — `recompute_def_in_txn`
 writes to `txn.read_cache` and never to `txn.written`, so no def value is ever
-committed by it, and `store_committed_writes` commits vars only. If the def is
+committed by it, and commit (`commit_txn`) stores vars only. If the def is
 never read, all of that work is discarded at commit. Worse, it is not cheap
 work: a purely local write to `x`, where some `def y = x + remote.z` exists,
 forces a network round trip and a remote read lock — per assignment, so once per

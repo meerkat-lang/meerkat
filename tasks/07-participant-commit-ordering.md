@@ -42,8 +42,12 @@ async fn propagate_committed_writes(&mut self, txn: &Transaction);
 and sets `latest_write_txn`. `propagate_committed_writes` calls `propagate` for
 each written member.
 
-`apply_committed_writes` remains as the composition of the two, for the one
-caller that has nothing below it to commit first.
+`apply_committed_writes` is then deleted. Its third caller, service
+initialization (`create_service`), also has participants and is switched to the
+two halves as well. That is for consistency, not a bug fix: initialization
+only evaluates expressions, never runs actions, so its transaction buffers no
+writes and its participants hold only read locks. There is nothing for the
+ordering to get wrong there, so no test can tell the difference.
 
 `commit_participant` must then run, in this order:
 
@@ -52,8 +56,8 @@ caller that has nothing below it to commit first.
 3. `propagate_committed_writes(&txn).await`
 4. release locks
 
-Both commit paths that can have participants — `execute_action_with_txn` and
-`commit_participant` — call the two halves separately.
+All three commit paths — `execute_action_with_txn`, `commit_participant` and
+`create_service` — call the two halves separately, in that order.
 
 Locks stay held through step 3. Today the event loop is blocked for the whole
 call, so an earlier release would be harmless; that stops being true under #28's

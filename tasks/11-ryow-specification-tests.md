@@ -28,9 +28,18 @@ skip this task and fold these files into task 12.
 A `def` is an eagerly evaluated, cached terminal value, not a thunk. A plain
 lookup of a def returns whatever the last committed propagation stored. So a
 transaction that writes `x` and then reads `def y = x + 1` sees the
-*pre-transaction* `y`. Since an `@test` block runs as a single transaction, this
-breaks the most basic thing a test can do. `meerkat/tests/s1.mkt` is the
-regression that opened PR #189.
+*pre-transaction* `y`, which breaks the most basic thing an action can do.
+
+`meerkat/tests/s1.mkt` was the regression that opened PR #189, but it no longer
+demonstrates the problem. PR #201 made each `do` in an `@test` block its own
+transaction, so s1.mkt's writes commit and propagate *between* its statements
+and it passes. The contract below is unaffected: a write and a dependent read
+within **one** transaction still sees the stale value.
+
+    pub def probe = action { x = 5; assert(y == 6); };   // still fails
+
+Use that shape — write and dependent read inside a single action — when
+demonstrating the gap, not s1.mkt.
 
 ## Specification
 
@@ -81,5 +90,7 @@ wrong:
 
 ## Notes
 
-- `meerkat/tests/s1.mkt` also exercises this end to end. Note in the README that
-  it is expected to fail until task 12.
+- `meerkat/tests/s1.mkt` no longer exercises this; it passes as of PR #201. Do
+  not mark it ignored, and do not document it as expected to fail. The
+  end-to-end cases that still fail are those writing a var and reading a
+  dependent def inside a single `do`.

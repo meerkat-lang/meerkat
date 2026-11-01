@@ -50,9 +50,10 @@ node) so the replay skips it rather than sending it twice.
 
 **Originators retry.**  The originator's transaction is a local variable in
 `execute_action_with_txn`, called directly from the CLI or the REPL.  It has no
-event loop to return to, so it cannot park.  On `main`, a `WaitOn` fails the
-action outright.  Task 06 (#202) turns it into a retry with backoff, capped at
-`MAX_WAIT_DIE_RETRIES`, so an older transaction gives up after about 200ms.
+event loop to return to, so it cannot park.  Before task 06 (#202), a `WaitOn`
+failed the action outright.  #202 turns it into a retry with backoff, capped at
+`MAX_WAIT_DIE_RETRIES`, so an older transaction gives up after about 200ms of
+backoff.
 
 ## Why these fall short
 
@@ -167,10 +168,17 @@ cleanly.
 **Step 2: do not hold compute-on-read for the refactor.**  Task 12 extends
 #209's replay path a little (`ComposedCall` gains `touched_services`), and that
 code will later be deleted.  The cost is small, and `s1.mkt` stays broken until
-task 12 lands.  #202's retry cap is a temporary conflict with the first goal.
-One option is to remove the cap for the wait case and keep retrying with
-backoff: a retry keeps the transaction's timestamp, so the oldest transaction
-still makes progress.
+task 12 lands.  #202's retry cap is a temporary conflict with the first goal,
+but it should stay until step 3.  Without it, a wait can hang the node.  The
+lock may be held by a participant transaction on this node, which releases it
+only when its originator's `Commit` or `Abort` arrives, and an originator in
+the retry loop may process no network messages at all: with no participants
+to abort, it awaits nothing but its backoff.  #202's comment on
+`retry_backoff` notes this case.  The cap turns the hang into a failure after
+about 200ms of backoff.  Processing messages during the backoff would avoid
+the hang, but that is waiting in place, which can deadlock as shown above.
+Step 3 removes the cap for waits, because a parked originator leaves the loop
+free to process the release.
 
 **Step 3: build the loop so that step 4 fits into it.**  Three choices matter:
 

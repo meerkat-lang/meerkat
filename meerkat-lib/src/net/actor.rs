@@ -178,6 +178,45 @@ fn spawn_event_loop(fut: impl std::future::Future<Output = ()> + 'static) {
     wasm_bindgen_futures::spawn_local(fut);
 }
 
+/// Report a TCP listen address whose port another socket already holds
+///
+/// libp2p binds every TCP listener with `SO_REUSEPORT`, so listening on a port
+/// a stale node still holds succeeds without error. The kernel then splits
+/// incoming connections between the two, and because libp2p also dials out
+/// from its own listen port, a given peer reaches the same one every time:
+/// either always this node or always the stale one, which fails the handshake
+/// on its peer id (#204). Binding a plain socket first, which does not set
+/// `SO_REUSEPORT`, turns that into an error at startup.
+///
+/// Port 0 asks for any free port and cannot conflict, and an address that is
+/// not plain TCP over IP is left for libp2p to judge.
+#[cfg(not(target_arch = "wasm32"))]
+fn port_in_use(addr: &Address) -> Option<String> {
+    let multiaddr = addr.0.parse::<Multiaddr>().ok()?;
+    let mut protocols = multiaddr.iter();
+    let ip: std::net::IpAddr = match protocols.next()? {
+        Protocol::Ip4(ip) => ip.into(),
+        Protocol::Ip6(ip) => ip.into(),
+        _ => return None,
+    };
+    let port = match protocols.next()? {
+        Protocol::Tcp(port) if port != 0 => port,
+        _ => return None,
+    };
+    match std::net::TcpListener::bind((ip, port)) {
+        Ok(_) => None,
+        Err(e) => Some(format!(
+            "cannot listen on {}: {} (is another node still running on this port?)",
+            addr.0, e
+        )),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn port_in_use(_addr: &Address) -> Option<String> {
+    None
+}
+
 impl NetworkActor {
     pub async fn new(node_type: NodeType) -> anyhow::Result<Self> {
         Self::new_with_identity(node_type, None).await
@@ -227,6 +266,9 @@ impl NetworkActor {
                 NetworkReply::MessageSent { msg_id }
             }
             NetworkCommand::Listen { addr } => {
+                if let Some(error) = port_in_use(&addr) {
+                    return NetworkReply::Failure(error);
+                }
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                 let _ = self
                     .command_tx

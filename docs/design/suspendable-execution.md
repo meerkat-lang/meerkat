@@ -172,17 +172,17 @@ action that writes a var and then reads a def over it sees the def's old
 value: with `def y = x + 1`, `action { x = 5; assert(y == 6); }` fails.
 (`meerkat/tests/s1.mkt`, the regression that opened PR #189, no longer shows
 this.  Since PR #201 each `do` in an `@test` is its own transaction, so its
-writes commit between statements and it passes.)  #202's retry cap is a temporary conflict with the first goal,
-but it should stay until step 3.  Without it, a wait can hang the node.  The
-lock may be held by a participant transaction on this node, which releases it
-only when its originator's `Commit` or `Abort` arrives, and an originator in
-the retry loop may process no network messages at all: with no participants
-to abort, it awaits nothing but its backoff.  #202's comment on
-`retry_backoff` notes this case.  The cap turns the hang into a failure after
-about 200ms of backoff.  Processing messages during the backoff would avoid
-the hang, but that is waiting in place, which can deadlock as shown above.
-Step 3 removes the cap for waits, because a parked originator leaves the loop
-free to process the release.
+writes commit between statements and it passes.)  #202's retry cap is a
+temporary conflict with the first goal, but it should stay until step 3.
+Without it, a wait can hang the node.  The lock may be held by a participant
+transaction on this node, which releases it only when its originator's
+`Commit` or `Abort` arrives, and an originator in the retry loop may process
+no network messages at all: with no participants to abort, it awaits nothing
+but its backoff.  #202's comment on `retry_backoff` notes this case.  The cap
+turns the hang into a failure after about 200ms of backoff.  Processing
+messages during the backoff would avoid the hang, but that is waiting in
+place, which can deadlock as shown above.  Step 3 removes the cap for waits,
+because a parked originator leaves the loop free to process the release.
 
 **Step 3: build the loop so that step 4 fits into it.**  Three choices matter:
 

@@ -22,10 +22,12 @@ use tokio::sync::oneshot;
 /// An originator has no queue to park in, so it waits by retrying (see
 /// `execute_action_with_txn`). That makes this budget the originator's wait
 /// **timeout** as well: an older transaction -- one wait-die says should win --
-/// is killed after roughly `MAX_WAIT_DIE_RETRIES * WAIT_ON_RETRY_BACKOFF_MS`
-/// (about 200ms) of contention. The bound is inherent to retrying instead of
-/// parking, not a tuning accident; lifting it needs the background message
-/// loop of #28.
+/// is killed after `MAX_WAIT_DIE_RETRIES * WAIT_ON_RETRY_BACKOFF_MS` (200ms)
+/// of backoff, plus however long the attempts themselves take. That includes
+/// aborting each attempt's participants: `send_abort` waits for every
+/// acknowledgement, up to `send_and_await_reply`'s 15-second timeout when one
+/// is lost. The bound is inherent to retrying instead of parking, not a tuning
+/// accident; lifting it needs the background message loop of #28.
 pub const MAX_WAIT_DIE_RETRIES: u32 = 10;
 
 /// Pause before re-running a transaction that died (`WaitDieAbort`). A die
@@ -4053,7 +4055,11 @@ mod tests {
     /// The upper bound on the die run is what catches wiring one backoff to
     /// both outcomes: it would either make the die as slow as a wait or the
     /// wait as quick as a die (and the wait bound catches the latter).
-    #[tokio::test]
+    ///
+    /// Runs on paused Tokio time, so the measured durations are exactly the
+    /// backoffs slept and scheduler delays on a loaded machine cannot push
+    /// the die run past its upper bound.
+    #[tokio::test(start_paused = true)]
     async fn test_wait_die_retries_are_paced() {
         async fn run_against_holder(timestamp: u128) -> Duration {
             let mut tc = manager_with_x().await;
@@ -4074,7 +4080,7 @@ mod tests {
                 name: tc.x,
                 expr: Expr::Variable { name: tc.x },
             }];
-            let started = std::time::Instant::now();
+            let started = tokio::time::Instant::now();
             let err = tc
                 .manager
                 .execute_action(tc.foo, &stmts)

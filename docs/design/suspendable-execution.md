@@ -82,8 +82,8 @@ of waiting on it.
 
 The first goal does not strictly need suspension.  An older transaction only
 has to wait without failing, and parking plus replay already does that for
-participants.  Originators can use the same mechanism once there is an event
-loop for them to park in.
+participants.  Originators can park too once there is an event loop for them
+to park in, though they restart rather than replay (see step 3).
 
 The second goal does need it.  In principle replay could do this too: park at
 every remote call, and re-run the action from the start when each reply
@@ -149,8 +149,9 @@ We propose this order:
 2. **Tasks 06, 11 and 12.**  Compute-on-read lands, and
    `meerkat/tests/s1.mkt` passes.
 3. **#28: one event loop.**  Input and network are handled together.
-   Originators park instead of retrying, so wait-die holds for them too, and
-   #202's wait retry goes away.
+   An originator that must wait parks until the lock frees and then
+   restarts, instead of retrying on a timer, so wait-die holds for
+   originators too, and #202's retry cap no longer applies to waits.
 4. **Suspendable execution.**  Nodes stay responsive during remote calls, and
    a park becomes a wait on a lock grant.  #209's replay and task 09's
    re-dispatch go away.
@@ -171,15 +172,40 @@ One option is to remove the cap for the wait case and keep retrying with
 backoff: a retry keeps the transaction's timestamp, so the oldest transaction
 still makes progress.
 
-**Step 3: build the loop so that step 4 fits into it.**  Two choices matter:
+**Step 3: build the loop so that step 4 fits into it.**  Three choices matter:
 
 - The loop should deliver network replies to the existing `pending_replies`
   channels, instead of `send_and_await_reply` processing events itself.  Those
   channels already are a table of continuations.
-- Originator transactions should live in a table while they wait, keyed by id,
-  like `pending_txns`.  That lets an originator park and replay the way a
-  participant does.  Task 12 already needs the originator's transaction to be
-  reachable by id while it runs, and it names #28 as the fix.
+- Originator transactions should live in a table while they run, keyed by id,
+  like `pending_txns`.  Task 12 already needs the originator's transaction to
+  be reachable by id while it runs, and it names #28 as the fix.
+- An originator that must wait should park and restart, not replay.  On
+  `WaitOn` it does what #202's retry does: it aborts its participants,
+  releases its locks and discards its buffers.  Then, instead of sleeping and
+  trying again, it checks the contended key once more and, with no `await` in
+  between, either parks on `wait_queue` under it or, if the key freed during
+  the cleanup, restarts at once.  The cleanup awaits the participants' abort
+  acknowledgements, so the holder can release the key in that window, and
+  `release_locks` records a freed key only when something is already parked
+  on it: parking after that release would never be woken.  Either way, the
+  restart runs the action again from its first statement as a new attempt
+  (`TxnId::retry`) with the same timestamp.  A wait counts against no retry
+  cap, so an older transaction never fails because it waited.
+
+  Replaying the way a participant does would need more than the table.  A
+  waiting originator may already have sent composed actions, whose
+  participants hold its writes buffered under the transaction id, and a
+  replay would send them again.  Preventing that means carrying #209's
+  rollback and position records over to `execute_action_with_txn`, only for
+  step 4 to delete them.  Restarting needs none of that, because aborting the
+  participants discards what they hold.
+
+  Restarting has two costs.  The new attempt redoes the work of the old one.
+  And a parked originator holds no locks, so a younger transaction can take
+  one it gave up and make it wait again.  It keeps its timestamp, so it
+  still never dies, and step 4 removes both costs: a suspended originator
+  keeps its locks and resumes where it stopped.
 
 Either design in #28 works for this, as long as the loop owns event dispatch:
 the `tokio::select!` loop that owns the `Manager`, or the actor design.  With
@@ -201,8 +227,10 @@ to the new.
 
 **After step 3**, when there is one event loop and originators park:
 
-- #202's wait retry, which the originator no longer needs.  Its die retry
-  stays: that is wait-die itself.
+- #202's backoff and retry cap for a wait, which parking replaces.  The
+  abort before parking stays until step 4, and so does the restart, which
+  the lock freeing now triggers instead of a timer.  The die retry stays:
+  that is wait-die itself.
 - `send_and_await_reply` processing network events itself.
 - The separate places that handle network messages outside the loop: the
   `--watch` loop and the server loop in `main.rs`, and the REPL's lack of
@@ -217,6 +245,8 @@ to the new.
   with their tests.  Task 12's additions to it go too.
 - Task 09's re-dispatch of parked requests, which becomes waking suspended
   actions.
+- The originator's abort and restart on a wait, from step 3.  A waiting
+  originator suspends with its locks held, as a participant does.
 - `reactive_cache` as a field on the `Manager`, which moves into each
   execution's context.
 

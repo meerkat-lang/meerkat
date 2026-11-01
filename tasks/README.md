@@ -64,6 +64,12 @@ exposes.
 
 ## Known consequence
 
-`meerkat/tests/s1.mkt` — the read-your-own-writes regression that opened PR
-#189 — stays broken on `main` until task 12 lands. This is deliberate. Task 11
-exists partly to document why.
+Until task 12 lands, an action that writes a var and then reads a def over it
+sees the def's pre-transaction value: with `def y = x + 1`,
+`action { x = 5; assert(y == 6); }` fails. This is deliberate. Task 11 exists
+partly to document why.
+
+`meerkat/tests/s1.mkt`, the read-your-own-writes regression that opened PR
+#189, no longer shows this and passes on `main`. Since PR #201 each `do` in an
+`@test` block is its own transaction, so its writes commit and propagate
+between statements.

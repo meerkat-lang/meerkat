@@ -147,8 +147,8 @@ We propose this order:
 
 1. **Merge #209 (task 10).**  Parked participant actions replay correctly,
    and wait-die holds for participants.
-2. **Tasks 06, 11 and 12.**  Compute-on-read lands, and
-   `meerkat/tests/s1.mkt` passes.
+2. **Tasks 06, 11 and 12.**  Compute-on-read lands, so an action that writes
+   a var and then reads a def over it sees the new value.
 3. **#28: one event loop.**  Input and network are handled together.
    An originator that must wait parks until the lock frees and then
    restarts, instead of retrying on a timer, so wait-die holds for
@@ -167,8 +167,12 @@ cleanly.
 
 **Step 2: do not hold compute-on-read for the refactor.**  Task 12 extends
 #209's replay path a little (`ComposedCall` gains `touched_services`), and that
-code will later be deleted.  The cost is small, and `s1.mkt` stays broken until
-task 12 lands.  #202's retry cap is a temporary conflict with the first goal,
+code will later be deleted.  The cost is small, and until task 12 lands, an
+action that writes a var and then reads a def over it sees the def's old
+value: with `def y = x + 1`, `action { x = 5; assert(y == 6); }` fails.
+(`meerkat/tests/s1.mkt`, the regression that opened PR #189, no longer shows
+this.  Since PR #201 each `do` in an `@test` is its own transaction, so its
+writes commit between statements and it passes.)  #202's retry cap is a temporary conflict with the first goal,
 but it should stay until step 3.  Without it, a wait can hang the node.  The
 lock may be held by a participant transaction on this node, which releases it
 only when its originator's `Commit` or `Abort` arrives, and an originator in

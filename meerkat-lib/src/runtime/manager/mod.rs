@@ -1147,6 +1147,17 @@ impl Manager {
             None => return,
         };
 
+        // There is no message to cancel a subscription, so an owner on another
+        // node keeps sending after an update turns the listening def into a
+        // var. Only a current def is recomputed
+        if !self.services[&listener_svc]
+            .graphs
+            .defs
+            .contains(&listener_def_sym)
+        {
+            return;
+        }
+
         if let Some(svc) = self.services.get_mut(&listener_svc) {
             svc.dep_cache
                 .entry(listener_def_sym)

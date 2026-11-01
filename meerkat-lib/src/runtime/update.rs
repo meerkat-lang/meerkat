@@ -465,19 +465,24 @@ impl Transaction {
             }
         }
 
+        // Rebuild each service's defs from its patched declarations rather than
+        // inserting into them: a def the update turned into a var must leave
+        // `service.defs`, or anything still reaching `recompute_def` for it
+        // re-runs the old def expression over the var
         for stmt in &manager.unified_ast {
             if let Stmt::Service { name, decls } = stmt {
                 if let Some(service) = manager.services.get_mut(name) {
-                    for decl in decls {
-                        if let Decl::DefDecl {
-                            name: def_name,
-                            val,
-                            ..
-                        } = decl
-                        {
-                            service.defs.insert(*def_name, val.clone());
-                        }
-                    }
+                    service.defs = decls
+                        .iter()
+                        .filter_map(|decl| match decl {
+                            Decl::DefDecl {
+                                name: def_name,
+                                val,
+                                ..
+                            } => Some((*def_name, val.clone())),
+                            _ => None,
+                        })
+                        .collect();
                 }
             }
         }

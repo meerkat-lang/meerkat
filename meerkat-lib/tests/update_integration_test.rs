@@ -849,6 +849,68 @@ async fn test_update_def_to_var_unwires_cross_service_listener() {
     );
 }
 
+/// Verify an update that turns a def into a var is not undone by an `Update`
+/// from a subscription the def made before
+///
+/// An owner on another node keeps the def's subscription after the update,
+/// since nothing cancels it, and keeps sending `Update`s for it. Calling
+/// `handle_update` directly delivers one the way the network dispatcher would.
+/// Two things each keep the var safe: the update's commit drops the old def
+/// from `service.defs`, and `handle_update` ignores a listener that is no
+/// longer a def
+#[tokio::test]
+async fn test_update_def_to_var_ignores_update_from_stale_subscription() {
+    let mut manager = manager_after_update(
+        "
+        service b {
+            var m = 1;
+            pub def mm = m;
+        }
+        service a {
+            pub def d = b.mm + 1;
+        }
+        ",
+        "
+        update a {
+            var d: int = b.mm;
+        }
+        ",
+    )
+    .await;
+
+    let a_sym = manager.interner.insert("a");
+    let b_sym = manager.interner.insert("b");
+    let mm_sym = manager.interner.insert("mm");
+    let d_sym = manager.interner.insert("d");
+
+    assert!(
+        !manager.services[&a_sym].defs.contains_key(&d_sym),
+        "the update must drop the old def expression for `d`"
+    );
+
+    manager
+        .assign(a_sym, d_sym, Value::Int { val: 50 }, None)
+        .await
+        .unwrap();
+    let a_id = manager.services[&a_sym].id.clone();
+    let value =
+        meerkat_lib::net::codec::encode_value(&Value::Int { val: 11 }, &manager.interner).unwrap();
+    manager
+        .handle_update(a_id, d_sym, b_sym, mm_sym, value)
+        .await;
+
+    assert!(
+        !manager.services[&a_sym].dep_cache.contains_key(&d_sym),
+        "an `Update` for a listener that is no longer a def must be ignored"
+    );
+    let d_val = manager.lookup(d_sym, a_sym, None).await.unwrap();
+    assert_eq!(
+        d_val,
+        Value::Int { val: 50 },
+        "12 means the var was recomputed from the old def expression"
+    );
+}
+
 /// Verify empty statement lists do not panic and complete cleanly
 #[tokio::test]
 async fn test_update_empty_statements_no_panic() {

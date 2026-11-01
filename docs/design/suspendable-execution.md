@@ -183,8 +183,13 @@ still makes progress.
 - An originator that must wait should park and restart, not replay.  On
   `WaitOn` it does what #202's retry does: it aborts its participants,
   releases its locks and discards its buffers.  Then, instead of sleeping and
-  trying again, it parks on `wait_queue` under the contended key.  When the
-  key frees, the action runs again from its first statement as a new attempt
+  trying again, it checks the contended key once more and, with no `await` in
+  between, either parks on `wait_queue` under it or, if the key freed during
+  the cleanup, restarts at once.  The cleanup awaits the participants' abort
+  acknowledgements, so the holder can release the key in that window, and
+  `release_locks` records a freed key only when something is already parked
+  on it: parking after that release would never be woken.  Either way, the
+  restart runs the action again from its first statement as a new attempt
   (`TxnId::retry`) with the same timestamp.  A wait counts against no retry
   cap, so an older transaction never fails because it waited.
 
@@ -223,8 +228,9 @@ to the new.
 **After step 3**, when there is one event loop and originators park:
 
 - #202's backoff and retry cap for a wait, which parking replaces.  The
-  abort and restart on a wait stay until step 4, now triggered by the lock
-  freeing.  The die retry stays: that is wait-die itself.
+  abort before parking stays until step 4, and so does the restart, which
+  the lock freeing now triggers instead of a timer.  The die retry stays:
+  that is wait-die itself.
 - `send_and_await_reply` processing network events itself.
 - The separate places that handle network messages outside the loop: the
   `--watch` loop and the server loop in `main.rs`, and the REPL's lack of

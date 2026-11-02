@@ -16,7 +16,6 @@ import sys
 import os
 import signal
 import time
-import tempfile
 from argparse import ArgumentParser
 
 
@@ -272,56 +271,31 @@ def test_empty_expect_fail():
 
 
 def test_python_cmd_uses_current_interpreter():
-    """Run helper nodes with both generic Python names via this interpreter."""
-    with tempfile.TemporaryDirectory(prefix="mkn-python-command-") as temp_dir:
-        nodes = []
-        output_paths = []
-        for index, name in enumerate(("python", "python3")):
-            output_path = os.path.join(temp_dir, f"resolved-{index}.txt")
-            script = (
-                "from pathlib import Path; import sys; "
-                f"Path({output_path!r}).write_text(sys.executable)"
-            )
-            nodes.append({
-                "alias": f"python_{index}",
-                "type": "client",
-                "cmd": [name, "-c", script],
-                "timeout": 10,
-            })
-            output_paths.append(output_path)
+    """Resolve Python helper aliases to the interpreter running mkn (#222)."""
+    import importlib.util
+    from unittest.mock import patch
 
-        manifest_path = os.path.join(temp_dir, "manifest.json")
-        with open(manifest_path, "w") as manifest_file:
-            json.dump({"nodes": nodes}, manifest_file)
+    spec = importlib.util.spec_from_file_location("mkn", MKN)
+    if spec is None or spec.loader is None:
+        return False
+    mkn = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mkn)
+    resolve = mkn._resolve_python_command
 
-        code, output = run_cmd(
-            [sys.executable, MKN, manifest_path],
-            timeout=30,
-        )
-        if code != 0:
-            print(
-                f"\nFAIL: Python command manifest exited {code}. "
-                f"Output:\n{output.strip()}"
-            )
-            return False
+    if not (
+        resolve(["python3", "-c", "pass"]) == [sys.executable, "-c", "pass"]
+        and resolve(["python", "x.py"]) == [sys.executable, "x.py"]
+        and resolve(["cargo", "run"]) == ["cargo", "run"]
+        and resolve([]) == []
+    ):
+        return False
 
-        for output_path in output_paths:
-            if not os.path.isfile(output_path):
-                print(
-                    "\nFAIL: Python helper did not write its interpreter path."
-                )
-                return False
-            with open(output_path) as result_file:
-                actual = result_file.read()
-            if actual != sys.executable:
-                print(
-                    f"\nFAIL: helper used {actual!r}, "
-                    f"expected {sys.executable!r}."
-                )
+    for executable in ("", None):
+        with patch.object(mkn.sys, "executable", executable):
+            if resolve(["python3", "-c", "pass"]) != ["python3", "-c", "pass"]:
                 return False
 
     return True
-
 
 def unit_tests():
     """Return the full list of unit test (name, callable) pairs.

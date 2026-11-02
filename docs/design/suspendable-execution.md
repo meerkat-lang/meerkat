@@ -153,6 +153,33 @@ under CI's `-D warnings`, backs this up inside the handle's own module.  It
 is not enough by itself: it sees a `Ref` or `RefMut` held directly in a
 variable across an `await`, but not one wrapped in another type.
 
+**What this buys.**  This is what meets the second goal: a node keeps
+handling network messages and user input while its actions wait for replies.
+Once step 4 is in place, a remote call goes like this:
+
+1. The action sends its request and gets back the receiving end of a reply
+   channel, `let reply = handle.with(|m| m.start_lookup(…));`.  The borrow
+   ends with the closure.
+2. The action awaits the reply.  As a local task, awaiting hands the thread
+   back to the scheduler.
+3. The event loop, another task on the same `LocalSet`, runs meanwhile.  It
+   takes the next event from its channel (a request from another node, a REPL
+   line, a GUI action) and handles it through its own `with` call.  Nothing
+   blocks it, because no action holds the `Manager` while it waits.
+4. When the reply arrives, the network layer completes the action's reply
+   channel (see step 3 below), and the action resumes on its next turn on the
+   thread.
+
+A request from another node that starts an action, such as a participant
+running part of a transaction, is spawned the same way, so it too can wait
+without blocking anything.  Responsiveness comes at `await` points: on one
+thread, a long stretch of pure computation, such as a large `fold` with no
+network access, holds the thread until it finishes.  That is inherent to
+cooperative scheduling, and sharing the `Manager` across threads would not
+avoid it, since other tasks would still wait for the `Manager`.  If it ever
+matters, the interpreter can yield periodically with
+`tokio::task::yield_now()`.
+
 **Why.**  The design removes the `Send` bounds that `#[async_recursion]` puts
 on `eval` and `execute`, the `SendWrapper`s that wasm needs today to pass
 browser timers through those bounds (`manager/mod.rs`), and most of the
@@ -282,7 +309,10 @@ because a parked originator leaves the loop free to process the release.
 - Network replies bypass the loop.  The network actor delivers each reply
   directly to its request's `pending_replies` channel, instead of
   `send_and_await_reply` processing events itself.  Those channels already
-  are a table of continuations.  A reply must never queue behind the loop:
+  are a table of continuations, but today `pending_replies` is a field of the
+  `Manager`, which the network actor cannot reach, so the table moves into the
+  network actor, or into a small registry shared with it; requests register
+  there.  A reply must never queue behind the loop:
   until step 4 an action runs to completion inside the loop, and an action
   waiting for a reply that sits in the loop's own queue would wait forever.
 - Originator transactions should live in a table while they run, keyed by id,

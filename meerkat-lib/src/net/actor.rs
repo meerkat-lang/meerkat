@@ -185,18 +185,21 @@ fn spawn_event_loop(fut: impl std::future::Future<Output = ()> + 'static) {
 /// incoming connections between the two, and because libp2p also dials out
 /// from its own listen port, a given peer reaches the same one every time:
 /// either always this node or always the stale one, which fails the handshake
-/// on its peer id (#204). Binding a plain socket first, which does not set
-/// `SO_REUSEPORT`, turns that into an error at startup.
+/// on its peer id (#204). Binding a socket first with libp2p's listener options
+/// except `SO_REUSEPORT` turns that into an error at startup.
 ///
-/// One window remains: the plain socket is closed before libp2p binds, so two
+/// This only asks the OS whether the port is free; it carries no traffic, and
+/// every connection still goes through libp2p, which offers no way to listen
+/// without `SO_REUSEPORT`.
+///
+/// One window remains: the probe socket is closed before libp2p binds, so two
 /// nodes starting on the same port at the same moment can both pass. It can't
 /// be closed here. libp2p-tcp always listens with `SO_REUSEPORT`, and keeping
-/// the plain socket open would make libp2p's own bind fail. Ports chosen by the
-/// OS remove the collision instead (#233).
+/// the probe open would make libp2p's own bind fail. Ports chosen by the OS
+/// remove the collision instead (#233).
 ///
 /// Port 0 asks for any free port and cannot conflict, and an address that is
-/// not plain TCP over IP is left for libp2p to judge. Connections left in
-/// `TIME_WAIT` don't count: `TcpListener::bind` sets `SO_REUSEADDR` on Unix.
+/// not plain TCP over IP is left for libp2p to judge.
 #[cfg(not(target_arch = "wasm32"))]
 fn port_in_use(addr: &Address) -> Option<String> {
     let multiaddr = addr.0.parse::<Multiaddr>().ok()?;
@@ -210,8 +213,29 @@ fn port_in_use(addr: &Address) -> Option<String> {
         Protocol::Tcp(port) if port != 0 => port,
         _ => return None,
     };
-    match std::net::TcpListener::bind((ip, port)) {
-        Ok(_) => None,
+    let socket_addr = std::net::SocketAddr::new(ip, port);
+    let probe = || -> std::io::Result<()> {
+        let socket = socket2::Socket::new(
+            socket2::Domain::for_address(socket_addr),
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )?;
+        // As libp2p does: an IPv6 listener is IPv6-only, so it can share a
+        // port with an IPv4 one. A dual-stack probe would report that as a
+        // conflict
+        if socket_addr.is_ipv6() {
+            socket.set_only_v6(true)?;
+        }
+        // So that old connections on the port in TIME_WAIT don't count. Not
+        // on Windows, where SO_REUSEADDR would let the probe bind over an
+        // active listener too
+        #[cfg(unix)]
+        socket.set_reuse_address(true)?;
+        socket.bind(&socket_addr.into())?;
+        socket.listen(1)
+    };
+    match probe() {
+        Ok(()) => None,
         Err(e) => Some(format!(
             "cannot listen on {}: {} (is another node still running on this port?)",
             addr.0, e

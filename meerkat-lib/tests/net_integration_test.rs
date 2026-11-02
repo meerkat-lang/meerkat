@@ -1183,3 +1183,65 @@ async fn test_listen_rejects_a_port_another_node_listens_on() {
         reply
     );
 }
+
+/// Whether this machine can listen on IPv6 loopback at all
+fn ipv6_available() -> bool {
+    std::net::TcpListener::bind("[::1]:0").is_ok()
+}
+
+/// An IPv6 listener may share a port with an IPv4 one, as libp2p binds it
+/// IPv6-only. The port check must not report that as a conflict.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_listen_allows_ipv6_on_a_port_ipv4_holds() {
+    if !ipv6_available() {
+        return;
+    }
+    let holder = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let port = holder.local_addr().unwrap().port();
+
+    let mut node = NetworkActor::new(NodeType::Server).await.unwrap();
+    let reply = node
+        .handle_command(NetworkCommand::Listen {
+            addr: Address::new(format!("/ip6/::/tcp/{}", port)),
+        })
+        .await;
+
+    assert!(
+        matches!(reply, NetworkReply::ListenSuccess { .. }),
+        "IPv6 on a port only IPv4 holds is not a conflict, got {:?}",
+        reply
+    );
+}
+
+/// A second node listening on the first node's IPv6 port must fail, as it
+/// does for IPv4.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_listen_rejects_an_ipv6_port_another_node_listens_on() {
+    if !ipv6_available() {
+        return;
+    }
+    let mut first = NetworkActor::new(NodeType::Server).await.unwrap();
+    let first_addr = match first
+        .handle_command(NetworkCommand::Listen {
+            addr: Address::new("/ip6/::1/tcp/0"),
+        })
+        .await
+    {
+        NetworkReply::ListenSuccess { addr } => addr,
+        other => panic!("Expected ListenSuccess, got {:?}", other),
+    };
+
+    let mut second = NetworkActor::new(NodeType::Server).await.unwrap();
+    let reply = second
+        .handle_command(NetworkCommand::Listen {
+            addr: first_addr.clone(),
+        })
+        .await;
+
+    assert!(
+        matches!(reply, NetworkReply::Failure(_)),
+        "a second node must not share {}, got {:?}",
+        first_addr.0,
+        reply
+    );
+}

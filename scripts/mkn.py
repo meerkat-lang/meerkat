@@ -54,7 +54,7 @@ def purge_mkn_logs(clean: bool, log_dir_session: str = None, success: bool = Fal
     mkn_dir = os.path.join("tmp", "logs", "mkn")
     if clean:
         shutil.rmtree(mkn_dir, ignore_errors=True)
-        print("Purged entire log directory.")
+        _safe_print("Purged entire log directory.")
     elif success and log_dir_session:
         shutil.rmtree(log_dir_session, ignore_errors=True)
         # If the parent directory 'tmp/logs/mkn' is empty, delete it as well
@@ -695,6 +695,10 @@ class NetworkOrchestrator:
 
         if self.nodes_by_alias:
             _safe_print("\nShutting down all Meerkat nodes...")
+            # Signal every node before waiting on any, so that if a wait fails
+            # or is interrupted (a second Ctrl-C), no node is left unsignalled
+            # and holding its fixed port
+            signalled = []
             for node in self.nodes_by_alias.values():
                 if node.proc:
                     proc = node.proc
@@ -705,16 +709,22 @@ class NetworkOrchestrator:
                         _safe_print(f"Stopping node '{node.alias}' (PID: {proc.pid}) with terminate()...")
                         try:
                             proc.terminate()
-                            try:
-                                exit_code = proc.wait(timeout=self.terminate_timeout)
-                                _safe_print(f"Node '{node.alias}' (PID: {proc.pid}) stopped cleanly (Exit code: {exit_code}).")
-                            except subprocess.TimeoutExpired:
-                                _safe_print(f"Warning: Node '{node.alias}' (PID: {proc.pid}) did not terminate in time. Killing...")
-                                proc.kill()
-                                exit_code = proc.wait()
-                                _safe_print(f"Node '{node.alias}' (PID: {proc.pid}) killed (Exit code: {exit_code}).")
+                            signalled.append(node)
                         except Exception as e:
                             _safe_print(f"Error: Failed to stop node '{node.alias}' (PID: {proc.pid}): {e}", file=sys.stderr)
+            for node in signalled:
+                proc = node.proc
+                try:
+                    try:
+                        exit_code = proc.wait(timeout=self.terminate_timeout)
+                        _safe_print(f"Node '{node.alias}' (PID: {proc.pid}) stopped cleanly (Exit code: {exit_code}).")
+                    except subprocess.TimeoutExpired:
+                        _safe_print(f"Warning: Node '{node.alias}' (PID: {proc.pid}) did not terminate in time. Killing...")
+                        proc.kill()
+                        exit_code = proc.wait()
+                        _safe_print(f"Node '{node.alias}' (PID: {proc.pid}) killed (Exit code: {exit_code}).")
+                except Exception as e:
+                    _safe_print(f"Error: Failed to stop node '{node.alias}' (PID: {proc.pid}): {e}", file=sys.stderr)
             self.nodes_by_alias.clear()
             _safe_print("Cleanup complete.")
 

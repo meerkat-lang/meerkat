@@ -61,14 +61,17 @@ def run_cmd(args, timeout=30):
         # Interrupted, e.g. by Ctrl-C. The child runs in its own session, so
         # the signal never reached it or the nodes it started. Ask them to
         # stop, so `mkn.py` can clean up, then make sure: a node left running
-        # holds its fixed port and breaks later runs (#204).
-        if not is_windows:
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-                proc.wait(timeout=10)
-            except (ProcessLookupError, subprocess.TimeoutExpired):
-                pass
-        _kill_tree(proc, is_windows)
+        # holds its fixed port and breaks later runs (#204). The forced stop
+        # runs however the wait ends, including a second Ctrl-C during it.
+        try:
+            if not is_windows:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                    proc.wait(timeout=10)
+                except (ProcessLookupError, subprocess.TimeoutExpired):
+                    pass
+        finally:
+            _kill_tree(proc, is_windows)
         raise
 
 

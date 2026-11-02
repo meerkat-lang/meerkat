@@ -134,6 +134,15 @@ class Node:
         self.remote_services = {}  # Dict[svc_name, Service]
         self.relayed_services = {} # Dict[svc_name, Service]
 
+
+def _resolve_python_command(command):
+    """Use the interpreter running mkn for portable Python helper commands."""
+    resolved = list(command)
+    if resolved and resolved[0] in {"python", "python3"}:
+        resolved[0] = sys.executable
+    return resolved
+
+
 class Manifest:
     """Parses and validates the Meerkat Network Orchestrator JSON manifest."""
     def __init__(self, file_path: str):
@@ -399,7 +408,7 @@ class NetworkOrchestrator:
             import_flags.extend(["-i", svc.url])
 
         if node.cmd:
-            cmd = list(node.cmd)
+            cmd = _resolve_python_command(node.cmd)
             if node.relay:
                 relay_node = self.nodes_by_alias[node.relay]
                 cmd.extend(["--relay", relay_node.peer_id])

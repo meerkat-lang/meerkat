@@ -188,8 +188,15 @@ fn spawn_event_loop(fut: impl std::future::Future<Output = ()> + 'static) {
 /// on its peer id (#204). Binding a plain socket first, which does not set
 /// `SO_REUSEPORT`, turns that into an error at startup.
 ///
+/// One window remains: the plain socket is closed before libp2p binds, so two
+/// nodes starting on the same port at the same moment can both pass. It can't
+/// be closed here. libp2p-tcp always listens with `SO_REUSEPORT`, and keeping
+/// the plain socket open would make libp2p's own bind fail. Ports chosen by the
+/// OS remove the collision instead (#233).
+///
 /// Port 0 asks for any free port and cannot conflict, and an address that is
-/// not plain TCP over IP is left for libp2p to judge.
+/// not plain TCP over IP is left for libp2p to judge. Connections left in
+/// `TIME_WAIT` don't count: `TcpListener::bind` sets `SO_REUSEADDR` on Unix.
 #[cfg(not(target_arch = "wasm32"))]
 fn port_in_use(addr: &Address) -> Option<String> {
     let multiaddr = addr.0.parse::<Multiaddr>().ok()?;

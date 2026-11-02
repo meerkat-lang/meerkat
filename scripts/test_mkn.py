@@ -270,6 +270,33 @@ def test_empty_expect_fail():
     return False
 
 
+def test_python_cmd_uses_current_interpreter():
+    """Resolve Python helper aliases to the interpreter running mkn (#222)."""
+    import importlib.util
+    from unittest.mock import patch
+
+    spec = importlib.util.spec_from_file_location("mkn", MKN)
+    if spec is None or spec.loader is None:
+        return False
+    mkn = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mkn)
+    resolve = mkn._resolve_python_command
+
+    if not (
+        resolve(["python3", "-c", "pass"]) == [sys.executable, "-c", "pass"]
+        and resolve(["python", "x.py"]) == [sys.executable, "x.py"]
+        and resolve(["cargo", "run"]) == ["cargo", "run"]
+        and resolve([]) == []
+    ):
+        return False
+
+    for executable in ("", None):
+        with patch.object(mkn.sys, "executable", executable):
+            if resolve(["python3", "-c", "pass"]) != ["python3", "-c", "pass"]:
+                return False
+
+    return True
+
 def unit_tests():
     """Return the full list of unit test (name, callable) pairs.
 
@@ -283,6 +310,10 @@ def unit_tests():
     tests.append((
         "empty_expect_fail",
         test_empty_expect_fail,
+    ))
+    tests.append((
+        "python_cmd_uses_current_interpreter",
+        test_python_cmd_uses_current_interpreter,
     ))
     return tests
 

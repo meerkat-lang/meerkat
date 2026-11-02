@@ -134,6 +134,15 @@ class Node:
         self.remote_services = {}  # Dict[svc_name, Service]
         self.relayed_services = {} # Dict[svc_name, Service]
 
+
+def _resolve_python_command(command):
+    """Use the interpreter running mkn for portable Python helper commands."""
+    resolved = list(command)
+    if resolved and resolved[0] in {"python", "python3"} and sys.executable:
+        resolved[0] = sys.executable
+    return resolved
+
+
 class Manifest:
     """Parses and validates the Meerkat Network Orchestrator JSON manifest."""
     def __init__(self, file_path: str):
@@ -399,7 +408,7 @@ class NetworkOrchestrator:
             import_flags.extend(["-i", svc.url])
 
         if node.cmd:
-            cmd = list(node.cmd)
+            cmd = _resolve_python_command(node.cmd)
             if node.relay:
                 relay_node = self.nodes_by_alias[node.relay]
                 cmd.extend(["--relay", relay_node.peer_id])
@@ -736,6 +745,10 @@ def main():
     Main entry point: parses arguments, loads manifest, configures global
     signal and exception hooks, and triggers orchestrator execution.
     """
+    reconfigure_stdout = getattr(sys.stdout, "reconfigure", None)
+    if reconfigure_stdout is not None:
+        reconfigure_stdout(errors="backslashreplace")
+
     parser = argparse.ArgumentParser(
         description="Meerkat Network Orchestrator (mkn): orchestrates and tests multi-node, relay, and multi-hop distributed topologies for Meerkat.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -843,4 +856,5 @@ Manifest file format (JSON):
 
     sys.exit(exit_code)
 
-main()
+if __name__ == "__main__":
+    main()

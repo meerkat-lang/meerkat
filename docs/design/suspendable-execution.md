@@ -287,7 +287,7 @@ messages during the backoff would avoid the hang, but that is waiting in
 place, which can deadlock as shown above.  Step 3 removes the cap for waits,
 because a parked originator leaves the loop free to process the release.
 
-**Step 3: build the loop so that step 4 fits into it.**  Four choices matter:
+**Step 3: build the loop so that step 4 fits into it.**  Five choices matter:
 
 - The loop is one channel and a `match`.  Every source of events (the
   network actor, a thread reading stdin, timers, later the GUI) forwards into
@@ -308,13 +308,33 @@ because a parked originator leaves the loop free to process the release.
   machinery than this needs.
 - Network replies bypass the loop.  The network actor delivers each reply
   directly to its request's `pending_replies` channel, instead of
-  `send_and_await_reply` processing events itself.  Those channels already
-  are a table of continuations, but today `pending_replies` is a field of the
-  `Manager`, which the network actor cannot reach, so the table moves into the
-  network actor, or into a small registry shared with it; requests register
-  there.  A reply must never queue behind the loop:
+  `send_and_await_reply` finding it among the events it processes.  Those
+  channels already are a table of continuations, but today `pending_replies`
+  is a field of the `Manager`, which the network actor cannot reach, so the
+  table moves into the network actor, or into a small registry shared with
+  it; requests register there.  A reply must never queue behind the loop:
   until step 4 an action runs to completion inside the loop, and an action
   waiting for a reply that sits in the loop's own queue would wait forever.
+- Incoming requests stay served during a remote wait, until step 4.  While an
+  action runs inside the loop, nothing else handles them, and some are
+  needed for its own reply: the request it sent may trigger a `LockRequest`
+  back to this node, as cascading lock groups do
+  (`acquire_lock_group_internal`), and that callback must be served before the
+  reply can come.  So `send_and_await_reply` keeps serving, while it waits,
+  what `dispatch_network_events` serves today: `LockRequest`,
+  `RequestUpdates`, `Update` and `UpdateServiceRequest`, now taken from the
+  loop's channel.  Everything else, including REPL input, `ActionRequest`,
+  `Commit` and `Abort`, stays queued for the loop until the action finishes;
+  today it is dropped.  `Commit` and `Abort` are not served during the wait
+  on purpose: committing a participant can forward the commit to the nodes
+  below and wait for them, which nests one wait inside another, the waiting
+  in place shown above to deadlock.
+
+  This is no worse than today, and loses nothing that today drops.  It does
+  not help a request that starts an action and calls back (an action on A
+  composes onto B, which composes back onto A): that still waits until A's
+  action finishes.  Step 4 fixes it, since the loop then runs while A's action
+  waits.
 - Originator transactions should live in a table while they run, keyed by id,
   like `pending_txns`.  Task 12 already needs the originator's transaction to
   be reachable by id while it runs, and it names #28 as the fix.
@@ -370,7 +390,6 @@ to the new.
   abort before parking stays until step 4, and so does the restart, which
   the lock freeing now triggers instead of a timer.  The die retry stays:
   that is wait-die itself.
-- `send_and_await_reply` processing network events itself.
 - The separate places that handle network messages outside the loop: the
   `--watch` loop and the server loop in `main.rs`, and the REPL's lack of
   any.
@@ -386,6 +405,8 @@ to the new.
   actions.
 - The originator's abort and restart on a wait, from step 3.  A waiting
   originator suspends with its locks held, as a participant does.
+- `send_and_await_reply` serving incoming requests while it waits, from
+  step 3.  The loop itself runs during the wait now, so it serves them.
 - `reactive_cache` as a field on the `Manager`, which moves into each
   execution's context.
 

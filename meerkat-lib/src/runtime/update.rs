@@ -14,7 +14,7 @@ use crate::runtime::graphs::{
 };
 use crate::runtime::interner::{Interner, Symbol};
 use crate::runtime::interpreter::evaluator::{eval, EvalContext, EvalError};
-use crate::runtime::manager::Manager;
+use crate::runtime::manager::{join_clocks, Manager};
 use crate::runtime::nameres;
 use crate::runtime::tt::check::{self as tt};
 use crate::runtime::tt::types::ServiceType;
@@ -183,6 +183,8 @@ impl Transaction {
                     break;
                 }
 
+                // Retain remote read clocks for migration initializers as well.
+                txn.observed_reads = Some(HashSet::new());
                 self.lock_txn = Some(txn);
                 self.state = TransactionState::LocksAcquired;
                 match apply_updates_to_ast(manager.unified_ast(), &self.updates) {
@@ -339,10 +341,8 @@ impl Transaction {
                     .iter()
                     .flat_map(|(svc, decls)| {
                         decls.iter().filter_map(move |decl| match decl {
-                            Decl::VarDecl { name, .. } | Decl::DefDecl { name, .. } => {
-                                Some((**svc, *name))
-                            }
-                            Decl::TableDecl { .. } => None,
+                            Decl::DefDecl { name, .. } => Some((**svc, *name)),
+                            Decl::VarDecl { .. } | Decl::TableDecl { .. } => None,
                         })
                     })
                     .collect();
@@ -423,6 +423,7 @@ impl Transaction {
         debug_assert_eq!(self.state, TransactionState::Evaluated);
         manager.local_services = std::mem::replace(&mut self.types, Env::new(None));
 
+        let mut write_set = HashSet::new();
         for ((svc_name, var_name), val) in std::mem::take(&mut self.values) {
             if let Some(service) = manager.services.get_mut(&svc_name) {
                 if let Some(var_state) = service.vars.get_mut(&var_name) {
@@ -441,8 +442,16 @@ impl Transaction {
                         },
                     );
                 }
+                write_set.insert((svc_name, var_name));
             }
         }
+        let read_clock = join_clocks(
+            self.lock_txn
+                .iter()
+                .flat_map(|txn| txn.read_cache.values())
+                .filter_map(|entry| entry.1.as_ref()),
+        );
+        manager.simultaneous_bump(read_clock, &write_set);
 
         for stmt in &self.ast {
             if let Stmt::Service { name, decls } = stmt {

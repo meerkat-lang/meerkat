@@ -161,7 +161,7 @@ pub fn local_service_names(prog: &[Stmt]) -> HashSet<Symbol> {
 }
 
 /// Pointwise max of `clocks`; a dimension a clock omits counts as zero.
-fn join_clocks<'a>(clocks: impl IntoIterator<Item = &'a VClock>) -> VClock {
+pub(super) fn join_clocks<'a>(clocks: impl IntoIterator<Item = &'a VClock>) -> VClock {
     let mut joined = VClock::new();
     for clock in clocks {
         for (&dim, &counter) in clock {
@@ -391,15 +391,27 @@ impl Manager {
         // reordered, so creating imports only when their `Stmt::Import` is
         // reached would build `app` before the `dep` it reads and fail with
         // `ServiceNotFound`.
-        let imported: Vec<(Symbol, Vec<Decl>)> = self
-            .unified_ast
-            .iter()
-            .filter_map(|s| match s {
-                Stmt::Service { name, decls } => Some((*name, decls.clone())),
-                _ => None,
-            })
-            .filter(|(name, _)| !local.contains(name) && !self.remote_services.contains_key(name))
-            .collect();
+        let mut imported = Vec::new();
+        let mut seen = HashSet::new();
+        self.unified_ast.retain(|stmt| match stmt {
+            Stmt::Service { name, decls }
+                if !local.contains(name) && !self.remote_services.contains_key(name) =>
+            {
+                if seen.insert(*name) {
+                    imported.push((*name, decls.clone()));
+                    true
+                } else {
+                    // The cached graph may belong to this skipped declaration.
+                    self.declaration_graphs.remove(name);
+                    false
+                }
+            }
+            _ => true,
+        });
+        let graphs = declaration_graphs(&self.unified_ast, |name, _| {
+            !self.services.contains_key(&name) && !self.declaration_graphs.contains_key(&name)
+        });
+        self.declaration_graphs.extend(graphs);
         for (name, decls) in imported {
             if self.services.contains_key(&name) {
                 continue;
@@ -976,7 +988,7 @@ impl Manager {
         if let Some(service) = self.services.get_mut(&service_name) {
             if let Some(var_state) = service.vars.get_mut(&var_name) {
                 var_state.value = value;
-                self.simultaneous_bump(&HashSet::new(), &HashSet::from([(service_name, var_name)]));
+                self.simultaneous_bump(VClock::new(), &HashSet::from([(service_name, var_name)]));
             } else {
                 // in theory we should never encounter this after nameres is fully integrated
                 // keep this in mind to guide future development
@@ -1077,27 +1089,18 @@ impl Manager {
     }
 
     // helper function to apply a simultaneous bump, as described in section 5.2 of vector clock semantics
-    fn simultaneous_bump(
+    pub(super) fn simultaneous_bump(
         &mut self,
-        read_set: &HashSet<(Symbol, Symbol)>,
+        read_clock: VClock,
         write_set: &HashSet<(Symbol, Symbol)>,
     ) {
-        let mut vclocks: Vec<&VClock> = Vec::new();
-        // get all the vclocks first
-        for (svc, var) in read_set.union(write_set) {
-            match self.get_clock(svc, var) {
-                Some(clock) => vclocks.push(clock),
-                None => {
-                    log::warn!(
-                        "simultaneous_bump: clock for var {} in service {} not found",
-                        self.interner.get(*var),
-                        self.interner.get(*svc)
-                    );
-                }
-            }
-        }
-        // compute the max over all vclocks
-        let mut v_base = join_clocks(vclocks);
+        let mut v_base = join_clocks(
+            std::iter::once(&read_clock).chain(
+                write_set
+                    .iter()
+                    .filter_map(|(svc, var)| self.get_clock(svc, var)),
+            ),
+        );
         // increment if they're in the write_set
         for (svc, var) in write_set {
             *v_base.entry((*svc, *var)).or_insert(0) += 1;
@@ -1112,6 +1115,9 @@ impl Manager {
     /// Mark affected defs after all updated graphs are installed. A blocked def
     /// keeps its notification until an input permits successful recomputation.
     pub(crate) fn mark_source_updates(&mut self, members: Vec<(Symbol, Symbol)>) {
+        if members.is_empty() {
+            return;
+        }
         // This temporary graph joins existing dependency edges across services,
         // including imported declarations. It is built only for code updates.
         let mut dependents = DiGraphMap::<(Symbol, Symbol), ()>::new();
@@ -2910,12 +2916,11 @@ impl Manager {
             .keys()
             .filter_map(|(sid, var)| self.service_name_for_net_id(sid).map(|n| (n, *var)))
             .collect();
-        let read_set: HashSet<(Symbol, Symbol)> = txn
-            .read_cache
-            .keys()
-            .filter_map(|(sid, var)| self.service_name_for_net_id(sid).map(|n| (n, *var)))
-            .collect();
-        self.simultaneous_bump(&read_set, &write_set);
+        let read_clock = join_clocks(txn.read_cache.keys().filter_map(|(sid, var)| {
+            self.service_name_for_net_id(sid)
+                .and_then(|name| self.get_clock(&name, var))
+        }));
+        self.simultaneous_bump(read_clock, &write_set);
         let error = self.commit_participants(txn).await;
         for (listener, def, owner, member) in self.forget_participant_deps(txn) {
             self.subscribe_remote(owner, member, listener, def).await;
@@ -4804,7 +4809,7 @@ mod tests {
         tc.manager.create_service(tc.foo, decls).await.unwrap();
 
         let w = HashSet::from([(tc.foo, tc.x), (tc.foo, tc.y)]);
-        tc.manager.simultaneous_bump(&HashSet::new(), &w);
+        tc.manager.simultaneous_bump(VClock::new(), &w);
 
         let foo = tc.manager.services.get(&tc.foo).unwrap();
         let xc = foo.vars.get(&tc.x).unwrap().vector_clock.clone();
@@ -4840,10 +4845,9 @@ mod tests {
             .await
             .unwrap();
         // now write x having READ y
-        tc.manager.simultaneous_bump(
-            &HashSet::from([(tc.foo, tc.y)]),
-            &HashSet::from([(tc.foo, tc.x)]),
-        );
+        let read_clock = tc.manager.get_clock(&tc.foo, &tc.y).unwrap().clone();
+        tc.manager
+            .simultaneous_bump(read_clock, &HashSet::from([(tc.foo, tc.x)]));
 
         let xc = &tc
             .manager

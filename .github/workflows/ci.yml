@@ -65,3 +65,9 @@ jobs:
 
       - name: Smoke test CLI
         run: cargo run --locked -p meerkat -- --help
+
+      # End-to-end tests across real nodes (#144). The nodes start with
+      # `cargo run -p meerkat`, which reuses the binary the smoke test just
+      # built, so no node spends its startup timeout compiling.
+      - name: Run multi-node tests
+        run: python3 scripts/test_mkn.py

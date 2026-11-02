@@ -16,11 +16,12 @@ only when the issue's stated verification evidence supports it.
 CI (`.github/workflows/ci.yml`) and the pre-commit hooks cover the same Rust checks: formatting, `cargo clippy` with `-D warnings`, the wasm32 `cargo check`, and `cargo test --workspace` skipping `multiple_message`. CI checks formatting with `cargo fmt --all -- --check`; the pre-commit hook runs `cargo fmt --all --` and may rewrite files. CI also runs a `meerkat -- --help` smoke test; see both config files for exact flags.
 
 A full regression run also includes `python3 scripts/test_mkn.py`, the
-multi-node network tests. It is not in CI and takes about a minute. Run
-`cargo build -p meerkat` first: it launches nodes with `cargo run`, and the
-hooks build with `--all-features`, so after a commit the first node can spend
-its startup time compiling and fail with "Timeout waiting for node ... to
-initialize".
+multi-node network tests. CI runs it after the smoke test; the pre-commit hooks
+don't, so run it locally before pushing a change that could affect it. It takes
+about a minute. Run `cargo build -p meerkat` first: it launches nodes with
+`cargo run`, and the hooks build with `--all-features`, so after a commit the
+first node can spend its startup time compiling and fail with "Timeout waiting
+for node ... to initialize".
 
 The tests use fixed ports, so a node left running from an earlier run, or a
 server started by hand, makes a test's server fail with "cannot listen on ...:

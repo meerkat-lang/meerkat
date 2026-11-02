@@ -41,36 +41,65 @@ def run_cmd(args, timeout=30):
     else:
         kwargs["start_new_session"] = True
 
+    proc = subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        **kwargs,
+    )
     try:
-        proc = subprocess.Popen(
-            args,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            **kwargs,
-        )
         stdout, _ = proc.communicate(timeout=timeout)
         return proc.returncode, stdout
     except subprocess.TimeoutExpired:
-        if is_windows:
-            try:
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            except Exception:
-                pass
-        else:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-
+        _kill_tree(proc, is_windows)
         stdout, _ = proc.communicate()
         if stdout is None:
             stdout = ""
         return -1, stdout
+    except BaseException:
+        # Interrupted, e.g. by Ctrl-C. The child runs in its own session, so
+        # the signal never reached it or the nodes it started. Ask them to
+        # stop, so `mkn.py` can clean up, then make sure: a node left running
+        # holds its fixed port and breaks later runs (#204). The forced stop
+        # runs however the wait ends, including a second Ctrl-C during it.
+        try:
+            if not is_windows:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                    proc.wait(timeout=10)
+                except (ProcessLookupError, subprocess.TimeoutExpired):
+                    pass
+        finally:
+            _kill_tree(proc, is_windows)
+        raise
+
+
+def _kill_tree(proc, is_windows):
+    """Forcibly stop `proc` and every process it started.
+
+    `run_cmd` starts the child in a new session (a new process group on
+    Windows), whose id is the child's pid, so this also reaches the nodes
+    `mkn.py` spawned, even after `mkn.py` itself has exited.
+
+    Args:
+        proc (subprocess.Popen): The process started by `run_cmd`.
+        is_windows (bool): Whether running on Windows.
+    """
+    if is_windows:
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 
 # ---------------------------------------------------------------------------

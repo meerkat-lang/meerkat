@@ -2363,6 +2363,7 @@ dependencies = [
  "send_wrapper",
  "serde",
  "serde_json",
+ "socket2 0.6.5",
  "strum_macros",
  "thiserror 2.0.21",
  "tokio",

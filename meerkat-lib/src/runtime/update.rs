@@ -534,20 +534,17 @@ impl Transaction {
         );
         manager.simultaneous_bump(read_clock, &write_set);
 
-        for stmt in &self.ast {
-            if let Stmt::Service { name, decls } = stmt {
-                if let Some(service) = manager.services.get_mut(name) {
-                    for decl in decls {
-                        if let Decl::DefDecl {
-                            name: def_name,
-                            val,
-                            ..
-                        } = decl
-                        {
-                            service.defs.insert(*def_name, val.clone());
-                        }
-                    }
-                }
+        for (name, stmt) in service_declarations(&self.ast) {
+            if let (Some(service), Stmt::Service { decls, .. }) =
+                (manager.services.get_mut(&name), stmt)
+            {
+                service.defs = decls
+                    .iter()
+                    .filter_map(|decl| match decl {
+                        Decl::DefDecl { name, val, .. } => Some((*name, val.clone())),
+                        _ => None,
+                    })
+                    .collect();
             }
         }
         manager.install_analyzed_ast(std::mem::take(&mut self.ast), &mut self.deps);

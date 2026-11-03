@@ -12,7 +12,7 @@ use crate::runtime::interner::{Interner, Symbol};
 use crate::runtime::txn::{ReadEntry, Sources, Transaction, TxnId, VClock, VarState, WaitKey};
 use petgraph::{graphmap::DiGraphMap, visit::Dfs};
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -90,6 +90,9 @@ impl ParkedRequest {
     }
 }
 
+/// An applied code update awaiting the first values of its new defs.
+type Completing = (u64, String, Vec<(Symbol, Symbol)>, web_time::Instant);
+
 pub struct Manager {
     pub services: HashMap<Symbol, Service>,
     /// Maps service name to remote address (for distributed services)
@@ -98,6 +101,10 @@ pub struct Manager {
     pub network: Option<NetworkActor>,
     /// Pending reply channels keyed by request_id
     pub pending_replies: HashMap<u64, oneshot::Sender<MeerkatMessage>>,
+    /// Requests received during an RPC, to serve after its caller finishes.
+    deferred_events: VecDeque<NetworkEvent>,
+    /// Shared by server dispatch and RPC waits; completing never starts an RPC.
+    completing_updates: Vec<Completing>,
     /// (Probabilistically) unique identifier of this node, used in transaction
     /// ids so ids minted on different nodes never collide.
     pub node_id: u64,
@@ -204,6 +211,8 @@ impl Manager {
             remote_services: HashMap::new(),
             network: None,
             pending_replies: HashMap::new(),
+            deferred_events: VecDeque::new(),
+            completing_updates: Vec::new(),
             node_id: Self::random_node_id(),
             pending_txns: HashMap::new(),
             wait_queue: HashMap::new(),
@@ -826,22 +835,27 @@ impl Manager {
     /// Returns:
     ///     `()`
     pub async fn update_service_graphs(&mut self, svc_name: Symbol, new_graphs: ServiceGraphs) {
-        let (updated_id, old_edges, edges) = match self.services.get_mut(&svc_name) {
+        let (updated_id, old_edges, edges, defs) = match self.services.get_mut(&svc_name) {
             Some(service) => {
                 let old_edges: HashSet<_> = Self::listener_edges(svc_name, service).collect();
                 service.graphs = new_graphs;
+                let defs = &service.graphs.defs;
+                service.dep_cache.retain(|def, _| defs.contains(def));
+                service
+                    .pending_source_updates
+                    .retain(|def| defs.contains(def));
                 let edges: Vec<_> = Self::listener_edges(svc_name, service).collect();
-                (service.id.clone(), old_edges, edges)
+                (service.id.clone(), old_edges, edges, defs.clone())
             }
             None => return,
         };
 
-        // Keep what this service's defs registered for inputs that evaluation
-        // reached at run time (see `follow_input`): no graph lists them
+        // Keep runtime input registrations only while their listener is a def.
         for (&owner, service) in self.services.iter_mut() {
             for (&member, listener_set) in service.listeners.iter_mut() {
                 listener_set.retain(|(lid, def)| {
-                    *lid != updated_id || !old_edges.contains(&(owner, member, *def))
+                    *lid != updated_id
+                        || (defs.contains(def) && !old_edges.contains(&(owner, member, *def)))
                 });
             }
         }
@@ -871,14 +885,15 @@ impl Manager {
             .graphs
             .reactive_edges()
             .into_iter()
-            .filter(|(_, def)| service.defs.contains_key(def))
             .map(move |(member, def)| (svc_name, member, def));
         let cross = service.graphs.cross_deps.iter().flat_map(|(&def, inputs)| {
             inputs
                 .iter()
                 .map(move |&(owner, member)| (owner, member, def))
         });
-        local.chain(cross)
+        local
+            .chain(cross)
+            .filter(|(_, _, def)| service.graphs.defs.contains(def))
     }
 
     /// Initialization is private to its transaction, including cache reads.
@@ -1751,30 +1766,102 @@ impl Manager {
         Ok(None)
     }
 
-    /// Drive the network until each of `defs` has a value (see
-    /// `first_values`), within a nominal budget of the reply timeout of
-    /// `send_and_await_reply`. Only the pauses between steps count against it,
-    /// so requests served meanwhile can make the wait last longer.
-    /// Meanwhile requests are answered as the CLI server loop answers them, so
-    /// waiting loses none, including one the awaited input itself depends on
+    /// Apply an incoming code update without waiting inside the request handler.
+    /// Its reply is sent by complete_code_updates after its new defs have values.
+    pub async fn apply_service_update(
+        &mut self,
+        request_id: u64,
+        txn_id: Option<TxnId>,
+        source: &str,
+        reply_to: String,
+    ) {
+        let result = match crate::runtime::parser::parse_string(source, &mut self.interner) {
+            Ok(stmts) => {
+                let mut txn = match txn_id {
+                    Some(tid) => crate::runtime::update::Transaction::new_with_id(tid, stmts),
+                    None => crate::runtime::update::Transaction::new(stmts),
+                };
+                Box::pin(txn.apply(self)).await.map_err(|e| e.to_string())
+            }
+            Err(e) => Err(e),
+        };
+        match result {
+            Ok(introduced) => self.completing_updates.push((
+                request_id,
+                reply_to,
+                introduced,
+                web_time::Instant::now() + std::time::Duration::from_secs(15),
+            )),
+            Err(error) => {
+                if !reply_to.is_empty() {
+                    self.send_oneway(
+                        Address::new(&reply_to),
+                        MeerkatMessage::UpdateServiceResponse {
+                            request_id,
+                            error: Some(error),
+                        },
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    /// Advance applied updates using paired inputs already available locally.
+    /// This does not wait for a first value or enter another network dispatcher.
+    pub async fn complete_code_updates(&mut self) {
+        for (request_id, reply_to, defs, deadline) in std::mem::take(&mut self.completing_updates) {
+            let error = match self.first_values(&defs).await {
+                Ok(None) => None,
+                Ok(Some(_)) if web_time::Instant::now() < deadline => {
+                    self.completing_updates
+                        .push((request_id, reply_to, defs, deadline));
+                    continue;
+                }
+                Ok(Some(waiting)) => Some(self.uninitialized(waiting).to_string()),
+                Err(e) => Some(e.to_string()),
+            };
+            if !reply_to.is_empty() {
+                self.send_oneway(
+                    Address::new(&reply_to),
+                    MeerkatMessage::UpdateServiceResponse { request_id, error },
+                )
+                .await;
+            }
+        }
+    }
+
+    /// Reassure requests waiting on locks or the first values of a code update.
+    pub async fn keepalive_waiters(&mut self) {
+        let mut targets = self.parked_keepalive_targets();
+        targets.extend(
+            self.completing_updates
+                .iter()
+                .map(|(request_id, reply_to, _, _)| (*request_id, reply_to.clone())),
+        );
+        for (request_id, reply_to) in targets {
+            self.send_oneway(
+                Address::new(&reply_to),
+                MeerkatMessage::WaitParked { request_id },
+            )
+            .await;
+        }
+    }
+
+    /// Drive a top-level code update until its new defs have first values.
+    /// Only pauses count against this nominal reply-timeout budget.
     pub async fn await_first_values(&mut self, defs: &[(Symbol, Symbol)]) -> Result<(), EvalError> {
-        // Counted in the steps of the wasm branch of `send_and_await_reply`
         let mut remaining_ms: i64 = 15_000;
         loop {
+            self.serve_network_events().await;
             let Some(waiting) = self.first_values(defs).await? else {
                 return Ok(());
             };
             if remaining_ms <= 0 {
                 return Err(self.uninitialized(waiting));
             }
-            self.dispatch_events(true).await;
-            self.wake_freed().await;
-            // The CLI server loop's keepalive for requests parked on locks
             if remaining_ms % 5_000 == 0 {
-                for (request_id, reply_to) in self.parked_keepalive_targets() {
-                    let keepalive = MeerkatMessage::WaitParked { request_id };
-                    self.send_oneway(Address::new(&reply_to), keepalive).await;
-                }
+                self.keepalive_waiters().await;
             }
             pause(10).await;
             remaining_ms -= 10;
@@ -1961,7 +2048,7 @@ impl Manager {
         let listener_svc = self
             .services
             .iter()
-            .find(|(_, s)| s.id == listener_id)
+            .find(|(_, s)| s.id == listener_id && s.defs.contains_key(&listener_def_sym))
             .map(|(name, _)| *name);
         let listener_svc = match listener_svc {
             Some(n) => n,
@@ -1991,20 +2078,32 @@ impl Manager {
         }
     }
 
-    /// Drain all pending network events and dispatch each to the matching
-    /// oneshot channel in pending_replies. Non-matching events are dropped.
+    /// Next event at a request boundary, including requests deferred by an RPC.
+    /// Never use this while a request is still executing.
+    pub fn try_recv_event(&mut self) -> Option<NetworkEvent> {
+        self.deferred_events
+            .pop_front()
+            .or_else(|| self.network.as_mut().and_then(|n| n.try_recv_event()))
+    }
+
+    /// Dispatch at a request boundary, where participant transactions are stored
+    /// and their requests have already produced their replies.
+    pub async fn serve_network_events(&mut self) {
+        self.dispatch_events(true).await;
+        self.wake_freed().await;
+    }
+
+    /// Pump replies and reactive traffic during an RPC. Requests that need the
+    /// suspended caller's state remain queued for the next request boundary.
     pub async fn dispatch_network_events(&mut self) {
         self.dispatch_events(false).await
     }
 
-    /// `dispatch_network_events`; with `serve`, also answer the requests the
-    /// CLI server loop answers instead of dropping them (`serve_request`)
     async fn dispatch_events(&mut self, serve: bool) {
-        // Scope the network borrow to just the receive (via the inner match) so
-        // the rest of the loop body can take &mut self for the reactive handlers.
-        while let Some(event) = match self.network.as_mut() {
-            Some(n) => n.try_recv_event(),
-            None => None,
+        while let Some(event) = if serve {
+            self.try_recv_event()
+        } else {
+            self.network.as_mut().and_then(|n| n.try_recv_event())
         } {
             match event {
                 NetworkEvent::MessageReceived { msg, peer } => match msg {
@@ -2080,52 +2179,45 @@ impl Manager {
                         source,
                         reply_to,
                     } => {
-                        let res = match codec::decode_update_service_request(
+                        let target_addr = if !peer.is_empty() { peer } else { reply_to };
+                        match codec::decode_update_service_request(
                             &service_name,
                             &source,
                             &mut self.interner,
                         ) {
-                            Ok((_sym, validated_source)) => {
-                                match crate::runtime::parser::parse_string(
-                                    &validated_source,
-                                    &mut self.interner,
-                                ) {
-                                    Ok(stmts) => {
-                                        let mut txn = match txn_id {
-                                            Some(tid) => {
-                                                crate::runtime::update::Transaction::new_with_id(
-                                                    tid, stmts,
-                                                )
-                                            }
-                                            None => crate::runtime::update::Transaction::new(stmts),
-                                        };
-                                        Box::pin(txn.poll(self)).await.map_err(|e| e.to_string())
-                                    }
-                                    Err(e) => Err(e),
+                            Ok((_sym, source)) => {
+                                self.apply_service_update(request_id, txn_id, &source, target_addr)
+                                    .await;
+                            }
+                            Err(e) => {
+                                if !target_addr.is_empty() {
+                                    self.send_oneway(
+                                        Address::new(&target_addr),
+                                        MeerkatMessage::UpdateServiceResponse {
+                                            request_id,
+                                            error: Some(e.to_string()),
+                                        },
+                                    )
+                                    .await;
                                 }
                             }
-                            Err(e) => Err(e.to_string()),
-                        };
-                        let error = res.err();
-                        let reply_msg = MeerkatMessage::UpdateServiceResponse { request_id, error };
-                        let target_addr = if !peer.is_empty() {
-                            peer.clone()
-                        } else {
-                            reply_to
-                        };
-                        if !target_addr.is_empty() {
-                            self.send_oneway(Address::new(&target_addr), reply_msg)
-                                .await;
                         }
+                    }
+                    msg @ MeerkatMessage::ServiceCodeRequest { .. } => {
+                        Box::pin(self.serve_request(msg)).await;
                     }
                     msg @ (MeerkatMessage::LookupRequest { .. }
                     | MeerkatMessage::ActionRequest { .. }
                     | MeerkatMessage::Commit { .. }
-                    | MeerkatMessage::Abort { .. }
-                    | MeerkatMessage::LockRequest { .. }
-                    | MeerkatMessage::ServiceCodeRequest { .. })
-                        if serve =>
-                    {
+                    | MeerkatMessage::Abort { .. }) => {
+                        if serve {
+                            Box::pin(self.serve_request(msg)).await;
+                        } else {
+                            self.deferred_events
+                                .push_back(NetworkEvent::MessageReceived { msg, peer });
+                        }
+                    }
+                    msg @ MeerkatMessage::LockRequest { .. } if serve => {
                         Box::pin(self.serve_request(msg)).await;
                     }
                     MeerkatMessage::LockRequest {
@@ -2200,6 +2292,7 @@ impl Manager {
                 NetworkEvent::PeerDisconnected { .. } => {}
             }
         }
+        self.complete_code_updates().await;
     }
 
     /// Rebuild a structured error from a failure a remote node reported.
@@ -2263,6 +2356,7 @@ impl Manager {
         // Register oneshot channel for this request
         let (tx, mut rx) = oneshot::channel::<MeerkatMessage>();
         self.pending_replies.insert(request_id, tx);
+        let mut last_keepalive = web_time::Instant::now();
 
         // Loop dispatching pending network events then checking for reply,
         // timeout, or a short yield. The loop is required until the background
@@ -2278,6 +2372,10 @@ impl Manager {
 
             loop {
                 self.dispatch_network_events().await;
+                if last_keepalive.elapsed() >= std::time::Duration::from_secs(5) {
+                    self.keepalive_waiters().await;
+                    last_keepalive = web_time::Instant::now();
+                }
                 tokio::select! {
                     biased;
                     result = &mut rx => {
@@ -2319,6 +2417,10 @@ impl Manager {
             let mut remaining_ms: i64 = 15_000;
             loop {
                 self.dispatch_network_events().await;
+                if last_keepalive.elapsed() >= std::time::Duration::from_secs(5) {
+                    self.keepalive_waiters().await;
+                    last_keepalive = web_time::Instant::now();
+                }
 
                 // #39: SendWrapper makes the (browser-thread-only) timer
                 // futures Send so callers on the Send-bounded eval path still

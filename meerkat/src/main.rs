@@ -1,7 +1,6 @@
 mod repl;
 
 use clap::Parser;
-use meerkat_lib::net::network_layer::NetworkLayer;
 use meerkat_lib::net::types::NodeType;
 use meerkat_lib::net::NetworkActor;
 use meerkat_lib::net::{
@@ -9,7 +8,9 @@ use meerkat_lib::net::{
 };
 use meerkat_lib::runtime::ast::{AstPrinter, Stmt};
 use meerkat_lib::runtime::interner::Symbol;
-use meerkat_lib::runtime::{parser, Manager, Node};
+#[cfg(test)]
+use meerkat_lib::runtime::parser;
+use meerkat_lib::runtime::{Manager, Node};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 
@@ -405,11 +406,6 @@ fn print_service_urls(manager: &Manager, full_addr: &str) {
     }
 }
 
-/// An applied code update whose new defs still take their first value, from
-/// inputs the update's own publication may have to reach: the request, where
-/// to answer it, those defs, and when to stop waiting
-type Completing = (u64, String, Vec<(Symbol, Symbol)>, tokio::time::Instant);
-
 async fn run_server(
     node: Node,
     prog: Vec<Stmt>,
@@ -518,8 +514,6 @@ async fn run_server(
         String,
     )> = std::collections::VecDeque::new();
 
-    let mut completing: Vec<Completing> = Vec::new();
-
     let mut last_keepalive = tokio::time::Instant::now();
     loop {
         // Wake what is parked on locks released with no dispatcher to hand the
@@ -530,87 +524,20 @@ async fn run_server(
         // Defer pending service updates so that network events can be processed
         // without blocking the server loop during multi-step updates
         if let Some((request_id, txn_id, source, reply_to, peer)) = pending_updates.pop_front() {
-            let parse_res = parser::parse_string(&source, &mut manager.interner);
-            let res = match parse_res {
-                Ok(stmts) => {
-                    let mut txn = match txn_id {
-                        Some(tid) => {
-                            meerkat_lib::runtime::update::Transaction::new_with_id(tid, stmts)
-                        }
-                        None => meerkat_lib::runtime::update::Transaction::new(stmts),
-                    };
-                    txn.apply(&mut manager).await.map_err(|e| e.to_string())
-                }
-                Err(e) => Err(e),
-            };
             let target_addr = if !reply_to.is_empty() { reply_to } else { peer };
-            match res {
-                // Answered below, while this loop keeps serving requests
-                Ok(introduced) => completing.push((
-                    request_id,
-                    target_addr,
-                    introduced,
-                    tokio::time::Instant::now() + std::time::Duration::from_secs(15),
-                )),
-                Err(e) => {
-                    let response = MeerkatMessage::UpdateServiceResponse {
-                        request_id,
-                        error: Some(e),
-                    };
-                    if !target_addr.is_empty() {
-                        if let Some(net) = manager.network.as_mut() {
-                            send_net_msg(net, &target_addr, response).await;
-                        }
-                    }
-                }
-            }
+            manager
+                .apply_service_update(request_id, txn_id, &source, target_addr)
+                .await;
         }
-
-        // Answer an applied update once its new defs have values
-        let mut i = 0;
-        while i < completing.len() {
-            let error = match manager.first_values(&completing[i].2).await {
-                Ok(None) => None,
-                Ok(Some(_)) if tokio::time::Instant::now() < completing[i].3 => {
-                    i += 1;
-                    continue;
-                }
-                Ok(Some(waiting)) => Some(manager.uninitialized(waiting).to_string()),
-                Err(e) => Some(e.to_string()),
-            };
-            let (request_id, target_addr, _, _) = completing.remove(i);
-            let response = MeerkatMessage::UpdateServiceResponse { request_id, error };
-            if !target_addr.is_empty() {
-                if let Some(net) = manager.network.as_mut() {
-                    send_net_msg(net, &target_addr, response).await;
-                }
-            }
-        }
+        manager.complete_code_updates().await;
 
         // Periodically reassure parked waiters (wait-die wait) that they are
         // still queued, so their reply timeout never fires while we hold them.
         if last_keepalive.elapsed() >= std::time::Duration::from_secs(5) {
-            for (request_id, reply_to) in manager.parked_keepalive_targets() {
-                if let Some(net) = manager.network.as_mut() {
-                    send_net_msg(net, &reply_to, MeerkatMessage::WaitParked { request_id }).await;
-                }
-            }
-            // An update still completing is as alive as a parked request
-            for (request_id, reply_to, _, _) in &completing {
-                if let Some(net) = manager.network.as_mut() {
-                    send_net_msg(
-                        net,
-                        reply_to,
-                        MeerkatMessage::WaitParked {
-                            request_id: *request_id,
-                        },
-                    )
-                    .await;
-                }
-            }
+            manager.keepalive_waiters().await;
             last_keepalive = tokio::time::Instant::now();
         }
-        let event = manager.network.as_mut().and_then(|n| n.try_recv_event());
+        let event = manager.try_recv_event();
         if let Some(NetworkEvent::MessageReceived { msg, peer }) = event {
             match msg {
                 MeerkatMessage::UpdateServiceRequest {
@@ -866,14 +793,16 @@ async fn run_client(
     if watch {
         println!("Watching for changes, press Ctrl+C to stop...");
         loop {
-            let msg = manager
-                .network
-                .as_mut()
-                .and_then(|n| n.try_recv_event())
-                .and_then(|ev| match ev {
-                    NetworkEvent::MessageReceived { msg, .. } => Some(msg),
-                    _ => None,
-                });
+            manager.complete_code_updates().await;
+            manager.wake_freed().await;
+            let msg = manager.try_recv_event().and_then(|ev| match ev {
+                NetworkEvent::MessageReceived { msg, .. } => Some(msg),
+                _ => None,
+            });
+            let msg = match msg {
+                Some(msg) => manager.serve_request(msg).await,
+                None => None,
+            };
             if let Some(MeerkatMessage::Update {
                 listener_service,
                 listener_def,

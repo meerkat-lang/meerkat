@@ -954,7 +954,7 @@ fn test_import_member_access_resolves_with_unified_ast() {
     //   service nb { pub def val = na.get_x; }
     let program = vec![
         Stmt::Import {
-            path: "na".to_string(),
+            path: None,
             service_name: remote_svc,
         },
         Stmt::Service {

@@ -8,7 +8,7 @@ use meerkat_lib::net::{
     codec, Address, MeerkatMessage, NetworkCommand, NetworkEvent, NetworkReply, ServiceNetId,
 };
 use meerkat_lib::runtime::ast::{AstPrinter, Stmt};
-use meerkat_lib::runtime::interner::{Interner, Symbol};
+use meerkat_lib::runtime::interner::Symbol;
 use meerkat_lib::runtime::interpreter::EvalError;
 use meerkat_lib::runtime::manager::ParkedRequest;
 use meerkat_lib::runtime::{parser, Manager, Node};
@@ -17,6 +17,8 @@ use std::error::Error;
 
 #[cfg(debug_assertions)]
 use meerkat_lib::net::types::LockGroup;
+#[cfg(debug_assertions)]
+use meerkat_lib::runtime::interner::Interner;
 #[cfg(debug_assertions)]
 use meerkat_lib::runtime::txn::TxnId;
 
@@ -268,8 +270,6 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                 return Ok(());
             }
 
-            let interner = node.interner.clone();
-
             if args.server {
                 let server_net = opt_server_net
                     .expect("Server network should be initialized when args.server is true");
@@ -277,7 +277,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                     .expect("Server address should be initialized when args.server is true");
 
                 run_server(
-                    node.unified_ast.clone(),
+                    node,
                     prog,
                     file,
                     remote_url_map,
@@ -287,20 +287,11 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                         local: args.local,
                         identity: args.identity,
                     },
-                    interner,
                     Some((server_net, server_addr)),
                 )
                 .await
             } else {
-                run_client(
-                    node.unified_ast.clone(),
-                    prog,
-                    remote_url_map,
-                    args.local,
-                    args.watch,
-                    interner,
-                )
-                .await
+                run_client(node, prog, remote_url_map, args.local, args.watch).await
             }
         }
         None => {
@@ -354,10 +345,25 @@ async fn dispatch_parked(manager: &mut Manager, parked: ParkedRequest) {
                     );
                 }
                 other => {
+                    // What the transaction has read and written through this
+                    // node so far, for the originator's commit stamp
+                    let (history, writes) = match &other {
+                        Ok(()) => {
+                            let (v_base, write_set) =
+                                manager.transaction_history(&manager.pending_txns[&tid]);
+                            (
+                                codec::encode_clock(&v_base, &manager.interner),
+                                codec::encode_sources(&write_set, &manager.interner),
+                            )
+                        }
+                        Err(_) => (Vec::new(), Vec::new()),
+                    };
                     let response = MeerkatMessage::ActionResponse {
                         request_id,
                         success: other.is_ok(),
                         error: other.err().map(|e| e.to_string()),
+                        history,
+                        writes,
                     };
                     if let Some(net) = manager.network.as_mut() {
                         send_net_msg(net, &reply_to, response).await;
@@ -508,9 +514,11 @@ struct ServerConfig {
 /// imports, and must be kept distinct from `prog`. Server mode once passed the
 /// program alone whenever any `-i` flag was present, which silently dropped
 /// every import and left services that read one failing with `ServiceNotFound`.
+/// `imports` is the part of it this node runs, `Node::local_imports`.
 async fn init_server_services(
     manager: &mut Manager,
     full_ast: Vec<Stmt>,
+    imports: &[Stmt],
     prog: &[Stmt],
     remote_url_map: &std::collections::HashMap<String, String>,
 ) -> Result<(), Box<dyn Error>> {
@@ -519,7 +527,7 @@ async fn init_server_services(
     manager.install_unified_ast(full_ast);
 
     manager
-        .register_and_instantiate_imports(prog, remote_url_map)
+        .register_and_instantiate_imports(imports, prog, remote_url_map)
         .await
         .map_err(|e| format!("Import service error: {}", e))?;
 
@@ -574,12 +582,11 @@ fn print_service_urls(manager: &Manager, full_addr: &str) {
 }
 
 async fn run_server(
-    full_ast: Vec<Stmt>,
+    node: Node,
     prog: Vec<Stmt>,
     input_file: &str,
     remote_url_map: std::collections::HashMap<String, String>,
     config: ServerConfig,
-    interner: Interner,
     pre_init: Option<(NetworkActor, String)>,
 ) -> Result<(), Box<dyn Error>> {
     // #39: the directory the server was started from is the root for serving
@@ -590,7 +597,7 @@ async fn run_server(
         .unwrap_or_else(|| std::path::Path::new("."))
         .to_path_buf();
 
-    let mut manager = Manager::new(interner);
+    let mut manager = Manager::new(node.interner);
     manager.local = config.local;
 
     let (mut net, full_addr) = match pre_init {
@@ -660,7 +667,14 @@ async fn run_server(
 
     // Called after the network is wired, so that remote lookups during
     // service initialization work correctly.
-    init_server_services(&mut manager, full_ast, &prog, &remote_url_map).await?;
+    init_server_services(
+        &mut manager,
+        node.unified_ast,
+        &node.local_imports,
+        &prog,
+        &remote_url_map,
+    )
+    .await?;
 
     print_service_urls(&manager, &full_addr);
 
@@ -820,6 +834,8 @@ async fn run_server(
                             request_id,
                             success: false,
                             error: Some(e.to_string()),
+                            history: Vec::new(),
+                            writes: Vec::new(),
                         };
                         if let Some(net) = manager.network.as_mut() {
                             send_net_msg(net, &reply_to, response).await;
@@ -858,6 +874,8 @@ async fn run_server(
                             request_id,
                             success: false,
                             error: error_msg,
+                            history: Vec::new(),
+                            writes: Vec::new(),
                         };
                         if let Some(net) = manager.network.as_mut() {
                             send_net_msg(net, &reply_to, response).await;
@@ -890,6 +908,8 @@ async fn run_server(
                                 request_id,
                                 success: result.is_ok(),
                                 error: result.err().map(|e| e.to_string()),
+                                history: Vec::new(),
+                                writes: Vec::new(),
                             };
                             if let Some(net) = manager.network.as_mut() {
                                 send_net_msg(net, &reply_to, response).await;
@@ -901,8 +921,14 @@ async fn run_server(
                     request_id,
                     txn_id,
                     reply_to,
+                    clock,
                 } => {
-                    let result = manager.commit_participant(&txn_id).await;
+                    // An undecodable clock commits nothing: the transaction
+                    // stays held, as if this `Commit` had never arrived
+                    let result = match codec::clock_entry_to_vclock(clock, &mut manager.interner) {
+                        Ok(clock) => manager.commit_participant(&txn_id, &clock).await,
+                        Err(e) => Err(EvalError::LocalDispatchFailed(e.to_string())),
+                    };
                     let response = MeerkatMessage::CommitResponse {
                         request_id,
                         success: result.is_ok(),
@@ -1084,19 +1110,18 @@ async fn run_server(
 }
 
 async fn run_client(
-    full_ast: Vec<Stmt>,
+    node: Node,
     prog: Vec<Stmt>,
     remote_url_map: std::collections::HashMap<String, String>,
     local: bool,
     watch: bool,
-    interner: Interner,
 ) -> Result<(), Box<dyn Error>> {
-    let mut manager = Manager::new(interner);
+    let mut manager = Manager::new(node.interner);
     manager.local = local;
     // Pre-populate unified_ast with the full AST (including remote imports)
     // so that runtime updates against remote services can successfully find
     // the target service definitions to patch against and type-check.
-    manager.install_unified_ast(full_ast);
+    manager.install_unified_ast(node.unified_ast);
 
     // Start the network if we have remote imports, or always in watch mode
     // (watch needs the network to receive change notifications).
@@ -1135,10 +1160,10 @@ async fn run_client(
         manager.set_local_address(addr);
     }
 
-    // Register the -i remotes and build the imported services, before any of
-    // this program's own.
+    // Register the -i remotes and run the imports, before any of this
+    // program's own statements.
     manager
-        .register_and_instantiate_imports(&prog, &remote_url_map)
+        .register_and_instantiate_imports(&node.local_imports, &prog, &remote_url_map)
         .await
         .map_err(|e| format!("Import service error: {}", e))?;
 
@@ -1542,10 +1567,12 @@ async fn run_lock_test_client(
                      transaction on F to wake older lock request..."
                 );
                 if let Ok(mut temp_net) = NetworkActor::new(NodeType::Server).await {
+                    // The conflict transaction only holds a lock: nothing to stamp
                     let msg = MeerkatMessage::Commit {
                         request_id: 99,
                         txn_id: conflict_txn_id_clone,
                         reply_to: reply_to_addr,
+                        clock: Vec::new(),
                     };
                     let _ = temp_net
                         .handle_command(NetworkCommand::SendMessage {
@@ -1614,6 +1641,7 @@ fn exceeds_pending_update_limit(
 mod tests {
     use super::*;
     use meerkat_lib::net::MessageId;
+    use meerkat_lib::runtime::interner::Interner;
     use meerkat_lib::runtime::txn::{TxnId, WaitKey};
 
     #[test]
@@ -1705,13 +1733,13 @@ mod tests {
     #[tokio::test]
     async fn advertised_services_covers_locally_resolved_imports() {
         let mut interner = Interner::new();
-        let (full, prog) = server_asts(&mut interner);
+        let (full, imports, prog) = server_asts(&mut interner);
         let app = interner.insert("app");
         let dep = interner.insert("dep");
 
         let mut manager = Manager::new(interner);
         manager.local = true;
-        init_server_services(&mut manager, full, &prog, &HashMap::new())
+        init_server_services(&mut manager, full, &imports, &prog, &HashMap::new())
             .await
             .expect("server startup succeeds");
 
@@ -1745,7 +1773,7 @@ mod tests {
 
         let mut manager = Manager::new(interner);
         manager.local = true;
-        init_server_services(&mut manager, full, &prog, &remotes)
+        init_server_services(&mut manager, full, &[], &prog, &remotes)
             .await
             .expect("server startup succeeds");
 
@@ -1756,17 +1784,20 @@ mod tests {
         );
     }
 
-    /// Build the two ASTs `init_server_services` takes: the dependency-ordered
-    /// program-plus-imports AST, and the root program on its own.
-    fn server_asts(interner: &mut Interner) -> (Vec<Stmt>, Vec<Stmt>) {
+    /// Build the three ASTs `init_server_services` takes: the dependency-ordered
+    /// program-plus-imports AST, the imports this node runs, and the root
+    /// program on its own.
+    fn server_asts(interner: &mut Interner) -> (Vec<Stmt>, Vec<Stmt>, Vec<Stmt>) {
         let full = parser::parse_string(
             "service dep { var x = 1; } service app { def y = dep.x + 1; }",
             interner,
         )
         .expect("fixture parses");
+        let imports =
+            parser::parse_string("service dep { var x = 1; }", interner).expect("fixture parses");
         let prog = parser::parse_string("service app { def y = dep.x + 1; }", interner)
             .expect("fixture parses");
-        (full, prog)
+        (full, imports, prog)
     }
 
     /// Server mode must instantiate a locally resolved import before the
@@ -1778,15 +1809,21 @@ mod tests {
     #[tokio::test]
     async fn init_server_services_instantiates_locally_resolved_imports() {
         let mut interner = Interner::new();
-        let (full, prog) = server_asts(&mut interner);
+        let (full, imports, prog) = server_asts(&mut interner);
         let app = interner.insert("app");
         let dep = interner.insert("dep");
 
         let mut manager = Manager::new(interner);
         manager.local = true;
-        init_server_services(&mut manager, full, &prog, &std::collections::HashMap::new())
-            .await
-            .expect("server startup succeeds");
+        init_server_services(
+            &mut manager,
+            full,
+            &imports,
+            &prog,
+            &std::collections::HashMap::new(),
+        )
+        .await
+        .expect("server startup succeeds");
 
         assert!(
             manager.services.contains_key(&dep),
@@ -1804,7 +1841,7 @@ mod tests {
     #[tokio::test]
     async fn init_server_services_keeps_imports_when_an_unrelated_remote_is_configured() {
         let mut interner = Interner::new();
-        let (full, prog) = server_asts(&mut interner);
+        let (full, imports, prog) = server_asts(&mut interner);
         let dep = interner.insert("dep");
 
         let mut remotes = std::collections::HashMap::new();
@@ -1812,7 +1849,7 @@ mod tests {
 
         let mut manager = Manager::new(interner);
         manager.local = true;
-        init_server_services(&mut manager, full, &prog, &remotes)
+        init_server_services(&mut manager, full, &imports, &prog, &remotes)
             .await
             .expect("server startup succeeds");
 

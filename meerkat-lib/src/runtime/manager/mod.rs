@@ -161,7 +161,7 @@ pub fn local_service_names(prog: &[Stmt]) -> HashSet<Symbol> {
 }
 
 /// Pointwise max of `clocks`; a dimension a clock omits counts as zero.
-fn join_clocks<'a>(clocks: impl IntoIterator<Item = &'a VClock>) -> VClock {
+pub(super) fn join_clocks<'a>(clocks: impl IntoIterator<Item = &'a VClock>) -> VClock {
     let mut joined = VClock::new();
     for clock in clocks {
         for (&dim, &counter) in clock {
@@ -170,6 +170,23 @@ fn join_clocks<'a>(clocks: impl IntoIterator<Item = &'a VClock>) -> VClock {
         }
     }
     joined
+}
+
+/// Whether an input's `clock` has reached `target` on every dimension its
+/// value depends on (§5.3). Unknown `sources` depend on all of them
+fn caught_up(target: &VClock, clock: &VClock, sources: Option<&Sources>) -> bool {
+    target.iter().all(|(dim, &counter)| {
+        sources.is_some_and(|sources| !sources.contains(dim))
+            || clock.get(dim).copied().unwrap_or(0) >= counter
+    })
+}
+
+/// §5.2's `V_new`: the joined history `v_base` advanced once in each written var
+fn advance(mut v_base: VClock, write_set: &HashSet<(Symbol, Symbol)>) -> VClock {
+    for &var in write_set {
+        *v_base.entry(var).or_insert(0) += 1;
+    }
+    v_base
 }
 
 impl Manager {
@@ -351,7 +368,7 @@ impl Manager {
         }
     }
 
-    /// Register the parsed `-i <url>` mappings, then instantiate every locally
+    /// Register the parsed `-i <url>` mappings, then run every locally
     /// resolved import. Steps 1-3 of CLI startup; the caller then creates the
     /// services the program declares itself, in program order.
     ///
@@ -359,14 +376,20 @@ impl Manager {
     /// the ordering below is established once rather than re-derived per
     /// caller. `unified_ast` must already be set.
     ///
+    /// `imports` holds the statements of the imported files this node runs, in
+    /// dependency order (`Node::local_imports`). Their services are built and
+    /// their updates applied; their other statements are not run here.
+    ///
     /// `remote_url_map` maps a service slug to the address serving it. The CLI
     /// builds it from repeated `-i <url>` flags, taking the slug from each
     /// URL's final path segment (`meerkat/src/main.rs`).
     ///
     /// Errors:
-    ///   `EvalError`: If instantiating an imported service fails
+    ///   `EvalError`: If instantiating an imported service or applying an
+    ///   imported update fails
     pub async fn register_and_instantiate_imports(
         &mut self,
+        imports: &[Stmt],
         prog: &[Stmt],
         remote_url_map: &HashMap<String, String>,
     ) -> Result<(), EvalError> {
@@ -385,27 +408,69 @@ impl Manager {
         self.register_remote_services(remote_url_map, &local);
 
         // Instantiate every locally resolved import before any of this
-        // program's own services, in `unified_ast` order (which is dependency
-        // order). The grammar allows `import` to appear after the service that
-        // uses it, and static checks accept that because the unified AST is
-        // reordered, so creating imports only when their `Stmt::Import` is
-        // reached would build `app` before the `dep` it reads and fail with
-        // `ServiceNotFound`.
-        let imported: Vec<(Symbol, Vec<Decl>)> = self
-            .unified_ast
-            .iter()
-            .filter_map(|s| match s {
-                Stmt::Service { name, decls } => Some((*name, decls.clone())),
-                _ => None,
-            })
-            .filter(|(name, _)| !local.contains(name) && !self.remote_services.contains_key(name))
-            .collect();
-        for (name, decls) in imported {
-            if self.services.contains_key(&name) {
-                continue;
+        // program's own services, in dependency order. The grammar allows
+        // `import` to appear after the service that uses it, and static checks
+        // accept that because the unified AST is reordered, so creating imports
+        // only when their `Stmt::Import` is reached would build `app` before
+        // the `dep` it reads and fail with `ServiceNotFound`.
+        let mut imported = HashMap::new();
+        self.unified_ast.retain(|stmt| match stmt {
+            Stmt::Service { name, decls }
+                if !local.contains(name) && !self.remote_services.contains_key(name) =>
+            {
+                if imported.contains_key(name) {
+                    // The cached graph may belong to this skipped declaration.
+                    self.declaration_graphs.remove(name);
+                    false
+                } else {
+                    imported.insert(*name, decls.clone());
+                    true
+                }
             }
-            self.create_service(name, decls).await?;
-            println!("Imported service '{}'", self.interner.get(name));
+            _ => true,
+        });
+        let graphs = declaration_graphs(&self.unified_ast, |name, _| {
+            !self.services.contains_key(&name) && !self.declaration_graphs.contains_key(&name)
+        });
+        self.declaration_graphs.extend(graphs);
+
+        // Run each import's statements in file order, as on a node of its own:
+        // a service is built from the declaration kept above, and an update is
+        // applied where it stands, so whatever follows -- such as a later
+        // service whose `var` reads the updated member -- sees it.
+        for stmt in imports {
+            match stmt {
+                Stmt::Service { name, .. } => {
+                    let Some(decls) = imported.remove(name) else {
+                        continue;
+                    };
+                    if self.services.contains_key(name) {
+                        continue;
+                    }
+                    self.create_service(*name, decls).await?;
+                    println!("Imported service '{}'", self.interner.get(*name));
+                }
+                Stmt::Update { service_name, .. } => {
+                    let mut txn = crate::runtime::update::Transaction::new(vec![stmt.clone()]);
+                    txn.poll(self).await?;
+                    println!("Service '{}' updated", self.interner.get(*service_name));
+                }
+                Stmt::Atomic { updates } => {
+                    if !updates.is_empty() {
+                        let mut txn = crate::runtime::update::Transaction::new(updates.clone());
+                        txn.poll(self).await?;
+                        println!(
+                            "Atomic update transaction completed ({} updates)",
+                            updates.len()
+                        );
+                    }
+                }
+                Stmt::Import { .. }
+                | Stmt::Connect { .. }
+                | Stmt::Test { .. }
+                | Stmt::ActionStmt(_)
+                | Stmt::Watch { .. } => {}
+            }
         }
         Ok(())
     }
@@ -976,7 +1041,7 @@ impl Manager {
         if let Some(service) = self.services.get_mut(&service_name) {
             if let Some(var_state) = service.vars.get_mut(&var_name) {
                 var_state.value = value;
-                self.simultaneous_bump(&HashSet::new(), &HashSet::from([(service_name, var_name)]));
+                self.simultaneous_bump(VClock::new(), &HashSet::from([(service_name, var_name)]));
             } else {
                 // in theory we should never encounter this after nameres is fully integrated
                 // keep this in mind to guide future development
@@ -1077,41 +1142,61 @@ impl Manager {
     }
 
     // helper function to apply a simultaneous bump, as described in section 5.2 of vector clock semantics
-    fn simultaneous_bump(
+    pub(super) fn simultaneous_bump(
         &mut self,
-        read_set: &HashSet<(Symbol, Symbol)>,
+        read_clock: VClock,
         write_set: &HashSet<(Symbol, Symbol)>,
     ) {
-        let mut vclocks: Vec<&VClock> = Vec::new();
-        // get all the vclocks first
-        for (svc, var) in read_set.union(write_set) {
-            match self.get_clock(svc, var) {
-                Some(clock) => vclocks.push(clock),
-                None => {
-                    log::warn!(
-                        "simultaneous_bump: clock for var {} in service {} not found",
-                        self.interner.get(*var),
-                        self.interner.get(*svc)
-                    );
-                }
-            }
-        }
-        // compute the max over all vclocks
-        let mut v_base = join_clocks(vclocks);
-        // increment if they're in the write_set
-        for (svc, var) in write_set {
-            *v_base.entry((*svc, *var)).or_insert(0) += 1;
-        }
+        let v_base = join_clocks(
+            std::iter::once(&read_clock).chain(
+                write_set
+                    .iter()
+                    .filter_map(|(svc, var)| self.get_clock(svc, var)),
+            ),
+        );
+        let v_new = advance(v_base, write_set);
         for (svc, var) in write_set {
             if let Some(vs) = self.services.get_mut(svc).and_then(|s| s.vars.get_mut(var)) {
-                vs.vector_clock = v_base.clone(); // write the new base vector clock back to everything in the write set
+                vs.vector_clock = v_new.clone(); // write the new base vector clock back to everything in the write set
             }
         }
+    }
+
+    /// §5.2's `V_base` and `W` for everything `txn` has done so far, on this
+    /// node and on the participants that replied to it: the clocks of the
+    /// snapshots it read and the prior clocks of the vars it overwrote, and
+    /// those vars
+    ///
+    /// Reads are taken from the snapshots the transaction recorded, not the
+    /// current state, which may have moved on since
+    pub fn transaction_history(&self, txn: &Transaction) -> (VClock, HashSet<(Symbol, Symbol)>) {
+        let local_writes: Vec<_> = txn
+            .written
+            .keys()
+            .filter_map(|(sid, var)| self.service_name_for_net_id(sid).map(|n| (n, *var)))
+            .collect();
+        let v_base = join_clocks(
+            txn.read_cache
+                .values()
+                .filter_map(|(_, clock, _)| clock.as_ref())
+                .chain(
+                    local_writes
+                        .iter()
+                        .filter_map(|(svc, var)| self.get_clock(svc, var)),
+                )
+                .chain([&txn.participant_history]),
+        );
+        let mut write_set = txn.participant_writes.clone();
+        write_set.extend(local_writes);
+        (v_base, write_set)
     }
 
     /// Mark affected defs after all updated graphs are installed. A blocked def
     /// keeps its notification until an input permits successful recomputation.
     pub(crate) fn mark_source_updates(&mut self, members: Vec<(Symbol, Symbol)>) {
+        if members.is_empty() {
+            return;
+        }
         // This temporary graph joins existing dependency edges across services,
         // including imported declarations. It is built only for code updates.
         let mut dependents = DiGraphMap::<(Symbol, Symbol), ()>::new();
@@ -1258,14 +1343,9 @@ impl Manager {
         inputs: &[(&VClock, Option<Cow<'_, Sources>>)],
     ) -> (VClock, bool, Option<Sources>) {
         let v_target = join_clocks(inputs.iter().map(|(clock, _)| *clock));
-        let gate_ok = inputs.iter().all(|(clock, sources)| {
-            v_target.iter().all(|(dim, &target)| {
-                sources
-                    .as_ref()
-                    .is_some_and(|sources| !sources.contains(dim))
-                    || clock.get(dim).copied().unwrap_or(0) >= target
-            })
-        });
+        let gate_ok = inputs
+            .iter()
+            .all(|(clock, sources)| caught_up(&v_target, clock, sources.as_deref()));
         let sources = gate_ok
             .then(|| {
                 inputs
@@ -2346,6 +2426,13 @@ impl Manager {
                     .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?;
                 let entry = (value, clock, sources);
                 if let Some(txn) = txn {
+                    // A node that only serves reads never answers an action,
+                    // so what it read reaches the commit stamp only through
+                    // here. Only the clock is kept: the value is fetched again
+                    // on every read
+                    if let Some(clock) = &entry.1 {
+                        txn.participant_history = join_clocks([&txn.participant_history, clock]);
+                    }
                     if txn.observed_reads.is_some() {
                         let key = (self.service_net_id_for_name(service), member);
                         txn.read_cache.insert(key, entry.clone());
@@ -2423,7 +2510,7 @@ impl Manager {
         service_net_id: &ServiceNetId,
         stmts: Vec<ActionStmt>,
         env: Vec<(Symbol, Value)>,
-        txn: Option<&mut Transaction>,
+        mut txn: Option<&mut Transaction>,
     ) -> Result<(), EvalError> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT_ACTION_ID: AtomicU64 = AtomicU64::new(1);
@@ -2448,7 +2535,7 @@ impl Manager {
         // the remote never received the request, the `Abort` it gets is a
         // harmless no-op
         if shared_tid.is_some() {
-            if let Some(t) = txn {
+            if let Some(t) = txn.as_deref_mut() {
                 t.participants.insert(addr.clone());
             }
         }
@@ -2488,9 +2575,24 @@ impl Manager {
             .await?;
 
         match reply {
-            MeerkatMessage::ActionResponse { success, error, .. } => {
+            MeerkatMessage::ActionResponse {
+                success,
+                error,
+                history,
+                writes,
+                ..
+            } => {
                 if success {
-                    // Participant already registered above; nothing more to do.
+                    // Participant already registered above. Keep what it
+                    // reports it read and wrote for the commit stamp
+                    if let Some(txn) = txn {
+                        let history = codec::clock_entry_to_vclock(history, &mut self.interner)
+                            .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?;
+                        let writes = codec::decode_sources(writes, &mut self.interner)
+                            .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?;
+                        txn.participant_history = join_clocks([&txn.participant_history, &history]);
+                        txn.participant_writes.extend(writes);
+                    }
                     Ok(())
                 } else {
                     Err(Self::remote_error(
@@ -2894,30 +2996,35 @@ impl Manager {
     /// Propagation is best-effort and runs even when a participant failed:
     /// the writes are stored, so the transaction has committed here and there
     /// is no way back
+    ///
+    /// Every write, here and on every participant, is stamped with the one
+    /// `V_new` of §5.2, computed from what the participants reported
     async fn commit_txn(&mut self, txn: &Transaction) -> Option<EvalError> {
+        let (v_base, write_set) = self.transaction_history(txn);
+        self.commit_stamped(txn, &advance(v_base, &write_set)).await
+    }
+
+    /// Store `txn`'s writes on this node with `clock`, the transaction's
+    /// `V_new`, commit its participants with the same clock, then propagate
+    ///
+    /// `clock` records what the transaction saw of other owners. A cached
+    /// remote input behind it would hold back every def that pairs it with
+    /// these writes, so its owner is asked for its current value again. The
+    /// owner's own `Update` usually arrives as well, possibly after the
+    /// `CommitResponse`; the request covers one that will not, because it was
+    /// overtaken by an older one or lost
+    async fn commit_stamped(&mut self, txn: &Transaction, clock: &VClock) -> Option<EvalError> {
         for ((sid, var), value) in &txn.written {
             if let Some(service) = self.service_by_net_id_mut(sid) {
                 if let Some(var_state) = service.vars.get_mut(var) {
                     var_state.value = value.clone();
                     var_state.latest_write_txn = Some(txn.id.clone());
+                    var_state.vector_clock = clock.clone();
                 }
             }
         }
-
-        // before we propagate, need to apply simultaneous bump
-        let write_set: HashSet<(Symbol, Symbol)> = txn
-            .written
-            .keys()
-            .filter_map(|(sid, var)| self.service_name_for_net_id(sid).map(|n| (n, *var)))
-            .collect();
-        let read_set: HashSet<(Symbol, Symbol)> = txn
-            .read_cache
-            .keys()
-            .filter_map(|(sid, var)| self.service_name_for_net_id(sid).map(|n| (n, *var)))
-            .collect();
-        self.simultaneous_bump(&read_set, &write_set);
-        let error = self.commit_participants(txn).await;
-        for (listener, def, owner, member) in self.forget_participant_deps(txn) {
+        let error = self.commit_participants(txn, clock).await;
+        for (listener, def, owner, member) in self.inputs_behind(clock) {
             self.subscribe_remote(owner, member, listener, def).await;
         }
         for (sid, var) in txn.written.keys() {
@@ -2928,58 +3035,44 @@ impl Manager {
         error
     }
 
-    /// Send `Commit` to every participant of `txn`, returning the first
-    /// failure in the set's iteration order, which is arbitrary
+    /// The cached remote inputs, as `(listener, def, owner, member)`, whose
+    /// clocks have not reached `clock` on a dimension their value depends on
+    fn inputs_behind(&self, clock: &VClock) -> Vec<(ServiceNetId, Symbol, Symbol, Symbol)> {
+        let mut behind = Vec::new();
+        for service in self.services.values() {
+            for (def, cache) in &service.dep_cache {
+                for (&(owner, member), (_, cached, sources)) in cache {
+                    if cached
+                        .as_ref()
+                        .is_some_and(|cached| !caught_up(clock, cached, sources.as_ref()))
+                    {
+                        behind.push((service.id.clone(), *def, owner, member));
+                    }
+                }
+            }
+        }
+        behind
+    }
+
+    /// Send `Commit`, carrying the transaction's `clock`, to every participant
+    /// of `txn`, returning the first failure in the set's iteration order,
+    /// which is arbitrary
     ///
     /// Does not stop at a failure, or the later participants are left
     /// prepared and holding locks
-    pub(crate) async fn commit_participants(&mut self, txn: &Transaction) -> Option<EvalError> {
+    pub(crate) async fn commit_participants(
+        &mut self,
+        txn: &Transaction,
+        clock: &VClock,
+    ) -> Option<EvalError> {
         let mut first_error = None;
         for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
-            if let Err(e) = self.send_commit(addr.clone(), &txn.id).await {
+            if let Err(e) = self.send_commit(addr.clone(), &txn.id, clock).await {
                 log::warn!("participant {} failed to commit: {}", addr.0, e);
                 first_error.get_or_insert(e);
             }
         }
         first_error
-    }
-
-    /// Invalidate cached values owned by a transaction's participants,
-    /// returning each invalidated `(listener, def, owner, member)`.
-    ///
-    /// `dep_cache` holds whatever the last `Update` delivered, and a
-    /// participant's `Update` for this commit can arrive after its
-    /// `CommitResponse`. Recomputing from the cache would then pair this node's
-    /// new writes with the participant's old values. Without a clock the gate
-    /// waits; Sources remain available for already computed local values.
-    /// The caller subscribes again for the participant's current value and clock.
-    fn forget_participant_deps(
-        &mut self,
-        txn: &Transaction,
-    ) -> Vec<(ServiceNetId, Symbol, Symbol, Symbol)> {
-        let mut forgotten = Vec::new();
-        if txn.participants.is_empty() {
-            return forgotten;
-        }
-        let owned_by_participants: HashSet<Symbol> = self
-            .remote_services
-            .keys()
-            .copied()
-            .filter(|svc| {
-                self.remote_addr(*svc)
-                    .is_ok_and(|addr| txn.participants.contains(&addr))
-            })
-            .collect();
-        for service in self.services.values_mut() {
-            for (def, cache) in service.dep_cache.iter_mut() {
-                for (&(owner, member), (_, clock, _)) in cache.iter_mut() {
-                    if owned_by_participants.contains(&owner) && clock.take().is_some() {
-                        forgotten.push((service.id.clone(), *def, owner, member));
-                    }
-                }
-            }
-        }
-        forgotten
     }
 
     /// Participant side: execute a composed action under a shared transaction
@@ -3014,16 +3107,21 @@ impl Manager {
         Ok(())
     }
 
-    /// Participant side: apply and release a held transaction on `Commit`
+    /// Participant side: apply and release a held transaction on `Commit`,
+    /// stamping its writes with the originator's `clock`
     ///
     /// An error is a failure forwarding the commit to a node below. The local
     /// commit is done either way, and the freed keys reach the server loop
     /// through `freed_awaiting_wake`, so they are woken on that path too
-    pub async fn commit_participant(&mut self, tid: &TxnId) -> Result<(), EvalError> {
+    pub async fn commit_participant(
+        &mut self,
+        tid: &TxnId,
+        clock: &VClock,
+    ) -> Result<(), EvalError> {
         let Some(txn) = self.pending_txns.remove(tid) else {
             return Ok(());
         };
-        let forward_error = self.commit_txn(&txn).await;
+        let forward_error = self.commit_stamped(&txn, clock).await;
         // Held until here, like the originator holds its own. Today the
         // event loop is blocked for the whole of this call, so an earlier
         // release would be harmless. That stops being true under #28's
@@ -3376,6 +3474,7 @@ impl Manager {
         &mut self,
         addr: Address,
         tid: &TxnId,
+        clock: &VClock,
     ) -> Result<(), EvalError> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT_COMMIT_ID: AtomicU64 = AtomicU64::new(1);
@@ -3385,6 +3484,7 @@ impl Manager {
             request_id,
             txn_id: tid.clone(),
             reply_to,
+            clock: codec::encode_clock(clock, &self.interner),
         };
         let reply = self
             .send_and_await_reply(
@@ -3986,10 +4086,10 @@ mod tests {
         let dep = service_stmt(&mut manager.interner, "dep", 7);
         let app = service_stmt(&mut manager.interner, "app", 1);
         let prog = vec![app.clone()];
-        manager.install_unified_ast(vec![dep, app]);
+        manager.install_unified_ast(vec![dep.clone(), app]);
 
         manager
-            .register_and_instantiate_imports(&prog, &HashMap::new())
+            .register_and_instantiate_imports(&[dep], &prog, &HashMap::new())
             .await
             .expect("imports instantiate");
 
@@ -4017,12 +4117,12 @@ mod tests {
         let dep = service_stmt(&mut manager.interner, "dep", 7);
         let app = service_stmt(&mut manager.interner, "app", 1);
         let prog = vec![app.clone()];
-        manager.install_unified_ast(vec![dep, app]);
+        manager.install_unified_ast(vec![dep.clone(), app]);
         let mut urls = HashMap::new();
         urls.insert("far".to_string(), "/ip4/127.0.0.1/tcp/9000".to_string());
 
         manager
-            .register_and_instantiate_imports(&prog, &urls)
+            .register_and_instantiate_imports(&[dep], &prog, &urls)
             .await
             .expect("imports instantiate");
 
@@ -4044,12 +4144,12 @@ mod tests {
         let dep = service_stmt(&mut manager.interner, "dep", 7);
         let app = service_stmt(&mut manager.interner, "app", 1);
         let prog = vec![app.clone()];
-        manager.install_unified_ast(vec![dep, app]);
+        manager.install_unified_ast(vec![dep.clone(), app]);
         let mut urls = HashMap::new();
         urls.insert("dep".to_string(), "/ip4/127.0.0.1/tcp/9000".to_string());
 
         manager
-            .register_and_instantiate_imports(&prog, &urls)
+            .register_and_instantiate_imports(&[dep], &prog, &urls)
             .await
             .expect("imports instantiate");
 
@@ -4804,7 +4904,7 @@ mod tests {
         tc.manager.create_service(tc.foo, decls).await.unwrap();
 
         let w = HashSet::from([(tc.foo, tc.x), (tc.foo, tc.y)]);
-        tc.manager.simultaneous_bump(&HashSet::new(), &w);
+        tc.manager.simultaneous_bump(VClock::new(), &w);
 
         let foo = tc.manager.services.get(&tc.foo).unwrap();
         let xc = foo.vars.get(&tc.x).unwrap().vector_clock.clone();
@@ -4840,10 +4940,9 @@ mod tests {
             .await
             .unwrap();
         // now write x having READ y
-        tc.manager.simultaneous_bump(
-            &HashSet::from([(tc.foo, tc.y)]),
-            &HashSet::from([(tc.foo, tc.x)]),
-        );
+        let read_clock = tc.manager.get_clock(&tc.foo, &tc.y).unwrap().clone();
+        tc.manager
+            .simultaneous_bump(read_clock, &HashSet::from([(tc.foo, tc.x)]));
 
         let xc = &tc
             .manager
@@ -6245,7 +6344,11 @@ mod tests {
         tc.manager.park_request_key(key.clone(), second);
 
         // The server loop commits, then wakes what the queue reports.
-        tc.manager.commit_participant(&holder).await.unwrap();
+        let clock = HashMap::from([((tc.foo, tc.x), 1)]);
+        tc.manager
+            .commit_participant(&holder, &clock)
+            .await
+            .unwrap();
         let freed = tc.manager.take_freed_awaiting_wake();
         assert!(freed.contains(&key), "the commit released `x`");
 

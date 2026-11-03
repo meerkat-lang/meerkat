@@ -135,10 +135,13 @@ async fn refuse_commits(net: &mut NetworkActor, reason: &str, got_commit: &Cell<
                     reply_to,
                     ..
                 } => {
+                    // The composed actions here are empty: nothing read or written
                     let msg = MeerkatMessage::ActionResponse {
                         request_id,
                         success: true,
                         error: None,
+                        history: Vec::new(),
+                        writes: Vec::new(),
                     };
                     reply(net, &reply_to, msg).await;
                 }
@@ -163,8 +166,7 @@ async fn refuse_commits(net: &mut NetworkActor, reason: &str, got_commit: &Cell<
     }
 }
 
-/// Run the stand-in for `rc` until `mid` holds an `Update` of `rc.gc`. A
-/// commit drops the one it held, `rc` having taken part, and subscribes again
+/// Run the stand-in for `rc` until `mid` holds an `Update` of `rc.gc`
 async fn await_gc_update(m: &mut Manager, rc_net: &mut NetworkActor) {
     let [mid, mid_view, rc, gc] = ["mid", "mid_view", "rc", "gc"].map(|n| m.interner.insert(n));
     let cached = |m: &Manager| {
@@ -320,10 +322,11 @@ async fn test_participant_reports_a_failed_commit_forward_and_still_propagates()
     };
     m.park_request_key(key.clone(), waiter);
 
+    let clock = HashMap::from([((mid, mv), 1)]);
     let got_commit = Cell::new(false);
     let committed = tokio::select! {
         biased;
-        c = m.commit_participant(&tid) => c,
+        c = m.commit_participant(&tid, &clock) => c,
         _ = refuse_commits(&mut rc_net, REASON, &got_commit) => {
             unreachable!("the stand-in for rc runs forever")
         }
@@ -350,14 +353,15 @@ async fn test_every_participant_is_committed_after_one_refuses() {
     let (mut rc_net, rc_addr) = listening_node().await;
     let (mut other_net, other_addr) = listening_node().await;
     let mut m = middle_node(mid_net, &mut rc_net, &rc_addr).await;
-    let (tid, _) = hold_participant_txn(&mut m, &[&rc_addr, &other_addr]);
+    let (tid, (_, mv)) = hold_participant_txn(&mut m, &[&rc_addr, &other_addr]);
+    let clock = HashMap::from([((m.interner.insert("mid"), mv), 1)]);
 
     // Both refuse, so whichever is sent `Commit` first, the other is only
     // reached if the loop keeps going after a failure.
     let (rc_got, other_got) = (Cell::new(false), Cell::new(false));
     let committed = tokio::select! {
         biased;
-        c = m.commit_participant(&tid) => c,
+        c = m.commit_participant(&tid, &clock) => c,
         _ = refuse_commits(&mut rc_net, "rc refused", &rc_got) => {
             unreachable!("the stand-in for rc runs forever")
         }

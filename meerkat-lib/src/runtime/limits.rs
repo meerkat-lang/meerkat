@@ -32,6 +32,10 @@ pub const IMPORT_POLL_INTERVAL_MS: u64 = 10;
 /// Maximum length of source code received over network in bytes
 pub const MAX_NET_REQUEST_SOURCE_LENGTH: usize = 1_048_576;
 
+/// Maximum number of source-identity pairs accepted from a network message.
+/// Two 64-byte identifiers per pair allow at most 1 MiB of identifier bytes.
+pub const MAX_NET_SOURCE_PAIRS: usize = 8192;
+
 /// Maximum number of services allowed to be imported
 pub const MAX_IMPORTED_SERVICES: usize = 256;
 

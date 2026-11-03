@@ -14,7 +14,7 @@ use crate::runtime::ast::{ActionStmt, BinOp, Expr, Field, TableType, UnOp, Value
 use crate::runtime::interner::{Interner, Symbol};
 use crate::runtime::limits::{
     MAX_IDENTIFIER_LENGTH, MAX_NET_REQUEST_SOURCE_LENGTH, MAX_NET_REQUEST_STRING_LENGTH,
-    MAX_STRING_LITERAL_LENGTH, MAX_TYPE_DEPTH,
+    MAX_NET_SOURCE_PAIRS, MAX_STRING_LITERAL_LENGTH, MAX_TYPE_DEPTH,
 };
 use crate::runtime::tt::{Param, ServiceType, TupleType, Type};
 use crate::runtime::txn::{Sources, VClock};
@@ -303,14 +303,20 @@ pub fn clock_entry_to_vclock(clock: Vec<ClockEntry>, interner: &mut Interner) ->
 
 /// Decode the source identities paired with a network value.
 pub fn decode_sources(sources: Vec<(String, String)>, interner: &mut Interner) -> Result<Sources> {
-    sources
+    if sources.len() > MAX_NET_SOURCE_PAIRS {
+        return Err(Error::LimitExceeded(format!(
+            "sources exceed maximum count of {} pairs",
+            MAX_NET_SOURCE_PAIRS
+        )));
+    }
+    for (service, member) in &sources {
+        validate_identifier(service)?;
+        validate_identifier(member)?;
+    }
+    Ok(sources
         .into_iter()
-        .map(|(service, member)| {
-            validate_identifier(&service)?;
-            validate_identifier(&member)?;
-            Ok((interner.insert(&service), interner.insert(&member)))
-        })
-        .collect()
+        .map(|(service, member)| (interner.insert(&service), interner.insert(&member)))
+        .collect())
 }
 
 /// #24: validate and intern the identifier fields of an `Update` message

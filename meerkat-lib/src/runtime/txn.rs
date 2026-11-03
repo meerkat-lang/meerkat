@@ -267,10 +267,11 @@ pub struct Transaction {
     /// Services this transaction currently holds a whole-service lock on
     pub service_locked: HashSet<ServiceNetId>,
     /// Read snapshots keyed by (service, member). Local reads reuse the pair.
-    /// Initialization also records remote pairs without skipping later RPCs.
+    /// Initialization and code migration also record remote pairs without
+    /// skipping later RPCs.
     pub read_cache: HashMap<(ServiceNetId, Symbol), ReadEntry>,
-    /// Collect the current def's inputs during initialization. Ordinary
-    /// transactions do not need this per-evaluation set.
+    /// Collect initialization inputs and enable remote read receipts during
+    /// initialization and code migration. Ordinary transactions do not need it.
     pub(crate) observed_reads: Option<HashSet<(Symbol, Symbol)>>,
     /// Values written by this transaction, keyed by (service, variable),
     /// buffered and applied only on successful commit (so a failed
@@ -279,6 +280,12 @@ pub struct Transaction {
     /// Remote nodes that joined this transaction (executed a composed action
     /// under this `id` and are holding locks or buffered writes until commit or abort)
     pub participants: HashSet<Address>,
+    /// What the participants reported in their replies: the clocks of what
+    /// they read and of the vars they overwrote. Joined into the one clock
+    /// every write of the transaction is stamped with
+    pub(crate) participant_history: VClock,
+    /// The vars the participants wrote, from the same replies
+    pub(crate) participant_writes: HashSet<(Symbol, Symbol)>,
 }
 
 impl Transaction {
@@ -292,6 +299,8 @@ impl Transaction {
             observed_reads: None,
             written: HashMap::new(),
             participants: HashSet::new(),
+            participant_history: VClock::new(),
+            participant_writes: HashSet::new(),
         }
     }
 }

@@ -639,12 +639,19 @@ impl Manager {
                 service.graphs = new_graphs;
                 let updated_id = service.id.clone();
                 let mut edges: Vec<(Symbol, Symbol, Symbol)> = Vec::new();
+                // Only defs listen. Ask the graphs just installed, not
+                // `service.defs`: an update that turns a def into a var leaves
+                // the old entry in `service.defs`, and wiring the var would
+                // re-run the old def expression over it
                 for (dep_member, listener_def) in service.graphs.reactive_edges() {
-                    if service.defs.contains_key(&listener_def) {
+                    if service.graphs.defs.contains(&listener_def) {
                         edges.push((svc_name, dep_member, listener_def));
                     }
                 }
                 for (def_name, cross_set) in &service.graphs.cross_deps {
+                    if !service.graphs.defs.contains(def_name) {
+                        continue;
+                    }
                     for (owner, member) in cross_set {
                         edges.push((*owner, *member, *def_name));
                     }
@@ -1139,6 +1146,17 @@ impl Manager {
             Some(n) => n,
             None => return,
         };
+
+        // There is no message to cancel a subscription, so an owner on another
+        // node keeps sending after an update turns the listening def into a
+        // var. Only a current def is recomputed
+        if !self.services[&listener_svc]
+            .graphs
+            .defs
+            .contains(&listener_def_sym)
+        {
+            return;
+        }
 
         if let Some(svc) = self.services.get_mut(&listener_svc) {
             svc.dep_cache

@@ -14,7 +14,7 @@ use crate::runtime::graphs::{
 };
 use crate::runtime::interner::{Interner, Symbol};
 use crate::runtime::interpreter::evaluator::{eval, EvalContext, EvalError};
-use crate::runtime::manager::{join_clocks, Manager};
+use crate::runtime::manager::Manager;
 use crate::runtime::nameres;
 use crate::runtime::tt::check::{self as tt};
 use crate::runtime::tt::types::ServiceType;
@@ -206,8 +206,6 @@ impl Transaction {
                     break;
                 }
 
-                // Retain remote read clocks for migration initializers as well.
-                txn.observed_reads = Some(HashSet::new());
                 self.lock_txn = Some(txn);
                 self.state = TransactionState::LocksAcquired;
                 match apply_updates_to_ast(manager.unified_ast(), &self.updates) {
@@ -526,12 +524,13 @@ impl Transaction {
                 write_set.insert((svc_name, var_name));
             }
         }
-        let read_clock = join_clocks(
-            self.lock_txn
-                .iter()
-                .flat_map(|txn| txn.read_cache.values())
-                .filter_map(|entry| entry.1.as_ref()),
-        );
+        // What the initializers read, here and on other owners, as for any
+        // transaction; `simultaneous_bump` adds the overwritten vars' clocks
+        let read_clock = self
+            .lock_txn
+            .as_ref()
+            .map(|txn| manager.transaction_history(txn).0)
+            .unwrap_or_default();
         manager.simultaneous_bump(read_clock, &write_set);
 
         for (name, stmt) in service_declarations(&self.ast) {

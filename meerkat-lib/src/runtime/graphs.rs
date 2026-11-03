@@ -7,6 +7,7 @@ use crate::runtime::interner::Symbol;
 use petgraph::algo::{has_path_connecting, tarjan_scc, toposort, Cycle};
 use petgraph::graphmap::DiGraphMap;
 use petgraph::visit::{Dfs, DfsPostOrder, Reversed};
+use petgraph::Direction;
 use std::collections::{HashMap, HashSet};
 
 /// Pre-computed dependency graphs and analysis state for a service
@@ -48,6 +49,27 @@ impl ServiceGraphs {
             edges.push((src, target));
         }
         edges
+    }
+
+    /// The static inputs of `member` as `(service, member)` pairs: its
+    /// predecessors in the reactive graph, which belong to `service`, and its
+    /// cross-service dependencies
+    ///
+    /// Args:
+    ///   `service` (`Symbol`): The service these graphs belong to
+    ///   `member` (`Symbol`): The member whose inputs are listed
+    ///
+    /// Returns:
+    ///   `impl Iterator<Item = (Symbol, Symbol)>`: The inputs of `member`
+    pub(crate) fn inputs(
+        &self,
+        service: Symbol,
+        member: Symbol,
+    ) -> impl Iterator<Item = (Symbol, Symbol)> + '_ {
+        self.reactive_graph
+            .neighbors_directed(member, Direction::Incoming)
+            .map(move |input| (service, input))
+            .chain(self.cross_deps.get(&member).into_iter().flatten().copied())
     }
 
     /// Extract all transitive dependencies of a member using `petgraph::visit::Dfs`

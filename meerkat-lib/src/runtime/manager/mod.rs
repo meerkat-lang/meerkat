@@ -42,7 +42,9 @@ pub const WAIT_DIE_RETRY_BACKOFF_MS: u64 = 2;
 /// wait must give the holder time to commit, so this is longer than a die's.
 pub const WAIT_ON_RETRY_BACKOFF_MS: u64 = 20;
 
-/// Pause between two attempts of a transaction in `execute_action_with_txn`.
+/// Pause between two attempts of a transaction in `execute_action_with_txn`,
+/// and between two checks for a code update's first values in
+/// `await_first_values`.
 ///
 /// Without it all `MAX_WAIT_DIE_RETRIES` attempts run back to back. A
 /// transaction with no participants awaits nothing on the retry path -- there
@@ -212,7 +214,7 @@ pub fn local_service_names(prog: &[Stmt]) -> HashSet<Symbol> {
 }
 
 /// Pointwise max of `clocks`; a dimension a clock omits counts as zero.
-pub(super) fn join_clocks<'a>(clocks: impl IntoIterator<Item = &'a VClock>) -> VClock {
+fn join_clocks<'a>(clocks: impl IntoIterator<Item = &'a VClock>) -> VClock {
     let mut joined = VClock::new();
     for clock in clocks {
         for (&dim, &counter) in clock {
@@ -238,15 +240,6 @@ fn advance(mut v_base: VClock, write_set: &HashSet<(Symbol, Symbol)>) -> VClock 
         *v_base.entry(var).or_insert(0) += 1;
     }
     v_base
-}
-
-/// Let the network run for `ms` milliseconds. As in `send_and_await_reply`,
-/// browsers have no tokio timer driver
-async fn pause(ms: u32) {
-    #[cfg(not(target_arch = "wasm32"))]
-    tokio::time::sleep(Duration::from_millis(ms.into())).await;
-    #[cfg(target_arch = "wasm32")]
-    send_wrapper::SendWrapper::new(gloo_timers::future::TimeoutFuture::new(ms)).await;
 }
 
 impl Manager {
@@ -695,14 +688,7 @@ impl Manager {
                     // local def referenced before its own initialization has
                     // no state yet, so its inputs stand in for it, as in Sources.
                     let graphs = &self.services[&svc_name].graphs;
-                    let static_inputs = |def| {
-                        graphs
-                            .reactive_graph
-                            .neighbors_directed(def, petgraph::Direction::Incoming)
-                            .map(move |member| (svc_name, member))
-                            .chain(graphs.cross_deps.get(&def).into_iter().flatten().copied())
-                    };
-                    let mut pending: Vec<_> = static_inputs(name).collect();
+                    let mut pending: Vec<_> = graphs.inputs(svc_name, name).collect();
                     activated.extend(
                         reads
                             .iter()
@@ -727,7 +713,7 @@ impl Manager {
                                 self.sources(input.0, input.1, Some(&txn)),
                             )),
                             None if input.0 == svc_name && graphs.defs.contains(&input.1) => {
-                                pending.extend(static_inputs(input.1))
+                                pending.extend(graphs.inputs(svc_name, input.1))
                             }
                             None => {}
                         }
@@ -906,18 +892,8 @@ impl Manager {
         }
 
         for (owner, member, listener_def) in edges {
-            if self.services.contains_key(&owner) {
-                if let Some(owner_svc) = self.services.get_mut(&owner) {
-                    owner_svc
-                        .listeners
-                        .entry(member)
-                        .or_default()
-                        .insert((updated_id.clone(), listener_def));
-                }
-            } else {
-                self.subscribe_remote(owner, member, updated_id.clone(), listener_def)
-                    .await;
-            }
+            self.follow_input((svc_name, listener_def), (owner, member))
+                .await;
         }
     }
 
@@ -926,19 +902,12 @@ impl Manager {
         svc_name: Symbol,
         service: &Service,
     ) -> impl Iterator<Item = (Symbol, Symbol, Symbol)> + '_ {
-        let local = service
-            .graphs
-            .reactive_edges()
-            .into_iter()
-            .map(move |(member, def)| (svc_name, member, def));
-        let cross = service.graphs.cross_deps.iter().flat_map(|(&def, inputs)| {
-            inputs
-                .iter()
-                .map(move |&(owner, member)| (owner, member, def))
-        });
-        local
-            .chain(cross)
-            .filter(|(_, _, def)| service.graphs.defs.contains(def))
+        let graphs = &service.graphs;
+        graphs.defs.iter().flat_map(move |&def| {
+            graphs
+                .inputs(svc_name, def)
+                .map(move |(owner, member)| (owner, member, def))
+        })
     }
 
     /// Initialization is private to its transaction, including cache reads.
@@ -1291,20 +1260,11 @@ impl Manager {
             .map(|(name, service)| (name, &service.graphs))
             .chain(self.declaration_graphs.iter())
         {
+            // A var's initializer does not create a reactive dependency.
             for &def in &graphs.defs {
                 dependents.add_node((svc, def));
-            }
-            for (input, def, _) in graphs.reactive_graph.all_edges() {
-                // A var's initializer does not create a reactive dependency.
-                if graphs.defs.contains(&def) {
-                    dependents.add_edge((svc, input), (svc, def), ());
-                }
-            }
-            for (&def, inputs) in &graphs.cross_deps {
-                if graphs.defs.contains(&def) {
-                    for &input in inputs {
-                        dependents.add_edge(input, (svc, def), ());
-                    }
+                for input in graphs.inputs(svc, def) {
+                    dependents.add_edge(input, (svc, def), ());
                 }
             }
         }
@@ -1407,18 +1367,7 @@ impl Manager {
         }
         service
             .graphs
-            .reactive_graph
-            .neighbors_directed(def, petgraph::Direction::Incoming)
-            .map(|member| (service.name, member))
-            .chain(
-                service
-                    .graphs
-                    .cross_deps
-                    .get(&def)
-                    .into_iter()
-                    .flatten()
-                    .copied(),
-            )
+            .inputs(service.name, def)
             .map(|input| Some((input, self.input_receipt((service.name, def), input)?)))
             .collect()
     }
@@ -1499,21 +1448,7 @@ impl Manager {
             {
                 continue;
             }
-            let inputs = service
-                .graphs
-                .reactive_graph
-                .neighbors_directed(node.1, petgraph::Direction::Incoming)
-                .map(|member| (node.0, member))
-                .chain(
-                    service
-                        .graphs
-                        .cross_deps
-                        .get(&node.1)
-                        .into_iter()
-                        .flatten()
-                        .copied(),
-                );
-            for input in inputs {
+            for input in service.graphs.inputs(node.0, node.1) {
                 if !graph.contains_node(input) {
                     pending.push(input);
                 }
@@ -1908,7 +1843,7 @@ impl Manager {
             if remaining_ms % 5_000 == 0 {
                 self.keepalive_waiters().await;
             }
-            pause(10).await;
+            retry_backoff(10).await;
             remaining_ms -= 10;
         }
     }
@@ -2090,29 +2025,16 @@ impl Manager {
             Err(_) => return,
         };
 
-        let listener_svc = self
+        let Some((&listener_svc, service)) = self
             .services
-            .iter()
+            .iter_mut()
             .find(|(_, s)| s.id == listener_id && s.defs.contains_key(&listener_def_sym))
-            .map(|(name, _)| *name);
-        let listener_svc = match listener_svc {
-            Some(n) => n,
-            None => return,
+        else {
+            return;
         };
-
-        let sources_changed = self
-            .services
-            .get(&listener_svc)
-            .and_then(|service| service.dep_cache.get(&listener_def_sym))
-            .and_then(|cache| cache.get(&source))
-            .map(|entry| &entry.2)
-            != Some(&sources);
-        if let Some(svc) = self.services.get_mut(&listener_svc) {
-            svc.dep_cache
-                .entry(listener_def_sym)
-                .or_default()
-                .insert(source, (value, Some(clock), sources));
-        }
+        let cache = service.dep_cache.entry(listener_def_sym).or_default();
+        let sources_changed = cache.get(&source).map(|entry| &entry.2) != Some(&sources);
+        cache.insert(source, (value, Some(clock), sources));
 
         if sources_changed {
             self.mark_source_updates(vec![(listener_svc, listener_def_sym)]);
@@ -3072,30 +2994,8 @@ impl Manager {
                             },
                         );
                     }
-                    Ok((val, clock, sources)) => {
-                        let response = match codec::encode_value(&val, &self.interner) {
-                            Ok(enc_val) => MeerkatMessage::LookupResponse {
-                                request_id,
-                                value: enc_val,
-                                clock: clock
-                                    .as_ref()
-                                    .map(|clock| codec::encode_clock(clock, &self.interner)),
-                                sources: sources
-                                    .as_ref()
-                                    .map(|sources| codec::encode_sources(sources, &self.interner)),
-                            },
-                            Err(e) => MeerkatMessage::LookupError {
-                                request_id,
-                                error: e.to_string(),
-                            },
-                        };
-                        self.send_oneway(Address::new(&reply_to), response).await;
-                    }
-                    Err(e) => {
-                        let response = MeerkatMessage::LookupError {
-                            request_id,
-                            error: e.to_string(),
-                        };
+                    result => {
+                        let response = self.lookup_reply(request_id, result);
                         self.send_oneway(Address::new(&reply_to), response).await;
                     }
                 }
@@ -3153,6 +3053,27 @@ impl Manager {
         }
     }
 
+    /// The reply to a lookup: the value read with the clock and Sources of the
+    /// same snapshot, or why it could not be read or encoded
+    fn lookup_reply(
+        &self,
+        request_id: u64,
+        result: Result<ReadEntry, EvalError>,
+    ) -> MeerkatMessage {
+        result
+            .map_err(|e| e.to_string())
+            .and_then(|(value, clock, sources)| {
+                Ok(MeerkatMessage::LookupResponse {
+                    request_id,
+                    value: codec::encode_value(&value, &self.interner)
+                        .map_err(|e| e.to_string())?,
+                    clock: clock.map(|clock| codec::encode_clock(&clock, &self.interner)),
+                    sources: sources.map(|sources| codec::encode_sources(&sources, &self.interner)),
+                })
+            })
+            .unwrap_or_else(|error| MeerkatMessage::LookupError { request_id, error })
+    }
+
     /// Serve a request a node answers itself: a lookup, an action, a
     /// participant's commit or abort, a lock request, or a request for a file
     /// in `served_base_dir`. Shared by the CLI server loop and by the wait for
@@ -3206,30 +3127,7 @@ impl Manager {
                     // Plain unlocked read: reply immediately
                     None => {
                         let result = self.lookup_with_clock(mem_sym, svc_sym, None).await;
-                        let response = match result {
-                            Ok((val, clock, sources)) => {
-                                match codec::encode_value(&val, &self.interner) {
-                                    Ok(enc_val) => MeerkatMessage::LookupResponse {
-                                        request_id,
-                                        value: enc_val,
-                                        clock: clock.as_ref().map(|clock| {
-                                            codec::encode_clock(clock, &self.interner)
-                                        }),
-                                        sources: sources.as_ref().map(|sources| {
-                                            codec::encode_sources(sources, &self.interner)
-                                        }),
-                                    },
-                                    Err(e) => MeerkatMessage::LookupError {
-                                        request_id,
-                                        error: e.to_string(),
-                                    },
-                                }
-                            }
-                            Err(e) => MeerkatMessage::LookupError {
-                                request_id,
-                                error: e.to_string(),
-                            },
-                        };
+                        let response = self.lookup_reply(request_id, result);
                         self.send_oneway(Address::new(&reply_to), response).await;
                     }
                 }

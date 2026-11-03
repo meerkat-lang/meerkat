@@ -286,6 +286,30 @@ pub struct Transaction {
     pub(crate) participant_history: VClock,
     /// The vars the participants wrote, from the same replies
     pub(crate) participant_writes: HashSet<(Symbol, Symbol)>,
+    /// Composed actions already executed under this transaction, keyed by
+    /// their position in this transaction's dispatch order
+    ///
+    /// A participant action that parks is re-run from its first statement, so
+    /// a composed action it completed is reached again. It must not be sent
+    /// again: the other node already ran it under this id and holds its writes
+    /// buffered, where this node cannot roll them back
+    ///
+    /// Scaffolding: once a parked action is suspended and resumed rather than
+    /// re-run (#213), this and `composed_seq` go away
+    pub composed_done: HashMap<u64, ComposedCall>,
+    /// Position the next composed action dispatched under this transaction
+    /// takes. A park rewinds it, so a replayed dispatch lands on the position
+    /// the first attempt recorded
+    pub composed_seq: u64,
+}
+
+/// A composed action that completed under a transaction: where it was sent,
+/// and what was sent, so a diverging replay is detected rather than suppressed
+#[derive(Debug, Clone)]
+pub struct ComposedCall {
+    pub target: ServiceNetId,
+    /// Hash of the encoded statements and environment the dispatch shipped
+    pub fingerprint: u64,
 }
 
 impl Transaction {
@@ -301,6 +325,8 @@ impl Transaction {
             participants: HashSet::new(),
             participant_history: VClock::new(),
             participant_writes: HashSet::new(),
+            composed_done: HashMap::new(),
+            composed_seq: 0,
         }
     }
 }

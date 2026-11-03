@@ -10,7 +10,9 @@ use crate::net::{
     NetworkReply, ServiceNetId,
 };
 use crate::runtime::interner::{Interner, Symbol};
-use crate::runtime::txn::{ReadEntry, Sources, Transaction, TxnId, VClock, VarState, WaitKey};
+use crate::runtime::txn::{
+    ComposedCall, ReadEntry, Sources, Transaction, TxnId, VClock, VarState, WaitKey,
+};
 use petgraph::{graphmap::DiGraphMap, visit::Dfs};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -31,6 +33,36 @@ use tokio::sync::oneshot;
 /// is lost. The bound is inherent to retrying instead of parking, not a tuning
 /// accident; lifting it needs the background message loop of #28.
 pub const MAX_WAIT_DIE_RETRIES: u32 = 10;
+
+/// Pause before re-running a transaction that died (`WaitDieAbort`). A die
+/// re-runs promptly.
+pub const WAIT_DIE_RETRY_BACKOFF_MS: u64 = 2;
+
+/// Pause before re-running a transaction that was told to wait (`WaitOn`). A
+/// wait must give the holder time to commit, so this is longer than a die's.
+pub const WAIT_ON_RETRY_BACKOFF_MS: u64 = 20;
+
+/// Pause between two attempts of a transaction in `execute_action_with_txn`.
+///
+/// Without it all `MAX_WAIT_DIE_RETRIES` attempts run back to back. A
+/// transaction with no participants awaits nothing on the retry path -- there
+/// is no `send_abort` to make -- so the budget would be spent within
+/// microseconds, before the lock holder had any chance to commit, and ordinary
+/// contention would be reported as an exhausted wait.
+///
+/// This is a yield point, not a fix for the case where the only thing that
+/// could release the lock is a message this node cannot receive while inside
+/// the retry loop; that needs the background message loop of #28.
+///
+/// Platform-split like the timeout in `send_and_await_reply`: wasm has no tokio
+/// timer driver in the browser, and `SendWrapper` keeps the (browser-thread
+/// only) timer future usable from the `Send`-bounded eval path.
+async fn retry_backoff(ms: u64) {
+    #[cfg(not(target_arch = "wasm32"))]
+    tokio::time::sleep(Duration::from_millis(ms)).await;
+    #[cfg(target_arch = "wasm32")]
+    send_wrapper::SendWrapper::new(gloo_timers::future::TimeoutFuture::new(ms as u32)).await;
+}
 
 /// One cross-service dependency's cached state: the last value delivered for it
 /// plus the vector clock that value was stamped with by its writer.
@@ -2907,9 +2939,12 @@ impl Manager {
                 ..
             } => {
                 if success {
-                    // Participant already registered above. Keep what it
-                    // reports it read and wrote for the commit stamp
+                    // Record completion before decoding metadata: the remote
+                    // action has already run and must not run again on replay.
                     if let Some(txn) = txn {
+                        if let Some((seq, call)) = claim {
+                            txn.composed_done.insert(seq, call);
+                        }
                         let history = codec::clock_entry_to_vclock(history, &mut self.interner)
                             .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?;
                         let writes = codec::decode_sources(writes, &mut self.interner)

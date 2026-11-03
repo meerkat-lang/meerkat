@@ -368,7 +368,7 @@ impl Manager {
         }
     }
 
-    /// Register the parsed `-i <url>` mappings, then instantiate every locally
+    /// Register the parsed `-i <url>` mappings, then run every locally
     /// resolved import. Steps 1-3 of CLI startup; the caller then creates the
     /// services the program declares itself, in program order.
     ///
@@ -376,14 +376,20 @@ impl Manager {
     /// the ordering below is established once rather than re-derived per
     /// caller. `unified_ast` must already be set.
     ///
+    /// `imports` holds the statements of the imported files this node runs, in
+    /// dependency order (`Node::local_imports`). Their services are built and
+    /// their updates applied; their other statements are not run here.
+    ///
     /// `remote_url_map` maps a service slug to the address serving it. The CLI
     /// builds it from repeated `-i <url>` flags, taking the slug from each
     /// URL's final path segment (`meerkat/src/main.rs`).
     ///
     /// Errors:
-    ///   `EvalError`: If instantiating an imported service fails
+    ///   `EvalError`: If instantiating an imported service or applying an
+    ///   imported update fails
     pub async fn register_and_instantiate_imports(
         &mut self,
+        imports: &[Stmt],
         prog: &[Stmt],
         remote_url_map: &HashMap<String, String>,
     ) -> Result<(), EvalError> {
@@ -402,25 +408,23 @@ impl Manager {
         self.register_remote_services(remote_url_map, &local);
 
         // Instantiate every locally resolved import before any of this
-        // program's own services, in `unified_ast` order (which is dependency
-        // order). The grammar allows `import` to appear after the service that
-        // uses it, and static checks accept that because the unified AST is
-        // reordered, so creating imports only when their `Stmt::Import` is
-        // reached would build `app` before the `dep` it reads and fail with
-        // `ServiceNotFound`.
-        let mut imported = Vec::new();
-        let mut seen = HashSet::new();
+        // program's own services, in dependency order. The grammar allows
+        // `import` to appear after the service that uses it, and static checks
+        // accept that because the unified AST is reordered, so creating imports
+        // only when their `Stmt::Import` is reached would build `app` before
+        // the `dep` it reads and fail with `ServiceNotFound`.
+        let mut imported = HashMap::new();
         self.unified_ast.retain(|stmt| match stmt {
             Stmt::Service { name, decls }
                 if !local.contains(name) && !self.remote_services.contains_key(name) =>
             {
-                if seen.insert(*name) {
-                    imported.push((*name, decls.clone()));
-                    true
-                } else {
+                if imported.contains_key(name) {
                     // The cached graph may belong to this skipped declaration.
                     self.declaration_graphs.remove(name);
                     false
+                } else {
+                    imported.insert(*name, decls.clone());
+                    true
                 }
             }
             _ => true,
@@ -429,12 +433,44 @@ impl Manager {
             !self.services.contains_key(&name) && !self.declaration_graphs.contains_key(&name)
         });
         self.declaration_graphs.extend(graphs);
-        for (name, decls) in imported {
-            if self.services.contains_key(&name) {
-                continue;
+
+        // Run each import's statements in file order, as on a node of its own:
+        // a service is built from the declaration kept above, and an update is
+        // applied where it stands, so whatever follows -- such as a later
+        // service whose `var` reads the updated member -- sees it.
+        for stmt in imports {
+            match stmt {
+                Stmt::Service { name, .. } => {
+                    let Some(decls) = imported.remove(name) else {
+                        continue;
+                    };
+                    if self.services.contains_key(name) {
+                        continue;
+                    }
+                    self.create_service(*name, decls).await?;
+                    println!("Imported service '{}'", self.interner.get(*name));
+                }
+                Stmt::Update { service_name, .. } => {
+                    let mut txn = crate::runtime::update::Transaction::new(vec![stmt.clone()]);
+                    txn.poll(self).await?;
+                    println!("Service '{}' updated", self.interner.get(*service_name));
+                }
+                Stmt::Atomic { updates } => {
+                    if !updates.is_empty() {
+                        let mut txn = crate::runtime::update::Transaction::new(updates.clone());
+                        txn.poll(self).await?;
+                        println!(
+                            "Atomic update transaction completed ({} updates)",
+                            updates.len()
+                        );
+                    }
+                }
+                Stmt::Import { .. }
+                | Stmt::Connect { .. }
+                | Stmt::Test { .. }
+                | Stmt::ActionStmt(_)
+                | Stmt::Watch { .. } => {}
             }
-            self.create_service(name, decls).await?;
-            println!("Imported service '{}'", self.interner.get(name));
         }
         Ok(())
     }
@@ -4050,10 +4086,10 @@ mod tests {
         let dep = service_stmt(&mut manager.interner, "dep", 7);
         let app = service_stmt(&mut manager.interner, "app", 1);
         let prog = vec![app.clone()];
-        manager.install_unified_ast(vec![dep, app]);
+        manager.install_unified_ast(vec![dep.clone(), app]);
 
         manager
-            .register_and_instantiate_imports(&prog, &HashMap::new())
+            .register_and_instantiate_imports(&[dep], &prog, &HashMap::new())
             .await
             .expect("imports instantiate");
 
@@ -4081,12 +4117,12 @@ mod tests {
         let dep = service_stmt(&mut manager.interner, "dep", 7);
         let app = service_stmt(&mut manager.interner, "app", 1);
         let prog = vec![app.clone()];
-        manager.install_unified_ast(vec![dep, app]);
+        manager.install_unified_ast(vec![dep.clone(), app]);
         let mut urls = HashMap::new();
         urls.insert("far".to_string(), "/ip4/127.0.0.1/tcp/9000".to_string());
 
         manager
-            .register_and_instantiate_imports(&prog, &urls)
+            .register_and_instantiate_imports(&[dep], &prog, &urls)
             .await
             .expect("imports instantiate");
 
@@ -4108,12 +4144,12 @@ mod tests {
         let dep = service_stmt(&mut manager.interner, "dep", 7);
         let app = service_stmt(&mut manager.interner, "app", 1);
         let prog = vec![app.clone()];
-        manager.install_unified_ast(vec![dep, app]);
+        manager.install_unified_ast(vec![dep.clone(), app]);
         let mut urls = HashMap::new();
         urls.insert("dep".to_string(), "/ip4/127.0.0.1/tcp/9000".to_string());
 
         manager
-            .register_and_instantiate_imports(&prog, &urls)
+            .register_and_instantiate_imports(&[dep], &prog, &urls)
             .await
             .expect("imports instantiate");
 

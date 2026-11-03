@@ -32,6 +32,10 @@ pub struct Node {
     pub imported_services: Env<'static, ServiceType>,
     /// Unified program statements AST
     pub unified_ast: Vec<Stmt>,
+    /// Statements of the imports read from local disk, in dependency order.
+    /// Startup runs them before the program's own; a network-fetched module
+    /// is its peer's program, so it is left out. See `Imports::finalize`.
+    pub local_imports: Vec<Stmt>,
     /// Services a peer serves because a network-fetched module declares them.
     /// Service name to serving URL, in the same shape as the `-i` map, which
     /// it is merged into at startup. See `Imports::remote_service_owners`.
@@ -50,6 +54,7 @@ impl Node {
             local_services: Env::new(None),
             imported_services: Env::new(None),
             unified_ast: Vec::new(),
+            local_imports: Vec::new(),
             discovered_remote_services: HashMap::new(),
             interner: Interner::new(),
         }
@@ -204,7 +209,9 @@ impl Node {
         // program does not keep the first one's peers and register this
         // import at a stale one.
         self.discovered_remote_services = imports.remote_service_owners();
-        Ok(imports.finalize())
+        let (stmts, local_imports) = imports.finalize();
+        self.local_imports = local_imports;
+        Ok(stmts)
     }
 
     /// Drive P2P network import resolution loop over an active network actor
@@ -323,8 +330,9 @@ impl Node {
 
         // Before `finalize`, which consumes the state machine.
         let owners = imports.remote_service_owners();
-        let stmts = imports.finalize();
+        let (stmts, local_imports) = imports.finalize();
         self.discovered_remote_services = owners;
+        self.local_imports = local_imports;
         Ok((stmts, buffered_events))
     }
 
@@ -498,10 +506,10 @@ impl Node {
         manager.install_unified_ast(self.unified_ast);
         manager.local_services = self.local_services;
 
-        // Register the `-i` remotes and instantiate every locally resolved
-        // import, before the loop below creates this program's own services:
-        // a service may read an import, and `create_service` resolves that
-        // read immediately.
+        // Register the `-i` remotes and run every locally resolved import,
+        // before the loop below creates this program's own services: a
+        // service may read an import, and `create_service` resolves that read
+        // immediately.
         //
         // `local_ast`, not `self.unified_ast`, is what marks a service as
         // locally declared. The unified AST also holds the resolved bodies of
@@ -509,7 +517,7 @@ impl Node {
         // import as locally declared -- skipping its `-i` flag, and leaving it
         // to the loop below, which never sees it.
         manager
-            .register_and_instantiate_imports(local_ast, &remote_url_map)
+            .register_and_instantiate_imports(&self.local_imports, local_ast, &remote_url_map)
             .await
             .map_err(|e| Error::Message(format!("Import service error: {}", e)))?;
 
@@ -777,6 +785,9 @@ impl Node {
 
     pub fn run_static_checks(&mut self, program: &[Stmt]) -> Result<()> {
         self.unified_ast = program.to_vec();
+        // `program` resolves no imports, so none from an earlier resolution
+        // may run with it.
+        self.local_imports.clear();
         self.static_checks()
     }
 
@@ -850,9 +861,10 @@ mod tests {
     /// services, on this path too.
     ///
     /// This is the shape `on_node_startup` produces: `unified_ast` holds the
-    /// imported modules ahead of the root program, and the `local_ast` handed
-    /// back names only the root program's own services. Creating `app` without
-    /// having created the `dep` it reads fails with `ServiceNotFound`.
+    /// imported modules ahead of the root program, `local_imports` the modules
+    /// read from disk, and the `local_ast` handed back names only the root
+    /// program's own services. Creating `app` without having created the
+    /// `dep` it reads fails with `ServiceNotFound`.
     #[tokio::test]
     async fn on_manager_startup_instantiates_locally_resolved_imports() {
         let mut node = Node::new();
@@ -885,6 +897,7 @@ mod tests {
         };
 
         let local_ast = vec![app_stmt.clone()];
+        node.local_imports = vec![dep_stmt.clone()];
         node.unified_ast = vec![dep_stmt, app_stmt];
 
         let manager = node

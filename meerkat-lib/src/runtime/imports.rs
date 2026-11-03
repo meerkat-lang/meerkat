@@ -312,13 +312,18 @@ impl<'a> Imports<'a> {
     ///
     /// Args:
     ///   `failed_msg_id` (`MessageId`): Message ID that failed
+    ///   `cause` (`&str`): Why it failed, reported if retries run out
     ///
     /// Returns:
     ///   `Result<Option<ImportCommand>>`: Retry command
     ///
     /// Errors:
     ///   `Error`: If retry limit has been exceeded
-    pub fn on_send_failure(&mut self, failed_msg_id: MessageId) -> Result<Option<ImportCommand>> {
+    pub fn on_send_failure(
+        &mut self,
+        failed_msg_id: MessageId,
+        cause: &str,
+    ) -> Result<Option<ImportCommand>> {
         let pending = match self.pending_network.remove(&failed_msg_id) {
             Some(p) => p,
             None => return Ok(None),
@@ -332,8 +337,8 @@ impl<'a> Imports<'a> {
         let new_retry_count = pending.retry_count + 1;
         if new_retry_count > MAX_IMPORT_RETRIES {
             return Err(Error::Message(format!(
-                "Import fetch failed for service '{}' after {} retries",
-                pending.service_name, MAX_IMPORT_RETRIES
+                "Import fetch failed for service '{}' after {} retries: {}",
+                pending.service_name, MAX_IMPORT_RETRIES, cause
             )));
         }
 
@@ -381,16 +386,17 @@ impl<'a> Imports<'a> {
             }
         }
 
+        let cause = format!("no reply within {}s", INDIVIDUAL_IMPORT_TIMEOUT_SECS);
         if let Some((svc, max_retries)) = failed_service {
             return Err(Error::Message(format!(
-                "Import fetch failed for service '{}' after {} retries",
-                svc, max_retries
+                "Import fetch failed for service '{}' after {} retries: {}",
+                svc, max_retries, cause
             )));
         }
 
         let mut retry_cmds = Vec::new();
         for msg_id in to_retry {
-            if let Some(cmd) = self.on_send_failure(msg_id)? {
+            if let Some(cmd) = self.on_send_failure(msg_id, &cause)? {
                 retry_cmds.push(cmd);
             }
         }

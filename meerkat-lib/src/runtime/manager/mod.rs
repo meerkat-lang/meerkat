@@ -3,6 +3,7 @@ use super::env::Env;
 use super::graphs::{analysis::declaration_graphs, free_var::cross_service_deps, ServiceGraphs};
 use super::interpreter::{eval, execute_seq, EvalContext, EvalError, WAIT_DIE_DISPLAY_PREFIX};
 use super::tt::types::ServiceType;
+use crate::net::ast::{NetActionStmt, NetValue};
 use crate::net::network_layer::NetworkLayer;
 use crate::net::{
     codec, Address, LockGroup, MeerkatMessage, NetworkActor, NetworkCommand, NetworkEvent,
@@ -17,6 +18,18 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 use tokio::sync::oneshot;
 
+/// How many times an originator re-runs a transaction that died or was told
+/// to wait before giving up.
+///
+/// An originator has no queue to park in, so it waits by retrying (see
+/// `execute_action_with_txn`). That makes this budget the originator's wait
+/// **timeout** as well: an older transaction -- one wait-die says should win --
+/// is killed after `MAX_WAIT_DIE_RETRIES * WAIT_ON_RETRY_BACKOFF_MS` (200ms)
+/// of backoff, plus however long the attempts themselves take. That includes
+/// aborting each attempt's participants: `send_abort` waits for every
+/// acknowledgement, up to `send_and_await_reply`'s 15-second timeout when one
+/// is lost. The bound is inherent to retrying instead of parking, not a tuning
+/// accident; lifting it needs the background message loop of #28.
 pub const MAX_WAIT_DIE_RETRIES: u32 = 10;
 
 /// One cross-service dependency's cached state: the last value delivered for it
@@ -2300,7 +2313,7 @@ impl Manager {
     /// Errors cross the wire as their `Display` text, so a wait-die abort comes
     /// back as an ordinary string. Flattening it to `LocalDispatchFailed` turns
     /// ordinary lock contention into a terminal failure, because
-    /// `execute_action_with_txn` retries `WaitDieAbort` and nothing else. Every
+    /// `execute_action_with_txn` retries only wait-die outcomes. Every
     /// reply that can carry a lock outcome goes through here so lock requests,
     /// reads and composed actions all behave the same way.
     ///
@@ -2328,6 +2341,17 @@ impl Manager {
             Some(reason) => EvalError::WaitDieAbort(reason.to_string()),
             None => EvalError::LocalDispatchFailed(err),
         }
+    }
+
+    /// Identify a composed action by what its dispatch ships, so a replay can
+    /// tell whether it reached the same action as the recorded one
+    fn fingerprint(stmts: &[NetActionStmt], env: &[(String, NetValue)]) -> Result<u64, EvalError> {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let bytes = serde_json::to_vec(&(stmts, env))
+            .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?;
+        let mut hasher = DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        Ok(hasher.finish())
     }
 
     /// shared by remote_lookup and remote_action.
@@ -2820,6 +2844,40 @@ impl Manager {
             let enc_val = codec::encode_value(&val, &self.interner)
                 .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?;
             net_env.push((key_str, enc_val));
+        }
+
+        // Claim this dispatch's position in the transaction's dispatch order,
+        // and stop here if a parked run already completed it (`composed_done`)
+        let mut claim = None;
+        if let Some(t) = txn.as_deref_mut() {
+            let seq = t.composed_seq;
+            t.composed_seq += 1;
+            let call = ComposedCall {
+                target: service_net_id.clone(),
+                fingerprint: Self::fingerprint(&net_stmts, &net_env)?,
+            };
+            if let Some(done) = t.composed_done.get(&seq) {
+                // Target alone is not identity: a replay can branch into a
+                // different action on the same service. The recorded effect is
+                // already buffered on the other node and cannot be rolled back
+                // from here, so failing is the only honest outcome
+                if done.target != call.target {
+                    return Err(EvalError::LocalDispatchFailed(format!(
+                        "replayed transaction dispatched a composed action to '{}' \
+                         in place of the one it had dispatched to '{}'",
+                        call.target.0, done.target.0
+                    )));
+                }
+                if done.fingerprint != call.fingerprint {
+                    return Err(EvalError::LocalDispatchFailed(format!(
+                        "replayed transaction's composed action to '{}' differs \
+                         from the one it dispatched there before",
+                        call.target.0
+                    )));
+                }
+                return Ok(());
+            }
+            claim = Some((seq, call));
         }
 
         let msg = MeerkatMessage::ActionRequest {
@@ -3627,16 +3685,34 @@ impl Manager {
                 .await
                 .err();
 
-            if matches!(exec_error, Some(EvalError::WaitDieAbort(_))) {
+            // Both wait-die outcomes retry the whole transaction. A participant
+            // told to wait parks on `wait_queue`, but an originator drives its
+            // own transaction and has no queue to park in, so retrying is how
+            // it waits.
+            if let Some(EvalError::WaitDieAbort(_) | EvalError::WaitOn(_)) = &exec_error {
                 for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
                     self.send_abort(addr, &txn.id).await;
                 }
                 self.release_all_locks(&txn);
                 if txn_id.iteration < MAX_WAIT_DIE_RETRIES {
                     txn_id = txn_id.retry();
+                    let backoff = match exec_error {
+                        Some(EvalError::WaitOn(_)) => WAIT_ON_RETRY_BACKOFF_MS,
+                        _ => WAIT_DIE_RETRY_BACKOFF_MS,
+                    };
+                    retry_backoff(backoff).await;
                     continue;
                 }
-                return Err(exec_error.unwrap());
+                // Out of retries. `WaitOn` never leaves this loop as itself:
+                // its `WaitKey` holds ids only this node can read back.
+                return Err(match exec_error.unwrap() {
+                    EvalError::WaitOn(key) => EvalError::WaitDieAbort(format!(
+                        "gave up waiting for {} after {} retries",
+                        self.describe_wait_key(&key),
+                        MAX_WAIT_DIE_RETRIES
+                    )),
+                    other => other,
+                });
             }
 
             // A refused commit is reported, not swallowed: on `Ok` the CLI
@@ -3656,6 +3732,23 @@ impl Manager {
             self.release_all_locks(&txn);
 
             return error.map_or(Ok(()), Err);
+        }
+    }
+
+    /// Render a contended lock key in program terms: `service '<name>'` or
+    /// `'<service>.<member>'`, falling back to the raw `ServiceNetId` when the
+    /// service is not local.
+    fn describe_wait_key(&self, key: &WaitKey) -> String {
+        let name_of = |sid: &ServiceNetId| {
+            self.service_name_for_net_id(sid)
+                .map(|n| self.interner.get(n).to_string())
+                .unwrap_or_else(|| sid.0.clone())
+        };
+        match key {
+            WaitKey::Service(sid) => format!("service '{}'", name_of(sid)),
+            WaitKey::Member(sid, member) => {
+                format!("'{}.{}'", name_of(sid), self.interner.get(*member))
+            }
         }
     }
 
@@ -3765,12 +3858,41 @@ impl Manager {
             .pending_txns
             .remove(&tid)
             .unwrap_or_else(|| Transaction::new(tid.clone()));
+        // A `WaitOn` parks the whole action and re-runs it from the first
+        // statement, so a run that parks must leave the buffers as it found
+        // them, or `x = x + 1` reads its own buffered `1` on replay and
+        // commits `2`. Restored rather than cleared, because an earlier action
+        // under the same transaction id may have buffered writes here too.
+        // Locks and participants are kept: they hold this transaction's place
+        // in line and still need committing or aborting with it.
+        // `composed_seq` is rewound so a replayed composed action finds the
+        // record the parked run left in `composed_done`. All of this goes
+        // away once a parked action is suspended instead of re-run (#213)
+        let before = (
+            txn.written.clone(),
+            txn.read_cache.clone(),
+            txn.composed_seq,
+        );
         let mut env: Vec<(Symbol, Value)> = initial_env.to_vec();
-        let exec_error = execute_seq(stmts, &mut env, self, service_name, Some(&mut txn))
+        let mut exec_error = execute_seq(stmts, &mut env, self, service_name, Some(&mut txn))
             .await
             .err();
+        // Positions are dense, so a completed run that did not reach every
+        // recorded one branched past a composed action the parked run made,
+        // whose effect is buffered on the other node all the same. Positions
+        // below `start` belong to earlier actions under this transaction id
+        let start = before.2 as usize;
+        if exec_error.is_none() && (txn.composed_seq as usize) < txn.composed_done.len() {
+            exec_error = Some(EvalError::LocalDispatchFailed(format!(
+                "replayed action dispatched {} composed actions, but its parked run \
+                 had completed {}",
+                txn.composed_seq as usize - start,
+                txn.composed_done.len() - start
+            )));
+        }
         if let Some(e) = exec_error {
             if matches!(e, EvalError::WaitOn(_)) {
+                (txn.written, txn.read_cache, txn.composed_seq) = before;
                 self.pending_txns.insert(tid, txn);
                 return Err(e);
             }
@@ -6202,6 +6324,70 @@ mod tests {
                 .lock,
             crate::runtime::txn::VarLock::WriteLocked(_)
         ));
+    }
+
+    /// The retry loop must pause between attempts, and for as long as the
+    /// outcome calls for: a die re-runs after `WAIT_DIE_RETRY_BACKOFF_MS`, a
+    /// wait after the longer `WAIT_ON_RETRY_BACKOFF_MS`.
+    ///
+    /// The upper bound on the die run is what catches wiring one backoff to
+    /// both outcomes: it would either make the die as slow as a wait or the
+    /// wait as quick as a die (and the wait bound catches the latter).
+    ///
+    /// Runs on paused Tokio time, so the measured durations are exactly the
+    /// backoffs slept and scheduler delays on a loaded machine cannot push
+    /// the die run past its upper bound.
+    #[tokio::test(start_paused = true)]
+    async fn test_wait_die_retries_are_paced() {
+        async fn run_against_holder(timestamp: u128) -> Duration {
+            let mut tc = manager_with_x().await;
+            let holder = crate::runtime::txn::TxnId {
+                timestamp,
+                node_id: tc.manager.node_id,
+                iteration: 0,
+            };
+            tc.manager
+                .services
+                .get_mut(&tc.foo)
+                .unwrap()
+                .vars
+                .get_mut(&tc.x)
+                .unwrap()
+                .lock = crate::runtime::txn::VarLock::WriteLocked(holder);
+            let stmts = vec![ActionStmt::Assign {
+                name: tc.x,
+                expr: Expr::Variable { name: tc.x },
+            }];
+            let started = tokio::time::Instant::now();
+            let err = tc
+                .manager
+                .execute_action(tc.foo, &stmts)
+                .await
+                .expect_err("`x` is held for the whole run");
+            assert!(matches!(err, EvalError::WaitDieAbort(_)), "got {err:?}");
+            started.elapsed()
+        }
+        let retries = u64::from(MAX_WAIT_DIE_RETRIES);
+
+        // Holder is older: every attempt dies.
+        let die = run_against_holder(1).await;
+        let die_min = Duration::from_millis(WAIT_DIE_RETRY_BACKOFF_MS * retries);
+        let wait_min = Duration::from_millis(WAIT_ON_RETRY_BACKOFF_MS * retries);
+        assert!(
+            die >= die_min,
+            "a die must pause before each retry: {die:?}"
+        );
+        assert!(
+            die < wait_min,
+            "a die must use the short backoff, not the wait's: {die:?}"
+        );
+
+        // Holder is younger: every attempt is told to wait.
+        let wait = run_against_holder(u128::MAX).await;
+        assert!(
+            wait >= wait_min,
+            "a wait must use the long backoff before each retry: {wait:?}"
+        );
     }
 
     /// A wait-die abort raised on a participant must still be a wait-die abort

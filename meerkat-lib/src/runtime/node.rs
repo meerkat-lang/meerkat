@@ -300,9 +300,9 @@ impl Node {
                             buffered_events.push(NetworkEvent::MessageReceived { peer, msg });
                         }
                     },
-                    NetworkEvent::SendFailed { msg_id, error: _ } => {
+                    NetworkEvent::SendFailed { msg_id, error } => {
                         if let Some((cmd, s_name, t_url, retry)) =
-                            imports.on_send_failure(msg_id)?
+                            imports.on_send_failure(msg_id, &format!("{:?}", error))?
                         {
                             tokio::time::sleep(std::time::Duration::from_millis(
                                 IMPORT_RETRY_DELAY_MS,

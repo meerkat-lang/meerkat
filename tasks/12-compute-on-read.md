@@ -346,7 +346,10 @@ naming will otherwise invite someone to restore the symmetry.
    value. And a participant's def over the **originator's** var, read after the
    originator writes it, fails with the named error rather than returning the
    stale value.
-10. `meerkat/tests/s1.mkt` passes.
+10. `meerkat/tests/s1.mkt` still passes. It has passed since PR #201 made each
+    `do` in an `@test` its own transaction, so it no longer exercises
+    read-your-own-writes and is only a regression check. Tests 1 and 3 are
+    the ones that show compute-on-read working.
 
 ## Notes
 

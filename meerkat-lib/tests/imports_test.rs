@@ -232,7 +232,9 @@ fn test_imports_pending_cleanup() {
     );
 
     // Assert that msg1 was pruned by registering msg2
-    let retry1 = imports.on_send_failure(msg1).expect("on_send_failure ok");
+    let retry1 = imports
+        .on_send_failure(msg1, "test failure")
+        .expect("on_send_failure ok");
     assert!(retry1.is_none());
 
     // Receive source for B; should remove pending entries for B
@@ -242,7 +244,9 @@ fn test_imports_pending_cleanup() {
         .expect("on_recv_source success");
 
     // Stale failure notifications for completed service yield None
-    let retry2 = imports.on_send_failure(msg2).expect("on_send_failure ok");
+    let retry2 = imports
+        .on_send_failure(msg2, "test failure")
+        .expect("on_send_failure ok");
     assert!(retry2.is_none());
 }
 
@@ -754,4 +758,52 @@ async fn test_local_only_resolution_clears_discovered_ownership() {
     );
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// #204: when retries run out, the error says why the last attempt failed,
+/// not just that it did
+#[test]
+fn test_import_retry_exhaustion_reports_the_cause() {
+    use meerkat_lib::net::MessageId;
+    use meerkat_lib::runtime::limits::MAX_IMPORT_RETRIES;
+
+    // Parsed rather than built, so the test doesn't depend on the shape of
+    // `Stmt::Import`
+    let mut interner = Interner::new();
+    let base_ast = parser::parse_string("import B\n", &mut interner).expect("parse import");
+    let mut remote_map = HashMap::new();
+    remote_map.insert("B".to_string(), "/ip4/127.0.0.1/tcp/9000".to_string());
+    let (mut imports, _initial_cmds) = Imports::new(
+        &mut interner,
+        remote_map,
+        &base_ast,
+        Path::new(""),
+        "/ip4/127.0.0.1/tcp/8000/p2p/peer_a",
+    )
+    .expect("Imports::new success");
+
+    let cause = "ProtocolError(\"Outgoing connection failed: WrongPeerId\")";
+    let mut retry = 0;
+    loop {
+        let msg_id = MessageId(1000 + u64::from(retry));
+        imports.register_sent_command(
+            msg_id,
+            "B".to_string(),
+            "/ip4/127.0.0.1/tcp/9000".to_string(),
+            retry,
+        );
+        match imports.on_send_failure(msg_id, cause) {
+            Ok(Some((_, _, _, next))) => retry = next,
+            Ok(None) => panic!("B is still pending, so a failure must be retried"),
+            Err(e) => {
+                assert_eq!(retry, MAX_IMPORT_RETRIES, "gave up early");
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("after") && msg.contains(cause),
+                    "the error must name the last cause, got: {msg}"
+                );
+                break;
+            }
+        }
+    }
 }

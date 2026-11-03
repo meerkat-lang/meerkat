@@ -93,7 +93,8 @@ impl Transaction {
         }
     }
 
-    /// Drives the transaction forward through its state machine stages
+    /// Applies the update, then waits until every def it introduces has a
+    /// first value (see `apply`)
     ///
     /// Args:
     ///     `manager` (`&mut Manager`): The active runtime manager
@@ -102,8 +103,30 @@ impl Transaction {
     ///     `Result<(), EvalError>`: `Ok(())` on completion or `Err`
     ///
     /// Raises:
-    ///     `EvalError`: If lock acquisition, validation, or eval fails
+    ///     `EvalError`: If lock acquisition, validation, or eval fails, or a
+    ///     committed new def gets no value (`Manager::await_first_values`)
     pub async fn poll(&mut self, manager: &mut Manager) -> Result<(), EvalError> {
+        let introduced = self.apply(manager).await?;
+        manager.await_first_values(&introduced).await
+    }
+
+    /// Drives the transaction forward through its state machine stages
+    ///
+    /// Args:
+    ///     `manager` (`&mut Manager`): The active runtime manager
+    ///
+    /// Returns:
+    ///     `Result<Vec<(Symbol, Symbol)>, EvalError>`: The defs the committed
+    ///     update introduces. A def whose inputs only its own publication can
+    ///     complete takes its first value after this returns, through ordinary
+    ///     propagation (`Manager::first_values`)
+    ///
+    /// Raises:
+    ///     `EvalError`: If lock acquisition, validation, or eval fails
+    pub async fn apply(
+        &mut self,
+        manager: &mut Manager,
+    ) -> Result<Vec<(Symbol, Symbol)>, EvalError> {
         match self.state {
             TransactionState::Init => {
                 let mut lock_groups: HashMap<String, LockGroup> = HashMap::new();
@@ -310,6 +333,7 @@ impl Transaction {
                             && installed.get(&name).copied() != Some(stmt))
                 });
 
+                let introduced = self.unvalued_defs(manager);
                 self.state = TransactionState::Evaluated;
                 self.commit(manager);
 
@@ -337,6 +361,7 @@ impl Transaction {
                     }
                 }
 
+                let mut remote_failure = None;
                 let updated_members = updated_services
                     .iter()
                     .flat_map(|(svc, decls)| {
@@ -392,11 +417,30 @@ impl Transaction {
                         let res =
                             Box::pin(manager.send_and_await_reply(addr, msg, request_id, timeout))
                                 .await;
-                        if let Err(ref e) = res {
-                            eprintln!(
-                                "Warning: remote service update to {} failed: {}",
-                                svc_str, e
-                            );
+                        match res {
+                            // No answer, so no confirmed outcome either way
+                            Err(ref e) => {
+                                eprintln!(
+                                    "Warning: remote service update to {} failed: {}",
+                                    svc_str, e
+                                );
+                                remote_failure.get_or_insert(EvalError::RuntimeError(format!(
+                                    "Remote service update to '{}' was not confirmed and may have \
+                                     been applied: {}",
+                                    svc_str, e
+                                )));
+                            }
+                            // The owner reports a failed or incomplete update
+                            Ok(crate::net::types::MeerkatMessage::UpdateServiceResponse {
+                                error: Some(error),
+                                ..
+                            }) => {
+                                remote_failure.get_or_insert(EvalError::RuntimeError(format!(
+                                    "Remote service update to '{}' failed: {}",
+                                    svc_str, error
+                                )));
+                            }
+                            Ok(_) => {}
                         }
                     }
                 }
@@ -408,14 +452,48 @@ impl Transaction {
                 }
                 self.release_lock_txn(manager);
 
-                Ok(())
+                remote_failure.map_or(Ok(introduced), Err)
             }
             TransactionState::LocksAcquired => {
                 debug_assert!(false, "Unreachable poll call in LocksAcquired state");
-                Ok(())
+                Ok(Vec::new())
             }
-            TransactionState::Evaluated => Ok(()),
+            // Committed already: what remains is its defs still without a value
+            TransactionState::Evaluated => Ok(self.unvalued_defs(manager)),
         }
+    }
+
+    /// The defs this update declares on local services that have no value
+    ///
+    /// Args:
+    ///     `manager` (`&Manager`): The active runtime manager
+    ///
+    /// Returns:
+    ///     `Vec<(Symbol, Symbol)>`: `(service, def)` pairs
+    fn unvalued_defs(&self, manager: &Manager) -> Vec<(Symbol, Symbol)> {
+        self.updates
+            .iter()
+            .filter_map(|stmt| match stmt {
+                Stmt::Service { name, decls }
+                | Stmt::Update {
+                    service_name: name,
+                    decls,
+                } => Some((*name, decls)),
+                _ => None,
+            })
+            .flat_map(|(svc, decls)| {
+                decls.iter().filter_map(move |decl| match decl {
+                    Decl::DefDecl { name, .. } => Some((svc, *name)),
+                    Decl::VarDecl { .. } | Decl::TableDecl { .. } => None,
+                })
+            })
+            .filter(|(svc, def)| {
+                manager
+                    .services
+                    .get(svc)
+                    .is_some_and(|service| !service.vars.contains_key(def))
+            })
+            .collect()
     }
 
     /// Consumes the fully evaluated isolated state and overwrites Manager

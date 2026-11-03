@@ -132,10 +132,6 @@ pub struct Manager {
     pub local: bool,
     /// String interner
     pub interner: Interner,
-    /// #24: transient cache consulted during a reactive recompute. Holds the
-    /// (service, member) -> value map for the def currently being recomputed so
-    /// MemberAccess resolves from cache instead of a (possibly remote) lookup.
-    pub reactive_cache: Option<HashMap<(Symbol, Symbol), Value>>,
     /// #24: reply address for each remote listener, keyed by the listener's
     /// ServiceNetId, so the owner can route Updates back to it.
     pub listener_addrs: HashMap<ServiceNetId, String>,
@@ -145,6 +141,9 @@ pub struct Manager {
     declaration_graphs: HashMap<Symbol, ServiceGraphs>,
     /// Global local services type environment
     pub local_services: Env<'static, ServiceType>,
+    /// Directory whose files a server answers code requests from (#39); None
+    /// on a node that serves no files
+    pub served_base_dir: Option<std::path::PathBuf>,
 }
 
 /// The names of the services a program declares itself.
@@ -189,6 +188,15 @@ fn advance(mut v_base: VClock, write_set: &HashSet<(Symbol, Symbol)>) -> VClock 
     v_base
 }
 
+/// Let the network run for `ms` milliseconds. As in `send_and_await_reply`,
+/// browsers have no tokio timer driver
+async fn pause(ms: u32) {
+    #[cfg(not(target_arch = "wasm32"))]
+    tokio::time::sleep(Duration::from_millis(ms.into())).await;
+    #[cfg(target_arch = "wasm32")]
+    send_wrapper::SendWrapper::new(gloo_timers::future::TimeoutFuture::new(ms)).await;
+}
+
 impl Manager {
     pub fn new(interner: Interner) -> Self {
         Manager {
@@ -203,11 +211,11 @@ impl Manager {
             local_address: None,
             local: false,
             interner,
-            reactive_cache: None,
             listener_addrs: HashMap::new(),
             unified_ast: Vec::new(),
             declaration_graphs: HashMap::new(),
             local_services: Env::new(None),
+            served_base_dir: None,
         }
     }
 
@@ -581,6 +589,8 @@ impl Manager {
 
         let mut env: Vec<(Symbol, Value)> = vec![];
         let svc_name = name;
+        // Inputs a def read beyond its static inputs, through a call
+        let mut activated = Vec::new();
 
         let result = async {
             for decl in decls {
@@ -639,6 +649,12 @@ impl Manager {
                             .chain(graphs.cross_deps.get(&def).into_iter().flatten().copied())
                     };
                     let mut pending: Vec<_> = static_inputs(name).collect();
+                    activated.extend(
+                        reads
+                            .iter()
+                            .filter(|input| !pending.contains(input))
+                            .map(|&input| (name, input)),
+                    );
                     let mut seen = HashSet::new();
                     while let Some(input) = pending.pop() {
                         if reads.contains(&input)
@@ -700,11 +716,14 @@ impl Manager {
                 }
             }
 
+            // The remote pairs initialization read stay each def's incorporated
+            // inputs, with their clocks, including those a call reached
             let remote_inputs: Vec<_> = self.services[&svc_name]
                 .graphs
                 .cross_deps
                 .iter()
                 .flat_map(|(&def, inputs)| inputs.iter().map(move |&input| (def, input)))
+                .chain(activated.iter().copied())
                 .filter(|(_, (owner, _))| self.remote_services.contains_key(owner))
                 .filter_map(|(def, input)| {
                     let key = (self.service_net_id_for_name(input.0), input.1);
@@ -717,7 +736,7 @@ impl Manager {
                     .dep_cache
                     .entry(def)
                     .or_default()
-                    .insert(input, (entry.0.clone(), None, entry.2.clone()));
+                    .insert(input, entry.clone());
             }
 
             // Commit only after every initializer succeeds; participant failures
@@ -732,6 +751,10 @@ impl Manager {
                 self.services[&svc_name].listeners.keys().copied().collect();
             let graphs = std::mem::take(&mut self.services.get_mut(&svc_name).unwrap().graphs);
             self.update_service_graphs(svc_name, graphs).await;
+            // Their later changes must reach the def as its static inputs' do
+            for (def, input) in activated {
+                self.follow_input((svc_name, def), input).await;
+            }
             let affected = self.services[&svc_name]
                 .listeners
                 .values()
@@ -803,29 +826,23 @@ impl Manager {
     /// Returns:
     ///     `()`
     pub async fn update_service_graphs(&mut self, svc_name: Symbol, new_graphs: ServiceGraphs) {
-        let (updated_id, edges) = match self.services.get_mut(&svc_name) {
+        let (updated_id, old_edges, edges) = match self.services.get_mut(&svc_name) {
             Some(service) => {
+                let old_edges: HashSet<_> = Self::listener_edges(svc_name, service).collect();
                 service.graphs = new_graphs;
-                let updated_id = service.id.clone();
-                let mut edges: Vec<(Symbol, Symbol, Symbol)> = Vec::new();
-                for (dep_member, listener_def) in service.graphs.reactive_edges() {
-                    if service.defs.contains_key(&listener_def) {
-                        edges.push((svc_name, dep_member, listener_def));
-                    }
-                }
-                for (def_name, cross_set) in &service.graphs.cross_deps {
-                    for (owner, member) in cross_set {
-                        edges.push((*owner, *member, *def_name));
-                    }
-                }
-                (updated_id, edges)
+                let edges: Vec<_> = Self::listener_edges(svc_name, service).collect();
+                (service.id.clone(), old_edges, edges)
             }
             None => return,
         };
 
-        for service in self.services.values_mut() {
-            for listener_set in service.listeners.values_mut() {
-                listener_set.retain(|(lid, _)| *lid != updated_id);
+        // Keep what this service's defs registered for inputs that evaluation
+        // reached at run time (see `follow_input`): no graph lists them
+        for (&owner, service) in self.services.iter_mut() {
+            for (&member, listener_set) in service.listeners.iter_mut() {
+                listener_set.retain(|(lid, def)| {
+                    *lid != updated_id || !old_edges.contains(&(owner, member, *def))
+                });
             }
         }
 
@@ -843,6 +860,25 @@ impl Manager {
                     .await;
             }
         }
+    }
+
+    /// The `(owner, member, def)` listener registrations `service`'s graphs imply
+    fn listener_edges(
+        svc_name: Symbol,
+        service: &Service,
+    ) -> impl Iterator<Item = (Symbol, Symbol, Symbol)> + '_ {
+        let local = service
+            .graphs
+            .reactive_edges()
+            .into_iter()
+            .filter(|(_, def)| service.defs.contains_key(def))
+            .map(move |(member, def)| (svc_name, member, def));
+        let cross = service.graphs.cross_deps.iter().flat_map(|(&def, inputs)| {
+            inputs
+                .iter()
+                .map(move |&(owner, member)| (owner, member, def))
+        });
+        local.chain(cross)
     }
 
     /// Initialization is private to its transaction, including cache reads.
@@ -890,17 +926,6 @@ impl Manager {
     ) -> Result<Value, EvalError> {
         if let Some(reads) = txn.as_deref_mut().and_then(|t| t.observed_reads.as_mut()) {
             reads.insert((service_name, var_name));
-        }
-        if txn.is_none() {
-            if let Some(value) = self
-                .reactive_cache
-                .as_ref()
-                .and_then(|cache| cache.get(&(service_name, var_name)))
-                .cloned()
-            {
-                self.ensure_service_visible(service_name, None)?;
-                return Ok(value);
-            }
         }
         // Check if service is remote
         if self.remote_services.contains_key(&service_name) {
@@ -1276,65 +1301,66 @@ impl Manager {
         }
     }
 
-    // compute v_target from vector clock semantics 5.3 by taking max over all dependent vector clocks
-    // then, determine whether it is glitch-free or not
-    fn compute_v_target(
+    /// The pair `def` would read for `input` now, if one is complete: its
+    /// own cached delivery of a cross-service member, else the state of a
+    /// visible local member. A remote member is never read live here
+    fn input_receipt(
         &self,
-        curr_svc: &Service,
-        def: &Symbol,
-    ) -> (VClock, bool, Option<Sources>) {
-        if curr_svc.initializing.is_some() {
-            return (VClock::new(), false, None);
+        (svc, def): (Symbol, Symbol),
+        (owner, member): (Symbol, Symbol),
+    ) -> Option<ReadEntry> {
+        self.ensure_service_visible(owner, None).ok()?;
+        let cached = (owner != svc)
+            .then(|| {
+                self.services
+                    .get(&svc)?
+                    .dep_cache
+                    .get(&def)?
+                    .get(&(owner, member))
+            })
+            .flatten();
+        match cached {
+            Some((value, clock, sources)) => clock
+                .as_ref()
+                .map(|clock| (value.clone(), Some(clock.clone()), sources.clone())),
+            None if self.remote_services.contains_key(&owner) => None,
+            None => {
+                let state = self.services.get(&owner)?.vars.get(&member)?;
+                Some((
+                    state.value.clone(),
+                    Some(state.vector_clock.clone()),
+                    state.sources.clone(),
+                ))
+            }
         }
-        let mut inputs = Vec::new();
-        for name in curr_svc
+    }
+
+    /// Pairs for every static input of `def`, including inputs of branches an
+    /// evaluation does not take, or None while one is missing
+    fn static_receipts(
+        &self,
+        service: &Service,
+        def: Symbol,
+    ) -> Option<HashMap<(Symbol, Symbol), ReadEntry>> {
+        if service.initializing.is_some() {
+            return None;
+        }
+        service
             .graphs
             .reactive_graph
-            .neighbors_directed(*def, petgraph::Direction::Incoming)
-        {
-            let Some(state) = curr_svc.vars.get(&name) else {
-                log::warn!(
-                    "gate: local dep '{}' of def '{}' missing from vars",
-                    self.interner.get(name),
-                    self.interner.get(*def),
-                );
-                return (VClock::new(), false, None);
-            };
-            inputs.push((
-                &state.vector_clock,
-                state.sources.as_ref().map(Cow::Borrowed),
-            ));
-        }
-        for &(owner, member) in curr_svc.graphs.cross_deps.get(def).into_iter().flatten() {
-            if self.ensure_service_visible(owner, None).is_err() {
-                return (VClock::new(), false, None);
-            }
-            let cached = curr_svc
-                .dep_cache
-                .get(def)
-                .and_then(|deps| deps.get(&(owner, member)));
-            let input = match cached {
-                Some((_, clock, sources)) => clock
-                    .as_ref()
-                    .map(|clock| (clock, sources.as_ref().map(Cow::Borrowed))),
-                None if self.remote_services.contains_key(&owner) => None,
-                None => self
-                    .services
-                    .get(&owner)
-                    .and_then(|s| s.vars.get(&member))
-                    .map(|state| {
-                        (
-                            &state.vector_clock,
-                            state.sources.as_ref().map(Cow::Borrowed),
-                        )
-                    }),
-            };
-            match input {
-                Some(input) => inputs.push(input),
-                None => return (VClock::new(), false, None),
-            }
-        }
-        self.check_input_clocks(&inputs)
+            .neighbors_directed(def, petgraph::Direction::Incoming)
+            .map(|member| (service.name, member))
+            .chain(
+                service
+                    .graphs
+                    .cross_deps
+                    .get(&def)
+                    .into_iter()
+                    .flatten()
+                    .copied(),
+            )
+            .map(|input| Some((input, self.input_receipt((service.name, def), input)?)))
+            .collect()
     }
 
     /// Gate each input using the Sources paired with that value and clock.
@@ -1357,6 +1383,43 @@ impl Manager {
             })
             .flatten();
         (v_target, gate_ok, sources)
+    }
+
+    /// `check_input_clocks` over read pairs; one without a clock fails it
+    fn check_receipts<'a>(
+        &self,
+        receipts: impl IntoIterator<Item = &'a ReadEntry>,
+    ) -> (VClock, bool, Option<Sources>) {
+        let Some(inputs) = receipts
+            .into_iter()
+            .map(|(_, clock, sources)| Some((clock.as_ref()?, sources.as_ref().map(Cow::Borrowed))))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return (VClock::new(), false, None);
+        };
+        self.check_input_clocks(&inputs)
+    }
+
+    /// Make changes of `input` reach `def`: a listener on a local owner,
+    /// otherwise a subscription, whose first Update carries the input's pair
+    async fn follow_input(
+        &mut self,
+        (svc, def): (Symbol, Symbol),
+        (owner, member): (Symbol, Symbol),
+    ) {
+        let Some(listener) = self.services.get(&svc).map(|service| service.id.clone()) else {
+            return;
+        };
+        match self.services.get_mut(&owner) {
+            Some(service) => {
+                service
+                    .listeners
+                    .entry(member)
+                    .or_default()
+                    .insert((listener, def));
+            }
+            None => self.subscribe_remote(owner, member, listener, def).await,
+        }
     }
 
     async fn recompute_component(
@@ -1404,110 +1467,99 @@ impl Manager {
             return None;
         }
 
-        let mut boundaries = Vec::new();
+        // Each member's code and the pairs of its inputs outside the component
         let mut snapshots = HashMap::new();
         for &node in &component {
-            let service = &self.services[&node.0];
-            let mut env: HashMap<_, _> = service
-                .vars
-                .iter()
-                .map(|(&name, state)| ((node.0, name), Some(state.value.clone())))
-                .collect();
+            let mut receipts = HashMap::new();
             for input in graph.neighbors_directed(node, petgraph::Direction::Incoming) {
-                if component.contains(&input) {
-                    continue;
-                }
-                self.ensure_service_visible(input.0, None).ok()?;
-                let cached = (input.0 != node.0)
-                    .then(|| service.dep_cache.get(&node.1)?.get(&input))
-                    .flatten();
-                let entry = match cached {
-                    Some((value, clock, sources)) => {
-                        (value.clone(), clock.clone()?, sources.clone())
-                    }
-                    None if self.remote_services.contains_key(&input.0) => return None,
-                    None => {
-                        let state = self.services.get(&input.0)?.vars.get(&input.1)?;
-                        (
-                            state.value.clone(),
-                            state.vector_clock.clone(),
-                            state.sources.clone(),
-                        )
-                    }
-                };
-                env.insert(input, Some(entry.0));
-                boundaries.push((entry.1, entry.2));
-            }
-            snapshots.insert(node, (service.defs[&node.1].clone(), env));
-        }
-        // Every member of a strongly connected component reaches the same
-        // boundary roots; its completed clock and Sources therefore agree.
-        let inputs: Vec<_> = boundaries
-            .iter()
-            .map(|(clock, sources)| (clock, sources.as_ref().map(Cow::Borrowed)))
-            .collect();
-        let (clock, gate_ok, sources) = self.check_input_clocks(&inputs);
-        if !gate_ok {
-            return None;
-        }
-        let mut staged = HashMap::new();
-        while staged.len() < component.len() {
-            let previous_len = staged.len();
-            for &node in &component {
-                if staged.contains_key(&node) {
-                    continue;
-                }
-                let (expr, env) = &snapshots[&node];
-                let mut inputs = env.clone();
-                inputs.extend(
-                    component
-                        .iter()
-                        .map(|&input| (input, staged.get(&input).cloned())),
-                );
-                let outer_cache = self.reactive_cache.take();
-                let result = super::interpreter::evaluator::eval_with_inputs(
-                    expr,
-                    &[],
-                    &mut EvalContext {
-                        manager: self,
-                        service_name: node.0,
-                        txn: None,
-                    },
-                    Some(&inputs),
-                )
-                .await;
-                self.reactive_cache = outer_cache;
-                match result {
-                    Ok(value) => {
-                        staged.insert(node, value);
-                    }
-                    Err(EvalError::InputNotReady(_)) => {}
-                    Err(_) => return None,
+                if !component.contains(&input) {
+                    receipts.insert(input, self.input_receipt(node, input)?);
                 }
             }
-            if staged.len() == previous_len {
+            snapshots.insert(
+                node,
+                (self.services[&node.0].defs[&node.1].clone(), receipts),
+            );
+        }
+        'observe: loop {
+            // Every member of a strongly connected component reaches the same
+            // boundary roots; its completed clock and Sources therefore agree.
+            let (clock, gate_ok, sources) = self.check_receipts(
+                snapshots
+                    .values()
+                    .flat_map(|(_, receipts)| receipts.values()),
+            );
+            if !gate_ok {
                 return None;
             }
+            let mut staged = HashMap::new();
+            while staged.len() < component.len() {
+                let previous_len = staged.len();
+                for &node in &component {
+                    if staged.contains_key(&node) {
+                        continue;
+                    }
+                    let (expr, receipts) = &snapshots[&node];
+                    let inputs = receipts
+                        .iter()
+                        .map(|(&input, entry)| (input, Some(entry.0.clone())))
+                        .chain(
+                            component
+                                .iter()
+                                .map(|&input| (input, staged.get(&input).cloned())),
+                        )
+                        .collect();
+                    let result = super::interpreter::evaluator::eval_with_inputs(
+                        expr,
+                        &[],
+                        &mut EvalContext {
+                            manager: self,
+                            service_name: node.0,
+                            txn: None,
+                        },
+                        Some(&inputs),
+                    )
+                    .await;
+                    let input = match result {
+                        Ok(value) => {
+                            staged.insert(node, value);
+                            continue;
+                        }
+                        // Not staged yet: evaluated again in the next round
+                        Err(EvalError::InputNotReady(input)) if component.contains(&input) => {
+                            continue
+                        }
+                        Err(EvalError::InputNotReady(input)) => input,
+                        Err(_) => return None,
+                    };
+                    // A member a call reads outside the component joins its
+                    // boundary, and the whole component is observed again
+                    let receipt = self.input_receipt(node, input);
+                    if receipt.is_none() || self.services.contains_key(&input.0) {
+                        self.follow_input(node, input).await;
+                    }
+                    let Some(receipt) = receipt else {
+                        return Some(Vec::new());
+                    };
+                    if let Some((_, receipts)) = snapshots.get_mut(&node) {
+                        receipts.insert(input, receipt);
+                    }
+                    continue 'observe;
+                }
+                if staged.len() == previous_len {
+                    return None;
+                }
+            }
+            return Some(
+                staged
+                    .into_iter()
+                    .filter_map(|(node, value)| {
+                        self.install_recomputed(node, value, clock.clone(), sources.clone())
+                            .then_some(node)
+                    })
+                    .collect(),
+            );
         }
-        // A remote function call can process a code update while evaluation
-        // is suspended. Do not replace its result with an obsolete expression.
-        if snapshots.iter().any(|(&(owner, member), (expr, _))| {
-            self.services
-                .get(&owner)
-                .and_then(|service| service.defs.get(&member))
-                != Some(expr)
-        }) {
-            return None;
-        }
-        Some(
-            staged
-                .into_iter()
-                .filter_map(|(node, value)| {
-                    self.install_recomputed(node, value, clock.clone(), sources.clone())
-                        .then_some(node)
-                })
-                .collect(),
-        )
     }
 
     fn install_recomputed(
@@ -1541,6 +1593,54 @@ impl Manager {
         }
     }
 
+    /// Evaluate `expr`, the code of `def`, against one fixed set of paired
+    /// inputs: `receipts`, which hold its static inputs, plus the pair of each
+    /// member a call or branch reads, added before evaluating again from the
+    /// start. Evaluation reads nothing else, so it cannot suspend and its
+    /// value agrees with the clock and Sources it is gated with. Local inputs
+    /// reached this way are followed so their changes reach `def`
+    ///
+    /// Returns:
+    ///     The value with that clock and Sources, None while the pairs
+    ///     disagree, `EvalError::InputNotReady` for an input without a pair
+    async fn evaluate_checked(
+        &mut self,
+        (svc, def): (Symbol, Symbol),
+        expr: &Expr,
+        mut receipts: HashMap<(Symbol, Symbol), ReadEntry>,
+    ) -> Result<Option<(Value, VClock, Option<Sources>)>, EvalError> {
+        loop {
+            let (clock, gate_ok, sources) = self.check_receipts(receipts.values());
+            if !gate_ok {
+                return Ok(None);
+            }
+            let inputs = receipts
+                .iter()
+                .map(|(&input, entry)| (input, Some(entry.0.clone())))
+                .collect();
+            let result = super::interpreter::evaluator::eval_with_inputs(
+                expr,
+                &[],
+                &mut EvalContext {
+                    manager: self,
+                    service_name: svc,
+                    txn: None,
+                },
+                Some(&inputs),
+            )
+            .await;
+            let input = match result {
+                Err(EvalError::InputNotReady(input)) => input,
+                result => return result.map(|value| Some((value, clock, sources))),
+            };
+            let receipt = self.input_receipt((svc, def), input);
+            if self.services.contains_key(&input.0) {
+                self.follow_input((svc, def), input).await;
+            }
+            receipts.insert(input, receipt.ok_or(EvalError::InputNotReady(input))?);
+        }
+    }
+
     /// Ordinary propagation uses completed input snapshots. Recursive Sources
     /// changes, and changes a recursive member's own gate cannot accept before
     /// the rest of its cycle catches up, are installed together only after the
@@ -1551,95 +1651,143 @@ impl Manager {
         svc: Symbol,
         def: Symbol,
     ) -> Vec<(Symbol, Symbol)> {
-        let ready = self
+        let receipts = self
             .services
             .get(&svc)
-            .filter(|service| {
-                service
-                    .vars
-                    .get(&def)
-                    .is_some_and(|state| state.sources.is_some())
-                    && !service.pending_source_updates.contains(&def)
-            })
-            .map(|service| self.compute_v_target(service, &def))
-            .filter(|(_, gate_ok, _)| *gate_ok);
-        if ready.is_none() {
+            .and_then(|service| self.static_receipts(service, def));
+        let ready = self.services.get(&svc).is_some_and(|service| {
+            service
+                .vars
+                .get(&def)
+                .is_some_and(|state| state.sources.is_some())
+                && !service.pending_source_updates.contains(&def)
+        }) && receipts
+            .as_ref()
+            .is_some_and(|receipts| self.check_receipts(receipts.values()).1);
+        if !ready {
             if let Some(changed) = self.recompute_component((svc, def)).await {
                 return changed;
             }
         }
-        let (curr_svc, expr) = match self
+        let Some(expr) = self
             .services
             .get(&svc)
-            .and_then(|service| service.defs.get(&def).map(|expr| (service, expr)))
-        {
-            Some(input) => input,
-            None => {
-                log::warn!(
-                    "recompute_def: def '{}' not found in service '{}'",
-                    self.interner.get(def),
-                    self.interner.get(svc)
-                );
-                return Vec::new();
-            }
+            .and_then(|service| service.defs.get(&def))
+            .cloned()
+        else {
+            log::warn!(
+                "recompute_def: def '{}' not found in service '{}'",
+                self.interner.get(def),
+                self.interner.get(svc)
+            );
+            return Vec::new();
         };
-        let (v_target, gate_ok, sources) =
-            ready.unwrap_or_else(|| self.compute_v_target(curr_svc, &def));
+        let Some(receipts) = receipts else {
+            return Vec::new();
+        };
+        match self.evaluate_checked((svc, def), &expr, receipts).await {
+            Ok(Some((value, clock, sources))) => self
+                .install_recomputed((svc, def), value, clock, sources)
+                .then_some((svc, def))
+                .into_iter()
+                .collect(),
+            Ok(None) => Vec::new(),
+            Err(EvalError::InputNotReady(input)) => {
+                // A local input was followed already
+                if !self.services.contains_key(&input.0) {
+                    self.follow_input((svc, def), input).await;
+                }
+                Vec::new()
+            }
+            Err(e) => {
+                log::warn!(
+                    "propagation of def '{}' failed: {}",
+                    self.interner.get(def),
+                    e
+                );
+                Vec::new()
+            }
+        }
+    }
 
-        let changed = if gate_ok {
-            let expr = expr.clone();
-            let env: Vec<(Symbol, Value)> = curr_svc
-                .vars
-                .iter()
-                .map(|(k, v)| (*k, v.value.clone()))
-                .collect();
-            let cache = curr_svc
-                .dep_cache
-                .get(&def)
-                // Evaluation uses the values paired with the checked clocks.
-                .map(|m| {
-                    m.iter()
-                        .filter_map(|(k, (v, clock, _))| clock.as_ref().map(|_| (*k, v.clone())))
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            // A remote read can process an Update and re-enter recompute_def.
-            // Preserve the cache of the suspended outer evaluation.
-            let outer_cache = self.reactive_cache.take();
-            self.reactive_cache = Some(cache);
-
-            let result = eval(
-                &expr,
-                &env,
-                &mut EvalContext {
-                    manager: self,
-                    service_name: svc,
-                    txn: None,
-                },
-            )
-            .await;
-
-            // Restore on success and error. If propagation becomes cancellable,
-            // this must also handle a dropped evaluation future.
-            self.reactive_cache = outer_cache;
-
-            let value = match result {
-                Ok(v) => v,
+    /// The first of `defs`, introduced by a committed code update, that has no
+    /// value yet. Each is evaluated against its paired inputs as propagation
+    /// would, so one whose inputs are all paired installs its first value or
+    /// reports why its evaluation fails; one that lacks an input keeps
+    /// waiting for propagation to deliver it
+    pub async fn first_values(
+        &mut self,
+        defs: &[(Symbol, Symbol)],
+    ) -> Result<Option<(Symbol, Symbol)>, EvalError> {
+        for &(svc, def) in defs {
+            let Some(service) = self.services.get(&svc) else {
+                return Ok(Some((svc, def)));
+            };
+            if service.vars.contains_key(&def) {
+                continue;
+            }
+            let (Some(expr), Some(receipts)) = (
+                service.defs.get(&def).cloned(),
+                self.static_receipts(service, def),
+            ) else {
+                return Ok(Some((svc, def)));
+            };
+            match self.evaluate_checked((svc, def), &expr, receipts).await {
+                Ok(Some((value, clock, sources))) => {
+                    self.install_recomputed((svc, def), value, clock, sources);
+                    self.propagate(svc, def).await;
+                }
+                Ok(None) | Err(EvalError::InputNotReady(_)) => return Ok(Some((svc, def))),
                 Err(e) => {
-                    log::warn!(
-                        "propagation of def '{}' failed: {}",
+                    return Err(EvalError::RuntimeError(format!(
+                        "Update committed, but '{}.{}' cannot be initialized: {}",
+                        self.interner.get(svc),
                         self.interner.get(def),
                         e
-                    );
-                    return Vec::new();
+                    )))
                 }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Drive the network until each of `defs` has a value (see
+    /// `first_values`), within a nominal budget of the reply timeout of
+    /// `send_and_await_reply`. Only the pauses between steps count against it,
+    /// so requests served meanwhile can make the wait last longer.
+    /// Meanwhile requests are answered as the CLI server loop answers them, so
+    /// waiting loses none, including one the awaited input itself depends on
+    pub async fn await_first_values(&mut self, defs: &[(Symbol, Symbol)]) -> Result<(), EvalError> {
+        // Counted in the steps of the wasm branch of `send_and_await_reply`
+        let mut remaining_ms: i64 = 15_000;
+        loop {
+            let Some(waiting) = self.first_values(defs).await? else {
+                return Ok(());
             };
-            self.install_recomputed((svc, def), value, v_target, sources)
-        } else {
-            false
-        };
-        changed.then_some((svc, def)).into_iter().collect()
+            if remaining_ms <= 0 {
+                return Err(self.uninitialized(waiting));
+            }
+            self.dispatch_events(true).await;
+            self.wake_freed().await;
+            // The CLI server loop's keepalive for requests parked on locks
+            if remaining_ms % 5_000 == 0 {
+                for (request_id, reply_to) in self.parked_keepalive_targets() {
+                    let keepalive = MeerkatMessage::WaitParked { request_id };
+                    self.send_oneway(Address::new(&reply_to), keepalive).await;
+                }
+            }
+            pause(10).await;
+            remaining_ms -= 10;
+        }
+    }
+
+    /// The failure of a committed code update whose new `def` has no value yet
+    pub fn uninitialized(&self, (svc, def): (Symbol, Symbol)) -> EvalError {
+        EvalError::RuntimeError(format!(
+            "Update committed, but '{}.{}' has not received consistent inputs yet",
+            self.interner.get(svc),
+            self.interner.get(def)
+        ))
     }
 
     /// #24: fire-and-forget send (no reply awaited).
@@ -1846,6 +1994,12 @@ impl Manager {
     /// Drain all pending network events and dispatch each to the matching
     /// oneshot channel in pending_replies. Non-matching events are dropped.
     pub async fn dispatch_network_events(&mut self) {
+        self.dispatch_events(false).await
+    }
+
+    /// `dispatch_network_events`; with `serve`, also answer the requests the
+    /// CLI server loop answers instead of dropping them (`serve_request`)
+    async fn dispatch_events(&mut self, serve: bool) {
         // Scope the network borrow to just the receive (via the inner match) so
         // the rest of the loop body can take &mut self for the reactive handlers.
         while let Some(event) = match self.network.as_mut() {
@@ -1963,6 +2117,16 @@ impl Manager {
                             self.send_oneway(Address::new(&target_addr), reply_msg)
                                 .await;
                         }
+                    }
+                    msg @ (MeerkatMessage::LookupRequest { .. }
+                    | MeerkatMessage::ActionRequest { .. }
+                    | MeerkatMessage::Commit { .. }
+                    | MeerkatMessage::Abort { .. }
+                    | MeerkatMessage::LockRequest { .. }
+                    | MeerkatMessage::ServiceCodeRequest { .. })
+                        if serve =>
+                    {
+                        Box::pin(self.serve_request(msg)).await;
                     }
                     MeerkatMessage::LockRequest {
                         request_id,
@@ -2626,6 +2790,414 @@ impl Manager {
                 "Unexpected reply to action request".to_string(),
             )),
         }
+    }
+
+    /// Run a participant request (initial dispatch or a woken waiter), then wake
+    /// whatever is parked on locks it released
+    pub async fn run_and_reply_or_park(&mut self, parked: ParkedRequest) {
+        self.dispatch_parked(parked).await;
+        self.wake_freed().await;
+    }
+
+    /// Run a participant request and either send its reply, or, if the requesting
+    /// transaction is older than a current lock holder (wait-die), park it on the
+    /// contended variable's queue to be re-run when that lock frees.
+    async fn dispatch_parked(&mut self, parked: ParkedRequest) {
+        match parked {
+            ParkedRequest::Action {
+                request_id,
+                reply_to,
+                service,
+                stmts,
+                env,
+                tid,
+            } => {
+                match self
+                    .execute_action_participant(service, &stmts, &env, tid.clone())
+                    .await
+                {
+                    Err(EvalError::WaitOn(key)) => {
+                        self.park_request_key(
+                            key,
+                            ParkedRequest::Action {
+                                request_id,
+                                reply_to,
+                                service,
+                                stmts,
+                                env,
+                                tid,
+                            },
+                        );
+                    }
+                    other => {
+                        // What the transaction has read and written through this
+                        // node so far, for the originator's commit stamp
+                        let (history, writes) = match &other {
+                            Ok(()) => {
+                                let (v_base, write_set) =
+                                    self.transaction_history(&self.pending_txns[&tid]);
+                                (
+                                    codec::encode_clock(&v_base, &self.interner),
+                                    codec::encode_sources(&write_set, &self.interner),
+                                )
+                            }
+                            Err(_) => (Vec::new(), Vec::new()),
+                        };
+                        let response = MeerkatMessage::ActionResponse {
+                            request_id,
+                            success: other.is_ok(),
+                            error: other.err().map(|e| e.to_string()),
+                            history,
+                            writes,
+                        };
+                        self.send_oneway(Address::new(&reply_to), response).await;
+                    }
+                }
+            }
+            ParkedRequest::Lookup {
+                request_id,
+                reply_to,
+                service,
+                member,
+                tid,
+            } => {
+                match self
+                    .remote_read_participant(service, member, tid.clone())
+                    .await
+                {
+                    Err(EvalError::WaitOn(key)) => {
+                        self.park_request_key(
+                            key,
+                            ParkedRequest::Lookup {
+                                request_id,
+                                reply_to,
+                                service,
+                                member,
+                                tid,
+                            },
+                        );
+                    }
+                    Ok((val, clock, sources)) => {
+                        let response = match codec::encode_value(&val, &self.interner) {
+                            Ok(enc_val) => MeerkatMessage::LookupResponse {
+                                request_id,
+                                value: enc_val,
+                                clock: clock
+                                    .as_ref()
+                                    .map(|clock| codec::encode_clock(clock, &self.interner)),
+                                sources: sources
+                                    .as_ref()
+                                    .map(|sources| codec::encode_sources(sources, &self.interner)),
+                            },
+                            Err(e) => MeerkatMessage::LookupError {
+                                request_id,
+                                error: e.to_string(),
+                            },
+                        };
+                        self.send_oneway(Address::new(&reply_to), response).await;
+                    }
+                    Err(e) => {
+                        let response = MeerkatMessage::LookupError {
+                            request_id,
+                            error: e.to_string(),
+                        };
+                        self.send_oneway(Address::new(&reply_to), response).await;
+                    }
+                }
+            }
+            // Re-dispatch a previously parked LockRequest message.
+            // Attempts lock acquisition again under the transaction.
+            ParkedRequest::Lock {
+                request_id,
+                reply_to,
+                txn_id,
+                services,
+            } => {
+                match self
+                    .handle_lock_request(txn_id.clone(), services.clone())
+                    .await
+                {
+                    // Defensive check: If lock acquisition is blocked
+                    // again (e.g., by an older transaction), park the
+                    // request in the queue to await future release.
+                    Err(EvalError::WaitOn(key)) => {
+                        self.park_request_key(
+                            key,
+                            ParkedRequest::Lock {
+                                request_id,
+                                reply_to,
+                                txn_id,
+                                services,
+                            },
+                        );
+                    }
+                    // Terminal outcome: Lock request either succeeded
+                    // completely or aborted (died under wait-die). Send
+                    // the result back to the originator.
+                    other => {
+                        let response = MeerkatMessage::LockResponse {
+                            request_id,
+                            txn_id,
+                            success: other.is_ok(),
+                            error: other.err().map(|e| e.to_string()),
+                        };
+                        self.send_oneway(Address::new(&reply_to), response).await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Re-dispatch the requests parked on locks released since the last call
+    /// (`Manager::take_freed_awaiting_wake`), oldest first
+    pub async fn wake_freed(&mut self) {
+        let freed = self.take_freed_awaiting_wake();
+        for parked in self.take_ready_waiters(&freed) {
+            // Boxed: this and `run_and_reply_or_park` are mutually recursive
+            Box::pin(self.run_and_reply_or_park(parked)).await;
+        }
+    }
+
+    /// Serve a request a node answers itself: a lookup, an action, a
+    /// participant's commit or abort, a lock request, or a request for a file
+    /// in `served_base_dir`. Shared by the CLI server loop and by the wait for
+    /// a code update's first values, which must not drop them
+    /// (`await_first_values`). Returns any other message
+    pub async fn serve_request(&mut self, msg: MeerkatMessage) -> Option<MeerkatMessage> {
+        match msg {
+            // #39: a client requests a .mkt file by path, resolved safely
+            // against the served directory
+            MeerkatMessage::ServiceCodeRequest {
+                request_id,
+                path,
+                reply_to,
+            } if self.served_base_dir.is_some() => {
+                let response = self.served_base_dir.as_deref().map(|base_dir| {
+                    codec::serve_service_code(request_id, path, &reply_to, base_dir)
+                });
+                if let Some(response) = response {
+                    self.send_oneway(Address::new(&reply_to), response).await;
+                }
+            }
+            MeerkatMessage::LookupRequest {
+                request_id,
+                service,
+                member,
+                reply_to,
+                txn_id,
+            } => {
+                if let Err(e) = codec::validate_lookup_request(&service, &member) {
+                    let response = MeerkatMessage::LookupError {
+                        request_id,
+                        error: e.to_string(),
+                    };
+                    self.send_oneway(Address::new(&reply_to), response).await;
+                    return None;
+                }
+                let svc_sym = self.interner.insert(&service);
+                let mem_sym = self.interner.insert(&member);
+                match txn_id {
+                    // Transactional read: park if older than a holder
+                    Some(tid) => {
+                        self.run_and_reply_or_park(ParkedRequest::Lookup {
+                            request_id,
+                            reply_to,
+                            service: svc_sym,
+                            member: mem_sym,
+                            tid,
+                        })
+                        .await;
+                    }
+                    // Plain unlocked read: reply immediately
+                    None => {
+                        let result = self.lookup_with_clock(mem_sym, svc_sym, None).await;
+                        let response = match result {
+                            Ok((val, clock, sources)) => {
+                                match codec::encode_value(&val, &self.interner) {
+                                    Ok(enc_val) => MeerkatMessage::LookupResponse {
+                                        request_id,
+                                        value: enc_val,
+                                        clock: clock.as_ref().map(|clock| {
+                                            codec::encode_clock(clock, &self.interner)
+                                        }),
+                                        sources: sources.as_ref().map(|sources| {
+                                            codec::encode_sources(sources, &self.interner)
+                                        }),
+                                    },
+                                    Err(e) => MeerkatMessage::LookupError {
+                                        request_id,
+                                        error: e.to_string(),
+                                    },
+                                }
+                            }
+                            Err(e) => MeerkatMessage::LookupError {
+                                request_id,
+                                error: e.to_string(),
+                            },
+                        };
+                        self.send_oneway(Address::new(&reply_to), response).await;
+                    }
+                }
+            }
+            MeerkatMessage::ActionRequest {
+                request_id,
+                service,
+                stmts,
+                env: action_env,
+                reply_to,
+                txn_id,
+            } => {
+                if let Err(e) = codec::validate_action_request(&service) {
+                    let response = MeerkatMessage::ActionResponse {
+                        request_id,
+                        success: false,
+                        error: Some(e.to_string()),
+                        history: Vec::new(),
+                        writes: Vec::new(),
+                    };
+                    self.send_oneway(Address::new(&reply_to), response).await;
+                    return None;
+                }
+                let svc_sym = self.interner.insert(&service);
+                let mut local_stmts = Vec::new();
+                let mut decode_failed = false;
+                let mut error_msg = None;
+                for s in stmts {
+                    match codec::decode_action_stmt(s, &mut self.interner) {
+                        Ok(ds) => local_stmts.push(ds),
+                        Err(e) => {
+                            decode_failed = true;
+                            error_msg = Some(e.to_string());
+                            break;
+                        }
+                    }
+                }
+                let mut local_env = Vec::new();
+                if !decode_failed {
+                    for (k, v) in action_env {
+                        match codec::decode_value(v, &mut self.interner) {
+                            Ok(dv) => local_env.push((self.interner.insert(&k), dv)),
+                            Err(e) => {
+                                decode_failed = true;
+                                error_msg = Some(e.to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+                if decode_failed {
+                    let response = MeerkatMessage::ActionResponse {
+                        request_id,
+                        success: false,
+                        error: error_msg,
+                        history: Vec::new(),
+                        writes: Vec::new(),
+                    };
+                    self.send_oneway(Address::new(&reply_to), response).await;
+                    return None;
+                }
+                match txn_id {
+                    // Part of a distributed transaction: park if older
+                    // than a holder, otherwise reply
+                    Some(tid) => {
+                        self.run_and_reply_or_park(ParkedRequest::Action {
+                            request_id,
+                            reply_to,
+                            service: svc_sym,
+                            stmts: local_stmts,
+                            env: local_env,
+                            tid,
+                        })
+                        .await;
+                    }
+                    // Standalone: commit immediately and reply
+                    None => {
+                        let result = self
+                            .execute_action_with_env(svc_sym, &local_stmts, &local_env)
+                            .await;
+                        let response = MeerkatMessage::ActionResponse {
+                            request_id,
+                            success: result.is_ok(),
+                            error: result.err().map(|e| e.to_string()),
+                            history: Vec::new(),
+                            writes: Vec::new(),
+                        };
+                        self.send_oneway(Address::new(&reply_to), response).await;
+                    }
+                }
+            }
+            MeerkatMessage::Commit {
+                request_id,
+                txn_id,
+                reply_to,
+                clock,
+            } => {
+                // An undecodable clock commits nothing: the transaction
+                // stays held, as if this `Commit` had never arrived
+                let result = match codec::clock_entry_to_vclock(clock, &mut self.interner) {
+                    Ok(clock) => self.commit_participant(&txn_id, &clock).await,
+                    Err(e) => Err(EvalError::LocalDispatchFailed(e.to_string())),
+                };
+                let response = MeerkatMessage::CommitResponse {
+                    request_id,
+                    success: result.is_ok(),
+                    error: result.err().map(|e| e.to_string()),
+                };
+                self.send_oneway(Address::new(&reply_to), response).await;
+                // Wake transactions that were waiting on locks this
+                // commit just released, even if forwarding it failed.
+                self.wake_freed().await;
+            }
+            MeerkatMessage::Abort {
+                request_id,
+                txn_id,
+                reply_to,
+            } => {
+                self.abort_participant(&txn_id).await;
+                // Drop this transaction's own parked requests so they
+                // do not later wake for an abandoned transaction.
+                self.purge_parked_txn(&txn_id);
+                self.send_oneway(
+                    Address::new(&reply_to),
+                    MeerkatMessage::AbortResponse { request_id },
+                )
+                .await;
+                // Wake transactions that were waiting on locks this
+                // abort just released.
+                self.wake_freed().await;
+            }
+            // Incoming LockRequest from a remote originator node.
+            // Wraps the request as a `ParkedRequest::Lock` and
+            // dispatches it: if locks are free they are acquired
+            // immediately; if blocked, the request parks on the
+            // wait queue and is retried when locks are released.
+            MeerkatMessage::LockRequest {
+                request_id,
+                txn_id,
+                services,
+                reply_to,
+            } => {
+                if let Err(e) = codec::validate_lock_request(&services) {
+                    let response = MeerkatMessage::LockResponse {
+                        request_id,
+                        txn_id,
+                        success: false,
+                        error: Some(e.to_string()),
+                    };
+                    self.send_oneway(Address::new(&reply_to), response).await;
+                    return None;
+                }
+                self.run_and_reply_or_park(ParkedRequest::Lock {
+                    request_id,
+                    reply_to,
+                    txn_id,
+                    services,
+                })
+                .await;
+            }
+            other => return Some(other),
+        }
+        None
     }
 
     /// Resolve an in-scope service name to its global `ServiceNetId`
@@ -3962,14 +4534,12 @@ mod tests {
         assert_eq!(result, Value::Int { val: 5 });
     }
 
-    /// Recomputing a def must restore whatever reactive cache was already
-    /// active, not clear it.
+    /// Recomputing a def must leave the inputs of an evaluation already in
+    /// progress as they were.
     ///
-    /// Evaluation can await a remote read, and `send_and_await_reply` pumps
-    /// network events while it waits, so an inbound `Update` re-enters
-    /// `recompute_def` through `handle_update` in the middle of an outer
-    /// recompute. Clearing the cache on the way out would leave the suspended
-    /// outer evaluation resolving member accesses against nothing.
+    /// A checked evaluation reads members only from the fixed, private map of
+    /// paired inputs it was given, so a recompute nested in the middle of an
+    /// outer one cannot change what the outer evaluation goes on to read.
     #[tokio::test]
     async fn test_recompute_def_restores_an_active_reactive_cache() {
         let mut tc = TestContext::new();
@@ -3996,19 +4566,38 @@ mod tests {
         ];
         tc.manager.create_service(tc.foo, decls).await.unwrap();
 
-        // Stand in for an outer recompute suspended at an await with its own
-        // cross-service deps installed.
-        let outer: HashMap<(Symbol, Symbol), Value> = [((tc.s1, tc.w), Value::Int { val: 7 })]
-            .into_iter()
-            .collect();
-        tc.manager.reactive_cache = Some(outer.clone());
+        // Stand in for an outer recompute with its own cross-service dep
+        // among its fixed inputs.
+        let outer: HashMap<(Symbol, Symbol), Option<Value>> =
+            [((tc.s1, tc.w), Some(Value::Int { val: 7 }))]
+                .into_iter()
+                .collect();
+        let read_w = Expr::MemberAccess {
+            service_name: tc.s1,
+            member_name: tc.w,
+        };
+        let read = async |manager: &mut Manager| {
+            super::super::interpreter::evaluator::eval_with_inputs(
+                &read_w,
+                &[],
+                &mut EvalContext {
+                    manager,
+                    service_name: tc.foo,
+                    txn: None,
+                },
+                Some(&outer),
+            )
+            .await
+            .unwrap()
+        };
+        let before = read(&mut tc.manager).await;
 
         tc.manager.recompute_def(tc.foo, tc.y).await;
 
         assert_eq!(
-            tc.manager.reactive_cache,
-            Some(outer),
-            "a nested recompute must hand the outer cache back untouched"
+            (before, read(&mut tc.manager).await),
+            (Value::Int { val: 7 }, Value::Int { val: 7 }),
+            "a nested recompute must leave the outer inputs untouched"
         );
     }
 

@@ -82,13 +82,19 @@ pub async fn eval(
     eval_with_inputs(expr, env, ctx, None).await
 }
 
+/// A member read is answered by `inputs` alone when they are given: a checked
+/// evaluation must not read anything it did not receive as a paired input.
 async fn lookup_input(
     input: (Symbol, Symbol),
     ctx: &mut EvalContext<'_>,
     inputs: Option<&HashMap<(Symbol, Symbol), Option<Value>>>,
 ) -> Result<Value, EvalError> {
-    if let Some(value) = inputs.and_then(|inputs| inputs.get(&input)) {
-        return value.clone().ok_or(EvalError::InputNotReady(input));
+    if let Some(inputs) = inputs {
+        return inputs
+            .get(&input)
+            .cloned()
+            .flatten()
+            .ok_or(EvalError::InputNotReady(input));
     }
     ctx.manager
         .lookup(input.1, input.0, ctx.txn.as_deref_mut())

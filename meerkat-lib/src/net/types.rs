@@ -155,6 +155,12 @@ pub enum MeerkatMessage {
         request_id: u64,
         success: bool,
         error: Option<String>,
+        /// Inside a transaction, the clocks of everything the participant and
+        /// the nodes it composed onto have read or overwritten in it so far.
+        /// Empty outside a transaction
+        history: Vec<ClockEntry>,
+        /// The vars they have written, as `(service, member)`
+        writes: Vec<(String, String)>,
     },
 
     /// Tell a participant node to commit a distributed transaction:
@@ -164,6 +170,9 @@ pub enum MeerkatMessage {
         request_id: u64,
         txn_id: TxnId,
         reply_to: String,
+        /// The clock every write of the transaction is stamped with, on
+        /// every node
+        clock: Vec<ClockEntry>,
     },
 
     /// Acknowledgement that a `Commit` was applied (or failed) on a

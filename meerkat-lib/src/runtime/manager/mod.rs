@@ -172,6 +172,23 @@ pub(super) fn join_clocks<'a>(clocks: impl IntoIterator<Item = &'a VClock>) -> V
     joined
 }
 
+/// Whether an input's `clock` has reached `target` on every dimension its
+/// value depends on (§5.3). Unknown `sources` depend on all of them
+fn caught_up(target: &VClock, clock: &VClock, sources: Option<&Sources>) -> bool {
+    target.iter().all(|(dim, &counter)| {
+        sources.is_some_and(|sources| !sources.contains(dim))
+            || clock.get(dim).copied().unwrap_or(0) >= counter
+    })
+}
+
+/// §5.2's `V_new`: the joined history `v_base` advanced once in each written var
+fn advance(mut v_base: VClock, write_set: &HashSet<(Symbol, Symbol)>) -> VClock {
+    for &var in write_set {
+        *v_base.entry(var).or_insert(0) += 1;
+    }
+    v_base
+}
+
 impl Manager {
     pub fn new(interner: Interner) -> Self {
         Manager {
@@ -1094,22 +1111,48 @@ impl Manager {
         read_clock: VClock,
         write_set: &HashSet<(Symbol, Symbol)>,
     ) {
-        let mut v_base = join_clocks(
+        let v_base = join_clocks(
             std::iter::once(&read_clock).chain(
                 write_set
                     .iter()
                     .filter_map(|(svc, var)| self.get_clock(svc, var)),
             ),
         );
-        // increment if they're in the write_set
-        for (svc, var) in write_set {
-            *v_base.entry((*svc, *var)).or_insert(0) += 1;
-        }
+        let v_new = advance(v_base, write_set);
         for (svc, var) in write_set {
             if let Some(vs) = self.services.get_mut(svc).and_then(|s| s.vars.get_mut(var)) {
-                vs.vector_clock = v_base.clone(); // write the new base vector clock back to everything in the write set
+                vs.vector_clock = v_new.clone(); // write the new base vector clock back to everything in the write set
             }
         }
+    }
+
+    /// §5.2's `V_base` and `W` for everything `txn` has done so far, on this
+    /// node and on the participants that replied to it: the clocks of the
+    /// snapshots it read and the prior clocks of the vars it overwrote, and
+    /// those vars
+    ///
+    /// Reads are taken from the snapshots the transaction recorded, not the
+    /// current state, which may have moved on since
+    pub fn transaction_history(&self, txn: &Transaction) -> (VClock, HashSet<(Symbol, Symbol)>) {
+        let local_writes: Vec<_> = txn
+            .written
+            .keys()
+            .filter_map(|(sid, var)| self.service_name_for_net_id(sid).map(|n| (n, *var)))
+            .collect();
+        let v_base = join_clocks(
+            txn.read_cache
+                .values()
+                .filter_map(|(_, clock, _)| clock.as_ref())
+                .chain(
+                    local_writes
+                        .iter()
+                        .filter_map(|(svc, var)| self.get_clock(svc, var)),
+                )
+                .chain([&txn.participant_history]),
+        );
+        let mut write_set = txn.participant_writes.clone();
+        write_set.extend(local_writes);
+        (v_base, write_set)
     }
 
     /// Mark affected defs after all updated graphs are installed. A blocked def
@@ -1264,14 +1307,9 @@ impl Manager {
         inputs: &[(&VClock, Option<Cow<'_, Sources>>)],
     ) -> (VClock, bool, Option<Sources>) {
         let v_target = join_clocks(inputs.iter().map(|(clock, _)| *clock));
-        let gate_ok = inputs.iter().all(|(clock, sources)| {
-            v_target.iter().all(|(dim, &target)| {
-                sources
-                    .as_ref()
-                    .is_some_and(|sources| !sources.contains(dim))
-                    || clock.get(dim).copied().unwrap_or(0) >= target
-            })
-        });
+        let gate_ok = inputs
+            .iter()
+            .all(|(clock, sources)| caught_up(&v_target, clock, sources.as_deref()));
         let sources = gate_ok
             .then(|| {
                 inputs
@@ -2352,6 +2390,13 @@ impl Manager {
                     .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?;
                 let entry = (value, clock, sources);
                 if let Some(txn) = txn {
+                    // A node that only serves reads never answers an action,
+                    // so what it read reaches the commit stamp only through
+                    // here. Only the clock is kept: the value is fetched again
+                    // on every read
+                    if let Some(clock) = &entry.1 {
+                        txn.participant_history = join_clocks([&txn.participant_history, clock]);
+                    }
                     if txn.observed_reads.is_some() {
                         let key = (self.service_net_id_for_name(service), member);
                         txn.read_cache.insert(key, entry.clone());
@@ -2429,7 +2474,7 @@ impl Manager {
         service_net_id: &ServiceNetId,
         stmts: Vec<ActionStmt>,
         env: Vec<(Symbol, Value)>,
-        txn: Option<&mut Transaction>,
+        mut txn: Option<&mut Transaction>,
     ) -> Result<(), EvalError> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT_ACTION_ID: AtomicU64 = AtomicU64::new(1);
@@ -2454,7 +2499,7 @@ impl Manager {
         // the remote never received the request, the `Abort` it gets is a
         // harmless no-op
         if shared_tid.is_some() {
-            if let Some(t) = txn {
+            if let Some(t) = txn.as_deref_mut() {
                 t.participants.insert(addr.clone());
             }
         }
@@ -2494,9 +2539,24 @@ impl Manager {
             .await?;
 
         match reply {
-            MeerkatMessage::ActionResponse { success, error, .. } => {
+            MeerkatMessage::ActionResponse {
+                success,
+                error,
+                history,
+                writes,
+                ..
+            } => {
                 if success {
-                    // Participant already registered above; nothing more to do.
+                    // Participant already registered above. Keep what it
+                    // reports it read and wrote for the commit stamp
+                    if let Some(txn) = txn {
+                        let history = codec::clock_entry_to_vclock(history, &mut self.interner)
+                            .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?;
+                        let writes = codec::decode_sources(writes, &mut self.interner)
+                            .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?;
+                        txn.participant_history = join_clocks([&txn.participant_history, &history]);
+                        txn.participant_writes.extend(writes);
+                    }
                     Ok(())
                 } else {
                     Err(Self::remote_error(
@@ -2900,29 +2960,35 @@ impl Manager {
     /// Propagation is best-effort and runs even when a participant failed:
     /// the writes are stored, so the transaction has committed here and there
     /// is no way back
+    ///
+    /// Every write, here and on every participant, is stamped with the one
+    /// `V_new` of §5.2, computed from what the participants reported
     async fn commit_txn(&mut self, txn: &Transaction) -> Option<EvalError> {
+        let (v_base, write_set) = self.transaction_history(txn);
+        self.commit_stamped(txn, &advance(v_base, &write_set)).await
+    }
+
+    /// Store `txn`'s writes on this node with `clock`, the transaction's
+    /// `V_new`, commit its participants with the same clock, then propagate
+    ///
+    /// `clock` records what the transaction saw of other owners. A cached
+    /// remote input behind it would hold back every def that pairs it with
+    /// these writes, so its owner is asked for its current value again. The
+    /// owner's own `Update` usually arrives as well, possibly after the
+    /// `CommitResponse`; the request covers one that will not, because it was
+    /// overtaken by an older one or lost
+    async fn commit_stamped(&mut self, txn: &Transaction, clock: &VClock) -> Option<EvalError> {
         for ((sid, var), value) in &txn.written {
             if let Some(service) = self.service_by_net_id_mut(sid) {
                 if let Some(var_state) = service.vars.get_mut(var) {
                     var_state.value = value.clone();
                     var_state.latest_write_txn = Some(txn.id.clone());
+                    var_state.vector_clock = clock.clone();
                 }
             }
         }
-
-        // before we propagate, need to apply simultaneous bump
-        let write_set: HashSet<(Symbol, Symbol)> = txn
-            .written
-            .keys()
-            .filter_map(|(sid, var)| self.service_name_for_net_id(sid).map(|n| (n, *var)))
-            .collect();
-        let read_clock = join_clocks(txn.read_cache.keys().filter_map(|(sid, var)| {
-            self.service_name_for_net_id(sid)
-                .and_then(|name| self.get_clock(&name, var))
-        }));
-        self.simultaneous_bump(read_clock, &write_set);
-        let error = self.commit_participants(txn).await;
-        for (listener, def, owner, member) in self.forget_participant_deps(txn) {
+        let error = self.commit_participants(txn, clock).await;
+        for (listener, def, owner, member) in self.inputs_behind(clock) {
             self.subscribe_remote(owner, member, listener, def).await;
         }
         for (sid, var) in txn.written.keys() {
@@ -2933,58 +2999,44 @@ impl Manager {
         error
     }
 
-    /// Send `Commit` to every participant of `txn`, returning the first
-    /// failure in the set's iteration order, which is arbitrary
+    /// The cached remote inputs, as `(listener, def, owner, member)`, whose
+    /// clocks have not reached `clock` on a dimension their value depends on
+    fn inputs_behind(&self, clock: &VClock) -> Vec<(ServiceNetId, Symbol, Symbol, Symbol)> {
+        let mut behind = Vec::new();
+        for service in self.services.values() {
+            for (def, cache) in &service.dep_cache {
+                for (&(owner, member), (_, cached, sources)) in cache {
+                    if cached
+                        .as_ref()
+                        .is_some_and(|cached| !caught_up(clock, cached, sources.as_ref()))
+                    {
+                        behind.push((service.id.clone(), *def, owner, member));
+                    }
+                }
+            }
+        }
+        behind
+    }
+
+    /// Send `Commit`, carrying the transaction's `clock`, to every participant
+    /// of `txn`, returning the first failure in the set's iteration order,
+    /// which is arbitrary
     ///
     /// Does not stop at a failure, or the later participants are left
     /// prepared and holding locks
-    pub(crate) async fn commit_participants(&mut self, txn: &Transaction) -> Option<EvalError> {
+    pub(crate) async fn commit_participants(
+        &mut self,
+        txn: &Transaction,
+        clock: &VClock,
+    ) -> Option<EvalError> {
         let mut first_error = None;
         for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
-            if let Err(e) = self.send_commit(addr.clone(), &txn.id).await {
+            if let Err(e) = self.send_commit(addr.clone(), &txn.id, clock).await {
                 log::warn!("participant {} failed to commit: {}", addr.0, e);
                 first_error.get_or_insert(e);
             }
         }
         first_error
-    }
-
-    /// Invalidate cached values owned by a transaction's participants,
-    /// returning each invalidated `(listener, def, owner, member)`.
-    ///
-    /// `dep_cache` holds whatever the last `Update` delivered, and a
-    /// participant's `Update` for this commit can arrive after its
-    /// `CommitResponse`. Recomputing from the cache would then pair this node's
-    /// new writes with the participant's old values. Without a clock the gate
-    /// waits; Sources remain available for already computed local values.
-    /// The caller subscribes again for the participant's current value and clock.
-    fn forget_participant_deps(
-        &mut self,
-        txn: &Transaction,
-    ) -> Vec<(ServiceNetId, Symbol, Symbol, Symbol)> {
-        let mut forgotten = Vec::new();
-        if txn.participants.is_empty() {
-            return forgotten;
-        }
-        let owned_by_participants: HashSet<Symbol> = self
-            .remote_services
-            .keys()
-            .copied()
-            .filter(|svc| {
-                self.remote_addr(*svc)
-                    .is_ok_and(|addr| txn.participants.contains(&addr))
-            })
-            .collect();
-        for service in self.services.values_mut() {
-            for (def, cache) in service.dep_cache.iter_mut() {
-                for (&(owner, member), (_, clock, _)) in cache.iter_mut() {
-                    if owned_by_participants.contains(&owner) && clock.take().is_some() {
-                        forgotten.push((service.id.clone(), *def, owner, member));
-                    }
-                }
-            }
-        }
-        forgotten
     }
 
     /// Participant side: execute a composed action under a shared transaction
@@ -3019,16 +3071,21 @@ impl Manager {
         Ok(())
     }
 
-    /// Participant side: apply and release a held transaction on `Commit`
+    /// Participant side: apply and release a held transaction on `Commit`,
+    /// stamping its writes with the originator's `clock`
     ///
     /// An error is a failure forwarding the commit to a node below. The local
     /// commit is done either way, and the freed keys reach the server loop
     /// through `freed_awaiting_wake`, so they are woken on that path too
-    pub async fn commit_participant(&mut self, tid: &TxnId) -> Result<(), EvalError> {
+    pub async fn commit_participant(
+        &mut self,
+        tid: &TxnId,
+        clock: &VClock,
+    ) -> Result<(), EvalError> {
         let Some(txn) = self.pending_txns.remove(tid) else {
             return Ok(());
         };
-        let forward_error = self.commit_txn(&txn).await;
+        let forward_error = self.commit_stamped(&txn, clock).await;
         // Held until here, like the originator holds its own. Today the
         // event loop is blocked for the whole of this call, so an earlier
         // release would be harmless. That stops being true under #28's
@@ -3381,6 +3438,7 @@ impl Manager {
         &mut self,
         addr: Address,
         tid: &TxnId,
+        clock: &VClock,
     ) -> Result<(), EvalError> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT_COMMIT_ID: AtomicU64 = AtomicU64::new(1);
@@ -3390,6 +3448,7 @@ impl Manager {
             request_id,
             txn_id: tid.clone(),
             reply_to,
+            clock: codec::encode_clock(clock, &self.interner),
         };
         let reply = self
             .send_and_await_reply(
@@ -6249,7 +6308,11 @@ mod tests {
         tc.manager.park_request_key(key.clone(), second);
 
         // The server loop commits, then wakes what the queue reports.
-        tc.manager.commit_participant(&holder).await.unwrap();
+        let clock = HashMap::from([((tc.foo, tc.x), 1)]);
+        tc.manager
+            .commit_participant(&holder, &clock)
+            .await
+            .unwrap();
         let freed = tc.manager.take_freed_awaiting_wake();
         assert!(freed.contains(&key), "the commit released `x`");
 

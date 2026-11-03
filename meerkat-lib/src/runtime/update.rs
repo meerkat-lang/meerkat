@@ -18,7 +18,7 @@ use crate::runtime::manager::{join_clocks, Manager};
 use crate::runtime::nameres;
 use crate::runtime::tt::check::{self as tt};
 use crate::runtime::tt::types::ServiceType;
-use crate::runtime::txn::{Transaction as LockTxn, TxnId, VarLock};
+use crate::runtime::txn::{Transaction as LockTxn, TxnId, VClock, VarLock};
 use std::collections::{HashMap, HashSet};
 
 /// The current execution state of an atomic update transaction
@@ -400,8 +400,11 @@ impl Transaction {
                         }
                     }
                 }
+                // Only releases the participants' locks: they buffered no
+                // writes to stamp, and the vars this update changed were
+                // stamped in `commit`
                 if let Some(lock_txn) = &self.lock_txn {
-                    let _ = manager.commit_participants(lock_txn).await;
+                    let _ = manager.commit_participants(lock_txn, &VClock::new()).await;
                 }
                 self.release_lock_txn(manager);
 

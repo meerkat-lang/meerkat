@@ -280,6 +280,12 @@ pub struct Transaction {
     /// Remote nodes that joined this transaction (executed a composed action
     /// under this `id` and are holding locks or buffered writes until commit or abort)
     pub participants: HashSet<Address>,
+    /// What the participants reported in their replies: the clocks of what
+    /// they read and of the vars they overwrote. Joined into the one clock
+    /// every write of the transaction is stamped with
+    pub(crate) participant_history: VClock,
+    /// The vars the participants wrote, from the same replies
+    pub(crate) participant_writes: HashSet<(Symbol, Symbol)>,
 }
 
 impl Transaction {
@@ -293,6 +299,8 @@ impl Transaction {
             observed_reads: None,
             written: HashMap::new(),
             participants: HashSet::new(),
+            participant_history: VClock::new(),
+            participant_writes: HashSet::new(),
         }
     }
 }

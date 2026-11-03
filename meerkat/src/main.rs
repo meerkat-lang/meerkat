@@ -354,10 +354,25 @@ async fn dispatch_parked(manager: &mut Manager, parked: ParkedRequest) {
                     );
                 }
                 other => {
+                    // What the transaction has read and written through this
+                    // node so far, for the originator's commit stamp
+                    let (history, writes) = match &other {
+                        Ok(()) => {
+                            let (v_base, write_set) =
+                                manager.transaction_history(&manager.pending_txns[&tid]);
+                            (
+                                codec::encode_clock(&v_base, &manager.interner),
+                                codec::encode_sources(&write_set, &manager.interner),
+                            )
+                        }
+                        Err(_) => (Vec::new(), Vec::new()),
+                    };
                     let response = MeerkatMessage::ActionResponse {
                         request_id,
                         success: other.is_ok(),
                         error: other.err().map(|e| e.to_string()),
+                        history,
+                        writes,
                     };
                     if let Some(net) = manager.network.as_mut() {
                         send_net_msg(net, &reply_to, response).await;
@@ -820,6 +835,8 @@ async fn run_server(
                             request_id,
                             success: false,
                             error: Some(e.to_string()),
+                            history: Vec::new(),
+                            writes: Vec::new(),
                         };
                         if let Some(net) = manager.network.as_mut() {
                             send_net_msg(net, &reply_to, response).await;
@@ -858,6 +875,8 @@ async fn run_server(
                             request_id,
                             success: false,
                             error: error_msg,
+                            history: Vec::new(),
+                            writes: Vec::new(),
                         };
                         if let Some(net) = manager.network.as_mut() {
                             send_net_msg(net, &reply_to, response).await;
@@ -890,6 +909,8 @@ async fn run_server(
                                 request_id,
                                 success: result.is_ok(),
                                 error: result.err().map(|e| e.to_string()),
+                                history: Vec::new(),
+                                writes: Vec::new(),
                             };
                             if let Some(net) = manager.network.as_mut() {
                                 send_net_msg(net, &reply_to, response).await;
@@ -901,8 +922,14 @@ async fn run_server(
                     request_id,
                     txn_id,
                     reply_to,
+                    clock,
                 } => {
-                    let result = manager.commit_participant(&txn_id).await;
+                    // An undecodable clock commits nothing: the transaction
+                    // stays held, as if this `Commit` had never arrived
+                    let result = match codec::clock_entry_to_vclock(clock, &mut manager.interner) {
+                        Ok(clock) => manager.commit_participant(&txn_id, &clock).await,
+                        Err(e) => Err(EvalError::LocalDispatchFailed(e.to_string())),
+                    };
                     let response = MeerkatMessage::CommitResponse {
                         request_id,
                         success: result.is_ok(),
@@ -1542,10 +1569,12 @@ async fn run_lock_test_client(
                      transaction on F to wake older lock request..."
                 );
                 if let Ok(mut temp_net) = NetworkActor::new(NodeType::Server).await {
+                    // The conflict transaction only holds a lock: nothing to stamp
                     let msg = MeerkatMessage::Commit {
                         request_id: 99,
                         txn_id: conflict_txn_id_clone,
                         reply_to: reply_to_addr,
+                        clock: Vec::new(),
                     };
                     let _ = temp_net
                         .handle_command(NetworkCommand::SendMessage {

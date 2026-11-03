@@ -13,8 +13,8 @@
 //! been told to commit, which is exactly what a real participant does. That
 //! makes the ordering directly observable instead of timing-dependent.
 //!
-//! `mid` reads `rc.gc` from the `Update`s it subscribed to. A commit drops the
-//! one it holds, `rc` having taken part, and subscribes again; the stand-in
+//! `mid` reads `rc.gc` from the `Update`s it subscribed to. The commit's clock
+//! shows the one it holds is behind, so it subscribes again; the stand-in
 //! pushes nothing on its own, so `mid` sees the new value only through that.
 
 use meerkat_lib::net::ast::NetValue;
@@ -86,7 +86,7 @@ async fn middle_node(net: NetworkActor, rc_net: &mut NetworkActor, rc_addr: &Add
     m.subscribe_remote(rc, gc, mid_id, mid_view).await;
     tokio::select! {
         biased;
-        _ = await_gc_update(&mut m) => {}
+        _ = await_gc_update(&mut m, 1) => {}
         _ = serve_rc(rc_net) => unreachable!("the stand-in for rc runs forever"),
     }
     assert_eq!(
@@ -117,23 +117,16 @@ async fn reply(net: &mut NetworkActor, reply_to: &str, msg: MeerkatMessage) {
 
 /// Stand in for `rc`: accept a composed action, and serve reads of and
 /// subscriptions to `gc` as a real participant would -- the old committed value
-/// (1) until `Commit` arrives, the new one (11) after. The commit advances the
-/// clock of the source var `cv` from zero to one. Runs forever.
+/// (1) until `Commit` arrives, the new one (11) after, stamped with the clock
+/// the `Commit` carries. The action it accepts writes the source var `cv`,
+/// whose clock was zero. Runs forever.
 async fn serve_rc(rc_net: &mut NetworkActor) {
-    let mut committed = false;
+    let mut committed: Option<Vec<ClockEntry>> = None;
     loop {
         let value = NetValue::Int {
-            val: if committed { 11 } else { 1 },
+            val: if committed.is_some() { 11 } else { 1 },
         };
-        let clock = if committed {
-            vec![ClockEntry {
-                service: "rc".to_string(),
-                member: "cv".to_string(),
-                counter: 1,
-            }]
-        } else {
-            Vec::new()
-        };
+        let clock = committed.clone().unwrap_or_default();
         match rc_net.event_rx.try_recv() {
             Ok(NetworkEvent::MessageReceived { msg, .. }) => match msg {
                 MeerkatMessage::LookupRequest {
@@ -175,15 +168,18 @@ async fn serve_rc(rc_net: &mut NetworkActor) {
                         request_id,
                         success: true,
                         error: None,
+                        history: Vec::new(),
+                        writes: vec![("rc".into(), "cv".into())],
                     };
                     reply(rc_net, &reply_to, msg).await;
                 }
                 MeerkatMessage::Commit {
                     request_id,
                     reply_to,
+                    clock,
                     ..
                 } => {
-                    committed = true;
+                    committed = Some(clock);
                     let msg = MeerkatMessage::CommitResponse {
                         request_id,
                         success: true,
@@ -199,13 +195,14 @@ async fn serve_rc(rc_net: &mut NetworkActor) {
     }
 }
 
-/// Handle incoming messages until `mid` holds an `Update` of `rc.gc`
-async fn await_gc_update(m: &mut Manager) {
+/// Handle incoming messages until `mid` holds an `Update` of `rc.gc` with
+/// value `val`. The one it held before stays until then
+async fn await_gc_update(m: &mut Manager, val: i32) {
     let [mid, mid_view, rc, gc] = ["mid", "mid_view", "rc", "gc"].map(|n| m.interner.insert(n));
     let cached = |m: &Manager| {
         let deps = m.services[&mid].dep_cache.get(&mid_view);
         deps.and_then(|deps| deps.get(&(rc, gc)))
-            .is_some_and(|entry| entry.1.is_some())
+            .is_some_and(|entry| entry.0 == Value::Int { val } && entry.1.is_some())
     };
     let pump = async {
         while !cached(m) {
@@ -230,19 +227,21 @@ fn assert_committed_and_recomputed(m: &mut Manager) {
         Value::Int { val: 1 },
         "mid's own write must be committed"
     );
+    let commit_clock = HashMap::from([((mid, mv), 1), ((rc, cv), 1)]);
     assert_eq!(
-        m.services[&mid].vars[&mv].vector_clock,
-        HashMap::from([((mid, mv), 1)]),
-        "mid's own write advances its source clock"
+        m.services[&mid].vars[&mv].vector_clock, commit_clock,
+        "mid's own write is stamped with the transaction's one clock, which \
+         advances the source clock of both writes (section 5.2)"
     );
     assert_eq!(
         m.services[&mid].dep_cache[&mid_view][&(rc, gc)],
         (
             Value::Int { val: 11 },
-            Some(HashMap::from([((rc, cv), 1)])),
+            Some(commit_clock),
             Some(HashSet::from([(rc, cv)]))
         ),
-        "the refreshed cache preserves rc.gc's committed value and source clock"
+        "the refreshed cache preserves rc.gc's committed value and the clock \
+         rc's write was stamped with"
     );
     assert_eq!(
         m.services[&mid].vars[&mid_view].value,
@@ -275,6 +274,8 @@ async fn test_participant_commits_sub_participants_before_propagating() {
 async fn commit_as_participant(m: &mut Manager, rc_net: &mut NetworkActor, rc_addr: &Address) {
     let mid = m.interner.insert("mid");
     let mv = m.interner.insert("mv");
+    let rc = m.interner.insert("rc");
+    let cv = m.interner.insert("cv");
     let tid = TxnId {
         timestamp: 1,
         node_id: 7,
@@ -285,12 +286,14 @@ async fn commit_as_participant(m: &mut Manager, rc_net: &mut NetworkActor, rc_ad
         .insert((m.service_net_id_for_name(mid), mv), Value::Int { val: 1 });
     txn.participants.insert(rc_addr.clone());
     m.pending_txns.insert(tid.clone(), txn);
+    // What the originator commits with: both writes, neither with any history
+    let clock = HashMap::from([((mid, mv), 1), ((rc, cv), 1)]);
 
     let committed = tokio::select! {
         biased;
         c = async {
-            let c = m.commit_participant(&tid).await;
-            await_gc_update(m).await;
+            let c = m.commit_participant(&tid, &clock).await;
+            await_gc_update(m, 11).await;
             c
         } => c,
         _ = serve_rc(rc_net) => unreachable!("the stand-in for rc runs forever"),
@@ -372,7 +375,7 @@ async fn test_originator_commits_participants_before_propagating() {
         biased;
         r = async {
             let r = m.execute_action(mid, &stmts).await;
-            await_gc_update(&mut m).await;
+            await_gc_update(&mut m, 11).await;
             r
         } => r,
         _ = serve_rc(&mut rc_net) => unreachable!("the stand-in for rc runs forever"),

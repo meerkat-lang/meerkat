@@ -18,6 +18,7 @@ use crate::net::{
     codec, Address, MessageId, NetworkActor, NetworkCommand, NetworkEvent, NetworkReply, NodeType,
 };
 use crate::runtime::ast::{apply_updates_to_ast, Stmt};
+use crate::runtime::graphs::effects;
 use crate::runtime::imports::Imports;
 use crate::runtime::interner::Interner;
 use crate::runtime::limits::{IMPORT_POLL_INTERVAL_MS, IMPORT_RETRY_DELAY_MS};
@@ -606,6 +607,7 @@ impl Node {
             let mut local_services = Env::new(None);
             tt::check(&self.unified_ast, &mut local_services)
                 .map_err(|e| self.format_tt_error(e))?;
+            effects::check(&self.unified_ast).map_err(|e| self.format_dependency_error(e))?;
             self.local_services = local_services;
 
             return Ok(());
@@ -615,6 +617,7 @@ impl Node {
         nameres::resolve(&service_ast).map_err(|e| self.format_nameres_error(e))?;
         let mut initial_services = Env::new(None);
         tt::check(&service_ast, &mut initial_services).map_err(|e| self.format_tt_error(e))?;
+        effects::check(&service_ast).map_err(|e| self.format_dependency_error(e))?;
 
         let last_batch = update_batches.pop().unwrap();
 
@@ -630,6 +633,7 @@ impl Node {
             nameres::resolve(&service_ast).map_err(|e| self.format_nameres_error(e))?;
             let mut step_services = Env::new(None);
             tt::check(&service_ast, &mut step_services).map_err(|e| self.format_tt_error(e))?;
+            effects::check(&service_ast).map_err(|e| self.format_dependency_error(e))?;
         }
 
         // Process final atomic transaction batch
@@ -646,6 +650,7 @@ impl Node {
         nameres::resolve(&final_ast).map_err(|e| self.format_nameres_error(e))?;
         let mut final_services = Env::new(None);
         tt::check(&final_ast, &mut final_services).map_err(|e| self.format_tt_error(e))?;
+        effects::check(&final_ast).map_err(|e| self.format_dependency_error(e))?;
         self.local_services = final_services;
         // Validate future updates without installing their declarations.
         // The runtime transaction installs each update only after evaluation.
@@ -710,13 +715,6 @@ impl Node {
                     service_str, member_str
                 ))
             }
-            tt::check::Error::IllegalDependency(member) => {
-                let member_str = self.interner.get(member);
-                Error::Message(format!(
-                    "type check error: illegal eager forward reference or dependency cycle on '{}'",
-                    member_str
-                ))
-            }
             tt::check::Error::UnboundVariable(s) => {
                 let var_str = self.interner.get(s);
                 Error::Message(format!(
@@ -747,6 +745,28 @@ impl Node {
             tt::check::Error::NotAFunction => {
                 Error::Message("type check error: not a function.".to_string())
             }
+        }
+    }
+
+    /// Format a dependency error into a user-facing error message,
+    /// resolving interned symbol identifiers to string representations
+    ///
+    /// Args:
+    ///     `err` (`effects::Error`): The dependency error to format
+    ///
+    /// Returns:
+    ///     `Error`: The formatted Error::Message
+    fn format_dependency_error(&self, err: effects::Error) -> Error {
+        match err {
+            effects::Error::Cycle { service, member } => Error::Message(format!(
+                "type check error: dependency cycle detected at service '{}', member '{}'.",
+                self.interner.get(service),
+                self.interner.get(member)
+            )),
+            effects::Error::ForwardReference(member) => Error::Message(format!(
+                "type check error: illegal eager forward reference or dependency cycle on '{}'",
+                self.interner.get(member)
+            )),
         }
     }
 

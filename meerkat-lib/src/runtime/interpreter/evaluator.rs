@@ -87,13 +87,12 @@ pub async fn eval(
 async fn lookup_input(
     input: (Symbol, Symbol),
     ctx: &mut EvalContext<'_>,
-    inputs: Option<&HashMap<(Symbol, Symbol), Option<Value>>>,
+    inputs: Option<&HashMap<(Symbol, Symbol), Value>>,
 ) -> Result<Value, EvalError> {
     if let Some(inputs) = inputs {
         return inputs
             .get(&input)
             .cloned()
-            .flatten()
             .ok_or(EvalError::InputNotReady(input));
     }
     ctx.manager
@@ -108,7 +107,7 @@ pub(crate) async fn eval_with_inputs(
     expr: &Expr,
     env: &[(Symbol, Value)],
     ctx: &mut EvalContext<'_>,
-    inputs: Option<&HashMap<(Symbol, Symbol), Option<Value>>>,
+    inputs: Option<&HashMap<(Symbol, Symbol), Value>>,
 ) -> Result<Value, EvalError> {
     match expr {
         Expr::Literal { val } => Ok(val.clone()),

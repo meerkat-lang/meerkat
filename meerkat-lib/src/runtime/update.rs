@@ -8,10 +8,7 @@
 use crate::net::LockGroup;
 use crate::runtime::ast::{apply_updates_to_ast, Decl, Expr, Stmt, Value};
 use crate::runtime::env::Env;
-use crate::runtime::graphs::{
-    analysis::{declaration_graphs, service_declarations},
-    ServiceGraphs,
-};
+use crate::runtime::graphs::{analysis::service_declarations, effects};
 use crate::runtime::interner::{Interner, Symbol};
 use crate::runtime::interpreter::evaluator::{eval, EvalContext, EvalError};
 use crate::runtime::manager::Manager;
@@ -39,7 +36,6 @@ pub struct Transaction {
     ast: Vec<Stmt>,
     types: Env<'static, ServiceType>,
     values: HashMap<(Symbol, Symbol), Value>,
-    deps: HashMap<Symbol, ServiceGraphs>,
     lock_txn: Option<LockTxn>,
 }
 
@@ -58,7 +54,6 @@ impl Transaction {
             ast: Vec::new(),
             types: Env::new(None),
             values: HashMap::new(),
-            deps: HashMap::new(),
             lock_txn: None,
         }
     }
@@ -78,7 +73,6 @@ impl Transaction {
             ast: Vec::new(),
             types: Env::new(None),
             values: HashMap::new(),
-            deps: HashMap::new(),
             lock_txn: Some(LockTxn::new(txn_id)),
         }
     }
@@ -256,12 +250,6 @@ impl Transaction {
                                 manager.interner.get(*member)
                             )
                         }
-                        tt::Error::IllegalDependency(member) => {
-                            format!(
-                                "illegal eager forward reference or dependency cycle on '{}'",
-                                manager.interner.get(*member)
-                            )
-                        }
                         tt::Error::TypeMismatch { expected, found } => {
                             format!("type mismatch: expected {}, found {}", expected, found)
                         }
@@ -269,6 +257,24 @@ impl Transaction {
                         | tt::Error::DepthLimitExceeded
                         | tt::Error::InvalidTupleArity
                         | tt::Error::NotAFunction => format!("{}", e),
+                    };
+                    return Err(EvalError::RuntimeError(format!(
+                        "Type check failed on update: {}",
+                        msg
+                    )));
+                }
+                if let Err(e) = effects::check(&self.ast) {
+                    self.release_lock_txn(manager);
+                    let msg = match e {
+                        effects::Error::Cycle { service, member } => format!(
+                            "dependency cycle detected at service '{}', member '{}'",
+                            manager.interner.get(service),
+                            manager.interner.get(member)
+                        ),
+                        effects::Error::ForwardReference(member) => format!(
+                            "illegal eager forward reference or dependency cycle on '{}'",
+                            manager.interner.get(member)
+                        ),
                     };
                     return Err(EvalError::RuntimeError(format!(
                         "Type check failed on update: {}",
@@ -320,17 +326,6 @@ impl Transaction {
                     }
                 }
 
-                // Evaluation can dispatch other code updates. Include declarations
-                // this full AST install restores, so retained graphs still match it.
-                let installed = service_declarations(manager.unified_ast());
-                let mut targets = HashSet::new();
-                update_targets(&self.updates, &mut targets);
-                self.deps = declaration_graphs(&self.ast, |name, stmt| {
-                    targets.contains(&name)
-                        || (!manager.services.contains_key(&name)
-                            && installed.get(&name).copied() != Some(stmt))
-                });
-
                 let introduced = self.unvalued_defs(manager);
                 self.state = TransactionState::Evaluated;
                 self.commit(manager);
@@ -350,26 +345,16 @@ impl Transaction {
                 let updated_svc_names: HashSet<_> =
                     updated_services.iter().map(|(name, _)| **name).collect();
 
+                // Graphs follow the installed declarations everywhere: a def in
+                // another service reads differently once a function it calls changes
+                manager.refresh_graphs().await;
                 for updated_svc_name in updated_svc_names {
-                    if let Some(dep) = self.deps.remove(&updated_svc_name) {
-                        manager.update_service_graphs(updated_svc_name, dep).await;
-                        if let Some(service) = manager.services.get_mut(&updated_svc_name) {
-                            service.service_lock = None;
-                        }
+                    if let Some(service) = manager.services.get_mut(&updated_svc_name) {
+                        service.service_lock = None;
                     }
                 }
 
                 let mut remote_failure = None;
-                let updated_members = updated_services
-                    .iter()
-                    .flat_map(|(svc, decls)| {
-                        decls.iter().filter_map(move |decl| match decl {
-                            Decl::DefDecl { name, .. } => Some((**svc, *name)),
-                            Decl::VarDecl { .. } | Decl::TableDecl { .. } => None,
-                        })
-                    })
-                    .collect();
-                manager.mark_source_updates(updated_members);
 
                 for (svc_name, decls) in updated_services {
                     if manager.services.contains_key(svc_name) {
@@ -546,28 +531,7 @@ impl Transaction {
                     .collect();
             }
         }
-        manager.install_analyzed_ast(std::mem::take(&mut self.ast), &mut self.deps);
-    }
-}
-
-/// Services whose declarations `updates` replace, including inside `atomic`
-/// blocks, as `apply_updates_to_ast` applies them.
-fn update_targets(updates: &[Stmt], targets: &mut HashSet<Symbol>) {
-    for stmt in updates {
-        match stmt {
-            Stmt::Service { name, .. }
-            | Stmt::Update {
-                service_name: name, ..
-            } => {
-                targets.insert(*name);
-            }
-            Stmt::Atomic { updates } => update_targets(updates, targets),
-            Stmt::ActionStmt(_)
-            | Stmt::Connect { .. }
-            | Stmt::Import { .. }
-            | Stmt::Test { .. }
-            | Stmt::Watch { .. } => {}
-        }
+        manager.install_unified_ast(std::mem::take(&mut self.ast));
     }
 }
 

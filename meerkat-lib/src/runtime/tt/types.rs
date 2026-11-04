@@ -5,11 +5,7 @@
 
 use crate::runtime::interner::Symbol;
 use crate::runtime::Env;
-use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
-
-/// A set of symbols representing latent dependencies of a function body
-pub type DepSet = HashSet<Symbol>;
 
 /// Represents a type in the Meerkat language
 ///
@@ -22,7 +18,7 @@ pub enum Type {
     Bool,
     Unit,
     Tuple(TupleType),
-    Func(Box<Type>, Box<Type>, DepSet),
+    Func(Box<Type>, Box<Type>),
     List(Box<Type>),
     UnresolvedService(Symbol),
 }
@@ -35,7 +31,7 @@ impl PartialEq for Type {
             (Type::Bool, Type::Bool) => true,
             (Type::Unit, Type::Unit) => true,
             (Type::Tuple(a), Type::Tuple(b)) => a == b,
-            (Type::Func(p1, r1, _), Type::Func(p2, r2, _)) => p1 == p2 && r1 == r2,
+            (Type::Func(p1, r1), Type::Func(p2, r2)) => p1 == p2 && r1 == r2,
             (Type::List(a), Type::List(b)) => a == b,
             (Type::UnresolvedService(a), Type::UnresolvedService(b)) => a == b,
             _ => false,
@@ -51,10 +47,9 @@ impl Hash for Type {
         core::mem::discriminant(self).hash(state);
         match self {
             Type::Tuple(t) => t.hash(state),
-            Type::Func(p, r, _) => {
+            Type::Func(p, r) => {
                 p.hash(state);
                 r.hash(state);
-                // DepSet is explicitly ignored
             }
             Type::List(t) => t.hash(state),
             Type::UnresolvedService(s) => s.hash(state),
@@ -290,7 +285,7 @@ impl std::fmt::Display for Type {
             Type::Bool => write!(f, "bool"),
             Type::Unit => write!(f, "unit"),
             Type::Tuple(ts) => write!(f, "{}", ts),
-            Type::Func(t1, t2, _) => {
+            Type::Func(t1, t2) => {
                 // Determine if the left-hand side is a function type
                 // to preserve right-associativity during formatting
                 match t1.as_ref() {
@@ -347,77 +342,43 @@ mod tests {
     fn test_nested_type_formatting() {
         // case 1: (int -> bool) -> string
         let ty1 = Type::Func(
-            Box::new(Type::Func(
-                Box::new(Type::Int),
-                Box::new(Type::Bool),
-                std::collections::HashSet::new(),
-            )),
+            Box::new(Type::Func(Box::new(Type::Int), Box::new(Type::Bool))),
             Box::new(Type::String),
-            std::collections::HashSet::new(),
         );
         assert_eq!(ty1.to_string(), "(int -> bool) -> string");
 
         // case 2: int -> bool -> string (which is int -> (bool -> string))
         let ty2 = Type::Func(
             Box::new(Type::Int),
-            Box::new(Type::Func(
-                Box::new(Type::Bool),
-                Box::new(Type::String),
-                std::collections::HashSet::new(),
-            )),
-            std::collections::HashSet::new(),
+            Box::new(Type::Func(Box::new(Type::Bool), Box::new(Type::String))),
         );
         assert_eq!(ty2.to_string(), "int -> bool -> string");
 
         // case 3: ((int -> string) -> bool) -> unit
         let ty3 = Type::Func(
             Box::new(Type::Func(
-                Box::new(Type::Func(
-                    Box::new(Type::Int),
-                    Box::new(Type::String),
-                    std::collections::HashSet::new(),
-                )),
+                Box::new(Type::Func(Box::new(Type::Int), Box::new(Type::String))),
                 Box::new(Type::Bool),
-                std::collections::HashSet::new(),
             )),
             Box::new(Type::Unit),
-            std::collections::HashSet::new(),
         );
         assert_eq!(ty3.to_string(), "((int -> string) -> bool) -> unit");
 
         // case 4: (int -> bool) -> (string -> unit)
         let ty4 = Type::Func(
-            Box::new(Type::Func(
-                Box::new(Type::Int),
-                Box::new(Type::Bool),
-                std::collections::HashSet::new(),
-            )),
-            Box::new(Type::Func(
-                Box::new(Type::String),
-                Box::new(Type::Unit),
-                std::collections::HashSet::new(),
-            )),
-            std::collections::HashSet::new(),
+            Box::new(Type::Func(Box::new(Type::Int), Box::new(Type::Bool))),
+            Box::new(Type::Func(Box::new(Type::String), Box::new(Type::Unit))),
         );
         assert_eq!(ty4.to_string(), "(int -> bool) -> string -> unit");
 
         // case 5: () -> int
-        let ty5 = Type::Func(
-            Box::new(Type::Unit),
-            Box::new(Type::Int),
-            std::collections::HashSet::new(),
-        );
+        let ty5 = Type::Func(Box::new(Type::Unit), Box::new(Type::Int));
         assert_eq!(ty5.to_string(), "() -> int");
 
         // case 6: (() -> int) -> bool
         let ty6 = Type::Func(
-            Box::new(Type::Func(
-                Box::new(Type::Unit),
-                Box::new(Type::Int),
-                std::collections::HashSet::new(),
-            )),
+            Box::new(Type::Func(Box::new(Type::Unit), Box::new(Type::Int))),
             Box::new(Type::Bool),
-            std::collections::HashSet::new(),
         );
         assert_eq!(ty6.to_string(), "(() -> int) -> bool");
 
@@ -427,7 +388,6 @@ mod tests {
                 TupleType::new(vec![Type::Unit, Type::Unit]).unwrap(),
             )),
             Box::new(Type::Int),
-            std::collections::HashSet::new(),
         );
         assert_eq!(ty7.to_string(), "(unit, unit) -> int");
     }

@@ -269,9 +269,6 @@ pub struct Transaction {
     /// Read snapshots keyed by (service, member). Local reads reuse the pair.
     /// Initialization also records remote pairs without skipping later RPCs.
     pub read_cache: HashMap<(ServiceNetId, Symbol), ReadEntry>,
-    /// Collect initialization inputs and enable remote read receipts during
-    /// initialization. Other transactions do not need it.
-    pub(crate) observed_reads: Option<HashSet<(Symbol, Symbol)>>,
     /// Values written by this transaction, keyed by (service, variable),
     /// buffered and applied only on successful commit (so a failed
     /// transaction leaves no partial writes)
@@ -319,7 +316,6 @@ impl Transaction {
             locked: HashSet::new(),
             service_locked: HashSet::new(),
             read_cache: HashMap::new(),
-            observed_reads: None,
             written: HashMap::new(),
             participants: HashSet::new(),
             participant_history: VClock::new(),

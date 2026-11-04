@@ -1,6 +1,6 @@
 use super::ast::{ActionStmt, Decl, Expr, Stmt, Value};
 use super::env::Env;
-use super::graphs::{analysis::declaration_graphs, free_var::cross_service_deps, ServiceGraphs};
+use super::graphs::{analysis::service_declarations, effects::Effects, ServiceGraphs};
 use super::interpreter::{eval, execute_seq, EvalContext, EvalError, WAIT_DIE_DISPLAY_PREFIX};
 use super::tt::types::ServiceType;
 use crate::net::ast::{NetActionStmt, NetValue};
@@ -13,7 +13,6 @@ use crate::runtime::interner::{Interner, Symbol};
 use crate::runtime::txn::{
     ComposedCall, ReadEntry, Sources, Transaction, TxnId, VClock, VarState, WaitKey,
 };
-use petgraph::{graphmap::DiGraphMap, visit::Dfs};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(not(target_arch = "wasm32"))]
@@ -87,9 +86,6 @@ pub struct Service {
     /// #24: cached values of each def's cross-service deps:
     /// def -> {(source service, member) -> (value, clock)}.
     pub dep_cache: DepCache,
-    /// Defs that must notify listeners after their next successful recomputation
-    /// because a committed code update may have changed their Sources.
-    pending_source_updates: HashSet<Symbol>,
     /// The transaction building this instance; no other reader may observe it.
     initializing: Option<TxnId>,
 
@@ -191,8 +187,6 @@ pub struct Manager {
     pub listener_addrs: HashMap<ServiceNetId, String>,
     /// Installed declarations and imports, excluding executable program statements
     unified_ast: Vec<Stmt>,
-    /// Graphs for installed declarations without a local service instance
-    declaration_graphs: HashMap<Symbol, ServiceGraphs>,
     /// Global local services type environment
     pub local_services: Env<'static, ServiceType>,
     /// Directory whose files a server answers code requests from (#39); None
@@ -260,50 +254,111 @@ impl Manager {
             interner,
             listener_addrs: HashMap::new(),
             unified_ast: Vec::new(),
-            declaration_graphs: HashMap::new(),
             local_services: Env::new(None),
             served_base_dir: None,
         }
     }
 
-    /// Install initial or imported declarations and retain their analyzed graphs.
-    /// Running services keep their graphs; code updates install those separately.
-    pub fn install_unified_ast(&mut self, ast: Vec<Stmt>) {
-        let mut graphs = declaration_graphs(&ast, |name, _| !self.services.contains_key(&name));
-        self.declaration_graphs.clear();
-        self.install_analyzed_ast(ast, &mut graphs);
-    }
-
-    /// Install committed declarations, moving only graphs without local instances.
-    /// Graphs of declarations left unchanged stay installed.
-    /// Leave local candidates for update_service_graphs and listener installation.
-    pub(crate) fn install_analyzed_ast(
-        &mut self,
-        mut ast: Vec<Stmt>,
-        graphs: &mut HashMap<Symbol, ServiceGraphs>,
-    ) {
-        // Node validates top-level statements against the final program state;
-        // the caller keeps them for execution. Updates check only current declarations.
+    /// Install declarations and imports. Node validates top-level statements
+    /// against the final program state; the caller keeps them for execution
+    pub fn install_unified_ast(&mut self, mut ast: Vec<Stmt>) {
         ast.retain(|stmt| {
             matches!(
                 stmt,
                 Stmt::Service { .. } | Stmt::Import { .. } | Stmt::Connect { .. }
             )
         });
-        self.declaration_graphs
-            .extend(ast.iter().filter_map(|stmt| match stmt {
-                Stmt::Service { name, .. } if !self.services.contains_key(name) => {
-                    graphs.remove(name).map(|graph| (*name, graph))
-                }
-                _ => None,
-            }));
         self.unified_ast = ast;
     }
 
     /// Installed declarations and imports. Change them through
-    /// `install_unified_ast` or a code update, which maintain their graphs.
+    /// `install_unified_ast` or a code update
     pub fn unified_ast(&self) -> &[Stmt] {
         &self.unified_ast
+    }
+
+    /// The dependency graphs of `services` as installed. A function a member
+    /// holds is analyzed in that code: a local var in its current value, and a
+    /// remote member in each version delivered to the defs here that read it,
+    /// or read by `read`, the transaction initializing one of them
+    fn service_graphs(
+        &self,
+        services: impl IntoIterator<Item = Symbol>,
+        read: Option<&Transaction>,
+    ) -> HashMap<Symbol, ServiceGraphs> {
+        fn publish<'a>(
+            published: &mut HashMap<(Symbol, Symbol), Vec<&'a Value>>,
+            member: (Symbol, Symbol),
+            value: &'a Value,
+        ) {
+            if matches!(value, Value::Closure { .. }) {
+                let versions = published.entry(member).or_default();
+                if !versions.contains(&value) {
+                    versions.push(value);
+                }
+            }
+        }
+        let mut published = HashMap::new();
+        let declarations = service_declarations(&self.unified_ast);
+        for (&name, stmt) in &declarations {
+            let (Stmt::Service { decls, .. }, Some(service)) = (stmt, self.services.get(&name))
+            else {
+                continue;
+            };
+            for decl in decls {
+                if let Decl::VarDecl { name: var, .. } = decl {
+                    if let Some(state) = service.vars.get(var) {
+                        publish(&mut published, (name, *var), &state.value);
+                    }
+                }
+            }
+        }
+        for service in self.services.values() {
+            for (def, cache) in &service.dep_cache {
+                let inputs = service.graphs.cross_deps.get(def);
+                for (member, (value, _, _)) in cache {
+                    if self.remote_services.contains_key(&member.0)
+                        && inputs.is_some_and(|inputs| inputs.contains(member))
+                    {
+                        publish(&mut published, *member, value);
+                    }
+                }
+            }
+        }
+        if let Some(txn) = read {
+            for &owner in self.remote_services.keys() {
+                let id = self.service_net_id_for_name(owner);
+                for ((sid, member), (value, _, _)) in &txn.read_cache {
+                    if *sid == id {
+                        publish(&mut published, (owner, *member), value);
+                    }
+                }
+            }
+        }
+        let mut effects = Effects::new(&self.unified_ast, published);
+        services
+            .into_iter()
+            .filter_map(|name| match declarations.get(&name) {
+                Some(Stmt::Service { decls, .. }) => Some((name, effects.graphs(name, decls))),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Rewire each running service whose graphs no longer match the installed
+    /// declarations or the remote code its defs call
+    pub(crate) async fn refresh_graphs(&mut self) {
+        let running = self
+            .services
+            .iter()
+            .filter(|(_, service)| service.initializing.is_none())
+            .map(|(&name, _)| name)
+            .collect::<Vec<_>>();
+        for (name, graphs) in self.service_graphs(running, None) {
+            if self.services[&name].graphs != graphs {
+                self.update_service_graphs(name, graphs).await;
+            }
+        }
     }
 
     /// Park a request on the wait queue for the contended `WaitKey`
@@ -474,8 +529,6 @@ impl Manager {
                 if !local.contains(name) && !self.remote_services.contains_key(name) =>
             {
                 if imported.contains_key(name) {
-                    // The cached graph may belong to this skipped declaration.
-                    self.declaration_graphs.remove(name);
                     false
                 } else {
                     imported.insert(*name, decls.clone());
@@ -484,10 +537,6 @@ impl Manager {
             }
             _ => true,
         });
-        let graphs = declaration_graphs(&self.unified_ast, |name, _| {
-            !self.services.contains_key(&name) && !self.declaration_graphs.contains_key(&name)
-        });
-        self.declaration_graphs.extend(graphs);
 
         // Run each import's statements in file order, as on a node of its own:
         // a service is built from the declaration kept above, and an update is
@@ -593,11 +642,8 @@ impl Manager {
         }
 
         let graphs = self
-            .declaration_graphs
+            .service_graphs([name], None)
             .remove(&name)
-            .or_else(|| {
-                declaration_graphs(&self.unified_ast, |service, _| service == name).remove(&name)
-            })
             .unwrap_or_default();
 
         // Earlier services may already depend on this not-yet-created owner.
@@ -628,7 +674,6 @@ impl Manager {
                 graphs,
                 listeners,
                 dep_cache: HashMap::new(),
-                pending_source_updates: HashSet::new(),
                 initializing: Some(txn.id.clone()),
                 service_lock: Some(txn.id.clone()),
             },
@@ -636,8 +681,6 @@ impl Manager {
 
         let mut env: Vec<(Symbol, Value)> = vec![];
         let svc_name = name;
-        // Inputs a def read beyond its static inputs, through a call
-        let mut activated = Vec::new();
 
         let result = async {
             for decl in decls {
@@ -652,8 +695,7 @@ impl Manager {
                 };
                 // Defs resolve service members through their transactional snapshots;
                 // variable initializers retain their existing declaration environment.
-                txn.observed_reads = is_def.then(HashSet::new);
-                let result = eval(
+                let value = eval(
                     &val,
                     if is_def { &[] } else { &env },
                     &mut EvalContext {
@@ -662,63 +704,32 @@ impl Manager {
                         txn: Some(&mut txn),
                     },
                 )
-                .await;
-                let reads = txn.observed_reads.take();
-                let value = result?;
+                .await?;
                 let mut var_value = VarState::new(value);
-                if let Some(reads) = reads {
-                    let Some(mut inputs) = reads
+                if is_def {
+                    // The functions this transaction read decide what the def
+                    // reads through the calls it makes
+                    let graphs = self
+                        .service_graphs([svc_name], Some(&txn))
+                        .remove(&svc_name)
+                        .unwrap_or_default();
+                    self.services.get_mut(&svc_name).unwrap().graphs = graphs;
+                    // A static input this transaction read keeps its snapshot
+                    // pair. A local one it did not read, such as one of a
+                    // branch it did not take, contributes its current state. A
+                    // remote one it did not read needs no RPC and leaves the
+                    // Sources unknown
+                    let inputs: Vec<_> = self.services[&svc_name]
+                        .graphs
+                        .inputs(svc_name, name)
+                        .collect();
+                    let receipts: Vec<_> = inputs
                         .iter()
-                        .map(|&input| {
-                            let key = (self.service_net_id_for_name(input.0), input.1);
-                            let (_, clock, sources) = txn.read_cache.get(&key)?;
-                            Some((clock.as_ref()?, sources.as_ref().map(Cow::Borrowed)))
+                        .filter_map(|&input| {
+                            self.input_receipt((svc_name, name), input, Some(&txn))
                         })
-                        .collect::<Option<Vec<_>>>()
-                    else {
-                        return Err(EvalError::RuntimeError(format!(
-                            "Cannot initialize '{}.{}': input histories are missing",
-                            self.interner.get(svc_name),
-                            self.interner.get(name),
-                        )));
-                    };
-                    // Keep available local inputs from unselected branches
-                    // in step with static Sources. Actual reads retain their
-                    // snapshot clocks; deferred remote inputs need no RPC. A
-                    // local def referenced before its own initialization has
-                    // no state yet, so its inputs stand in for it, as in Sources.
-                    let graphs = &self.services[&svc_name].graphs;
-                    let mut pending: Vec<_> = graphs.inputs(svc_name, name).collect();
-                    activated.extend(
-                        reads
-                            .iter()
-                            .filter(|input| !pending.contains(input))
-                            .map(|&input| (name, input)),
-                    );
-                    let mut seen = HashSet::new();
-                    while let Some(input) = pending.pop() {
-                        if reads.contains(&input)
-                            || self.remote_services.contains_key(&input.0)
-                            || !seen.insert(input)
-                        {
-                            continue;
-                        }
-                        match self
-                            .services
-                            .get(&input.0)
-                            .and_then(|service| service.vars.get(&input.1))
-                        {
-                            Some(state) => inputs.push((
-                                &state.vector_clock,
-                                self.sources(input.0, input.1, Some(&txn)),
-                            )),
-                            None if input.0 == svc_name && graphs.defs.contains(&input.1) => {
-                                pending.extend(graphs.inputs(svc_name, input.1))
-                            }
-                            None => {}
-                        }
-                    }
-                    let (vector_clock, gate_ok, _) = self.check_input_clocks(&inputs);
+                        .collect();
+                    let (vector_clock, gate_ok, sources) = self.check_receipts(&receipts);
                     if !gate_ok {
                         return Err(EvalError::RuntimeError(format!(
                             "Cannot initialize '{}.{}': input clocks are missing or inconsistent",
@@ -727,22 +738,7 @@ impl Manager {
                         )));
                     }
                     var_value.vector_clock = vector_clock;
-                    var_value.sources =
-                        self.sources(svc_name, name, Some(&txn))
-                            .and_then(|sources| {
-                                let mut sources = sources.into_owned();
-                                for &(owner, member) in &reads {
-                                    let key = (self.service_net_id_for_name(owner), member);
-                                    match txn.read_cache[&key].2.as_ref() {
-                                        Some(read_sources) => sources.extend(read_sources),
-                                        None if self.remote_services.contains_key(&owner) => {
-                                            return None
-                                        }
-                                        None => {}
-                                    }
-                                }
-                                Some(sources)
-                            });
+                    var_value.sources = sources.filter(|_| receipts.len() == inputs.len());
                 } else {
                     var_value.sources = Some(Sources::from([(svc_name, name)]));
                 }
@@ -757,13 +753,12 @@ impl Manager {
             }
 
             // The remote pairs initialization read stay each def's incorporated
-            // inputs, with their clocks, including those a call reached
+            // inputs, with their clocks, including those its calls reached
             let remote_inputs: Vec<_> = self.services[&svc_name]
                 .graphs
                 .cross_deps
                 .iter()
                 .flat_map(|(&def, inputs)| inputs.iter().map(move |&input| (def, input)))
-                .chain(activated.iter().copied())
                 .filter(|(_, (owner, _))| self.remote_services.contains_key(owner))
                 .filter_map(|(def, input)| {
                     let key = (self.service_net_id_for_name(input.0), input.1);
@@ -791,32 +786,6 @@ impl Manager {
                 self.services[&svc_name].listeners.keys().copied().collect();
             let graphs = std::mem::take(&mut self.services.get_mut(&svc_name).unwrap().graphs);
             self.update_service_graphs(svc_name, graphs).await;
-            // Their later changes must reach the def as its static inputs' do
-            for (def, input) in activated {
-                self.follow_input((svc_name, def), input).await;
-            }
-            let affected = self.services[&svc_name]
-                .listeners
-                .values()
-                .flatten()
-                .filter_map(|(listener, def)| {
-                    self.service_name_for_net_id(listener)
-                        .filter(|name| *name != svc_name)
-                        .map(|name| (name, *def))
-                })
-                .collect();
-            let pending = std::mem::take(
-                &mut self
-                    .services
-                    .get_mut(&svc_name)
-                    .unwrap()
-                    .pending_source_updates,
-            );
-            self.mark_source_updates(affected);
-            self.services
-                .get_mut(&svc_name)
-                .unwrap()
-                .pending_source_updates = pending;
             self.services.get_mut(&svc_name).unwrap().initializing = None;
             self.release_all_locks(&txn);
             for member in deferred_members {
@@ -827,15 +796,12 @@ impl Manager {
             for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
                 self.send_abort(addr, &txn.id).await;
             }
-            let failed_service = self.services.remove(&svc_name).unwrap();
+            self.services.remove(&svc_name);
+            // A failed local instance must not erase an existing import
             if inserted {
                 self.unified_ast.retain(
                     |stmt| !matches!(stmt, Stmt::Service { name, .. } if *name == svc_name),
                 );
-            } else {
-                // A failed local instance must not erase an existing import.
-                self.declaration_graphs
-                    .insert(svc_name, failed_service.graphs);
             }
             self.release_all_locks(&txn);
         }
@@ -866,32 +832,28 @@ impl Manager {
     /// Returns:
     ///     `()`
     pub async fn update_service_graphs(&mut self, svc_name: Symbol, new_graphs: ServiceGraphs) {
-        let (updated_id, old_edges, edges, defs) = match self.services.get_mut(&svc_name) {
+        let (updated_id, old_edges, edges) = match self.services.get_mut(&svc_name) {
             Some(service) => {
                 let old_edges: HashSet<_> = Self::listener_edges(svc_name, service).collect();
                 service.graphs = new_graphs;
                 let defs = &service.graphs.defs;
                 service.dep_cache.retain(|def, _| defs.contains(def));
-                service
-                    .pending_source_updates
-                    .retain(|def| defs.contains(def));
-                let edges: Vec<_> = Self::listener_edges(svc_name, service).collect();
-                (service.id.clone(), old_edges, edges, defs.clone())
+                let edges: HashSet<_> = Self::listener_edges(svc_name, service).collect();
+                (service.id.clone(), old_edges, edges)
             }
             None => return,
         };
 
-        // Keep runtime input registrations only while their listener is a def.
+        // The registrations of this service's defs are those its graphs imply;
+        // an input followed before stays followed
         for (&owner, service) in self.services.iter_mut() {
             for (&member, listener_set) in service.listeners.iter_mut() {
                 listener_set.retain(|(lid, def)| {
-                    *lid != updated_id
-                        || (defs.contains(def) && !old_edges.contains(&(owner, member, *def)))
+                    *lid != updated_id || edges.contains(&(owner, member, *def))
                 });
             }
         }
-
-        for (owner, member, listener_def) in edges {
+        for &(owner, member, listener_def) in edges.difference(&old_edges) {
             self.follow_input((svc_name, listener_def), (owner, member))
                 .await;
         }
@@ -953,9 +915,6 @@ impl Manager {
         service_name: Symbol,
         mut txn: Option<&mut Transaction>,
     ) -> Result<Value, EvalError> {
-        if let Some(reads) = txn.as_deref_mut().and_then(|t| t.observed_reads.as_mut()) {
-            reads.insert((service_name, var_name));
-        }
         // Check if service is remote
         if self.remote_services.contains_key(&service_name) {
             return self.remote_lookup(service_name, var_name, txn).await;
@@ -1092,8 +1051,11 @@ impl Manager {
         }
 
         // Non-transactional path: apply the write immediately and propagate.
+        let functions;
         if let Some(service) = self.services.get_mut(&service_name) {
             if let Some(var_state) = service.vars.get_mut(&var_name) {
+                functions = matches!(value, Value::Closure { .. })
+                    || matches!(var_state.value, Value::Closure { .. });
                 var_state.value = value;
                 self.simultaneous_bump(VClock::new(), &HashSet::from([(service_name, var_name)]));
             } else {
@@ -1112,6 +1074,9 @@ impl Manager {
             )));
         }
 
+        if functions {
+            self.refresh_graphs().await;
+        }
         // propagate: re-evaluate defs that depend on this var in topo order
         self.propagate(service_name, var_name).await;
         Ok(())
@@ -1122,77 +1087,6 @@ impl Manager {
         let svc = self.services.get(service_name)?;
         let vars = svc.vars.get(var)?;
         Some(&vars.vector_clock)
-    }
-
-    /// Traverse the initializing graph; completed inputs retain paired Sources.
-    fn sources(
-        &self,
-        svc: Symbol,
-        member: Symbol,
-        txn: Option<&Transaction>,
-    ) -> Option<Cow<'_, Sources>> {
-        let service = self.services.get(&svc)?;
-        self.ensure_service_visible(svc, txn.map(|txn| &txn.id))
-            .ok()?;
-        if !txn.is_some_and(|txn| service.initializing.as_ref() == Some(&txn.id)) {
-            return service
-                .vars
-                .get(&member)?
-                .sources
-                .as_ref()
-                .map(Cow::Borrowed);
-        }
-        let graphs = &service.graphs;
-        let mut sources = Sources::new();
-        let mut seen = HashSet::new();
-        let mut seen_external = HashSet::new();
-        let mut pending = vec![member];
-        while let Some(name) = pending.pop() {
-            if !seen.insert(name) {
-                continue;
-            }
-            if graphs.vars.contains(&name) {
-                sources.insert((svc, name));
-            } else if graphs.defs.contains(&name) {
-                pending.extend(
-                    graphs
-                        .reactive_graph
-                        .neighbors_directed(name, petgraph::Direction::Incoming),
-                );
-                for &input in graphs.cross_deps.get(&name).into_iter().flatten() {
-                    if self.remote_services.contains_key(&input.0) {
-                        let entry = txn
-                            .and_then(|txn| {
-                                txn.read_cache
-                                    .get(&(self.service_net_id_for_name(input.0), input.1))
-                            })
-                            .or_else(|| service.dep_cache.get(&name)?.get(&input))?;
-                        sources.extend(entry.2.as_ref()?);
-                    } else if input.0 == svc {
-                        pending.push(input.1);
-                    } else {
-                        if !seen_external.insert(input) {
-                            continue;
-                        }
-                        let owner = self.services.get(&input.0)?;
-                        self.ensure_service_visible(input.0, txn.map(|txn| &txn.id))
-                            .ok()?;
-                        let entry = txn.and_then(|txn| {
-                            txn.read_cache
-                                .get(&(self.service_net_id_for_name(input.0), input.1))
-                        });
-                        let snapshot = match entry {
-                            Some(entry) => entry.2.as_ref(),
-                            None => owner.vars.get(&input.1)?.sources.as_ref(),
-                        };
-                        sources.extend(snapshot?);
-                    }
-                }
-            } else {
-                return None;
-            }
-        }
-        Some(Cow::Owned(sources))
     }
 
     // helper function to apply a simultaneous bump, as described in section 5.2 of vector clock semantics
@@ -1245,44 +1139,6 @@ impl Manager {
         (v_base, write_set)
     }
 
-    /// Mark affected defs after all updated graphs are installed. A blocked def
-    /// keeps its notification until an input permits successful recomputation.
-    pub(crate) fn mark_source_updates(&mut self, members: Vec<(Symbol, Symbol)>) {
-        if members.is_empty() {
-            return;
-        }
-        // This temporary graph joins existing dependency edges across services,
-        // including imported declarations. It is built only for code updates.
-        let mut dependents = DiGraphMap::<(Symbol, Symbol), ()>::new();
-        for (&svc, graphs) in self
-            .services
-            .iter()
-            .map(|(name, service)| (name, &service.graphs))
-            .chain(self.declaration_graphs.iter())
-        {
-            // A var's initializer does not create a reactive dependency.
-            for &def in &graphs.defs {
-                dependents.add_node((svc, def));
-                for input in graphs.inputs(svc, def) {
-                    dependents.add_edge(input, (svc, def), ());
-                }
-            }
-        }
-        // Share visited state across roots; cycles and shared upstreams need
-        // only one pending notification per affected def.
-        let mut dfs = Dfs::empty(&dependents);
-        for member in members {
-            dfs.move_to(member);
-            while let Some((svc, def)) = dfs.next(&dependents) {
-                if let Some(service) = self.services.get_mut(&svc) {
-                    if service.defs.contains_key(&def) {
-                        service.pending_source_updates.insert(def);
-                    }
-                }
-            }
-        }
-    }
-
     pub(crate) async fn propagate(&mut self, service_name: Symbol, changed_var: Symbol) {
         // #24: event-driven reactivity over the listener graph. A change to a
         // member notifies its listeners. For each listener we resolve its
@@ -1321,28 +1177,36 @@ impl Manager {
         }
     }
 
-    /// The pair `def` would read for `input` now, if one is complete: its
-    /// own cached delivery of a cross-service member, else the state of a
-    /// visible local member. A remote member is never read live here
+    /// The pair `def` would read for `input` now: the pair `txn` read, else
+    /// its own cached delivery of a cross-service member, else the state of a
+    /// visible local member. A pair without a clock is returned as read; the
+    /// gate rejects it. A remote member is never read live here
     fn input_receipt(
         &self,
         (svc, def): (Symbol, Symbol),
         (owner, member): (Symbol, Symbol),
+        txn: Option<&Transaction>,
     ) -> Option<ReadEntry> {
-        self.ensure_service_visible(owner, None).ok()?;
-        let cached = (owner != svc)
-            .then(|| {
-                self.services
-                    .get(&svc)?
-                    .dep_cache
-                    .get(&def)?
-                    .get(&(owner, member))
+        self.ensure_service_visible(owner, txn.map(|txn| &txn.id))
+            .ok()?;
+        let cached = txn
+            .and_then(|txn| {
+                txn.read_cache
+                    .get(&(self.service_net_id_for_name(owner), member))
             })
-            .flatten();
+            .or_else(|| {
+                (owner != svc)
+                    .then(|| {
+                        self.services
+                            .get(&svc)?
+                            .dep_cache
+                            .get(&def)?
+                            .get(&(owner, member))
+                    })
+                    .flatten()
+            });
         match cached {
-            Some((value, clock, sources)) => clock
-                .as_ref()
-                .map(|clock| (value.clone(), Some(clock.clone()), sources.clone())),
+            Some(entry) => Some(entry.clone()),
             None if self.remote_services.contains_key(&owner) => None,
             None => {
                 let state = self.services.get(&owner)?.vars.get(&member)?;
@@ -1356,19 +1220,31 @@ impl Manager {
     }
 
     /// Pairs for every static input of `def`, including inputs of branches an
-    /// evaluation does not take, or None while one is missing
+    /// evaluation does not take, or None while one is missing. An input whose
+    /// owner runs neither here nor remotely can never arrive: it maps to None,
+    /// and leaves the def's Sources unknown, as during initialization
     fn static_receipts(
         &self,
         service: &Service,
         def: Symbol,
-    ) -> Option<HashMap<(Symbol, Symbol), ReadEntry>> {
+    ) -> Option<HashMap<(Symbol, Symbol), Option<ReadEntry>>> {
         if service.initializing.is_some() {
             return None;
         }
         service
             .graphs
             .inputs(service.name, def)
-            .map(|input| Some((input, self.input_receipt((service.name, def), input)?)))
+            .map(|input| {
+                let absent = !self.services.contains_key(&input.0)
+                    && !self.remote_services.contains_key(&input.0);
+                match absent {
+                    true => Some((input, None)),
+                    false => Some((
+                        input,
+                        Some(self.input_receipt((service.name, def), input, None)?),
+                    )),
+                }
+            })
             .collect()
     }
 
@@ -1431,132 +1307,6 @@ impl Manager {
         }
     }
 
-    async fn recompute_component(
-        &mut self,
-        root: (Symbol, Symbol),
-    ) -> Option<Vec<(Symbol, Symbol)>> {
-        let mut graph = DiGraphMap::<(Symbol, Symbol), ()>::new();
-        graph.add_node(root);
-        let mut pending = vec![root];
-        while let Some(node) = pending.pop() {
-            let Some(service) = self.services.get(&node.0) else {
-                continue;
-            };
-            if self.remote_services.contains_key(&node.0)
-                || service.initializing.is_some()
-                || !service.defs.contains_key(&node.1)
-            {
-                continue;
-            }
-            for input in service.graphs.inputs(node.0, node.1) {
-                if !graph.contains_node(input) {
-                    pending.push(input);
-                }
-                graph.add_edge(input, node, ());
-            }
-        }
-        let component = petgraph::algo::tarjan_scc(&graph)
-            .into_iter()
-            .find(|component| component.contains(&root))?;
-        if component.len() < 2 && !graph.contains_edge(root, root) {
-            return None;
-        }
-
-        // Each member's code and the pairs of its inputs outside the component
-        let mut snapshots = HashMap::new();
-        for &node in &component {
-            let mut receipts = HashMap::new();
-            for input in graph.neighbors_directed(node, petgraph::Direction::Incoming) {
-                if !component.contains(&input) {
-                    receipts.insert(input, self.input_receipt(node, input)?);
-                }
-            }
-            snapshots.insert(
-                node,
-                (self.services[&node.0].defs[&node.1].clone(), receipts),
-            );
-        }
-        'observe: loop {
-            // Every member of a strongly connected component reaches the same
-            // boundary roots; its completed clock and Sources therefore agree.
-            let (clock, gate_ok, sources) = self.check_receipts(
-                snapshots
-                    .values()
-                    .flat_map(|(_, receipts)| receipts.values()),
-            );
-            if !gate_ok {
-                return None;
-            }
-            let mut staged = HashMap::new();
-            while staged.len() < component.len() {
-                let previous_len = staged.len();
-                for &node in &component {
-                    if staged.contains_key(&node) {
-                        continue;
-                    }
-                    let (expr, receipts) = &snapshots[&node];
-                    let inputs = receipts
-                        .iter()
-                        .map(|(&input, entry)| (input, Some(entry.0.clone())))
-                        .chain(
-                            component
-                                .iter()
-                                .map(|&input| (input, staged.get(&input).cloned())),
-                        )
-                        .collect();
-                    let result = super::interpreter::evaluator::eval_with_inputs(
-                        expr,
-                        &[],
-                        &mut EvalContext {
-                            manager: self,
-                            service_name: node.0,
-                            txn: None,
-                        },
-                        Some(&inputs),
-                    )
-                    .await;
-                    let input = match result {
-                        Ok(value) => {
-                            staged.insert(node, value);
-                            continue;
-                        }
-                        // Not staged yet: evaluated again in the next round
-                        Err(EvalError::InputNotReady(input)) if component.contains(&input) => {
-                            continue
-                        }
-                        Err(EvalError::InputNotReady(input)) => input,
-                        Err(_) => return None,
-                    };
-                    // A member a call reads outside the component joins its
-                    // boundary, and the whole component is observed again
-                    let receipt = self.input_receipt(node, input);
-                    if receipt.is_none() || self.services.contains_key(&input.0) {
-                        self.follow_input(node, input).await;
-                    }
-                    let Some(receipt) = receipt else {
-                        return Some(Vec::new());
-                    };
-                    if let Some((_, receipts)) = snapshots.get_mut(&node) {
-                        receipts.insert(input, receipt);
-                    }
-                    continue 'observe;
-                }
-                if staged.len() == previous_len {
-                    return None;
-                }
-            }
-            return Some(
-                staged
-                    .into_iter()
-                    .filter_map(|(node, value)| {
-                        self.install_recomputed(node, value, clock.clone(), sources.clone())
-                            .then_some(node)
-                    })
-                    .collect(),
-            );
-        }
-    }
-
     fn install_recomputed(
         &mut self,
         (svc, def): (Symbol, Symbol),
@@ -1571,14 +1321,13 @@ impl Manager {
             );
             return false;
         };
-        let pending = service.pending_source_updates.remove(&def);
         if let Some(state) = service.vars.get_mut(&def) {
             let differs =
                 state.value != value || state.vector_clock != clock || state.sources != sources;
             state.value = value;
             state.vector_clock = clock;
             state.sources = sources;
-            differs || pending
+            differs
         } else {
             let mut state = VarState::new(value);
             state.vector_clock = clock;
@@ -1588,59 +1337,43 @@ impl Manager {
         }
     }
 
-    /// Evaluate `expr`, the code of `def`, against one fixed set of paired
-    /// inputs: `receipts`, which hold its static inputs, plus the pair of each
-    /// member a call or branch reads, added before evaluating again from the
-    /// start. Evaluation reads nothing else, so it cannot suspend and its
-    /// value agrees with the clock and Sources it is gated with. Local inputs
-    /// reached this way are followed so their changes reach `def`
+    /// Evaluate `expr`, code of a def of `svc`, against `receipts`, the pairs
+    /// of its static inputs. Evaluation reads nothing else, so its value
+    /// agrees with the clock and Sources it is gated with
     ///
     /// Returns:
-    ///     The value with that clock and Sources, None while the pairs
-    ///     disagree, `EvalError::InputNotReady` for an input without a pair
+    ///     The value with that clock and Sources, None while the pairs disagree
     async fn evaluate_checked(
         &mut self,
-        (svc, def): (Symbol, Symbol),
+        svc: Symbol,
         expr: &Expr,
-        mut receipts: HashMap<(Symbol, Symbol), ReadEntry>,
+        receipts: HashMap<(Symbol, Symbol), Option<ReadEntry>>,
     ) -> Result<Option<(Value, VClock, Option<Sources>)>, EvalError> {
-        loop {
-            let (clock, gate_ok, sources) = self.check_receipts(receipts.values());
-            if !gate_ok {
-                return Ok(None);
-            }
-            let inputs = receipts
-                .iter()
-                .map(|(&input, entry)| (input, Some(entry.0.clone())))
-                .collect();
-            let result = super::interpreter::evaluator::eval_with_inputs(
-                expr,
-                &[],
-                &mut EvalContext {
-                    manager: self,
-                    service_name: svc,
-                    txn: None,
-                },
-                Some(&inputs),
-            )
-            .await;
-            let input = match result {
-                Err(EvalError::InputNotReady(input)) => input,
-                result => return result.map(|value| Some((value, clock, sources))),
-            };
-            let receipt = self.input_receipt((svc, def), input);
-            if self.services.contains_key(&input.0) {
-                self.follow_input((svc, def), input).await;
-            }
-            receipts.insert(input, receipt.ok_or(EvalError::InputNotReady(input))?);
+        let (clock, gate_ok, sources) = self.check_receipts(receipts.values().flatten());
+        if !gate_ok {
+            return Ok(None);
         }
+        let sources = sources.filter(|_| receipts.values().all(Option::is_some));
+        let inputs = receipts
+            .iter()
+            .filter_map(|(&input, entry)| Some((input, entry.as_ref()?.0.clone())))
+            .collect();
+        let value = super::interpreter::evaluator::eval_with_inputs(
+            expr,
+            &[],
+            &mut EvalContext {
+                manager: self,
+                service_name: svc,
+                txn: None,
+            },
+            Some(&inputs),
+        )
+        .await?;
+        Ok(Some((value, clock, sources)))
     }
 
-    /// Ordinary propagation uses completed input snapshots. Recursive Sources
-    /// changes, and changes a recursive member's own gate cannot accept before
-    /// the rest of its cycle catches up, are installed together only after the
-    /// component can be evaluated and gated against one private set of input
-    /// snapshots.
+    /// Recompute `def` from the paired snapshots of its inputs, returning it if
+    /// its value, clock or Sources changed
     pub(crate) async fn recompute_def(
         &mut self,
         svc: Symbol,
@@ -1650,20 +1383,6 @@ impl Manager {
             .services
             .get(&svc)
             .and_then(|service| self.static_receipts(service, def));
-        let ready = self.services.get(&svc).is_some_and(|service| {
-            service
-                .vars
-                .get(&def)
-                .is_some_and(|state| state.sources.is_some())
-                && !service.pending_source_updates.contains(&def)
-        }) && receipts
-            .as_ref()
-            .is_some_and(|receipts| self.check_receipts(receipts.values()).1);
-        if !ready {
-            if let Some(changed) = self.recompute_component((svc, def)).await {
-                return changed;
-            }
-        }
         let Some(expr) = self
             .services
             .get(&svc)
@@ -1680,20 +1399,13 @@ impl Manager {
         let Some(receipts) = receipts else {
             return Vec::new();
         };
-        match self.evaluate_checked((svc, def), &expr, receipts).await {
+        match self.evaluate_checked(svc, &expr, receipts).await {
             Ok(Some((value, clock, sources))) => self
                 .install_recomputed((svc, def), value, clock, sources)
                 .then_some((svc, def))
                 .into_iter()
                 .collect(),
             Ok(None) => Vec::new(),
-            Err(EvalError::InputNotReady(input)) => {
-                // A local input was followed already
-                if !self.services.contains_key(&input.0) {
-                    self.follow_input((svc, def), input).await;
-                }
-                Vec::new()
-            }
             Err(e) => {
                 log::warn!(
                     "propagation of def '{}' failed: {}",
@@ -1727,12 +1439,12 @@ impl Manager {
             ) else {
                 return Ok(Some((svc, def)));
             };
-            match self.evaluate_checked((svc, def), &expr, receipts).await {
+            match self.evaluate_checked(svc, &expr, receipts).await {
                 Ok(Some((value, clock, sources))) => {
                     self.install_recomputed((svc, def), value, clock, sources);
                     self.propagate(svc, def).await;
                 }
-                Ok(None) | Err(EvalError::InputNotReady(_)) => return Ok(Some((svc, def))),
+                Ok(None) => return Ok(Some((svc, def))),
                 Err(e) => {
                     return Err(EvalError::RuntimeError(format!(
                         "Update committed, but '{}.{}' cannot be initialized: {}",
@@ -2033,11 +1745,13 @@ impl Manager {
             return;
         };
         let cache = service.dep_cache.entry(listener_def_sym).or_default();
-        let sources_changed = cache.get(&source).map(|entry| &entry.2) != Some(&sources);
+        // A function in code not delivered before can change what its callers read
+        let new_code = matches!(value, Value::Closure { .. })
+            && cache.get(&source).map(|entry| &entry.0) != Some(&value);
         cache.insert(source, (value, Some(clock), sources));
 
-        if sources_changed {
-            self.mark_source_updates(vec![(listener_svc, listener_def_sym)]);
+        if new_code {
+            self.refresh_graphs().await;
         }
 
         for (svc, member) in self.recompute_def(listener_svc, listener_def_sym).await {
@@ -2677,7 +2391,13 @@ impl Manager {
                     if let Some(clock) = &entry.1 {
                         txn.participant_history = join_clocks([&txn.participant_history, clock]);
                     }
-                    if txn.observed_reads.is_some() {
+                    // Initialization keeps the pair: it stamps and seeds the
+                    // def that read it
+                    if self
+                        .services
+                        .values()
+                        .any(|s| s.initializing.as_ref() == Some(&txn.id))
+                    {
                         let key = (self.service_net_id_for_name(service), member);
                         txn.read_cache.insert(key, entry.clone());
                     }
@@ -3714,14 +3434,21 @@ impl Manager {
     /// `CommitResponse`; the request covers one that will not, because it was
     /// overtaken by an older one or lost
     async fn commit_stamped(&mut self, txn: &Transaction, clock: &VClock) -> Option<EvalError> {
+        let mut functions = false;
         for ((sid, var), value) in &txn.written {
             if let Some(service) = self.service_by_net_id_mut(sid) {
                 if let Some(var_state) = service.vars.get_mut(var) {
+                    functions |= matches!(value, Value::Closure { .. })
+                        || matches!(var_state.value, Value::Closure { .. });
                     var_state.value = value.clone();
                     var_state.latest_write_txn = Some(txn.id.clone());
                     var_state.vector_clock = clock.clone();
                 }
             }
+        }
+        // What a def reads through a function a var holds follows the var
+        if functions {
+            self.refresh_graphs().await;
         }
         let error = self.commit_participants(txn, clock).await;
         for (listener, def, owner, member) in self.inputs_behind(clock) {
@@ -4102,8 +3829,14 @@ impl Manager {
                         }
 
                         // Cross-service dependencies
-                        if let Some(expr) = service.defs.get(&mem_sym) {
-                            for (remote_svc, remote_mem) in cross_service_deps(expr) {
+                        if service.defs.contains_key(&mem_sym) {
+                            for &(remote_svc, remote_mem) in service
+                                .graphs
+                                .cross_deps
+                                .get(&mem_sym)
+                                .into_iter()
+                                .flatten()
+                            {
                                 if self.remote_services.contains_key(&remote_svc) {
                                     // Track remote dependencies for a
                                     // remote service to request them
@@ -4338,37 +4071,6 @@ mod tests {
     use crate::ast::{Decl, Expr, Value};
     use crate::runtime::interpreter::execute;
     use crate::runtime::{parser::parse_string, update::Transaction as CodeUpdate, Node};
-
-    // #24: cross_service_deps pulls out exactly the (service, member) symbols
-    // referenced via MemberAccess, and nothing for a purely local expression.
-    #[test]
-    fn test_cross_service_deps_extraction() {
-        let tc = TestContext::new();
-        // z = s1.y + 2  ->  {(s1, y)}
-        let z_expr = Expr::Binop {
-            op: crate::ast::BinOp::Add,
-            expr1: Box::new(Expr::MemberAccess {
-                service_name: tc.s1,
-                member_name: tc.y,
-            }),
-            expr2: Box::new(Expr::Literal {
-                val: Value::Int { val: 2 },
-            }),
-        };
-        assert_eq!(
-            cross_service_deps(&z_expr),
-            std::collections::HashSet::from([(tc.s1, tc.y)])
-        );
-        // y = x + 1  ->  {} (no cross-service references)
-        let y_expr = Expr::Binop {
-            op: crate::ast::BinOp::Add,
-            expr1: Box::new(Expr::Variable { name: tc.x }),
-            expr2: Box::new(Expr::Literal {
-                val: Value::Int { val: 1 },
-            }),
-        };
-        assert!(cross_service_deps(&y_expr).is_empty());
-    }
 
     // #24: a def in s2 that reads s1.y updates eagerly when s1.x changes,
     // driven by the listener cascade rather than a lazy re-lookup.
@@ -4725,10 +4427,9 @@ mod tests {
 
         // Stand in for an outer recompute with its own cross-service dep
         // among its fixed inputs.
-        let outer: HashMap<(Symbol, Symbol), Option<Value>> =
-            [((tc.s1, tc.w), Some(Value::Int { val: 7 }))]
-                .into_iter()
-                .collect();
+        let outer: HashMap<(Symbol, Symbol), Value> = [((tc.s1, tc.w), Value::Int { val: 7 })]
+            .into_iter()
+            .collect();
         let read_w = Expr::MemberAccess {
             service_name: tc.s1,
             member_name: tc.w,
@@ -7302,16 +7003,28 @@ mod tests {
         .await;
         let [s, x, y, a, b] = ["s", "x", "y", "a", "b"].map(|name| manager.interner.insert(name));
         let original = HashSet::from([(s, x), (s, y)]);
-        assert_eq!(manager.sources(s, a, None).as_deref(), Some(&original));
-        assert_eq!(manager.sources(s, b, None).as_deref(), Some(&original));
+        assert_eq!(
+            manager.services[&s].vars[&a].sources.as_ref(),
+            Some(&original)
+        );
+        assert_eq!(
+            manager.services[&s].vars[&b].sources.as_ref(),
+            Some(&original)
+        );
         let listener = (manager.services[&s].id.clone(), a);
         assert!(manager.services[&s].listeners[&y].contains(&listener));
 
         update_service_code(&mut manager, "update s { pub def a = x; }").await;
 
         let expected = HashSet::from([(s, x)]);
-        assert_eq!(manager.sources(s, b, None).as_deref(), Some(&expected));
-        assert_eq!(manager.sources(s, a, None).as_deref(), Some(&expected));
+        assert_eq!(
+            manager.services[&s].vars[&b].sources.as_ref(),
+            Some(&expected)
+        );
+        assert_eq!(
+            manager.services[&s].vars[&a].sources.as_ref(),
+            Some(&expected)
+        );
         assert!(manager.services[&s].listeners[&x].contains(&listener));
         assert!(!manager.services[&s]
             .listeners
@@ -7359,15 +7072,16 @@ mod tests {
         let [owner, consumer, x, y, a, z] =
             ["A", "B", "x", "y", "a", "z"].map(|name| manager.interner.insert(name));
         let consumer_decl = manager.unified_ast[1].clone();
-        let cross_deps = manager.declaration_graphs[&consumer].cross_deps.clone();
+        let graphs = manager.service_graphs([owner, consumer], None);
+        let cross_deps = graphs[&consumer].cross_deps.clone();
         assert!(manager.services.is_empty());
         assert_eq!(
-            manager.declaration_graphs[&consumer].transitive_dependencies_of(z),
+            graphs[&consumer].transitive_dependencies_of(z),
             HashSet::new()
         );
         assert_eq!(cross_deps[&z], HashSet::from([(owner, a)]));
         assert_eq!(
-            manager.declaration_graphs[&owner].transitive_dependencies_of(a),
+            graphs[&owner].transitive_dependencies_of(a),
             HashSet::from([x])
         );
 
@@ -7384,9 +7098,10 @@ mod tests {
         manager.install_unified_ast(declarations);
 
         assert_eq!(manager.unified_ast[1], consumer_decl);
-        assert_eq!(manager.declaration_graphs[&consumer].cross_deps, cross_deps);
+        let graphs = manager.service_graphs([owner, consumer], None);
+        assert_eq!(graphs[&consumer].cross_deps, cross_deps);
         assert_eq!(
-            manager.declaration_graphs[&owner].transitive_dependencies_of(a),
+            graphs[&owner].transitive_dependencies_of(a),
             HashSet::from([y])
         );
     }

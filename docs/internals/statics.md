@@ -15,11 +15,8 @@ The statics are organized as a multi-pass pipeline in the compiler/interpreter:
 
 1. **Import Resolution & AST Unification:** The entry point dispatch mechanisms resolve local and network imports, concatenating all dependencies into a single, unified abstract syntax tree. This unified AST exists so that subsequent static passes can evaluate the entire program context holistically, without needing to repeatedly traverse file boundaries or manage remote network requests.
 2. **Name Resolution:** The `nameres::resolve` module evaluates the AST to validate variable bindings and scoping rules.
-3. **Type Checking & Effect Tracking:** The core type checker, `tt::check`, evaluates the unified AST using an augmented bidirectional type checking algorithm. This pass is enhanced with an effect tracking system to handle the complexities of live updates:
-   - It validates all expressions and definitions to construct comprehensive `ServiceType` environments.
-   - It tracks the dependencies of function types by evaluating their bodies and embedding the accessed variables directly into their type signatures.
-   - It expands these projected dependencies to verify the absence of cycles before changes are committed.
-4. **Graph Construction:** The graph analysis module, `compute_dependencies`, transforms the validated AST into concrete execution topologies.
+3. **Type Checking:** The core type checker, `tt::check`, validates all expressions and definitions of the unified AST using an augmented bidirectional type checking algorithm, constructing comprehensive `ServiceType` environments.
+4. **Dependency Analysis & Graph Construction:** The reads pass in `graphs/effects.rs` computes what each member's code reads when evaluated, attributing the reads latent in a function to its callers. From these reads it rejects a program whose members cannot be initialized in declaration order or whose direct dependency graph has a cycle, and the runtime builds the execution topologies.
 
 ## Entry Points
 
@@ -33,7 +30,7 @@ When a Meerkat Node first boots up, it parses its initial configuration or the p
 - Once the dependencies are resolved, the state machine concatenates them into a single Unified AST.
 - This Unified AST is passed to the name resolution module, `nameres::resolve`, to validate variable bindings and scoping rules.
 - The system then invokes the core type checker, `tt::check`, on the Unified AST.
-- Finally, it passes the validated AST to the graph analysis module, `compute_dependencies`, to construct the execution topologies.
+- Finally, the reads pass checks the whole program for forward references and dependency cycles, and constructs the execution topologies.
 
 ### Atomic Updates & Transaction Semantics
 
@@ -55,62 +52,34 @@ Before an update transaction can evaluate its temporary state, it must acquire n
 The atomic update lifecycle is managed by a state machine that proceeds through four high-level phases:
 
 1. **Init:** The runtime computes lock requirements based on the requested update to determine necessary service-level and member-level locks.
-2. **LocksAcquired:** Once all locks are secured, the system merges the proposed AST updates into a unified AST. The statics pipeline (name resolution, type checking, and effect tracking) then scans this unified AST.
+2. **LocksAcquired:** Once all locks are secured, the system merges the proposed AST updates into a unified AST. The statics pipeline (name resolution, type checking, and dependency analysis) then scans this unified AST.
 3. **Evaluated:** If static checks pass, the initial expressions of the new members are evaluated against the locked old state.
 4. **Committed:** If evaluation succeeds without errors or cycles, the transaction is committed. The old state is replaced, locks are released, and the updates are broadcast to the rest of the system.
 
-## Type Inference & Dependency Analysis
+## Type Inference
 
-The core of the statics pipeline resides inside the type checker module, `tt::check.rs`. The augmented bidirectional type checker evaluates the AST to construct `ServiceType` representations while simultaneously tracing dependencies to evaluate the effects of updates. 
+The augmented bidirectional type checker in `tt::check.rs` evaluates the AST to construct `ServiceType` representations. Member types are computed on demand, so a member may reference one declared after it; a checking stack makes inference terminate when two members' types depend on each other. A function type carries its parameter and return types only.
 
-It accomplishes this by maintaining a stack of dependency sets. When the type checker enters a function body or action block, it pushes a new empty set onto the stack. As it evaluates expressions, any accessed variable or service member is added to the active set at the top of the stack. 
+## Dependency Analysis & Graph Construction
 
-When it exits a function block, it pops the set and embeds those accessed variables directly into the resulting `Type::Func` signature. By statically baking these dependencies into the type system, the runtime can prevent infinite loops during reactive propagation or recursive evaluation.
+After the type checker has validated the AST, the dependency pass in `graphs/effects.rs` computes the reads of each member's code. The same analysis decides whether the program can be initialized, whether its dependency graph is acyclic and, at runtime, which members each def listens to and which members a code update locks.
 
-### Dependency Sets
+### Reads and Edges
 
-Dependency tracking statically bookkeeps the names an expression relies on, its typed dependencies. A dependency set, `DepSet`, is a collection of these topological identities. 
+A member's code reads another member when evaluating it does. Constructing a closure or an action reads nothing; applying a function reads what its body reads, in the function's own service; a conditional reads what either branch reads. The pass follows the functions a value may be through locals, parameters, members and results, so a def reads the members latent in the functions it calls, and a def that only holds a closure reads nothing. A function applied to closures is analyzed for those arguments, so higher-order functions need no special treatment.
 
-A critical nuance is that dependency sets are only attached to function signatures, `Type::Func`. This boundary distinction arises because service-level declarations, such as `var` and `def`, are unguarded contexts. They evaluate sequentially and eagerly at initialization. Because they execute immediately, the type checker can trace and satisfy their dependencies directly inline while type checking without needing to persist them.
+Each read becomes a reactive edge within the service or a cross-service dependency. Only `def` members listen; the reads of a `var` initializer matter at initialization and for the locks a code update takes.
 
-Closures and functions, however, are guarded contexts. They suspend the evaluation of their abstract syntax tree until called. Therefore, `Type::Func` is the sole type representation that requires a `DepSet` to track latent dependencies that will be triggered upon invocation. Instead of modifying the parent execution scope immediately, the dependency set remains dormant inside the type signature until the function is explicitly invoked.
+### Initialization Order
 
-### Reusing Inference for Higher-Order Functions
+Services are initialized in program order and their members in declaration order, so a member's initializer may only read members that already exist: a member of its own service declared before it, and, through a function it applies, a member of a service declared before its own. A direct read of another service's member is not ordered. A program that breaks this rule is rejected as an illegal eager forward reference; one whose direct dependency graph has a cycle, across services included, is rejected as a dependency cycle.
 
-Higher-order functions, HOFs, accept closures as arguments. Because closures carry dependency sets, passing them opaquely can result in losing the dependency information when the HOF is executed.
+### Functions the Runtime Holds
 
-To address this, the type checker applies inference contextually at the call-site:
-
-1. When a function call expression encounters a target function, it checks the provided arguments.
-2. If any argument is a closure carrying a non-empty dependency set, the type checker creates a temporary, localized typing environment.
-3. This environment binds the caller-supplied parameter types, including their active dependency sets, to the formal parameters of the HOF.
-4. The type checker applies inference to the HOF body using this new environment.
-5. Whenever the HOF invokes the parameter, the environment unwraps and propagates those original dependencies up into the call site's active scope.
-
-### Same-Service vs Cross-Service Edges
-
-**Same-Service Dependencies:** References to members within the local service are accumulated into the block's active dependency set and statically validated against the tracked initialization state. This approach helps identify illegal forward references and dependency cycles.
-**Cross-Service Dependencies:** When navigating across a service boundary, the type checker validates the remote interface contract but isolates those remote dependencies from the local dependency set, which avoids false-positive dependency cycles across distributed boundaries.
-
-## Graph Construction
-
-After the type checker finishes validating the AST, the type information, including the dependency sets, is discarded. At this stage, the program has been evaluated for type consistency, uninitialized variable accesses, and topological initialization or reactive update cycles.
-
-Control flow then passes to the graph analysis module `graphs/analysis.rs`. 
-
-### Topology Construction
-
-The `graphs` module is a remnant of older dependency analysis logic. Its original analytical responsibilities were partially shifted into `tt::check` to properly handle complex evaluation cases like higher-order functions. However, the module is retained because various systems, including `manager.rs`, `node.rs`, and `update.rs`, still call out to it, expecting a fully constructed `ServiceGraphs` data structure to determine topological execution ordering.
-
-Because the type checker has already validated the AST, the `graphs` module no longer performs complex dependency validation or attempts to expand HOF closures. Instead, it functions as a simplified graph transformation pass:
-
-- It uses recursive AST traversals, `free_var` and `cross_service_deps`, to extract the baseline topological edges.
-- It maps these edges directly into service graph structures, compiling separate sub-graphs for reactive definitions, mutable state, and external dependencies.
-
-This output is returned to the entry point, where the runtime uses it to calculate the execution order and instantiate the program.
+The runtime computes the graphs of its running services from the installed declarations and the functions members actually hold: a local `var` is analyzed in the closure it currently holds, which an action may have stored; a remote member in each version of its code the owner delivered to the defs here that read it, or that a transaction initializing one of them read. Graphs are recomputed when a code update commits, when a delivered value brings new function code, and when a committed write stores a closure into a `var` or replaces one. A def therefore knows every member it will read before it is evaluated, and its evaluation reads only those inputs.
 
 ## Historical Context: The Old `dep_analysis` Module
 
 Initially, dependency analysis was decoupled from the type checker and performed entirely via heuristic AST traversals in a separate `dep_analysis` module. While this pure AST traversal worked for direct, first-order function calls, it was limited when handling the dynamic nature of higher-order functions. Without access to the typing environment, a pure AST traversal cannot trace which closure is actually being invoked when a function parameter is called. 
 
-Because of these limitations, the old `dep_analysis` module was removed. Integrating dependency tracking directly into the type checker addressed this issue, as the type system inherently tracks environment bindings and parameter flows.
+Because of these limitations, the old `dep_analysis` module was removed and dependency tracking was integrated into the type checker, which tracks environment bindings and parameter flows. That integration was later undone: the reads pass follows the functions a value may be through those same bindings and flows itself, which also lets it analyze the functions the runtime holds, and it names members by service, which the type-level sets did not.

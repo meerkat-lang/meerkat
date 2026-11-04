@@ -127,6 +127,9 @@ pub enum Value {
     List {
         vals: Vec<Value>,
     },
+    Record {
+        fields: Vec<(Symbol, Value)>,
+    },
     Range {
         start: i32,
         end: i32,
@@ -227,6 +230,12 @@ pub enum Expr {
         operation: Box<Expr>,
         identity: Box<Expr>,
     },
+    Map {
+        var: Symbol,
+        table_name: Symbol,
+        where_clause: Box<Expr>,
+        body: Box<Expr>,
+    },
     List(Vec<Expr>),
     Range {
         start: Box<Expr>,
@@ -257,6 +266,37 @@ pub enum Decl {
 pub struct Field {
     pub name: Symbol,
     pub ty: TableType,
+}
+
+/// Schema of `table_name` if it is declared in `decls`.
+pub fn table_decl_fields<'a, I>(decls: I, table_name: Symbol) -> Option<&'a [Field]>
+where
+    I: IntoIterator<Item = &'a Decl>,
+{
+    for d in decls {
+        if let Decl::TableDecl { name, fields } = d {
+            if *name == table_name {
+                return Some(fields.as_slice());
+            }
+        }
+    }
+    None
+}
+
+/// Schema of `table_name` on `service_name` in `program`.
+pub fn table_decl_in_service(
+    program: &[Stmt],
+    service_name: Symbol,
+    table_name: Symbol,
+) -> Option<&[Field]> {
+    for stmt in program {
+        if let Stmt::Service { name, decls } = stmt {
+            if *name == service_name {
+                return table_decl_fields(decls, table_name);
+            }
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -354,6 +394,16 @@ impl Display for Value {
                 }
                 write!(f, "]")
             }
+            Value::Record { fields } => {
+                write!(f, "{{")?;
+                for (i, (name, val)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{:?}: {}", name, val)?;
+                }
+                write!(f, "}}")
+            }
             Value::Range { start, end } => write!(f, "{}..{}", start, end),
         }
     }
@@ -443,6 +493,7 @@ impl Display for Expr {
                 write!(f, "]")
             }
             Expr::Fold { .. } => write!(f, "fold"),
+            Expr::Map { .. } => write!(f, "map"),
             Expr::List(exprs) => {
                 write!(f, "[")?;
                 for (i, expr) in exprs.iter().enumerate() {

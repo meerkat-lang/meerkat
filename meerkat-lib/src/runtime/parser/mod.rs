@@ -395,6 +395,33 @@ mod tests {
         }
     }
 
+    /// Parse a `map` projection over a table with a named-record body
+    #[test]
+    fn test_parse_map_expression() {
+        use crate::ast::{Decl, Expr, Stmt};
+
+        let mut interner = Interner::new();
+        let input = "service board { \
+            table tasks { id: int, done: bool, }; \
+            def open = map (m in tasks where !m.done) { id: m.id }; \
+        }";
+        let res = parse_string(input, &mut interner);
+        assert!(res.is_ok(), "{:?}", res.err());
+        let ast = res.unwrap();
+        if let Stmt::Service { decls, .. } = &ast[0] {
+            let Decl::DefDecl { val, .. } = &decls[1] else {
+                panic!("Expected DefDecl");
+            };
+            assert!(
+                matches!(val, Expr::Map { .. }),
+                "expected Map, got {:?}",
+                val
+            );
+        } else {
+            panic!("Expected Service Stmt");
+        }
+    }
+
     /// #39: parse_template splits literal text and interpolations, exposing the
     /// embedded expression through the template interface.
     #[test]

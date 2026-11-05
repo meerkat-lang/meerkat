@@ -15,6 +15,7 @@ pub mod manager;
 pub mod nameres;
 pub mod node;
 pub mod parser;
+pub mod paths;
 pub mod tt;
 pub mod txn;
 pub mod update;

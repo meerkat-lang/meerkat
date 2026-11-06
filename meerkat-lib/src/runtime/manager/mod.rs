@@ -1,6 +1,11 @@
 use super::ast::{ActionStmt, Decl, Expr, Stmt, Value};
 use super::env::Env;
-use super::graphs::{analysis::service_declarations, effects::Effects, ServiceGraphs};
+use super::graphs::{
+    analysis::service_declarations,
+    dependency_cycle,
+    effects::{depth_limit_message, Effects},
+    ServiceGraphs,
+};
 use super::interpreter::{eval, execute_seq, EvalContext, EvalError, WAIT_DIE_DISPLAY_PREFIX};
 use super::tt::types::ServiceType;
 use crate::net::ast::{NetActionStmt, NetValue};
@@ -286,6 +291,19 @@ impl Manager {
         services: impl IntoIterator<Item = Symbol>,
         read: Option<&Transaction>,
     ) -> HashMap<Symbol, ServiceGraphs> {
+        self.graphs_of(&self.unified_ast, services, read, &HashMap::new())
+    }
+
+    /// `service_graphs` for the declarations of `ast` and, for the members in
+    /// `overrides`, these values in place of the ones held: the graphs a code
+    /// update or a write would install
+    pub(crate) fn graphs_of<'a>(
+        &'a self,
+        ast: &'a [Stmt],
+        services: impl IntoIterator<Item = Symbol>,
+        read: Option<&'a Transaction>,
+        overrides: &HashMap<(Symbol, Symbol), Vec<&'a Value>>,
+    ) -> HashMap<Symbol, ServiceGraphs> {
         fn publish<'a>(
             published: &mut HashMap<(Symbol, Symbol), Vec<&'a Value>>,
             member: (Symbol, Symbol),
@@ -299,7 +317,7 @@ impl Manager {
             }
         }
         let mut published = HashMap::new();
-        let declarations = service_declarations(&self.unified_ast);
+        let declarations = service_declarations(ast);
         for (&name, stmt) in &declarations {
             let (Stmt::Service { decls, .. }, Some(service)) = (stmt, self.services.get(&name))
             else {
@@ -335,7 +353,15 @@ impl Manager {
                 }
             }
         }
-        let mut effects = Effects::new(&self.unified_ast, published);
+        for (&member, values) in overrides {
+            let versions = values
+                .iter()
+                .copied()
+                .filter(|value| matches!(value, Value::Closure { .. }))
+                .collect();
+            published.insert(member, versions);
+        }
+        let mut effects = Effects::new(ast, published);
         services
             .into_iter()
             .filter_map(|name| match declarations.get(&name) {
@@ -348,17 +374,93 @@ impl Manager {
     /// Rewire each running service whose graphs no longer match the installed
     /// declarations or the remote code its defs call
     pub(crate) async fn refresh_graphs(&mut self) {
-        let running = self
-            .services
-            .iter()
-            .filter(|(_, service)| service.initializing.is_none())
-            .map(|(&name, _)| name)
-            .collect::<Vec<_>>();
-        for (name, graphs) in self.service_graphs(running, None) {
+        let graphs = self.service_graphs(self.running_services(), None);
+        // A function value delivered from elsewhere can leave a def's reads
+        // incomplete or make the graph cyclic; the graphs installed stay the
+        // last ones found complete and acyclic
+        if let Err(e) = self.check_graphs(&graphs) {
+            log::warn!("dependency graphs not refreshed: {}", e);
+            return;
+        }
+        for (name, graphs) in graphs {
             if self.services[&name].graphs != graphs {
                 self.update_service_graphs(name, graphs).await;
             }
         }
+    }
+
+    /// The services running here: created and no longer initializing
+    pub(crate) fn running_services(&self) -> Vec<Symbol> {
+        self.services
+            .iter()
+            .filter(|(_, service)| service.initializing.is_none())
+            .map(|(&name, _)| name)
+            .collect()
+    }
+
+    /// Whether `graphs`, the graphs of every running service, can be
+    /// installed: the analysis of every def stayed within the depth limit,
+    /// and the direct dependency graph is acyclic (§2.1.4)
+    pub(crate) fn check_graphs(
+        &self,
+        graphs: &HashMap<Symbol, ServiceGraphs>,
+    ) -> Result<(), EvalError> {
+        let incomplete = graphs
+            .iter()
+            .flat_map(|(&service, graphs)| graphs.incomplete.iter().map(move |&def| (service, def)))
+            .min();
+        if let Some((service, def)) = incomplete {
+            return Err(EvalError::RuntimeError(depth_limit_message(&format!(
+                "{}.{}",
+                self.interner.get(service),
+                self.interner.get(def)
+            ))));
+        }
+        if let Some((service, member)) = dependency_cycle(graphs) {
+            return Err(EvalError::RuntimeError(format!(
+                "dependency cycle detected at service '{}', member '{}'",
+                self.interner.get(service),
+                self.interner.get(member)
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether the graphs of the running services stay complete and acyclic
+    /// with `writes` stored: checked before a write of a function value, or
+    /// over one, is applied or committed. Other writes change no graph
+    fn check_writes<'a>(
+        &self,
+        writes: impl IntoIterator<Item = ((Symbol, Symbol), &'a Value)>,
+    ) -> Result<(), EvalError> {
+        let overrides: HashMap<_, _> = writes
+            .into_iter()
+            .filter(|&((service, var), value)| {
+                matches!(value, Value::Closure { .. })
+                    || self
+                        .services
+                        .get(&service)
+                        .and_then(|service| service.vars.get(&var))
+                        .is_some_and(|state| matches!(state.value, Value::Closure { .. }))
+            })
+            .map(|(member, value)| (member, vec![value]))
+            .collect();
+        if overrides.is_empty() {
+            return Ok(());
+        }
+        self.check_graphs(&self.graphs_of(
+            &self.unified_ast,
+            self.running_services(),
+            None,
+            &overrides,
+        ))
+    }
+
+    /// `check_writes` for the writes `txn` buffered on this node
+    fn check_buffered_writes(&self, txn: &Transaction) -> Result<(), EvalError> {
+        self.check_writes(txn.written.iter().filter_map(|((sid, var), value)| {
+            Some(((self.service_name_for_net_id(sid)?, *var), value))
+        }))
     }
 
     /// Park a request on the wait queue for the contended `WaitKey`
@@ -776,6 +878,11 @@ impl Manager {
 
             // Commit only after every initializer succeeds; participant failures
             // take the same rollback path as failed initialization.
+            // With this service's defs, the graphs of every running service
+            // must stay complete and acyclic
+            let mut services = self.running_services();
+            services.push(svc_name);
+            self.check_graphs(&self.service_graphs(services, Some(&txn)))?;
             self.commit_txn(&txn).await.map_or(Ok(()), Err)
         }
         .await;
@@ -1056,6 +1163,9 @@ impl Manager {
         }
 
         // Non-transactional path: apply the write immediately and propagate.
+        // A function value is stored only if the defs applying it keep
+        // complete, acyclic graphs
+        self.check_writes([((service_name, var_name), &value)])?;
         let functions;
         if let Some(service) = self.services.get_mut(&service_name) {
             if let Some(var_state) = service.vars.get_mut(&var_name) {
@@ -3339,9 +3449,14 @@ impl Manager {
             let mut txn = Transaction::new(txn_id.clone());
 
             let mut env: Vec<(Symbol, Value)> = initial_env.to_vec();
-            let exec_error = execute_seq(stmts, &mut env, self, service_name, Some(&mut txn))
+            let mut exec_error = execute_seq(stmts, &mut env, self, service_name, Some(&mut txn))
                 .await
                 .err();
+            // A function value written is committed only if the defs
+            // applying it keep complete, acyclic graphs
+            if exec_error.is_none() {
+                exec_error = self.check_buffered_writes(&txn).err();
+            }
 
             // Both wait-die outcomes retry the whole transaction. A participant
             // told to wait parks on `wait_queue`, but an originator drives its
@@ -3542,6 +3657,9 @@ impl Manager {
         let mut exec_error = execute_seq(stmts, &mut env, self, service_name, Some(&mut txn))
             .await
             .err();
+        if exec_error.is_none() {
+            exec_error = self.check_buffered_writes(&txn).err();
+        }
         // Positions are dense, so a completed run that did not reach every
         // recorded one branched past a composed action the parked run made,
         // whose effect is buffered on the other node all the same. Positions

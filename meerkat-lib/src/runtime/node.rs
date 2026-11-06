@@ -767,6 +767,14 @@ impl Node {
                 "type check error: illegal eager forward reference or dependency cycle on '{}'",
                 self.interner.get(member)
             )),
+            effects::Error::DepthLimitExceeded { service, member } => Error::Message(format!(
+                "type check error: {}",
+                effects::depth_limit_message(&format!(
+                    "{}.{}",
+                    self.interner.get(service),
+                    self.interner.get(member)
+                ))
+            )),
         }
     }
 

@@ -15,6 +15,12 @@
 //! initializing one of them read. Applying a function whose code is not known
 //! here reads nothing; the runtime analyzes the code when it arrives, before
 //! any def can apply it
+//!
+//! The analysis is bounded as the type checker is: an application nested
+//! `MAX_SCOPE_DEPTH` deep exceeds the depth limit, which ends that member's
+//! analysis at once. Its reads are then reported incomplete rather than used:
+//! `check` rejects such a program, and the runtime refuses a function value
+//! that would leave a def's reads incomplete
 
 use super::free_var::free_var;
 use super::ServiceGraphs;
@@ -27,6 +33,11 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// A member, as `(service, member)`
 pub(crate) type Member = (Symbol, Symbol);
+
+/// The error text for a member whose analysis exceeded the depth limit
+pub(crate) fn depth_limit_message(member: &str) -> String {
+    format!("depth limit exceeded in the dependency analysis of '{member}'")
+}
 
 /// A function a value may be when it is applied: the lambda at this index of
 /// `Effects::lambdas`, or `UNKNOWN`
@@ -88,6 +99,9 @@ pub(crate) struct Effects<'a> {
     /// The reads and result of each application whose analysis did not
     /// reenter an application enclosing it
     applied: HashMap<Application, (HashSet<Member>, Functions)>,
+    /// Whether the analysis of the current member exceeded the depth limit:
+    /// its reads are incomplete, and it makes no further application
+    cut: bool,
 }
 
 impl<'a> Effects<'a> {
@@ -127,9 +141,12 @@ impl<'a> Effects<'a> {
             let Decl::DefDecl { .. } = decl else {
                 continue;
             };
-            let Some((name, reads)) = self.member_reads(service, decl) else {
+            let Some((name, reads, complete)) = self.member_reads(service, decl) else {
                 continue;
             };
+            if !complete {
+                graphs.incomplete.insert(name);
+            }
             for (owner, member) in reads.all() {
                 if owner != service {
                     graphs
@@ -145,14 +162,16 @@ impl<'a> Effects<'a> {
         graphs
     }
 
-    /// What evaluating the code of `decl`, a declaration of `service`, reads
-    fn member_reads(&mut self, service: Symbol, decl: &'a Decl) -> Option<(Symbol, Reads)> {
+    /// What evaluating the code of `decl`, a declaration of `service`, reads,
+    /// and whether the analysis found all of it within the depth limit
+    fn member_reads(&mut self, service: Symbol, decl: &'a Decl) -> Option<(Symbol, Reads, bool)> {
         let (Decl::VarDecl { name, val, .. } | Decl::DefDecl { name, val, .. }) = decl else {
             return None;
         };
         let mut reads = Reads::default();
+        self.cut = false;
         self.visit(val, service, &[], &mut reads);
-        Some((*name, reads))
+        Some((*name, reads, !self.cut))
     }
 
     fn decl(&self, (service, member): Member) -> Option<&'a Decl> {
@@ -305,16 +324,26 @@ impl<'a> Effects<'a> {
         // What the member's own code reads belongs to that member, not here,
         // and what it holds does not depend on the applications enclosing this
         let applying = std::mem::take(&mut self.applying);
+        let cut = std::mem::replace(&mut self.cut, false);
         let functions = self.visit(code, member.0, &[], &mut Reads::default());
         self.applying = applying;
         self.computing.remove(&member);
-        self.values.insert(member, functions.clone());
+        // Functions found under a cutoff are not kept: another member's
+        // analysis computes them again, within its own depth
+        if !self.cut {
+            self.values.insert(member, functions.clone());
+        }
+        self.cut |= cut;
         functions
     }
 
     /// Add to `reads` what applying `function` to `args` reads, and return the
     /// functions its result may be
     fn apply(&mut self, function: Function, args: &[Functions], reads: &mut Reads) -> Functions {
+        // Once cut off, the member's analysis makes no further application
+        if self.cut {
+            return BTreeSet::from([UNKNOWN]);
+        }
         let Some(Lambda {
             service,
             params,
@@ -330,17 +359,24 @@ impl<'a> Effects<'a> {
             return result.clone();
         }
         // A recursive application reads what the application it reenters
-        // reads. One past the depth limit is cut off like one reentering the
-        // outermost application, which no other analysis would follow deeper
+        // reads; the applications in between are not cached
         let depth = self.applying.len();
-        let reentered = self
+        if let Some(position) = self
             .applying
             .iter()
-            .position(|(other, _)| *other == application);
-        if reentered.is_some() || depth >= MAX_SCOPE_DEPTH {
+            .position(|(other, _)| *other == application)
+        {
             if let Some((_, outermost)) = self.applying.last_mut() {
-                *outermost = reentered.unwrap_or(0).min(*outermost);
+                *outermost = position.min(*outermost);
             }
+            return BTreeSet::from([UNKNOWN]);
+        }
+        // One nested past the depth limit exceeds it: what it reads is
+        // unknown, the current member's analysis is incomplete and ends here,
+        // and `cut` keeps every application enclosing the cutoff out of the
+        // cache
+        if depth >= MAX_SCOPE_DEPTH {
+            self.cut = true;
             return BTreeSet::from([UNKNOWN]);
         }
         let mut locals = env;
@@ -359,22 +395,26 @@ impl<'a> Effects<'a> {
         match self.applying.last_mut() {
             // Its reads lack those of the enclosing application it reentered
             Some((_, enclosing)) if outermost < depth => *enclosing = outermost.min(*enclosing),
-            _ => {
+            _ if !self.cut => {
                 self.applied.insert(application, (own, result.clone()));
             }
+            _ => {}
         }
         result
     }
 }
 
-/// A program whose declarations cannot be initialized in order, or whose
-/// direct dependency graph has a cycle
-#[derive(Debug)]
+/// A program whose declarations cannot be initialized in order, whose direct
+/// dependency graph has a cycle, or whose analysis exceeds the depth limit
+#[derive(Debug, PartialEq, Eq)]
 pub enum Error {
     /// Initializing this member would read a member declared after it
     ForwardReference(Symbol),
     /// This def reads itself, directly or through other defs
     Cycle { service: Symbol, member: Symbol },
+    /// The analysis of what this member reads nested applications
+    /// `MAX_SCOPE_DEPTH` deep
+    DepthLimitExceeded { service: Symbol, member: Symbol },
 }
 
 /// A member of a program, in initialization order: services in program
@@ -388,8 +428,9 @@ struct Declared {
     reads: Option<Reads>,
 }
 
-/// Check that `program` can be initialized in declaration order and that its
-/// direct dependency graph is acyclic, from one analysis of its declarations
+/// Check that `program` can be initialized in declaration order, that its
+/// direct dependency graph is acyclic, and that the analysis of each member
+/// stays within the depth limit, from one analysis of its declarations
 pub(crate) fn check(program: &[Stmt]) -> Result<(), Error> {
     let mut effects = Effects::new(program, HashMap::new());
     let mut services = Vec::new();
@@ -409,11 +450,21 @@ pub(crate) fn check(program: &[Stmt]) -> Result<(), Error> {
             let (Decl::VarDecl { name, .. }
             | Decl::DefDecl { name, .. }
             | Decl::TableDecl { name, .. }) = decl;
+            let reads = match effects.member_reads(service, decl) {
+                Some((_, _, false)) => {
+                    return Err(Error::DepthLimitExceeded {
+                        service,
+                        member: *name,
+                    })
+                }
+                Some((_, reads, true)) => Some(reads),
+                None => None,
+            };
             declared.push(Declared {
                 member: (service, *name),
                 at: (position, index),
                 def: matches!(decl, Decl::DefDecl { .. }),
-                reads: effects.member_reads(service, decl).map(|(_, reads)| reads),
+                reads,
             });
         }
     }

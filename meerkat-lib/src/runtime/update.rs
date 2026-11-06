@@ -275,6 +275,13 @@ impl Transaction {
                             "illegal eager forward reference or dependency cycle on '{}'",
                             manager.interner.get(member)
                         ),
+                        effects::Error::DepthLimitExceeded { service, member } => {
+                            effects::depth_limit_message(&format!(
+                                "{}.{}",
+                                manager.interner.get(service),
+                                manager.interner.get(member)
+                            ))
+                        }
                     };
                     return Err(EvalError::RuntimeError(format!(
                         "Type check failed on update: {}",
@@ -327,6 +334,20 @@ impl Transaction {
                 }
 
                 let introduced = self.unvalued_defs(manager);
+                // The declarations passed the static checks; with the
+                // function values the running services hold, their graphs
+                // must stay complete and acyclic as well
+                let overrides = self
+                    .values
+                    .iter()
+                    .map(|(member, value)| (*member, vec![value]))
+                    .collect();
+                let graphs =
+                    manager.graphs_of(&self.ast, manager.running_services(), None, &overrides);
+                if let Err(e) = manager.check_graphs(&graphs) {
+                    self.release_lock_txn(manager);
+                    return Err(e);
+                }
                 self.state = TransactionState::Evaluated;
                 self.commit(manager);
 

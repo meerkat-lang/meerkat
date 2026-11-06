@@ -21,6 +21,9 @@ pub struct ServiceGraphs {
     pub defs: HashSet<Symbol>,
     /// Set of table symbols defined in the service
     pub tables: HashSet<Symbol>,
+    /// Defs whose analysis exceeded the depth limit; their edges are what it
+    /// found. Never part of installed graphs
+    pub incomplete: HashSet<Symbol>,
 }
 
 impl ServiceGraphs {
@@ -35,6 +38,7 @@ impl ServiceGraphs {
             vars: HashSet::new(),
             defs: HashSet::new(),
             tables: HashSet::new(),
+            incomplete: HashSet::new(),
         }
     }
 
@@ -74,8 +78,31 @@ impl PartialEq for ServiceGraphs {
             && self.defs == other.defs
             && self.tables == other.tables
             && self.cross_deps == other.cross_deps
+            && self.incomplete == other.incomplete
             && edges(self) == edges(other)
     }
+}
+
+/// A def on a cycle of the direct dependency graph of `graphs`, the graphs
+/// of every running service, if there is one (§2.1.4): the smallest such
+/// member, so the choice does not depend on map order
+pub(crate) fn dependency_cycle(
+    graphs: &HashMap<Symbol, ServiceGraphs>,
+) -> Option<(Symbol, Symbol)> {
+    let mut graph = DiGraphMap::<(Symbol, Symbol), ()>::new();
+    for (&service, graphs) in graphs {
+        for &def in &graphs.defs {
+            graph.add_node((service, def));
+            for input in graphs.inputs(service, def) {
+                graph.add_edge(input, (service, def), ());
+            }
+        }
+    }
+    petgraph::algo::tarjan_scc(&graph)
+        .into_iter()
+        .filter(|component| component.len() > 1 || graph.contains_edge(component[0], component[0]))
+        .flatten()
+        .min()
 }
 
 impl Default for ServiceGraphs {

@@ -340,7 +340,7 @@ impl Transaction {
                 let overrides = self
                     .values
                     .iter()
-                    .map(|(member, value)| (*member, vec![value]))
+                    .map(|(member, value)| (*member, value))
                     .collect();
                 let graphs =
                     manager.graphs_of(&self.ast, manager.running_services(), None, &overrides);
@@ -366,9 +366,10 @@ impl Transaction {
                 let updated_svc_names: HashSet<_> =
                     updated_services.iter().map(|(name, _)| **name).collect();
 
-                // Graphs follow the installed declarations everywhere: a def in
-                // another service reads differently once a function it calls changes
-                manager.refresh_graphs().await;
+                // The staged values and declarations were installed without
+                // yielding; their checked graphs are still the ones to install
+                manager.install_graphs(graphs).await;
+                manager.retry_deferred_deliveries().await;
                 for updated_svc_name in updated_svc_names {
                     if let Some(service) = manager.services.get_mut(&updated_svc_name) {
                         service.service_lock = None;

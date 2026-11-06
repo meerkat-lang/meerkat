@@ -18,7 +18,6 @@ use crate::runtime::interner::{Interner, Symbol};
 use crate::runtime::txn::{
     ComposedCall, ReadEntry, Sources, Transaction, TxnId, VClock, VarState, WaitKey,
 };
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
@@ -422,15 +421,15 @@ impl Manager {
         self.graphs_of(&self.unified_ast, services, read, &HashMap::new())
     }
 
-    /// `service_graphs` for the declarations of `ast` and, for the members in
-    /// `overrides`, these values in place of the ones held: the graphs a code
-    /// update or a write would install
+    /// `service_graphs` for `ast`, substituting `overrides` for local vars this
+    /// node would install. Remote inputs keep their delivered versions until
+    /// their owners publish a new value
     pub(crate) fn graphs_of<'a>(
         &'a self,
         ast: &'a [Stmt],
         services: impl IntoIterator<Item = Symbol>,
         read: Option<&'a Transaction>,
-        overrides: &HashMap<(Symbol, Symbol), Vec<&'a Value>>,
+        overrides: &HashMap<(Symbol, Symbol), &'a Value>,
     ) -> HashMap<Symbol, ServiceGraphs> {
         fn publish<'a>(
             published: &mut HashMap<(Symbol, Symbol), Vec<&'a Value>>,
@@ -453,8 +452,13 @@ impl Manager {
             };
             for decl in decls {
                 if let Decl::VarDecl { name: var, .. } = decl {
-                    if let Some(state) = service.vars.get(var) {
-                        publish(&mut published, (name, *var), &state.value);
+                    let member = (name, *var);
+                    if let Some(value) = overrides
+                        .get(&member)
+                        .copied()
+                        .or_else(|| service.vars.get(var).map(|state| &state.value))
+                    {
+                        publish(&mut published, member, value);
                     }
                 }
             }
@@ -483,14 +487,6 @@ impl Manager {
                 }
             }
         }
-        for (&member, values) in overrides {
-            let versions = values
-                .iter()
-                .copied()
-                .filter(|value| matches!(value, Value::Closure { .. }))
-                .collect();
-            published.insert(member, versions);
-        }
         let mut effects = Effects::new(ast, published);
         services
             .into_iter()
@@ -517,12 +513,17 @@ impl Manager {
     pub(crate) async fn try_refresh_graphs(&mut self) -> Result<(), EvalError> {
         let graphs = self.service_graphs(self.running_services(), None);
         self.check_graphs(&graphs)?;
+        self.install_graphs(graphs).await;
+        Ok(())
+    }
+
+    /// Install the graphs checked for the state this node now holds
+    pub(crate) async fn install_graphs(&mut self, graphs: HashMap<Symbol, ServiceGraphs>) {
         for (name, graphs) in graphs {
             if self.services[&name].graphs != graphs {
                 self.update_service_graphs(name, graphs).await;
             }
         }
-        Ok(())
     }
 
     /// The services running here: created and no longer initializing
@@ -562,13 +563,12 @@ impl Manager {
         Ok(())
     }
 
-    /// Whether the graphs of the running services stay complete and acyclic
-    /// with `writes` stored: checked before a write of a function value, or
-    /// over one, is applied or committed. Other writes change no graph
-    fn check_writes<'a>(
+    /// The checked graphs with `writes` stored, or None if no function value
+    /// changes. A caller installing the writes immediately can reuse them
+    fn graphs_after_writes<'a>(
         &self,
         writes: impl IntoIterator<Item = ((Symbol, Symbol), &'a Value)>,
-    ) -> Result<(), EvalError> {
+    ) -> Result<Option<HashMap<Symbol, ServiceGraphs>>, EvalError> {
         let overrides: HashMap<_, _> = writes
             .into_iter()
             .filter(|&((service, var), value)| {
@@ -579,24 +579,22 @@ impl Manager {
                         .and_then(|service| service.vars.get(&var))
                         .is_some_and(|state| matches!(state.value, Value::Closure { .. }))
             })
-            .map(|(member, value)| (member, vec![value]))
             .collect();
         if overrides.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
-        self.check_graphs(&self.graphs_of(
-            &self.unified_ast,
-            self.running_services(),
-            None,
-            &overrides,
-        ))
+        let graphs = self.graphs_of(&self.unified_ast, self.running_services(), None, &overrides);
+        self.check_graphs(&graphs)?;
+        Ok(Some(graphs))
     }
 
-    /// `check_writes` for the writes `txn` buffered on this node
+    /// Check the writes `txn` buffered on this node. Its graph is not retained
+    /// across the separate prepare and commit phases
     fn check_buffered_writes(&self, txn: &Transaction) -> Result<(), EvalError> {
-        self.check_writes(txn.written.iter().filter_map(|((sid, var), value)| {
+        self.graphs_after_writes(txn.written.iter().filter_map(|((sid, var), value)| {
             Some(((self.service_name_for_net_id(sid)?, *var), value))
         }))
+        .map(|_| ())
     }
 
     /// Park a request on the wait queue for the contended `WaitKey`
@@ -961,22 +959,31 @@ impl Manager {
                         .graphs
                         .inputs(svc_name, name)
                         .collect();
-                    let receipts: Vec<_> = inputs
+                    // The pairs must form a batch, as any the def later selects
+                    let chains: Vec<_> = inputs
                         .iter()
                         .filter_map(|&input| {
-                            self.input_receipt((svc_name, name), input, Some(&txn))
+                            let candidates =
+                                self.input_candidates((svc_name, name), input, Some(&txn))?;
+                            Some(Chain { input, candidates })
                         })
                         .collect();
-                    let (vector_clock, gate_ok, sources) = self.check_receipts(&receipts);
-                    if !gate_ok {
+                    let mut selection = vec![0; chains.len()];
+                    if !Self::close_batch(&chains, &mut selection) {
                         return Err(EvalError::RuntimeError(format!(
                             "Cannot initialize '{}.{}': input clocks are missing or inconsistent",
                             self.interner.get(svc_name),
                             self.interner.get(name),
                         )));
                     }
+                    let (vector_clock, sources) = Self::join_receipts(
+                        chains
+                            .iter()
+                            .zip(&selection)
+                            .map(|(chain, &i)| &chain.candidates.pairs[i]),
+                    );
                     var_value.vector_clock = vector_clock;
-                    var_value.sources = sources.filter(|_| receipts.len() == inputs.len());
+                    var_value.sources = sources.filter(|_| chains.len() == inputs.len());
                 } else {
                     var_value.sources = Some(Sources::from([(svc_name, name)]));
                 }
@@ -1301,12 +1308,9 @@ impl Manager {
         // Non-transactional path: apply the write immediately and propagate.
         // A function value is stored only if the defs applying it keep
         // complete, acyclic graphs
-        self.check_writes([((service_name, var_name), &value)])?;
-        let functions;
+        let graphs = self.graphs_after_writes([((service_name, var_name), &value)])?;
         if let Some(service) = self.services.get_mut(&service_name) {
             if let Some(var_state) = service.vars.get_mut(&var_name) {
-                functions = matches!(value, Value::Closure { .. })
-                    || matches!(var_state.value, Value::Closure { .. });
                 var_state.value = value;
                 self.simultaneous_bump(VClock::new(), &HashSet::from([(service_name, var_name)]));
             } else {
@@ -1325,8 +1329,9 @@ impl Manager {
             )));
         }
 
-        if functions {
-            self.refresh_graphs().await;
+        if let Some(graphs) = graphs {
+            self.install_graphs(graphs).await;
+            self.retry_deferred_deliveries().await;
         }
         // propagate: re-evaluate defs that depend on this var in topo order
         self.propagate(service_name, var_name).await;
@@ -1477,52 +1482,25 @@ impl Manager {
         }
     }
 
-    /// The pair `def` would select for `input` before any pending delivery
-    fn input_receipt(
-        &self,
-        def: (Symbol, Symbol),
-        input: (Symbol, Symbol),
-        txn: Option<&Transaction>,
-    ) -> Option<ReadEntry> {
-        self.input_candidates(def, input, txn)
-            .and_then(|candidates| candidates.pairs.into_iter().next())
-    }
-
-    /// Gate each input using the Sources paired with that value and clock.
-    fn check_input_clocks(
-        &self,
-        inputs: &[(&VClock, Option<Cow<'_, Sources>>)],
-    ) -> (VClock, bool, Option<Sources>) {
-        let v_target = join_clocks(inputs.iter().map(|(clock, _)| *clock));
-        let gate_ok = inputs
-            .iter()
-            .all(|(clock, sources)| caught_up(&v_target, clock, sources.as_deref()));
-        let sources = gate_ok
-            .then(|| {
-                inputs
-                    .iter()
-                    .try_fold(Sources::new(), |mut result, (_, sources)| {
-                        result.extend(sources.as_ref()?.iter().copied());
-                        Some(result)
-                    })
-            })
-            .flatten();
-        (v_target, gate_ok, sources)
-    }
-
-    /// `check_input_clocks` over read pairs; one without a clock fails it
-    fn check_receipts<'a>(
-        &self,
+    /// The clock and Sources of a def evaluated against `receipts`, a batch
+    /// `close_batch` accepted: the join of their clocks, and the union of
+    /// their Sources, unknown if any is
+    fn join_receipts<'a>(
         receipts: impl IntoIterator<Item = &'a ReadEntry>,
-    ) -> (VClock, bool, Option<Sources>) {
-        let Some(inputs) = receipts
-            .into_iter()
-            .map(|(_, clock, sources)| Some((clock.as_ref()?, sources.as_ref().map(Cow::Borrowed))))
-            .collect::<Option<Vec<_>>>()
-        else {
-            return (VClock::new(), false, None);
-        };
-        self.check_input_clocks(&inputs)
+    ) -> (VClock, Option<Sources>) {
+        let mut clock = VClock::new();
+        let mut sources = Some(Sources::new());
+        for (_, pair_clock, pair_sources) in receipts {
+            clock = join_clocks([&clock, pair_clock.as_ref().unwrap_or(&VClock::new())]);
+            sources = match (sources, pair_sources) {
+                (Some(mut all), Some(more)) => {
+                    all.extend(more.iter().copied());
+                    Some(all)
+                }
+                _ => None,
+            };
+        }
+        (clock, sources)
     }
 
     /// Make changes of `input` reach `def`: a listener on a local owner,
@@ -1695,13 +1673,12 @@ impl Manager {
         .await;
         self.adopt_batch((svc, def), &chains, &selection);
         let value = result?;
-        let (clock, gate_ok, sources) = self.check_receipts(
+        let (clock, sources) = Self::join_receipts(
             chains
                 .iter()
                 .zip(&selection)
                 .map(|(chain, &i)| &chain.candidates.pairs[i]),
         );
-        debug_assert!(gate_ok, "close_batch selected a batch the gate rejects");
         let sources = sources.filter(|_| !absent);
         Ok(Some(self.install_recomputed(
             (svc, def),
@@ -2220,7 +2197,7 @@ impl Manager {
     /// taken one changes the graphs. One refused again is deferred again by
     /// `accept_delivery`; one the def no longer reads, or whose pair its
     /// history has overtaken, is dropped there
-    async fn retry_deferred_deliveries(&mut self) {
+    pub(crate) async fn retry_deferred_deliveries(&mut self) {
         loop {
             let deferred = std::mem::take(&mut self.deferred_deliveries);
             if deferred.is_empty() {
@@ -3914,13 +3891,6 @@ impl Manager {
 
     /// Store `txn`'s writes on this node with `clock`, the transaction's
     /// `V_new`, commit its participants with the same clock, then propagate
-    ///
-    /// `clock` records what the transaction saw of other owners. A cached
-    /// remote input behind it would hold back every def that pairs it with
-    /// these writes, so its owner is asked for its current value again. The
-    /// owner's own `Update` usually arrives as well, possibly after the
-    /// `CommitResponse`; the request covers one that will not, because it was
-    /// overtaken by an older one or lost
     async fn commit_stamped(&mut self, txn: &Transaction, clock: &VClock) -> Option<EvalError> {
         let mut functions = false;
         for ((sid, var), value) in &txn.written {

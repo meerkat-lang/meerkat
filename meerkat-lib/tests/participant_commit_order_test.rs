@@ -126,7 +126,7 @@ async fn reply(net: &mut NetworkActor, reply_to: &str, msg: MeerkatMessage) {
 /// whose clock was zero. Runs forever.
 async fn serve_rc(rc_net: &mut NetworkActor) {
     let mut committed: Option<Vec<ClockEntry>> = None;
-    // EXPERIMENT v6: the subscriber a real participant would propagate to; a
+    // The subscriber a real participant would propagate to; a
     // participant's listener table outlives each stand-in invocation
     // keyed by the originator's address (tests run in parallel, one originator each)
     static SUBSCRIBERS: std::sync::Mutex<Vec<(String, String, String)>> =
@@ -200,7 +200,7 @@ async fn serve_rc(rc_net: &mut NetworkActor) {
                         error: None,
                     };
                     reply(rc_net, &reply_to, msg).await;
-                    // EXPERIMENT v6: a real participant propagates the committed
+                    // A real participant propagates the committed
                     // write to the defs subscribed to it (commit_participant ->
                     // propagate -> emit_update); the stand-in does the same
                     let subscriber = SUBSCRIBERS

@@ -8,10 +8,9 @@
 //! latent in a function body are attributed to the caller, not to the member
 //! holding the function
 //!
-//! The analysis never fails. The functions a member may hold come from its
-//! code or, once the runtime holds them, from its values: a var holds what
-//! its initializer or an action stored in it, and a remote member what its
-//! owner published to the defs here that read it, or what a transaction
+//! The functions a member may hold come from its code or runtime values: a var
+//! holds what its initializer or an action stored in it, and a remote member
+//! what its owner published to the defs here that read it, or what a transaction
 //! initializing one of them read. Applying a function whose code is not known
 //! here reads nothing; the runtime analyzes the code when it arrives, before
 //! any def can apply it
@@ -48,6 +47,10 @@ const UNKNOWN: Function = usize::MAX;
 
 /// The functions a value may be; empty for a value that is not a function
 type Functions = BTreeSet<Function>;
+
+/// The current member could not be analyzed within the application depth limit
+#[derive(Clone, Copy)]
+struct DepthLimit;
 
 type Locals = Vec<(Symbol, Functions)>;
 
@@ -89,8 +92,8 @@ pub(crate) struct Effects<'a> {
     /// same function when they are the same code with the same captured locals
     lambdas: Vec<Lambda<'a>>,
     functions: HashMap<(Symbol, *const Expr, Locals), Function>,
-    /// The functions each member may hold, once computed
-    values: HashMap<Member, Functions>,
+    /// Each member's functions, or the failure to analyze them within the limit
+    values: HashMap<Member, Result<Functions, DepthLimit>>,
     /// Members whose value is being computed
     computing: HashSet<Member>,
     /// Applications being analyzed, each with the depth of the outermost of
@@ -99,12 +102,6 @@ pub(crate) struct Effects<'a> {
     /// The reads and result of each application whose analysis did not
     /// reenter an application enclosing it
     applied: HashMap<Application, (HashSet<Member>, Functions)>,
-    /// Whether the analysis of the current member exceeded the depth limit:
-    /// its reads are incomplete, and it analyzes nothing further
-    cut: bool,
-    /// Members whose own analysis exceeded the depth limit: it would again,
-    /// so a reader is cut off at once instead of computing them anew
-    incomplete: HashSet<Member>,
 }
 
 impl<'a> Effects<'a> {
@@ -172,9 +169,8 @@ impl<'a> Effects<'a> {
             return None;
         };
         let mut reads = Reads::default();
-        self.cut = false;
-        self.visit(val, service, &[], &mut reads);
-        Some((*name, reads, !self.cut))
+        let complete = self.visit(val, service, &[], &mut reads).is_ok();
+        Some((*name, reads, complete))
     }
 
     fn decl(&self, (service, member): Member) -> Option<&'a Decl> {
@@ -194,23 +190,19 @@ impl<'a> Effects<'a> {
         service: Symbol,
         locals: &[(Symbol, Functions)],
         reads: &mut Reads,
-    ) -> Functions {
-        // Once cut off, the member's analysis is over
-        if self.cut {
-            return Functions::new();
-        }
-        match expr {
+    ) -> Result<Functions, DepthLimit> {
+        Ok(match expr {
             Expr::Literal { val } => self.literal(val),
             // A name that is not a local is a member of the code's service,
             // declared here or not
             Expr::Variable { name } => match locals.iter().rev().find(|(local, _)| local == name) {
                 Some((_, functions)) => functions.clone(),
-                None => self.read((service, *name), reads),
+                None => self.read((service, *name), reads)?,
             },
             &Expr::MemberAccess {
                 service_name,
                 member_name,
-            } => self.read((service_name, member_name), reads),
+            } => self.read((service_name, member_name), reads)?,
             Expr::Func { params, body, .. } => {
                 // As in `eval`, a closure captures the locals free in its body,
                 // except one named like a member of its service
@@ -233,14 +225,14 @@ impl<'a> Effects<'a> {
             // Only a transaction runs an action; a table literal is data
             Expr::Action(_) | Expr::Table { .. } => Functions::new(),
             Expr::Call { func, args } => {
-                let callee = self.visit(func, service, locals, reads);
+                let callee = self.visit(func, service, locals, reads)?;
                 let args: Vec<_> = args
                     .iter()
                     .map(|arg| self.visit(arg, service, locals, reads))
-                    .collect();
+                    .collect::<Result<_, _>>()?;
                 let mut result = Functions::new();
                 for function in callee {
-                    result.extend(self.apply(function, &args, reads));
+                    result.extend(self.apply(function, &args, reads)?);
                 }
                 result
             }
@@ -249,10 +241,11 @@ impl<'a> Effects<'a> {
                 where_clause,
                 ..
             } => {
-                self.visit(where_clause, service, locals, reads);
+                let result = self.visit(where_clause, service, locals, reads);
                 if !locals.iter().any(|(local, _)| local == table_name) {
                     reads.direct.insert((service, *table_name));
                 }
+                result?;
                 Functions::new()
             }
             // Every other form reads what its parts read and may be any
@@ -260,11 +253,11 @@ impl<'a> Effects<'a> {
             _ => {
                 let mut value = Functions::new();
                 for child in expr.children() {
-                    value.extend(self.visit(child, service, locals, reads));
+                    value.extend(self.visit(child, service, locals, reads)?);
                 }
                 value
             }
-        }
+        })
     }
 
     fn literal(&mut self, val: &'a Value) -> Functions {
@@ -306,7 +299,7 @@ impl<'a> Effects<'a> {
     }
 
     /// Record a read of `member`, and return the functions it may hold
-    fn read(&mut self, member: Member, reads: &mut Reads) -> Functions {
+    fn read(&mut self, member: Member, reads: &mut Reads) -> Result<Functions, DepthLimit> {
         reads.direct.insert(member);
         if let Some(functions) = self.values.get(&member) {
             return functions.clone();
@@ -316,47 +309,36 @@ impl<'a> Effects<'a> {
             for value in versions {
                 functions.extend(self.literal(value));
             }
-            self.values.insert(member, functions.clone());
-            return functions;
+            self.values.insert(member, Ok(functions.clone()));
+            return Ok(functions);
         }
         let code = match self.decl(member) {
             Some(Decl::VarDecl { val, .. } | Decl::DefDecl { val, .. }) => val,
-            Some(Decl::TableDecl { .. }) => return Functions::new(),
+            Some(Decl::TableDecl { .. }) => return Ok(Functions::new()),
             // A member of a service known here only by name may hold any
-            None => return BTreeSet::from([UNKNOWN]),
+            None => return Ok(BTreeSet::from([UNKNOWN])),
         };
-        if self.incomplete.contains(&member) {
-            self.cut = true;
-            return BTreeSet::from([UNKNOWN]);
-        }
         if !self.computing.insert(member) {
-            return BTreeSet::from([UNKNOWN]);
+            return Ok(BTreeSet::from([UNKNOWN]));
         }
         // What the member's own code reads belongs to that member, not here,
         // and what it holds does not depend on the applications enclosing this
         let applying = std::mem::take(&mut self.applying);
-        let cut = std::mem::replace(&mut self.cut, false);
         let functions = self.visit(code, member.0, &[], &mut Reads::default());
         self.applying = applying;
         self.computing.remove(&member);
-        // Functions found under a cutoff are not kept; the member is
-        // remembered as incomplete instead
-        if self.cut {
-            self.incomplete.insert(member);
-        } else {
-            self.values.insert(member, functions.clone());
-        }
-        self.cut |= cut;
+        self.values.insert(member, functions.clone());
         functions
     }
 
     /// Add to `reads` what applying `function` to `args` reads, and return the
     /// functions its result may be
-    fn apply(&mut self, function: Function, args: &[Functions], reads: &mut Reads) -> Functions {
-        // Once cut off, the member's analysis makes no further application
-        if self.cut {
-            return BTreeSet::from([UNKNOWN]);
-        }
+    fn apply(
+        &mut self,
+        function: Function,
+        args: &[Functions],
+        reads: &mut Reads,
+    ) -> Result<Functions, DepthLimit> {
         let Some(Lambda {
             service,
             params,
@@ -364,12 +346,12 @@ impl<'a> Effects<'a> {
             env,
         }) = self.lambdas.get(function).cloned()
         else {
-            return BTreeSet::from([UNKNOWN]);
+            return Ok(BTreeSet::from([UNKNOWN]));
         };
         let application = (function, args.to_vec());
         if let Some((more, result)) = self.applied.get(&application) {
             reads.activated.extend(more);
-            return result.clone();
+            return Ok(result.clone());
         }
         // A recursive application reads what the application it reenters
         // reads; the applications in between are not cached
@@ -382,15 +364,12 @@ impl<'a> Effects<'a> {
             if let Some((_, outermost)) = self.applying.last_mut() {
                 *outermost = position.min(*outermost);
             }
-            return BTreeSet::from([UNKNOWN]);
+            return Ok(BTreeSet::from([UNKNOWN]));
         }
-        // One nested past the depth limit exceeds it: what it reads is
-        // unknown, the current member's analysis is incomplete and ends here,
-        // and `cut` keeps every application enclosing the cutoff out of the
-        // cache
+        // Propagation of this failure stops the member's analysis and leaves
+        // every application enclosing it out of the cache
         if depth >= MAX_SCOPE_DEPTH {
-            self.cut = true;
-            return BTreeSet::from([UNKNOWN]);
+            return Err(DepthLimit);
         }
         let mut locals = env;
         locals.extend(
@@ -405,15 +384,15 @@ impl<'a> Effects<'a> {
         let (application, outermost) = self.applying.pop().expect("pushed above");
         let own: HashSet<Member> = own.all().collect();
         reads.activated.extend(&own);
+        let result = result?;
         match self.applying.last_mut() {
             // Its reads lack those of the enclosing application it reentered
             Some((_, enclosing)) if outermost < depth => *enclosing = outermost.min(*enclosing),
-            _ if !self.cut => {
+            _ => {
                 self.applied.insert(application, (own, result.clone()));
             }
-            _ => {}
         }
-        result
+        Ok(result)
     }
 }
 

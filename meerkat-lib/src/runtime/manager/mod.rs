@@ -374,19 +374,23 @@ impl Manager {
     /// Rewire each running service whose graphs no longer match the installed
     /// declarations or the remote code its defs call
     pub(crate) async fn refresh_graphs(&mut self) {
-        let graphs = self.service_graphs(self.running_services(), None);
-        // A function value delivered from elsewhere can leave a def's reads
-        // incomplete or make the graph cyclic; the graphs installed stay the
-        // last ones found complete and acyclic
-        if let Err(e) = self.check_graphs(&graphs) {
+        if let Err(e) = self.try_refresh_graphs().await {
             log::warn!("dependency graphs not refreshed: {}", e);
-            return;
         }
+    }
+
+    /// `refresh_graphs`, or the reason the graphs of the running services
+    /// cannot be installed: a def's reads incomplete, or a cycle. Nothing is
+    /// installed then; the graphs stay the last ones found complete and acyclic
+    pub(crate) async fn try_refresh_graphs(&mut self) -> Result<(), EvalError> {
+        let graphs = self.service_graphs(self.running_services(), None);
+        self.check_graphs(&graphs)?;
         for (name, graphs) in graphs {
             if self.services[&name].graphs != graphs {
                 self.update_service_graphs(name, graphs).await;
             }
         }
+        Ok(())
     }
 
     /// The services running here: created and no longer initializing
@@ -1863,10 +1867,33 @@ impl Manager {
         // A function in code not delivered before can change what its callers read
         let new_code = matches!(value, Value::Closure { .. })
             && cache.get(&source).map(|entry| &entry.0) != Some(&value);
-        cache.insert(source, (value, Some(clock), sources));
+        let previous = cache.insert(source, (value, Some(clock), sources));
 
         if new_code {
-            self.refresh_graphs().await;
+            // A function that would leave a def's reads incomplete or close a
+            // cycle is not accepted: the def keeps the version it held, and
+            // the graphs of the other defs stay refreshable
+            if let Err(e) = self.try_refresh_graphs().await {
+                log::warn!(
+                    "update of {}.{} for {}.{} not accepted: {}",
+                    self.interner.get(source.0),
+                    self.interner.get(source.1),
+                    self.interner.get(listener_svc),
+                    self.interner.get(listener_def_sym),
+                    e
+                );
+                if let Some(cache) = self
+                    .services
+                    .get_mut(&listener_svc)
+                    .and_then(|service| service.dep_cache.get_mut(&listener_def_sym))
+                {
+                    match previous {
+                        Some(entry) => cache.insert(source, entry),
+                        None => cache.remove(&source),
+                    };
+                }
+                return;
+            }
         }
 
         for (svc, member) in self.recompute_def(listener_svc, listener_def_sym).await {

@@ -100,8 +100,11 @@ pub(crate) struct Effects<'a> {
     /// reenter an application enclosing it
     applied: HashMap<Application, (HashSet<Member>, Functions)>,
     /// Whether the analysis of the current member exceeded the depth limit:
-    /// its reads are incomplete, and it makes no further application
+    /// its reads are incomplete, and it analyzes nothing further
     cut: bool,
+    /// Members whose own analysis exceeded the depth limit: it would again,
+    /// so a reader is cut off at once instead of computing them anew
+    incomplete: HashSet<Member>,
 }
 
 impl<'a> Effects<'a> {
@@ -192,6 +195,10 @@ impl<'a> Effects<'a> {
         locals: &[(Symbol, Functions)],
         reads: &mut Reads,
     ) -> Functions {
+        // Once cut off, the member's analysis is over
+        if self.cut {
+            return Functions::new();
+        }
         match expr {
             Expr::Literal { val } => self.literal(val),
             // A name that is not a local is a member of the code's service,
@@ -318,6 +325,10 @@ impl<'a> Effects<'a> {
             // A member of a service known here only by name may hold any
             None => return BTreeSet::from([UNKNOWN]),
         };
+        if self.incomplete.contains(&member) {
+            self.cut = true;
+            return BTreeSet::from([UNKNOWN]);
+        }
         if !self.computing.insert(member) {
             return BTreeSet::from([UNKNOWN]);
         }
@@ -328,9 +339,11 @@ impl<'a> Effects<'a> {
         let functions = self.visit(code, member.0, &[], &mut Reads::default());
         self.applying = applying;
         self.computing.remove(&member);
-        // Functions found under a cutoff are not kept: another member's
-        // analysis computes them again, within its own depth
-        if !self.cut {
+        // Functions found under a cutoff are not kept; the member is
+        // remembered as incomplete instead
+        if self.cut {
+            self.incomplete.insert(member);
+        } else {
             self.values.insert(member, functions.clone());
         }
         self.cut |= cut;

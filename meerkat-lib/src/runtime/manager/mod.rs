@@ -70,13 +70,134 @@ async fn retry_backoff(ms: u64) {
     send_wrapper::SendWrapper::new(gloo_timers::future::TimeoutFuture::new(ms as u32)).await;
 }
 
-/// One cross-service dependency's cached state: the last value delivered for it
-/// plus the vector clock that value was stamped with by its writer.
-pub type DepEntry = ReadEntry;
+/// A delivery of function code refused for now, see `Manager::deferred_deliveries`
+struct DeferredDelivery {
+    listener: ServiceNetId,
+    def: Symbol,
+    source: (Symbol, Symbol),
+    entry: ReadEntry,
+}
 
-/// #24: cached values of each def's cross-service deps:
-/// def -> {(source service, member) -> (value, clock)}.
-pub type DepCache = HashMap<Symbol, HashMap<(Symbol, Symbol), DepEntry>>;
+/// One delivered input of a def, kept as §3.2 keeps an edge: the pair the
+/// def last incorporated and the pairs delivered since that it has not
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct InputState {
+    /// The pair the def last incorporated: read by its initialization, or
+    /// the delivery its last evaluation selected
+    pub retained: Option<ReadEntry>,
+    /// Deliveries the def has not incorporated, in the owner's publication
+    /// order. None is behind `retained` on a dimension its value depends on
+    pub pending: Vec<ReadEntry>,
+}
+
+impl InputState {
+    /// An edge whose incorporated pair is `entry`, with nothing pending
+    pub fn seeded(entry: ReadEntry) -> Self {
+        InputState {
+            retained: Some(entry),
+            pending: Vec::new(),
+        }
+    }
+
+    /// The newest pair delivered for the input, incorporated or not
+    pub fn newest(&self) -> Option<&ReadEntry> {
+        self.pending.last().or(self.retained.as_ref())
+    }
+
+    /// Every pair known for the input, oldest first
+    fn versions(&self) -> impl Iterator<Item = &ReadEntry> {
+        self.retained.iter().chain(&self.pending)
+    }
+
+    /// Queue a delivery for selection, unless the pair already incorporated
+    /// has overtaken it, since a history only grows (§3.3.2), or it repeats
+    /// a known pair; then it is dropped and false is returned. A pair with
+    /// the same data history but another value or Sources is a code update,
+    /// not a repeat. Code is not a history: a function value supersedes
+    /// every version known on the edge, since what a caller runs is the
+    /// newest code its owner delivered, unless it is behind the newest
+    fn offer(&mut self, entry: ReadEntry) -> bool {
+        if self.versions().any(|known| *known == entry) {
+            return false;
+        }
+        if matches!(entry.0, Value::Closure { .. }) {
+            if self.newest().is_some_and(|newest| behind(&entry, newest)) {
+                return false;
+            }
+            self.retained = None;
+            self.pending = vec![entry];
+            return true;
+        }
+        if self
+            .retained
+            .as_ref()
+            .is_some_and(|retained| behind(&entry, retained))
+        {
+            return false;
+        }
+        // The owner's order: before every pending pair strictly ahead of
+        // it, after the rest
+        let at = self
+            .pending
+            .iter()
+            .rposition(|pending| !strictly_ahead(pending, &entry))
+            .map_or(0, |i| i + 1);
+        self.pending.insert(at, entry);
+        true
+    }
+
+    /// The pending pair at `index` was incorporated: it is retained, and it
+    /// and the pairs before it are consumed
+    fn adopt_pending(&mut self, index: usize) {
+        if let Some(entry) = self.pending.drain(..=index).next_back() {
+            self.retained = Some(entry);
+        }
+    }
+}
+
+/// Whether `entry` is behind `incorporated` on a dimension its value depends
+/// on, so a def that incorporated the latter cannot incorporate it
+fn behind((_, clock, sources): &ReadEntry, (_, incorporated, _): &ReadEntry) -> bool {
+    match (clock, incorporated) {
+        (Some(clock), Some(incorporated)) => !caught_up(incorporated, clock, sources.as_ref()),
+        _ => false,
+    }
+}
+
+/// Whether `later` is ahead of `earlier` on some dimension and behind on none
+fn strictly_ahead((_, later, _): &ReadEntry, (_, earlier, _): &ReadEntry) -> bool {
+    match (later, earlier) {
+        (Some(later), Some(earlier)) => later != earlier && caught_up(earlier, later, None),
+        _ => false,
+    }
+}
+
+/// The pairs one evaluation of a def may select for an input, oldest first
+struct Candidates {
+    pairs: Vec<ReadEntry>,
+    /// Where the pending deliveries start; before it is the incorporated pair
+    pending_from: usize,
+}
+
+impl Candidates {
+    /// An input with one pair, which counts as incorporated
+    fn single(pair: ReadEntry) -> Self {
+        Candidates {
+            pairs: vec![pair],
+            pending_from: 1,
+        }
+    }
+}
+
+/// One input of an evaluation and its candidates
+struct Chain {
+    input: (Symbol, Symbol),
+    candidates: Candidates,
+}
+
+/// #24: the delivered inputs of each def: the pair it incorporated and the
+/// pairs pending, per cross-service member
+pub type DepCache = HashMap<Symbol, HashMap<(Symbol, Symbol), InputState>>;
 
 pub struct Service {
     /// Globally unique identity of this service (address-based when networked).
@@ -88,8 +209,8 @@ pub struct Service {
     pub graphs: ServiceGraphs,       // dependency graph container
     /// #24: who depends on each member: member -> {(listener service id, def)}.
     pub listeners: HashMap<Symbol, HashSet<(ServiceNetId, Symbol)>>,
-    /// #24: cached values of each def's cross-service deps:
-    /// def -> {(source service, member) -> (value, clock)}.
+    /// #24: the delivered inputs of each def: the pair it incorporated and
+    /// the pairs pending, per cross-service member
     pub dep_cache: DepCache,
     /// The transaction building this instance; no other reader may observe it.
     initializing: Option<TxnId>,
@@ -151,6 +272,12 @@ pub struct Manager {
     pub pending_replies: HashMap<u64, oneshot::Sender<MeerkatMessage>>,
     /// Requests received during an RPC, to serve after its caller finishes.
     deferred_events: VecDeque<NetworkEvent>,
+    /// Deliveries of function code the graphs of the running services could
+    /// not take (a def's reads incomplete, or a cycle), kept outside the
+    /// active inputs, the newest per edge, to be offered again when the
+    /// graphs change: with later versions of the other inputs they may be
+    /// taken (the owner's transaction may have changed several functions)
+    deferred_deliveries: Vec<DeferredDelivery>,
     /// Shared by server dispatch and RPC waits; completing never starts an RPC.
     completing_updates: Vec<Completing>,
     /// (Probabilistically) unique identifier of this node, used in transaction
@@ -249,6 +376,7 @@ impl Manager {
             network: None,
             pending_replies: HashMap::new(),
             deferred_events: VecDeque::new(),
+            deferred_deliveries: Vec::new(),
             completing_updates: Vec::new(),
             node_id: Self::random_node_id(),
             pending_txns: HashMap::new(),
@@ -334,11 +462,13 @@ impl Manager {
         for service in self.services.values() {
             for (def, cache) in &service.dep_cache {
                 let inputs = service.graphs.cross_deps.get(def);
-                for (member, (value, _, _)) in cache {
+                for (member, state) in cache {
                     if self.remote_services.contains_key(&member.0)
                         && inputs.is_some_and(|inputs| inputs.contains(member))
                     {
-                        publish(&mut published, *member, value);
+                        for (value, _, _) in state.versions() {
+                            publish(&mut published, *member, value);
+                        }
                     }
                 }
             }
@@ -374,8 +504,10 @@ impl Manager {
     /// Rewire each running service whose graphs no longer match the installed
     /// declarations or the remote code its defs call
     pub(crate) async fn refresh_graphs(&mut self) {
-        if let Err(e) = self.try_refresh_graphs().await {
-            log::warn!("dependency graphs not refreshed: {}", e);
+        match self.try_refresh_graphs().await {
+            // Changed graphs may take a delivery refused before
+            Ok(()) => self.retry_deferred_deliveries().await,
+            Err(e) => log::warn!("dependency graphs not refreshed: {}", e),
         }
     }
 
@@ -877,7 +1009,7 @@ impl Manager {
                     .dep_cache
                     .entry(def)
                     .or_default()
-                    .insert(input, entry.clone());
+                    .insert(input, InputState::seeded(entry.clone()));
             }
 
             // Commit only after every initializer succeeds; participant failures
@@ -1296,75 +1428,64 @@ impl Manager {
         }
     }
 
-    /// The pair `def` would read for `input` now: the pair `txn` read, else
-    /// its own cached delivery of a cross-service member, else the state of a
+    /// The pairs `def` may select for `input`, oldest first (§3.2): the pair
+    /// `txn` read; else the deliveries of a cross-service member, starting
+    /// with the one it incorporated; else the single current pair of a
     /// visible local member. A pair without a clock is returned as read; the
-    /// gate rejects it. A remote member is never read live here
-    fn input_receipt(
+    /// gate rejects it. A remote member without a delivery, or a local one
+    /// still initializing, has none; a remote member is never read live here
+    fn input_candidates(
         &self,
         (svc, def): (Symbol, Symbol),
         (owner, member): (Symbol, Symbol),
         txn: Option<&Transaction>,
-    ) -> Option<ReadEntry> {
+    ) -> Option<Candidates> {
         self.ensure_service_visible(owner, txn.map(|txn| &txn.id))
             .ok()?;
-        let cached = txn
-            .and_then(|txn| {
-                txn.read_cache
-                    .get(&(self.service_net_id_for_name(owner), member))
+        if let Some(entry) = txn.and_then(|txn| {
+            txn.read_cache
+                .get(&(self.service_net_id_for_name(owner), member))
+        }) {
+            return Some(Candidates::single(entry.clone()));
+        }
+        let delivered = (owner != svc)
+            .then(|| {
+                self.services
+                    .get(&svc)?
+                    .dep_cache
+                    .get(&def)?
+                    .get(&(owner, member))
             })
-            .or_else(|| {
-                (owner != svc)
-                    .then(|| {
-                        self.services
-                            .get(&svc)?
-                            .dep_cache
-                            .get(&def)?
-                            .get(&(owner, member))
-                    })
-                    .flatten()
-            });
-        match cached {
-            Some(entry) => Some(entry.clone()),
+            .flatten();
+        match delivered {
+            Some(state) => {
+                let pairs: Vec<_> = state.versions().cloned().collect();
+                (!pairs.is_empty()).then_some(Candidates {
+                    pairs,
+                    pending_from: state.retained.is_some() as usize,
+                })
+            }
             None if self.remote_services.contains_key(&owner) => None,
             None => {
                 let state = self.services.get(&owner)?.vars.get(&member)?;
-                Some((
+                Some(Candidates::single((
                     state.value.clone(),
                     Some(state.vector_clock.clone()),
                     state.sources.clone(),
-                ))
+                )))
             }
         }
     }
 
-    /// Pairs for every static input of `def`, including inputs of branches an
-    /// evaluation does not take, or None while one is missing. An input whose
-    /// owner runs neither here nor remotely can never arrive: it maps to None,
-    /// and leaves the def's Sources unknown, as during initialization
-    fn static_receipts(
+    /// The pair `def` would select for `input` before any pending delivery
+    fn input_receipt(
         &self,
-        service: &Service,
-        def: Symbol,
-    ) -> Option<HashMap<(Symbol, Symbol), Option<ReadEntry>>> {
-        if service.initializing.is_some() {
-            return None;
-        }
-        service
-            .graphs
-            .inputs(service.name, def)
-            .map(|input| {
-                let absent = !self.services.contains_key(&input.0)
-                    && !self.remote_services.contains_key(&input.0);
-                match absent {
-                    true => Some((input, None)),
-                    false => Some((
-                        input,
-                        Some(self.input_receipt((service.name, def), input, None)?),
-                    )),
-                }
-            })
-            .collect()
+        def: (Symbol, Symbol),
+        input: (Symbol, Symbol),
+        txn: Option<&Transaction>,
+    ) -> Option<ReadEntry> {
+        self.input_candidates(def, input, txn)
+            .and_then(|candidates| candidates.pairs.into_iter().next())
     }
 
     /// Gate each input using the Sources paired with that value and clock.
@@ -1456,28 +1577,112 @@ impl Manager {
         }
     }
 
-    /// Evaluate `expr`, code of a def of `svc`, against `receipts`, the pairs
-    /// of its static inputs. Evaluation reads nothing else, so its value
-    /// agrees with the clock and Sources it is gated with
+    /// Whether a delivery of `input` is pending for `def`, so it can root a
+    /// batch
+    fn has_pending(&self, (svc, def): (Symbol, Symbol), input: (Symbol, Symbol)) -> bool {
+        self.services
+            .get(&svc)
+            .and_then(|service| service.dep_cache.get(&def)?.get(&input))
+            .is_some_and(|state| !state.pending.is_empty())
+    }
+
+    /// Advance `selection`, one position per chain, to the least batch at or
+    /// above it that the gate of §5.3 accepts: while some selected pair has
+    /// not caught up with the join of all selected clocks on a dimension its
+    /// value depends on, select the least later candidate of that chain that
+    /// has. Each step moves one chain forward and never back, so this ends;
+    /// it fails only when a chain has no such candidate, and then no
+    /// acceptable batch at or above `selection` exists (DESIGN D-6)
+    fn close_batch(chains: &[Chain], selection: &mut [usize]) -> bool {
+        let reached = |target: &VClock, (_, clock, sources): &ReadEntry| {
+            clock
+                .as_ref()
+                .is_some_and(|clock| caught_up(target, clock, sources.as_ref()))
+        };
+        loop {
+            let selected = |k: usize| &chains[k].candidates.pairs[selection[k]];
+            let target = join_clocks((0..chains.len()).filter_map(|k| selected(k).1.as_ref()));
+            let Some(k) = (0..chains.len()).find(|&k| !reached(&target, selected(k))) else {
+                return true;
+            };
+            let mut later = selection[k] + 1..chains[k].candidates.pairs.len();
+            let Some(next) = later.find(|&i| reached(&target, &chains[k].candidates.pairs[i]))
+            else {
+                return false;
+            };
+            selection[k] = next;
+        }
+    }
+
+    /// Record the selected pairs as what `def` incorporated: a selected
+    /// delivery is retained on its edge and supersedes the deliveries before it
+    fn adopt_batch(&mut self, (svc, def): (Symbol, Symbol), chains: &[Chain], selection: &[usize]) {
+        let Some(service) = self.services.get_mut(&svc) else {
+            return;
+        };
+        for (chain, &i) in chains.iter().zip(selection) {
+            let Some(index) = i.checked_sub(chain.candidates.pending_from) else {
+                continue;
+            };
+            if let Some(state) = service
+                .dep_cache
+                .get_mut(&def)
+                .and_then(|cache| cache.get_mut(&chain.input))
+            {
+                state.adopt_pending(index);
+            }
+        }
+    }
+
+    /// Evaluate `expr`, the code of `def`, against the least batch of its
+    /// static `inputs` at or above the first pending delivery of `root`, or
+    /// at or above the incorporated pairs when there is none, and install the
+    /// result. `close_batch` selects the batch, so its value agrees with the
+    /// clock and Sources it is gated with; evaluation reads nothing but the
+    /// batch. An input whose owner runs neither here nor remotely can never
+    /// arrive: it is left out, and leaves the def's Sources unknown. A batch
+    /// whose evaluation fails is incorporated all the same, so the failure
+    /// does not hold back the deliveries after it
     ///
     /// Returns:
-    ///     The value with that clock and Sources, None while the pairs disagree
-    async fn evaluate_checked(
+    ///     Whether the installed pair changed; None while no acceptable batch
+    ///     exists or an input has no pair yet
+    async fn advance_batch(
         &mut self,
-        svc: Symbol,
+        (svc, def): (Symbol, Symbol),
         expr: &Expr,
-        receipts: HashMap<(Symbol, Symbol), Option<ReadEntry>>,
-    ) -> Result<Option<(Value, VClock, Option<Sources>)>, EvalError> {
-        let (clock, gate_ok, sources) = self.check_receipts(receipts.values().flatten());
-        if !gate_ok {
+        root: Option<(Symbol, Symbol)>,
+        inputs: &[(Symbol, Symbol)],
+    ) -> Result<Option<bool>, EvalError> {
+        let mut chains = Vec::new();
+        let mut absent = false;
+        for &input in inputs {
+            if !self.services.contains_key(&input.0) && !self.remote_services.contains_key(&input.0)
+            {
+                absent = true;
+                continue;
+            }
+            let Some(candidates) = self.input_candidates((svc, def), input, None) else {
+                return Ok(None);
+            };
+            chains.push(Chain { input, candidates });
+        }
+        let mut selection: Vec<_> = chains
+            .iter()
+            .map(|chain| match root {
+                Some(root) if chain.input == root => chain.candidates.pending_from,
+                _ => 0,
+            })
+            .collect();
+        if !Self::close_batch(&chains, &mut selection) {
             return Ok(None);
         }
-        let sources = sources.filter(|_| receipts.values().all(Option::is_some));
-        let inputs = receipts
+        let values = chains
             .iter()
-            .filter_map(|(&input, entry)| Some((input, entry.as_ref()?.0.clone())))
+            .zip(&selection)
+            .map(|(chain, &i)| (chain.input, chain.candidates.pairs[i].0.clone()))
             .collect();
-        let value = super::interpreter::evaluator::eval_with_inputs(
+        let result = super::interpreter::evaluator::eval_with_inputs(
             expr,
             &[],
             &mut EvalContext {
@@ -1485,23 +1690,40 @@ impl Manager {
                 service_name: svc,
                 txn: None,
             },
-            Some(&inputs),
+            Some(&values),
         )
-        .await?;
-        Ok(Some((value, clock, sources)))
+        .await;
+        self.adopt_batch((svc, def), &chains, &selection);
+        let value = result?;
+        let (clock, gate_ok, sources) = self.check_receipts(
+            chains
+                .iter()
+                .zip(&selection)
+                .map(|(chain, &i)| &chain.candidates.pairs[i]),
+        );
+        debug_assert!(gate_ok, "close_batch selected a batch the gate rejects");
+        let sources = sources.filter(|_| !absent);
+        Ok(Some(self.install_recomputed(
+            (svc, def),
+            value,
+            clock,
+            sources,
+        )))
     }
 
-    /// Recompute `def` from the paired snapshots of its inputs, returning it if
-    /// its value, clock or Sources changed
-    pub(crate) async fn recompute_def(
+    /// Advance `def` through the batches its inputs allow (§3.3.2): the base
+    /// observation first, unless `trigger` names the input whose delivery is
+    /// the only change, then each input with a pending delivery roots a
+    /// batch, until no root yields one. Each batch adopted consumes a
+    /// delivery, so this ends
+    ///
+    /// Returns:
+    ///     Whether the installed pair changed
+    async fn advance_def(
         &mut self,
-        svc: Symbol,
-        def: Symbol,
-    ) -> Vec<(Symbol, Symbol)> {
-        let receipts = self
-            .services
-            .get(&svc)
-            .and_then(|service| self.static_receipts(service, def));
+        (svc, def): (Symbol, Symbol),
+        trigger: Option<(Symbol, Symbol)>,
+    ) -> Result<bool, EvalError> {
         let Some(expr) = self
             .services
             .get(&svc)
@@ -1513,18 +1735,65 @@ impl Manager {
                 self.interner.get(def),
                 self.interner.get(svc)
             );
-            return Vec::new();
+            return Ok(false);
         };
-        let Some(receipts) = receipts else {
-            return Vec::new();
-        };
-        match self.evaluate_checked(svc, &expr, receipts).await {
-            Ok(Some((value, clock, sources))) => self
-                .install_recomputed((svc, def), value, clock, sources)
-                .then_some((svc, def))
-                .into_iter()
-                .collect(),
-            Ok(None) => Vec::new(),
+        let service = &self.services[&svc];
+        if service.initializing.is_some() {
+            return Ok(false);
+        }
+        let inputs: Vec<_> = service.graphs.inputs(svc, def).collect();
+        let mut changed = false;
+        let mut base = trigger.is_none();
+        let mut waited = HashSet::new();
+        loop {
+            let root =
+                if base {
+                    base = false;
+                    None
+                } else {
+                    match inputs.iter().copied().find(|&input| {
+                        !waited.contains(&input) && self.has_pending((svc, def), input)
+                    }) {
+                        Some(root) => Some(root),
+                        None => break,
+                    }
+                };
+            match self.advance_batch((svc, def), &expr, root, &inputs).await? {
+                Some(differs) => {
+                    changed |= differs;
+                    waited.clear();
+                }
+                None => {
+                    if let Some(root) = root {
+                        waited.insert(root);
+                    }
+                }
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Recompute `def` from the paired snapshots of its inputs, returning it if
+    /// its value, clock or Sources changed
+    pub(crate) async fn recompute_def(
+        &mut self,
+        svc: Symbol,
+        def: Symbol,
+    ) -> Vec<(Symbol, Symbol)> {
+        self.recompute_from(svc, def, None).await
+    }
+
+    /// `recompute_def` after a delivery of `trigger`: the pending deliveries,
+    /// not the base observation, are what can advance `def`. A failed
+    /// evaluation is logged, as for any propagation
+    async fn recompute_from(
+        &mut self,
+        svc: Symbol,
+        def: Symbol,
+        trigger: Option<(Symbol, Symbol)>,
+    ) -> Vec<(Symbol, Symbol)> {
+        match self.advance_def((svc, def), trigger).await {
+            Ok(changed) => changed.then_some((svc, def)).into_iter().collect(),
             Err(e) => {
                 log::warn!(
                     "propagation of def '{}' failed: {}",
@@ -1537,8 +1806,8 @@ impl Manager {
     }
 
     /// The first of `defs`, introduced by a committed code update, that has no
-    /// value yet. Each is evaluated against its paired inputs as propagation
-    /// would, so one whose inputs are all paired installs its first value or
+    /// value yet. Each is advanced against its paired inputs as propagation
+    /// would, so one whose inputs allow a batch installs its first value or
     /// reports why its evaluation fails; one that lacks an input keeps
     /// waiting for propagation to deliver it
     pub async fn first_values(
@@ -1552,27 +1821,21 @@ impl Manager {
             if service.vars.contains_key(&def) {
                 continue;
             }
-            let (Some(expr), Some(receipts)) = (
-                service.defs.get(&def).cloned(),
-                self.static_receipts(service, def),
-            ) else {
+            if !service.defs.contains_key(&def) {
                 return Ok(Some((svc, def)));
-            };
-            match self.evaluate_checked(svc, &expr, receipts).await {
-                Ok(Some((value, clock, sources))) => {
-                    self.install_recomputed((svc, def), value, clock, sources);
-                    self.propagate(svc, def).await;
-                }
-                Ok(None) => return Ok(Some((svc, def))),
-                Err(e) => {
-                    return Err(EvalError::RuntimeError(format!(
-                        "Update committed, but '{}.{}' cannot be initialized: {}",
-                        self.interner.get(svc),
-                        self.interner.get(def),
-                        e
-                    )))
-                }
             }
+            let installed = self.advance_def((svc, def), None).await.map_err(|e| {
+                EvalError::RuntimeError(format!(
+                    "Update committed, but '{}.{}' cannot be initialized: {}",
+                    self.interner.get(svc),
+                    self.interner.get(def),
+                    e
+                ))
+            })?;
+            if !installed {
+                return Ok(Some((svc, def)));
+            }
+            self.propagate(svc, def).await;
         }
         Ok(None)
     }
@@ -1855,27 +2118,75 @@ impl Manager {
             Ok(v) => v,
             Err(_) => return,
         };
-
-        let Some((&listener_svc, service)) = self
-            .services
-            .iter_mut()
-            .find(|(_, s)| s.id == listener_id && s.defs.contains_key(&listener_def_sym))
+        let entry = (value, Some(clock), sources);
+        let Some(listener_svc) = self
+            .accept_delivery(listener_id, listener_def_sym, source, entry)
+            .await
         else {
             return;
         };
-        let cache = service.dep_cache.entry(listener_def_sym).or_default();
-        // A function in code not delivered before can change what its callers read
-        let new_code = matches!(value, Value::Closure { .. })
-            && cache.get(&source).map(|entry| &entry.0) != Some(&value);
-        let previous = cache.insert(source, (value, Some(clock), sources));
+        for (svc, member) in self
+            .recompute_from(listener_svc, listener_def_sym, Some(source))
+            .await
+        {
+            self.propagate(svc, member).await;
+        }
+        // The graphs changed if the delivery was function code: a delivery
+        // refused before may be taken now
+        self.retry_deferred_deliveries().await;
+    }
 
-        if new_code {
-            // A function that would leave a def's reads incomplete or close a
-            // cycle is not accepted: the def keeps the version it held, and
-            // the graphs of the other defs stay refreshable
+    /// Offer `entry`, delivered for `source`, to the edge of `def` in the
+    /// service `listener`. Some(service) when the def takes it and may
+    /// advance; None when it is dropped (a member the def does not read, or
+    /// a pair its history has overtaken or already knows) or deferred
+    /// (function code the graphs cannot take yet)
+    async fn accept_delivery(
+        &mut self,
+        listener_id: ServiceNetId,
+        listener_def_sym: Symbol,
+        source: (Symbol, Symbol),
+        entry: ReadEntry,
+    ) -> Option<Symbol> {
+        let (&listener_svc, service) = self
+            .services
+            .iter_mut()
+            .find(|(_, s)| s.id == listener_id && s.defs.contains_key(&listener_def_sym))?;
+        // A member the def no longer reads: nothing it could incorporate
+        if !service
+            .graphs
+            .inputs(listener_svc, listener_def_sym)
+            .any(|input| input == source)
+        {
+            return None;
+        }
+        let state = service
+            .dep_cache
+            .entry(listener_def_sym)
+            .or_default()
+            .entry(source)
+            .or_default();
+        // A function in code not delivered before can change what its callers read
+        let new_code = matches!(entry.0, Value::Closure { .. })
+            && !state.versions().any(|(known, _, _)| *known == entry.0);
+        let kept = new_code.then(|| (state.clone(), entry.clone()));
+        // A repeat, or a delivery the def's incorporated pair has overtaken:
+        // a late delivery never rolls a history back
+        if !state.offer(entry) {
+            return None;
+        }
+        // The newest delivery for the edge supersedes one deferred for it
+        self.deferred_deliveries.retain(|d| {
+            d.listener != listener_id || d.def != listener_def_sym || d.source != source
+        });
+        if let Some((before, entry)) = kept {
+            // Nor is a function taken that would leave a def's reads
+            // incomplete or close a cycle: the edge keeps the versions it
+            // held, the graphs of the other defs stay refreshable, and the
+            // delivery waits for the graphs to change
             if let Err(e) = self.try_refresh_graphs().await {
                 log::warn!(
-                    "update of {}.{} for {}.{} not accepted: {}",
+                    "update of {}.{} for {}.{} deferred: {}",
                     self.interner.get(source.0),
                     self.interner.get(source.1),
                     self.interner.get(listener_svc),
@@ -1887,17 +2198,47 @@ impl Manager {
                     .get_mut(&listener_svc)
                     .and_then(|service| service.dep_cache.get_mut(&listener_def_sym))
                 {
-                    match previous {
-                        Some(entry) => cache.insert(source, entry),
-                        None => cache.remove(&source),
-                    };
+                    if before.newest().is_some() {
+                        cache.insert(source, before);
+                    } else {
+                        cache.remove(&source);
+                    }
                 }
-                return;
+                self.deferred_deliveries.push(DeferredDelivery {
+                    listener: listener_id,
+                    def: listener_def_sym,
+                    source,
+                    entry,
+                });
+                return None;
             }
         }
+        Some(listener_svc)
+    }
 
-        for (svc, member) in self.recompute_def(listener_svc, listener_def_sym).await {
-            self.propagate(svc, member).await;
+    /// Offer the deferred deliveries again, for as long as one is taken: each
+    /// taken one changes the graphs. One refused again is deferred again by
+    /// `accept_delivery`; one the def no longer reads, or whose pair its
+    /// history has overtaken, is dropped there
+    async fn retry_deferred_deliveries(&mut self) {
+        loop {
+            let deferred = std::mem::take(&mut self.deferred_deliveries);
+            if deferred.is_empty() {
+                return;
+            }
+            let mut taken = false;
+            for d in deferred {
+                let (def, source) = (d.def, d.source);
+                if let Some(svc) = self.accept_delivery(d.listener, def, source, d.entry).await {
+                    taken = true;
+                    for (s, m) in self.recompute_from(svc, def, Some(source)).await {
+                        self.propagate(s, m).await;
+                    }
+                }
+            }
+            if !taken {
+                return;
+            }
         }
     }
 
@@ -3598,34 +3939,12 @@ impl Manager {
             self.refresh_graphs().await;
         }
         let error = self.commit_participants(txn, clock).await;
-        for (listener, def, owner, member) in self.inputs_behind(clock) {
-            self.subscribe_remote(owner, member, listener, def).await;
-        }
         for (sid, var) in txn.written.keys() {
             if let Some(name) = self.service_name_for_net_id(sid) {
                 self.propagate(name, *var).await;
             }
         }
         error
-    }
-
-    /// The cached remote inputs, as `(listener, def, owner, member)`, whose
-    /// clocks have not reached `clock` on a dimension their value depends on
-    fn inputs_behind(&self, clock: &VClock) -> Vec<(ServiceNetId, Symbol, Symbol, Symbol)> {
-        let mut behind = Vec::new();
-        for service in self.services.values() {
-            for (def, cache) in &service.dep_cache {
-                for (&(owner, member), (_, cached, sources)) in cache {
-                    if cached
-                        .as_ref()
-                        .is_some_and(|cached| !caught_up(clock, cached, sources.as_ref()))
-                    {
-                        behind.push((service.id.clone(), *def, owner, member));
-                    }
-                }
-            }
-        }
-        behind
     }
 
     /// Send `Commit`, carrying the transaction's `clock`, to every participant

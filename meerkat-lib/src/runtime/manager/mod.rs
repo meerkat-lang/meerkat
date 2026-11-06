@@ -823,7 +823,9 @@ impl Manager {
         result
     }
 
-    /// Update pre-computed dependency graphs for a service and re-wire reactive listeners
+    /// Update pre-computed dependency graphs for a service, drop the cached
+    /// deliveries of inputs its defs no longer read, and re-wire reactive
+    /// listeners
     ///
     /// Args:
     ///     `svc_name` (`Symbol`): The target service symbol
@@ -836,8 +838,11 @@ impl Manager {
             Some(service) => {
                 let old_edges: HashSet<_> = Self::listener_edges(svc_name, service).collect();
                 service.graphs = new_graphs;
-                let defs = &service.graphs.defs;
-                service.dep_cache.retain(|def, _| defs.contains(def));
+                let graphs = &service.graphs;
+                service.dep_cache.retain(|def, _| graphs.defs.contains(def));
+                for (&def, cache) in service.dep_cache.iter_mut() {
+                    cache.retain(|input, _| graphs.inputs(svc_name, def).any(|i| i == *input));
+                }
                 let edges: HashSet<_> = Self::listener_edges(svc_name, service).collect();
                 (service.id.clone(), old_edges, edges)
             }
@@ -3819,43 +3824,27 @@ impl Manager {
                     self.upgrade_to_write_lock(svc_sym, mem_sym, &txn.id)?;
                 }
 
-                // Traverse dependencies after locking
+                // Queue the member's inputs after locking it. The queue
+                // reaches their inputs in turn, each member expanded once
                 if visited.insert((svc_sym, mem_sym)) {
                     if let Some(service) = self.services.get(&svc_sym) {
-                        // Transitive local dependencies
-                        let deps = service.graphs.transitive_dependencies_of(mem_sym);
-                        for dep_sym in &deps {
-                            queue.push((svc_sym, *dep_sym, false));
-                        }
-
-                        // Cross-service dependencies
-                        if service.defs.contains_key(&mem_sym) {
-                            for &(remote_svc, remote_mem) in service
-                                .graphs
-                                .cross_deps
-                                .get(&mem_sym)
-                                .into_iter()
-                                .flatten()
-                            {
-                                if self.remote_services.contains_key(&remote_svc) {
-                                    // Track remote dependencies for a
-                                    // remote service to request them
-                                    // as a batch later
-                                    let remote_mem_str = self.interner.get(remote_mem).to_string();
-                                    let entry =
-                                        remote_locks.entry(remote_svc).or_insert_with(|| {
-                                            LockGroup {
-                                                service_level_lock: false,
-                                                reads: HashSet::new(),
-                                                writes: HashSet::new(),
-                                            }
-                                        });
-                                    entry.reads.insert(remote_mem_str);
-                                } else {
-                                    // Queue cross-service dependency
-                                    // for local lock and traversal
-                                    queue.push((remote_svc, remote_mem, false));
-                                }
+                        for (owner, input) in service.graphs.inputs(svc_sym, mem_sym) {
+                            if self.remote_services.contains_key(&owner) {
+                                // Track remote dependencies for a
+                                // remote service to request them
+                                // as a batch later
+                                let input_str = self.interner.get(input).to_string();
+                                let entry =
+                                    remote_locks.entry(owner).or_insert_with(|| LockGroup {
+                                        service_level_lock: false,
+                                        reads: HashSet::new(),
+                                        writes: HashSet::new(),
+                                    });
+                                entry.reads.insert(input_str);
+                            } else {
+                                // Queue a local input, of this service or
+                                // another, for its lock and traversal
+                                queue.push((owner, input, false));
                             }
                         }
                     }

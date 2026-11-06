@@ -16,6 +16,7 @@
 //! here reads nothing; the runtime analyzes the code when it arrives, before
 //! any def can apply it
 
+use super::free_var::free_var;
 use super::ServiceGraphs;
 use crate::ast::{Decl, Expr, Stmt, Value};
 use crate::runtime::interner::Symbol;
@@ -106,7 +107,9 @@ impl<'a> Effects<'a> {
     }
 
     /// The dependency graphs of `decls`, declarations of `service`: an edge or
-    /// cross-service dependency for each member a declaration's code reads
+    /// cross-service dependency for each member a def's code reads. A var or a
+    /// table is a source: what a var's initializer reads, the transaction
+    /// initializing it reads once, and is no input of its value afterwards
     pub(crate) fn graphs(&mut self, service: Symbol, decls: &'a [Decl]) -> ServiceGraphs {
         let mut graphs = ServiceGraphs::new();
         for decl in decls {
@@ -121,6 +124,9 @@ impl<'a> Effects<'a> {
             graphs.reactive_graph.add_node(*name);
         }
         for decl in decls {
+            let Decl::DefDecl { .. } = decl else {
+                continue;
+            };
             let Some((name, reads)) = self.member_reads(service, decl) else {
                 continue;
             };
@@ -180,11 +186,15 @@ impl<'a> Effects<'a> {
                 member_name,
             } => self.read((service_name, member_name), reads),
             Expr::Func { params, body, .. } => {
-                // A closure does not capture a local named like a member of
-                // its service, as in `eval`
+                // As in `eval`, a closure captures the locals free in its body,
+                // except one named like a member of its service
+                let bound = params.iter().map(|param| param.name).collect();
+                let free = free_var(body, &bound);
                 let env = locals
                     .iter()
-                    .filter(|(local, _)| self.decl((service, *local)).is_none())
+                    .filter(|(local, _)| {
+                        free.contains(local) && self.decl((service, *local)).is_none()
+                    })
                     .cloned()
                     .collect();
                 BTreeSet::from([self.function(Lambda {
@@ -280,6 +290,7 @@ impl<'a> Effects<'a> {
             for value in versions {
                 functions.extend(self.literal(value));
             }
+            self.values.insert(member, functions.clone());
             return functions;
         }
         let code = match self.decl(member) {

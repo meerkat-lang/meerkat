@@ -1,12 +1,11 @@
 //! Dependency graphs of a service
 
-pub mod analysis;
+pub(crate) mod analysis;
 pub(crate) mod effects;
 pub mod free_var;
 
 use crate::runtime::interner::Symbol;
 use petgraph::graphmap::DiGraphMap;
-use petgraph::visit::{Dfs, Reversed};
 use petgraph::Direction;
 use std::collections::{HashMap, HashSet};
 
@@ -58,25 +57,6 @@ impl ServiceGraphs {
             .neighbors_directed(member, Direction::Incoming)
             .map(move |input| (service, input))
             .chain(self.cross_deps.get(&member).into_iter().flatten().copied())
-    }
-
-    /// Extract all transitive dependencies of a member using `petgraph::visit::Dfs`
-    ///
-    /// Args:
-    ///   `member` (`Symbol`): The target member symbol
-    ///
-    /// Returns:
-    ///   `HashSet<Symbol>`: Set of transitive dependency symbols
-    pub fn transitive_dependencies_of(&self, member: Symbol) -> HashSet<Symbol> {
-        let mut visited = HashSet::new();
-        let reversed = Reversed(&self.reactive_graph);
-        let mut dfs = Dfs::new(reversed, member);
-        while let Some(node) = dfs.next(reversed) {
-            if node != member {
-                visited.insert(node);
-            }
-        }
-        visited
     }
 }
 

@@ -35,6 +35,7 @@ These fail intermittently for reasons unrelated to most changes. If one fails,
 check its issue before investigating. When the issue closes, remove its line
 here.
 
-None currently.
+- `cascade_lock_wait` (in `scripts/test_mkn.py`): fails about once in 30–40
+  runs with "Timeout waiting for lock response from Node A". #244.
 
 List all known flaky tests with `gh issue list --label flaky`.

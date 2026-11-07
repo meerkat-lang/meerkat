@@ -85,19 +85,16 @@ impl ServiceGraphs {
 /// Graphs are equal when they declare the same members with the same edges
 impl PartialEq for ServiceGraphs {
     fn eq(&self, other: &Self) -> bool {
-        let edges = |graphs: &Self| {
-            graphs
-                .reactive_graph
-                .all_edges()
-                .map(|(input, member, _)| (input, member))
-                .collect::<HashSet<_>>()
-        };
         self.vars == other.vars
             && self.defs == other.defs
             && self.tables == other.tables
             && self.cross_deps == other.cross_deps
             && self.incomplete == other.incomplete
-            && edges(self) == edges(other)
+            && self.reactive_graph.edge_count() == other.reactive_graph.edge_count()
+            && self
+                .reactive_graph
+                .all_edges()
+                .all(|(input, member, _)| other.reactive_graph.contains_edge(input, member))
     }
 }
 

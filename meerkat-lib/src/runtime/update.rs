@@ -7,14 +7,10 @@
 
 use crate::net::LockGroup;
 use crate::runtime::ast::{apply_updates_to_ast, Decl, Expr, Stmt, Value};
-use crate::runtime::env::Env;
-use crate::runtime::graphs::{analysis::service_declarations, effects};
+use crate::runtime::graphs::analysis::service_declarations;
 use crate::runtime::interner::{Interner, Symbol};
 use crate::runtime::interpreter::evaluator::{eval, EvalContext, EvalError};
 use crate::runtime::manager::Manager;
-use crate::runtime::nameres;
-use crate::runtime::tt::check::{self as tt};
-use crate::runtime::tt::types::ServiceType;
 use crate::runtime::txn::{Transaction as LockTxn, TxnId, VClock, VarLock};
 use std::collections::{HashMap, HashSet};
 
@@ -22,7 +18,6 @@ use std::collections::{HashMap, HashSet};
 pub struct Transaction {
     updates: Vec<Stmt>,
     ast: Vec<Stmt>,
-    types: Env<'static, ServiceType>,
     values: HashMap<(Symbol, Symbol), Value>,
     lock_txn: Option<LockTxn>,
 }
@@ -39,7 +34,6 @@ impl Transaction {
         Self {
             updates,
             ast: Vec::new(),
-            types: Env::new(None),
             values: HashMap::new(),
             lock_txn: None,
         }
@@ -57,7 +51,6 @@ impl Transaction {
         Self {
             updates,
             ast: Vec::new(),
-            types: Env::new(None),
             values: HashMap::new(),
             lock_txn: Some(LockTxn::new(txn_id)),
         }
@@ -209,58 +202,10 @@ impl Transaction {
             }
         }
 
-        if let Err(e) = nameres::resolve(&self.ast) {
-            let msg = match &e {
-                nameres::Error::ForwardReference(sym) => {
-                    format!("ForwardReference({})", manager.interner.get(*sym))
-                }
-                nameres::Error::UnknownIdentifier { .. } | nameres::Error::DepthLimit => {
-                    format!("{}", e)
-                }
-            };
+        if let Err(e) = crate::runtime::node::check_program(&self.ast) {
             return Err(EvalError::RuntimeError(format!(
-                "Name resolution failed on update: {}",
-                msg
-            )));
-        }
-
-        let mut types = Env::new(None);
-        if let Err(e) = tt::check(&self.ast, &mut types) {
-            let msg = match &e {
-                tt::Error::UnknownUpdateTarget(s) => {
-                    format!(
-                        "Target service '{}' for update not found",
-                        manager.interner.get(*s)
-                    )
-                }
-                tt::Error::UnboundVariable(s) => {
-                    format!("UnboundVariable({})", manager.interner.get(*s))
-                }
-                tt::Error::RecursiveTypeInference { service, member } => {
-                    format!(
-                        "dependency cycle detected at service '{}', member '{}'",
-                        manager.interner.get(*service),
-                        manager.interner.get(*member)
-                    )
-                }
-                tt::Error::TypeMismatch { expected, found } => {
-                    format!("type mismatch: expected {}, found {}", expected, found)
-                }
-                tt::Error::CannotInferType
-                | tt::Error::DepthLimitExceeded
-                | tt::Error::InvalidTupleArity
-                | tt::Error::NotAFunction => format!("{}", e),
-            };
-            return Err(EvalError::RuntimeError(format!(
-                "Type check failed on update: {}",
-                msg
-            )));
-        }
-        if let Err(e) = effects::check(&self.ast) {
-            let msg = e.message(&manager.interner);
-            return Err(EvalError::RuntimeError(format!(
-                "Type check failed on update: {}",
-                msg
+                "Static check failed on update: {}",
+                e.message(&manager.interner)
             )));
         }
         for stmt in &self.updates {
@@ -464,8 +409,6 @@ impl Transaction {
     /// Args:
     ///     `manager` (`&mut Manager`): The active runtime manager
     fn commit(&mut self, manager: &mut Manager) {
-        manager.local_services = std::mem::replace(&mut self.types, Env::new(None));
-
         let mut write_set = HashSet::new();
         for ((svc_name, var_name), val) in std::mem::take(&mut self.values) {
             if let Some(service) = manager.services.get_mut(&svc_name) {

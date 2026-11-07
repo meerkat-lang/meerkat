@@ -224,11 +224,19 @@ pub fn serve_service_code(
 /// the resolved path is canonicalized and required to stay within the
 /// canonicalized base directory (blocking `..` and symlink escapes). Returns
 /// the validated path to read, or an error describing why it was rejected.
+/// An empty base directory means the current working directory.
 pub fn resolve_served_file(
     base_dir: &std::path::Path,
     requested: &str,
 ) -> Result<std::path::PathBuf> {
     use std::path::Path;
+
+    // A bare server entrypoint has an empty parent; serve from the current directory.
+    let base_dir = if base_dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        base_dir
+    };
 
     // Reject absolute paths outright; served files are always relative to base.
     if Path::new(requested).is_absolute() {
@@ -1924,6 +1932,18 @@ mod service_code_tests {
         assert_eq!(resolved, file.canonicalize().unwrap());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #221: a bare server filename yields an empty base; serve from cwd.
+    #[test]
+    fn test_resolve_served_file_empty_base() {
+        let resolved = resolve_served_file(std::path::Path::new(""), "Cargo.toml")
+            .expect("empty base must resolve against the current directory");
+        let expected = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("Cargo.toml")
+            .canonicalize()
+            .expect("the library crate manifest must exist");
+        assert_eq!(resolved, expected);
     }
 
     /// #39: an absolute path is rejected.

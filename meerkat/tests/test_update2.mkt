@@ -1,0 +1,21 @@
+service b { 
+    var m: int = 1; 
+    pub def mm = m; 
+    pub def bump = action { m = m + 10; }; 
+}
+
+service a { 
+    pub def d = b.mm + 1; 
+}
+
+update a { 
+    var d: int = b.mm; 
+    pub def set_d = action { d = 50; }; 
+}
+
+@test(a) { 
+    do set_d; 
+    assert(d == 50); 
+    do b.bump; 
+    assert(d + 0 == 50); 
+}

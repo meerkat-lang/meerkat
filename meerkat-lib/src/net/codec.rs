@@ -222,9 +222,12 @@ pub fn serve_service_code(
 /// This is a zero-trust boundary: the path comes from the network, so it is
 /// validated to prevent directory traversal. An absolute path is rejected, and
 /// the resolved path is canonicalized and required to stay within the
-/// canonicalized base directory (blocking `..` and symlink escapes). Returns
-/// the validated path to read, or an error describing why it was rejected.
-/// An empty base directory means the current working directory.
+/// canonicalized base directory (blocking `..` and symlink escapes). The
+/// canonicalized target must also be a regular file with a `.mkt` extension,
+/// so only Meerkat source files are served (a symlink named `evil.mkt` that
+/// points at another file is rejected, as are directories, FIFOs and device
+/// files). Returns the validated path to read, or an error describing why it
+/// was rejected. An empty base directory means the current working directory.
 pub fn resolve_served_file(
     base_dir: &std::path::Path,
     requested: &str,
@@ -259,6 +262,28 @@ pub fn resolve_served_file(
     if !canon_target.starts_with(&canon_base) {
         return Err(Error::LimitExceeded(format!(
             "requested path escapes the served directory: {:?}",
+            requested
+        )));
+    }
+
+    // Only `.mkt` source files are served. Check the canonicalized target, not
+    // the requested string, so a symlink named `evil.mkt` pointing at another
+    // file is still rejected.
+    if canon_target.extension().and_then(|e| e.to_str()) != Some("mkt") {
+        return Err(Error::LimitExceeded(format!(
+            "requested file is not a .mkt source file: {:?}",
+            requested
+        )));
+    }
+
+    // The target must be a regular file, so the server never blocks on a FIFO
+    // or reads a device file.
+    let meta = std::fs::metadata(&canon_target).map_err(|e| {
+        Error::LimitExceeded(format!("requested file is unavailable: {}", e))
+    })?;
+    if !meta.is_file() {
+        return Err(Error::LimitExceeded(format!(
+            "requested path is not a regular file: {:?}",
             requested
         )));
     }
@@ -1937,13 +1962,50 @@ mod service_code_tests {
     /// #221: a bare server filename yields an empty base; serve from cwd.
     #[test]
     fn test_resolve_served_file_empty_base() {
-        let resolved = resolve_served_file(std::path::Path::new(""), "Cargo.toml")
+        let resolved = resolve_served_file(std::path::Path::new(""), "tests/fixtures/served.mkt")
             .expect("empty base must resolve against the current directory");
         let expected = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("Cargo.toml")
+            .join("tests/fixtures/served.mkt")
             .canonicalize()
-            .expect("the library crate manifest must exist");
+            .expect("the served fixture must exist");
         assert_eq!(resolved, expected);
+    }
+
+    /// #239: a non-`.mkt` file inside the base directory is rejected.
+    #[test]
+    fn test_resolve_served_file_rejects_non_mkt() {
+        let dir = unique_temp_dir("nonmkt");
+        std::fs::write(dir.join("secret.txt"), "secret").unwrap();
+
+        let res = resolve_served_file(&dir, "secret.txt");
+        assert!(res.is_err(), "non-.mkt file must be rejected");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #239: a symlink named `link.mkt` pointing at a non-`.mkt` file is
+    /// rejected, because the canonicalized target is checked.
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_served_file_rejects_mkt_symlink_to_non_mkt() {
+        let dir = unique_temp_dir("symlink");
+        std::fs::write(dir.join(".env"), "SECRET=1").unwrap();
+        std::os::unix::fs::symlink(".env", dir.join("link.mkt")).unwrap();
+
+        let res = resolve_served_file(&dir, "link.mkt");
+        assert!(res.is_err(), "symlink to a non-.mkt file must be rejected");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #239: a directory named `dir.mkt` is rejected, since it is not a
+    /// regular file.
+    #[test]
+    fn test_resolve_served_file_rejects_directory() {
+        let dir = unique_temp_dir("dirmkt");
+        std::fs::create_dir_all(dir.join("dir.mkt")).unwrap();
+
+        let res = resolve_served_file(&dir, "dir.mkt");
+        assert!(res.is_err(), "a directory must be rejected");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #39: an absolute path is rejected.

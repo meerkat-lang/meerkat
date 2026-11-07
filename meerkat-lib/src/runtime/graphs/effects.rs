@@ -113,10 +113,11 @@ pub(crate) struct Effects<'a> {
     services: HashMap<Symbol, &'a [Decl]>,
     /// Each member's declaration: the first of its name in its service
     decls: HashMap<Member, &'a Decl>,
-    /// Values remote owners published for their members, analyzed in place of
-    /// the members' declarations. While a new version is on its way to some
-    /// readers, a member may hold any version they hold. A check of a write
-    /// puts the functions it would store in local vars here as well
+    /// Functions members hold besides those their declarations evaluate to,
+    /// analyzed with them: the versions of its code a remote owner delivered
+    /// (while a new one is on its way to some readers, a member may hold any
+    /// version they hold), the values local members hold, and the functions
+    /// a write would store
     published: HashMap<Member, Vec<&'a Value>>,
     /// Each lambda met, at the index that is its `Function`. Lambdas are the
     /// same function when they are the same code with the same captured locals
@@ -433,19 +434,20 @@ impl<'a> Effects<'a> {
         if let Some(functions) = self.values.get(&member) {
             return functions.clone();
         }
-        if let Some(versions) = self.published.get(&member).cloned() {
-            let mut functions = Functions::new();
-            for value in versions {
-                functions.extend(self.literal(value));
-            }
-            self.values.insert(member, Ok(functions.clone()));
-            return Ok(functions);
+        let mut published = Functions::new();
+        for value in self.published.get(&member).cloned().into_iter().flatten() {
+            published.extend(self.literal(value));
         }
         let code = match self.decl(member) {
             Some(Decl::VarDecl { val, .. } | Decl::DefDecl { val, .. }) => val,
             Some(Decl::TableDecl { .. }) => return Ok(Functions::new()),
             // A member of a service known here only by name may hold any
-            None => return Ok(BTreeSet::from([UNKNOWN])),
+            // function, unless its owner published what it holds
+            None if published.is_empty() => return Ok(BTreeSet::from([UNKNOWN])),
+            None => {
+                self.values.insert(member, Ok(published.clone()));
+                return Ok(published);
+            }
         };
         if !self.computing.insert(member) {
             return Ok(BTreeSet::from([UNKNOWN]));
@@ -453,7 +455,12 @@ impl<'a> Effects<'a> {
         // What the member's own code reads belongs to that member, not here,
         // and what it holds does not depend on the applications enclosing this
         let applying = std::mem::take(&mut self.applying);
-        let functions = self.visit(code, member.0, &[], &mut Reads::default());
+        let functions =
+            self.visit(code, member.0, &[], &mut Reads::default())
+                .map(|mut declared| {
+                    declared.append(&mut published);
+                    declared
+                });
         self.applying = applying;
         self.computing.remove(&member);
         self.values.insert(member, functions.clone());

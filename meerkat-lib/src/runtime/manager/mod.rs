@@ -504,6 +504,14 @@ impl Manager {
             publish(&mut published, member, value);
         }
         for service in self.services.values() {
+            // The function a local member holds is part of its type, as a
+            // version a remote owner delivered is of its member's; a write's
+            // override stands in for what it would overwrite
+            for (&member, state) in &service.vars {
+                if !overrides.contains_key(&(service.name, member)) {
+                    publish(&mut published, (service.name, member), &state.value);
+                }
+            }
             for (def, cache) in &service.dep_cache {
                 let inputs = service.graphs.cross_deps.get(def);
                 for (member, state) in cache {
@@ -543,6 +551,26 @@ impl Manager {
             .iter()
             .filter(|(_, service)| service.initializing.is_none())
             .map(|(&name, _)| name)
+            .collect()
+    }
+
+    /// The pairs `txn` read from remote owners for the inputs the graphs of
+    /// `service` name, with the def reading each
+    fn remote_reads<'t>(
+        &self,
+        service: Symbol,
+        txn: &'t Transaction,
+    ) -> Vec<(Symbol, (Symbol, Symbol), &'t ReadEntry)> {
+        self.services[&service]
+            .graphs
+            .cross_deps
+            .iter()
+            .flat_map(|(&def, inputs)| inputs.iter().map(move |&input| (def, input)))
+            .filter(|(_, (owner, _))| self.remote_services.contains_key(owner))
+            .filter_map(|(def, input)| {
+                let key = (self.service_net_id_for_name(input.0), input.1);
+                txn.read_cache.get(&key).map(|entry| (def, input, entry))
+            })
             .collect()
     }
 
@@ -625,13 +653,13 @@ impl Manager {
     }
 
     /// Check that storing `writes` keeps the graphs installed: what applying
-    /// a function reads is part of its type (§1.1 of the semantics), fixed
-    /// by the declarations until a code update, so a function value written
-    /// or overwritten is analyzed in place of the var's declared one, and no
-    /// def may come to read more through it, or fail to be analyzed within
-    /// the depth limit. Only the services reading the vars written are
-    /// analyzed; nothing is for writes that store no function and overwrite
-    /// none
+    /// a function reads is part of its type (§1.1 of the semantics), and a
+    /// var's type is its declared function's and the one it holds, so a
+    /// function value written or overwritten is analyzed in place of the one
+    /// held, with every other function the members hold, and no def may come
+    /// to read more through it, or fail to be analyzed within the depth
+    /// limit. Only the services reading the vars written are analyzed;
+    /// nothing is for writes that store no function and overwrite none
     fn check_function_writes<'a>(
         &self,
         writes: impl IntoIterator<Item = ((Symbol, Symbol), &'a Value)>,
@@ -983,10 +1011,7 @@ impl Manager {
             });
         }
 
-        let graphs = self
-            .service_graphs([name])
-            .remove(&name)
-            .unwrap_or_default();
+        let mut graphs = self.service_graphs([name]);
 
         // Earlier services may already depend on this not-yet-created owner.
         // Reuse initialization's deferred publication to complete those inputs.
@@ -1006,25 +1031,30 @@ impl Manager {
             }
         }
 
-        self.services.insert(
-            name,
-            Service {
-                id,
-                name,
-                vars: HashMap::new(),
-                defs: HashMap::new(),
-                graphs,
-                listeners,
-                dep_cache: HashMap::new(),
-                initializing: Some(txn.id.clone()),
-                service_lock: Some(txn.id.clone()),
-            },
-        );
-
         let mut env: Vec<(Symbol, Value)> = vec![];
         let svc_name = name;
 
         let result = async {
+            // The graphs must be complete and acyclic, as those recomputed
+            // below; the other services' follow from the same declarations
+            // and do not change
+            self.check_graphs(&graphs)?;
+            self.services.insert(
+                name,
+                Service {
+                    id,
+                    name,
+                    vars: HashMap::new(),
+                    defs: HashMap::new(),
+                    graphs: graphs.remove(&name).unwrap_or_default(),
+                    listeners,
+                    dep_cache: HashMap::new(),
+                    initializing: Some(txn.id.clone()),
+                    service_lock: Some(txn.id.clone()),
+                },
+            );
+            // Functions read from remote owners, published so far
+            let mut published = 0;
             for decl in decls {
                 let is_def = matches!(decl, Decl::DefDecl { .. });
                 let (name, val) = match decl {
@@ -1049,6 +1079,25 @@ impl Manager {
                 .await?;
                 let mut var_value = VarState::new(value);
                 if is_def {
+                    // The functions initialization read from remote owners are
+                    // part of the types of the members read: the graphs follow
+                    // them before the def's inputs are settled
+                    loop {
+                        let read: HashMap<_, _> = self
+                            .remote_reads(svc_name, &txn)
+                            .into_iter()
+                            .filter(|(_, _, entry)| entry.0.is_function())
+                            .map(|(_, input, entry)| (input, &entry.0))
+                            .collect();
+                        if read.len() <= published {
+                            break;
+                        }
+                        published = read.len();
+                        let mut graphs = self.graphs_of(&self.unified_ast, [svc_name], &read);
+                        self.check_graphs(&graphs)?;
+                        self.services.get_mut(&svc_name).unwrap().graphs =
+                            graphs.remove(&svc_name).unwrap_or_default();
+                    }
                     // A static input this transaction read keeps its snapshot
                     // pair. A local one it did not read, such as one of a
                     // branch it did not take, contributes its current state. A
@@ -1093,16 +1142,10 @@ impl Manager {
 
             // The remote pairs initialization read stay each def's incorporated
             // inputs, with their clocks, including those its calls reached
-            let remote_inputs: Vec<_> = self.services[&svc_name]
-                .graphs
-                .cross_deps
-                .iter()
-                .flat_map(|(&def, inputs)| inputs.iter().map(move |&input| (def, input)))
-                .filter(|(_, (owner, _))| self.remote_services.contains_key(owner))
-                .filter_map(|(def, input)| {
-                    let key = (self.service_net_id_for_name(input.0), input.1);
-                    txn.read_cache.get(&key).map(|entry| (def, input, entry))
-                })
+            let remote_inputs: Vec<_> = self
+                .remote_reads(svc_name, &txn)
+                .into_iter()
+                .map(|(def, input, entry)| (def, input, entry.clone()))
                 .collect();
             let service = self.services.get_mut(&svc_name).unwrap();
             for (def, input, entry) in remote_inputs {
@@ -1110,15 +1153,11 @@ impl Manager {
                     .dep_cache
                     .entry(def)
                     .or_default()
-                    .insert(input, InputState::seeded(entry.clone()));
+                    .insert(input, InputState::seeded(entry));
             }
 
             // Commit only after every initializer succeeds; participant failures
-            // take the same rollback path as failed initialization.
-            // This service's graphs, with the remote code initialization
-            // read, must be complete and acyclic; those of the other services
-            // follow from the same declarations and do not change
-            self.check_graphs(&self.service_graphs([svc_name]))?;
+            // take the same rollback path as failed initialization
             self.commit_txn(&txn).await.map_or(Ok(()), Err)
         }
         .await;

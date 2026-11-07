@@ -321,7 +321,14 @@ impl Transaction {
                 .map(|(&name, _)| name)
                 .filter(|name| running.contains(name)),
         );
-        let graphs = manager.graphs_of(&self.ast, services, &HashMap::new());
+        // The values the declarations evaluated to stand in for those the
+        // vars hold
+        let staged = self
+            .values
+            .iter()
+            .map(|(&var, value)| (var, value))
+            .collect();
+        let graphs = manager.graphs_of(&self.ast, services, &staged);
         manager.check_graphs(&graphs)?;
         self.commit(manager);
 

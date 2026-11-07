@@ -68,30 +68,6 @@ fn load_or_create_identity(
     }
 }
 
-/// Helper to send a message over net actor and log if message sending fails
-///
-/// TODO(GitHub Issue #174): The current routing implementation relies
-/// on payload-provided `reply_to` fields, which lack transport-layer
-/// authentication context. Moving forward, it may be beneficial to
-/// align the trust boundary by utilizing authenticated transport
-/// identities.
-///
-/// Args:
-///   `net` (`&mut NetworkActor`): Active network actor
-///   `reply_to` (`&str`): Target multiaddress string
-///   `msg` (`MeerkatMessage`): Message payload to send
-async fn send_net_msg(net: &mut NetworkActor, reply_to: &str, msg: MeerkatMessage) {
-    let reply = net
-        .handle_command(NetworkCommand::SendMessage {
-            addr: Address::new(reply_to),
-            msg,
-        })
-        .await;
-    if let NetworkReply::Failure(e) = reply {
-        log::warn!("Failed to send network message to {}: {}", reply_to, e);
-    }
-}
-
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Args {
@@ -548,20 +524,14 @@ async fn run_server(
                     reply_to,
                 } => {
                     if exceeds_pending_update_limit(&pending_updates, &peer) {
-                        let response = MeerkatMessage::UpdateServiceResponse {
-                            request_id,
-                            error: Some("Too many pending updates from this peer".to_string()),
-                        };
-                        let target_addr = if !reply_to.is_empty() {
-                            reply_to
-                        } else {
-                            peer
-                        };
-                        if !target_addr.is_empty() {
-                            if let Some(net) = manager.network.as_mut() {
-                                send_net_msg(net, &target_addr, response).await;
-                            }
-                        }
+                        let target_addr = if !reply_to.is_empty() { reply_to } else { peer };
+                        manager
+                            .reply_update_service(
+                                request_id,
+                                &target_addr,
+                                Some("Too many pending updates from this peer".to_string()),
+                            )
+                            .await;
                     } else {
                         pending_updates.push_back((request_id, txn_id, source, reply_to, peer));
                     }
@@ -574,70 +544,9 @@ async fn run_server(
                 | MeerkatMessage::ServiceCodeRequest { .. }) => {
                     manager.serve_request(msg).await;
                 }
-                MeerkatMessage::RequestUpdates {
-                    service,
-                    member,
-                    listener_service,
-                    listener_def,
-                    reply_to,
-                    ..
-                } => {
-                    // #24: validate + intern wire names through codec (the sole
-                    // interning authority for network data); skip on bad input.
-                    let (service_sym, member_sym, listener_def_sym) =
-                        match codec::decode_request_updates(
-                            &service,
-                            &member,
-                            &listener_def,
-                            &mut manager.interner,
-                        ) {
-                            Ok(syms) => syms,
-                            Err(_) => continue,
-                        };
-                    manager
-                        .handle_request_updates(
-                            service_sym,
-                            member_sym,
-                            ServiceNetId(listener_service),
-                            listener_def_sym,
-                            reply_to,
-                        )
-                        .await;
-                }
-                MeerkatMessage::Update {
-                    listener_service,
-                    listener_def,
-                    source_service,
-                    member,
-                    value,
-                    clock,
-                    sources,
-                } => {
-                    // #24: validate + intern wire names through codec; skip on bad input.
-                    // Vector-clock PR: the clock's dimension names are interned here
-                    // too, so a bad one drops the whole message.
-                    let (listener_def_sym, source_sym, member_sym, vclock, sources) =
-                        match codec::decode_update(
-                            &listener_def,
-                            &source_service,
-                            &member,
-                            &mut manager.interner,
-                            clock,
-                            sources,
-                        ) {
-                            Ok(syms) => syms,
-                            Err(_) => continue,
-                        };
-                    manager
-                        .handle_update(
-                            ServiceNetId(listener_service),
-                            listener_def_sym,
-                            (source_sym, member_sym),
-                            value,
-                            vclock,
-                            sources,
-                        )
-                        .await;
+                // #24: reactive messages are handled inline, never queued
+                msg @ (MeerkatMessage::RequestUpdates { .. } | MeerkatMessage::Update { .. }) => {
+                    manager.serve_reactive(msg).await;
                 }
                 // #39: a client is requesting a .mkt file by path. Validate,
                 // safely resolve the path against the served base directory,
@@ -732,35 +641,8 @@ async fn run_client(
 
     for stmt in &prog {
         match stmt {
-            &Stmt::Service { name, ref decls } => {
-                manager
-                    .create_service(name, decls.clone())
-                    .await
-                    .map_err(|e| format!("Service error: {}", e))?;
-                println!("Service '{}' loaded", manager.interner.get(name));
-            }
-            &Stmt::Update {
-                service_name,
-                ref decls,
-            } => {
-                let _ = decls;
-                let mut txn = meerkat_lib::runtime::update::Transaction::new(vec![stmt.clone()]);
-                txn.poll(&mut manager)
-                    .await
-                    .map_err(|e| format!("Update error: {}", e))?;
-                println!("Service '{}' updated", manager.interner.get(service_name));
-            }
-            Stmt::Atomic { updates } => {
-                if !updates.is_empty() {
-                    let mut txn = meerkat_lib::runtime::update::Transaction::new(updates.clone());
-                    txn.poll(&mut manager)
-                        .await
-                        .map_err(|e| format!("Atomic update error: {}", e))?;
-                    println!(
-                        "Atomic update transaction completed ({} updates)",
-                        updates.len()
-                    );
-                }
+            Stmt::Service { .. } | Stmt::Update { .. } | Stmt::Atomic { .. } => {
+                manager.run_declaration(stmt).await?;
             }
             &Stmt::Test {
                 service_name,

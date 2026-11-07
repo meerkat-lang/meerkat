@@ -25,6 +25,26 @@ use crate::runtime::limits::{IMPORT_POLL_INTERVAL_MS, IMPORT_RETRY_DELAY_MS};
 use crate::runtime::tt::types::ServiceType;
 use crate::runtime::{nameres, tt, Env, Manager};
 
+/// The static checks a program passes before it runs or is installed, in
+/// order: names resolve, types check, the dependency graph is complete and
+/// acyclic. The typing environment of the checked program is the result
+pub(crate) fn check_program(
+    ast: &[Stmt],
+) -> std::result::Result<Env<'static, ServiceType>, StaticError> {
+    nameres::resolve(ast).map_err(StaticError::Names)?;
+    let mut types = Env::new(None);
+    tt::check(ast, &mut types).map_err(StaticError::Types)?;
+    effects::check(ast).map_err(StaticError::Effects)?;
+    Ok(types)
+}
+
+/// The failure of one of the static checks
+pub(crate) enum StaticError {
+    Names(nameres::Error),
+    Types(tt::check::Error),
+    Effects(effects::Error),
+}
+
 /// Root manager for executing a Meerkat node
 pub struct Node {
     /// Local services registered on this node
@@ -523,42 +543,10 @@ impl Node {
             .map_err(|e| Error::Message(format!("Import service error: {}", e)))?;
 
         for stmt in local_ast {
-            match stmt {
-                Stmt::Service { name, decls } => {
-                    manager
-                        .create_service(*name, decls.clone())
-                        .await
-                        .map_err(|e| Error::Message(format!("Service error: {}", e)))?;
-                    println!("Service '{}' loaded", manager.interner.get(*name));
-                }
-                Stmt::Update {
-                    service_name,
-                    decls: _,
-                } => {
-                    let mut txn = crate::runtime::update::Transaction::new(vec![stmt.clone()]);
-                    txn.poll(&mut manager)
-                        .await
-                        .map_err(|e| Error::Message(format!("Update error: {}", e)))?;
-                    println!("Service '{}' updated", manager.interner.get(*service_name));
-                }
-                Stmt::Atomic { updates } => {
-                    if !updates.is_empty() {
-                        let mut txn = crate::runtime::update::Transaction::new(updates.clone());
-                        txn.poll(&mut manager)
-                            .await
-                            .map_err(|e| Error::Message(format!("Atomic update error: {}", e)))?;
-                        println!(
-                            "Atomic update transaction completed ({} updates)",
-                            updates.len()
-                        );
-                    }
-                }
-                Stmt::Import { .. }
-                | Stmt::Test { .. }
-                | Stmt::ActionStmt(_)
-                | Stmt::Connect { .. }
-                | Stmt::Watch { .. } => {}
-            }
+            manager
+                .run_declaration(stmt)
+                .await
+                .map_err(Error::Message)?;
         }
 
         Ok(manager)
@@ -602,22 +590,13 @@ impl Node {
         }
 
         if update_batches.is_empty() {
-            nameres::resolve(&self.unified_ast).map_err(|e| self.format_nameres_error(e))?;
-
-            let mut local_services = Env::new(None);
-            tt::check(&self.unified_ast, &mut local_services)
-                .map_err(|e| self.format_tt_error(e))?;
-            effects::check(&self.unified_ast).map_err(|e| self.format_dependency_error(e))?;
-            self.local_services = local_services;
-
+            self.local_services =
+                check_program(&self.unified_ast).map_err(|e| self.format_static_error(e))?;
             return Ok(());
         }
 
         // Initial validation of base service declarations
-        nameres::resolve(&service_ast).map_err(|e| self.format_nameres_error(e))?;
-        let mut initial_services = Env::new(None);
-        tt::check(&service_ast, &mut initial_services).map_err(|e| self.format_tt_error(e))?;
-        effects::check(&service_ast).map_err(|e| self.format_dependency_error(e))?;
+        check_program(&service_ast).map_err(|e| self.format_static_error(e))?;
 
         let last_batch = update_batches.pop().unwrap();
 
@@ -630,10 +609,7 @@ impl Node {
                 ))
             })?;
 
-            nameres::resolve(&service_ast).map_err(|e| self.format_nameres_error(e))?;
-            let mut step_services = Env::new(None);
-            tt::check(&service_ast, &mut step_services).map_err(|e| self.format_tt_error(e))?;
-            effects::check(&service_ast).map_err(|e| self.format_dependency_error(e))?;
+            check_program(&service_ast).map_err(|e| self.format_static_error(e))?;
         }
 
         // Process final atomic transaction batch
@@ -647,11 +623,7 @@ impl Node {
         let mut final_ast = service_ast;
         final_ast.extend(top_level_stmts);
 
-        nameres::resolve(&final_ast).map_err(|e| self.format_nameres_error(e))?;
-        let mut final_services = Env::new(None);
-        tt::check(&final_ast, &mut final_services).map_err(|e| self.format_tt_error(e))?;
-        effects::check(&final_ast).map_err(|e| self.format_dependency_error(e))?;
-        self.local_services = final_services;
+        self.local_services = check_program(&final_ast).map_err(|e| self.format_static_error(e))?;
         // Validate future updates without installing their declarations.
         // The runtime transaction installs each update only after evaluation.
 
@@ -757,24 +729,20 @@ impl Node {
     /// Returns:
     ///     `Error`: The formatted Error::Message
     fn format_dependency_error(&self, err: effects::Error) -> Error {
+        let message = err.message(&self.interner);
+        Error::Message(match err {
+            // Ends a sentence, as the type checker's cycle text does
+            effects::Error::Cycle { .. } => format!("type check error: {}.", message),
+            _ => format!("type check error: {}", message),
+        })
+    }
+
+    /// Render a failed static check as the user sees it
+    fn format_static_error(&self, err: StaticError) -> Error {
         match err {
-            effects::Error::Cycle { service, member } => Error::Message(format!(
-                "type check error: dependency cycle detected at service '{}', member '{}'.",
-                self.interner.get(service),
-                self.interner.get(member)
-            )),
-            effects::Error::ForwardReference(member) => Error::Message(format!(
-                "type check error: illegal eager forward reference or dependency cycle on '{}'",
-                self.interner.get(member)
-            )),
-            effects::Error::DepthLimitExceeded { service, member } => Error::Message(format!(
-                "type check error: {}",
-                effects::depth_limit_message(&format!(
-                    "{}.{}",
-                    self.interner.get(service),
-                    self.interner.get(member)
-                ))
-            )),
+            StaticError::Names(e) => self.format_nameres_error(e),
+            StaticError::Types(e) => self.format_tt_error(e),
+            StaticError::Effects(e) => self.format_dependency_error(e),
         }
     }
 

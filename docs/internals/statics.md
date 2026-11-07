@@ -76,7 +76,7 @@ Services are initialized in program order and their members in declaration order
 
 ### Functions the Runtime Holds
 
-The runtime computes the graphs of its running services from the installed declarations and the functions members actually hold: a local `var` is analyzed in the closure it currently holds, which an action may have stored; a remote member in each version of its code the owner delivered to the defs here that read it, or that a transaction initializing one of them read. Graphs are recomputed when a code update commits, when a delivered value brings new function code, and when a committed write stores a closure into a `var` or replaces one. A def therefore knows every member it will read before it is evaluated, and its evaluation reads only those inputs.
+What applying a function reads is part of the function's type (§1.1 of the semantics), so the graphs of the running services follow the declarations: a local `var` is analyzed in the functions its initializer may evaluate to, a remote member in each version of its code the owner delivered to the defs here that read it. A committed write that stores a closure into a `var`, or replaces one, is checked against the installed graphs: it is refused, as a type error, when a def applying the var would come to read a member its declarations did not make it read, or could no longer be analyzed within the depth limit; a code update declares the new reads. Graphs are recomputed when a code update commits and when a delivered value brings new function code from a remote owner. A def therefore knows every member it will read before it is evaluated, and its evaluation reads only those inputs.
 
 ## Historical Context: The Old `dep_analysis` Module
 

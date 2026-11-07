@@ -8,24 +8,36 @@
 //! latent in a function body are attributed to the caller, not to the member
 //! holding the function
 //!
-//! The functions a member may hold come from its code or runtime values: a var
-//! holds what its initializer or an action stored in it, and a remote member
-//! what its owner published to the defs here that read it, or what a transaction
-//! initializing one of them read. Applying a function whose code is not known
-//! here reads nothing; the runtime analyzes the code when it arrives, before
-//! any def can apply it
+//! The functions a member may hold come from its declaration: a var holds
+//! what its initializer may evaluate to (an action may store another function
+//! in it only while every def applying the var keeps the reads found here,
+//! see `Manager::check_function_writes`), and a remote member what its owner
+//! published to the defs here that read it. Applying a function whose code is
+//! not known here reads nothing; the runtime analyzes the code when it
+//! arrives, before any def can apply it
 //!
-//! The analysis is bounded as the type checker is: an application nested
-//! `MAX_SCOPE_DEPTH` deep exceeds the depth limit, which ends that member's
-//! analysis at once. Its reads are then reported incomplete rather than used:
-//! `check` rejects such a program, and the runtime refuses a function value
-//! that would leave a def's reads incomplete
+//! A recursive application returns what the application it reenters is
+//! assumed to return, at first nothing; when the analysis of that application
+//! returns more, it runs again under the larger assumption, until its result
+//! stands still. The functions of a program are finite, so it does: lambdas
+//! are told apart by their code and the functions they captured, and a lambda
+//! capturing, in some function, a lambda of its own code point (a recursion
+//! wrapping a closure around the one before) is read as its code point's
+//! summary, one lambda capturing what every such lambda captured
+//!
+//! The analysis is bounded all the same: recursion `MAX_ANALYSIS_DEPTH` deep,
+//! counting every expression visited within another and every application
+//! analyzed within another, or a result that does not stand still within
+//! `MAX_ANALYSIS_ROUNDS` rounds, exceeds the depth limit, which ends that
+//! member's analysis at once. Its reads are then reported incomplete rather
+//! than used: `check` rejects such a program, and the runtime refuses a
+//! function value that would leave a def's reads incomplete
 
 use super::free_var::free_var;
-use super::ServiceGraphs;
+use super::{cyclic_members, ServiceGraphs};
 use crate::ast::{Decl, Expr, Stmt, Value};
-use crate::runtime::interner::Symbol;
-use crate::runtime::limits::MAX_SCOPE_DEPTH;
+use crate::runtime::interner::{Interner, Symbol};
+use crate::runtime::limits::{MAX_ANALYSIS_DEPTH, MAX_ANALYSIS_ROUNDS};
 use crate::runtime::tt::Param;
 use petgraph::graphmap::DiGraphMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -48,9 +60,12 @@ const UNKNOWN: Function = usize::MAX;
 /// The functions a value may be; empty for a value that is not a function
 type Functions = BTreeSet<Function>;
 
-/// The current member could not be analyzed within the application depth limit
+/// The current member could not be analyzed within the depth limit
 #[derive(Clone, Copy)]
 struct DepthLimit;
+
+/// A code point: a lambda expression of a service
+type Point = (Symbol, *const Expr);
 
 type Locals = Vec<(Symbol, Functions)>;
 
@@ -71,6 +86,18 @@ impl Reads {
 /// A function applied to the functions each argument may be
 type Application = (Function, Vec<Functions>);
 
+/// An application being analyzed
+struct Applying {
+    application: Application,
+    /// The depth of the outermost application it reentered, directly or
+    /// through the applications it made; its own depth if none
+    outermost: usize,
+    /// The functions its result is assumed to be where it reenters itself
+    assumed: Functions,
+    /// Whether it reentered itself in the current round
+    reentered: bool,
+}
+
 /// A lambda of the program, applied in its service to its captured locals
 #[derive(Clone)]
 struct Lambda<'a> {
@@ -84,21 +111,29 @@ struct Lambda<'a> {
 #[derive(Default)]
 pub(crate) struct Effects<'a> {
     services: HashMap<Symbol, &'a [Decl]>,
+    /// Each member's declaration: the first of its name in its service
+    decls: HashMap<Member, &'a Decl>,
     /// Values remote owners published for their members, analyzed in place of
     /// the members' declarations. While a new version is on its way to some
-    /// readers, a member may hold any version they hold
+    /// readers, a member may hold any version they hold. A check of a write
+    /// puts the functions it would store in local vars here as well
     published: HashMap<Member, Vec<&'a Value>>,
     /// Each lambda met, at the index that is its `Function`. Lambdas are the
     /// same function when they are the same code with the same captured locals
     lambdas: Vec<Lambda<'a>>,
     functions: HashMap<(Symbol, *const Expr, Locals), Function>,
+    /// The summary of each code point some lambda of which captured a lambda
+    /// of the point: the one function every such lambda is
+    summaries: HashMap<Point, Function>,
+    /// The depth of the recursion: the expressions being visited and the
+    /// applications being analyzed, each within the one before
+    depth: usize,
     /// Each member's functions, or the failure to analyze them within the limit
     values: HashMap<Member, Result<Functions, DepthLimit>>,
     /// Members whose value is being computed
     computing: HashSet<Member>,
-    /// Applications being analyzed, each with the depth of the outermost of
-    /// these it reentered, directly or through the applications it made
-    applying: Vec<(Application, usize)>,
+    /// Applications being analyzed, innermost last
+    applying: Vec<Applying>,
     /// The reads and result of each application whose analysis did not
     /// reenter an application enclosing it
     applied: HashMap<Application, (HashSet<Member>, Functions)>,
@@ -106,15 +141,22 @@ pub(crate) struct Effects<'a> {
 
 impl<'a> Effects<'a> {
     pub(crate) fn new(program: &'a [Stmt], published: HashMap<Member, Vec<&'a Value>>) -> Self {
-        let services = super::analysis::service_declarations(program)
+        let services: HashMap<Symbol, &'a [Decl]> = super::analysis::service_declarations(program)
             .into_iter()
             .filter_map(|(name, stmt)| match stmt {
                 Stmt::Service { decls, .. } => Some((name, decls.as_slice())),
                 _ => None,
             })
             .collect();
+        let mut decls = HashMap::new();
+        for (&service, declarations) in &services {
+            for decl in *declarations {
+                decls.entry((service, decl.name())).or_insert(decl);
+            }
+        }
         Effects {
             services,
+            decls,
             published,
             ..Default::default()
         }
@@ -127,15 +169,13 @@ impl<'a> Effects<'a> {
     pub(crate) fn graphs(&mut self, service: Symbol, decls: &'a [Decl]) -> ServiceGraphs {
         let mut graphs = ServiceGraphs::new();
         for decl in decls {
-            let (Decl::VarDecl { name, .. }
-            | Decl::DefDecl { name, .. }
-            | Decl::TableDecl { name, .. }) = decl;
+            let name = decl.name();
             match decl {
-                Decl::VarDecl { .. } => graphs.vars.insert(*name),
-                Decl::DefDecl { .. } => graphs.defs.insert(*name),
-                Decl::TableDecl { .. } => graphs.tables.insert(*name),
+                Decl::VarDecl { .. } => graphs.vars.insert(name),
+                Decl::DefDecl { .. } => graphs.defs.insert(name),
+                Decl::TableDecl { .. } => graphs.tables.insert(name),
             };
-            graphs.reactive_graph.add_node(*name);
+            graphs.reactive_graph.add_node(name);
         }
         for decl in decls {
             let Decl::DefDecl { .. } = decl else {
@@ -174,17 +214,34 @@ impl<'a> Effects<'a> {
     }
 
     fn decl(&self, (service, member): Member) -> Option<&'a Decl> {
-        self.services.get(&service)?.iter().find(|decl| {
-            let (Decl::VarDecl { name, .. }
-            | Decl::DefDecl { name, .. }
-            | Decl::TableDecl { name, .. }) = decl;
-            *name == member
-        })
+        self.decls.get(&(service, member)).copied()
     }
 
     /// Add to `reads` what evaluating `expr` in `service` reads, and return the
     /// functions its value may be
     fn visit(
+        &mut self,
+        expr: &'a Expr,
+        service: Symbol,
+        locals: &[(Symbol, Functions)],
+        reads: &mut Reads,
+    ) -> Result<Functions, DepthLimit> {
+        self.descend()?;
+        let result = self.visit_expr(expr, service, locals, reads);
+        self.depth -= 1;
+        result
+    }
+
+    /// One level deeper, unless the recursion is at its limit
+    fn descend(&mut self) -> Result<(), DepthLimit> {
+        if self.depth >= MAX_ANALYSIS_DEPTH {
+            return Err(DepthLimit);
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    fn visit_expr(
         &mut self,
         expr: &'a Expr,
         service: Symbol,
@@ -284,8 +341,17 @@ impl<'a> Effects<'a> {
         }
     }
 
-    /// The function that is `lambda`
+    /// The function that is `lambda`: the same code with the same captured
+    /// locals is the same function. A lambda that captured, in some function
+    /// a local may be, a lambda of its own code point is one of a family a
+    /// recursion builds without end, each around the one before; it is the
+    /// point's summary, one function capturing what every lambda of the
+    /// family captured, so the functions of a program stay finite
     fn function(&mut self, lambda: Lambda<'a>) -> Function {
+        let point = (lambda.service, lambda.body as *const Expr);
+        if self.nests(point, &lambda.env) {
+            return self.summarize(point, lambda);
+        }
         let identity = (
             lambda.service,
             lambda.body as *const Expr,
@@ -296,6 +362,69 @@ impl<'a> Effects<'a> {
             lambdas.push(lambda);
             lambdas.len() - 1
         })
+    }
+
+    /// Whether a function some local of `env` may be is a lambda of `point`,
+    /// itself or through what it captured
+    fn nests(&self, point: Point, env: &Locals) -> bool {
+        let mut seen = HashSet::new();
+        let mut pending: Vec<Function> = env.iter().flat_map(|(_, f)| f.iter().copied()).collect();
+        while let Some(function) = pending.pop() {
+            let Some(lambda) = self.lambdas.get(function) else {
+                continue;
+            };
+            if !seen.insert(function) {
+                continue;
+            }
+            if (lambda.service, lambda.body as *const Expr) == point {
+                return true;
+            }
+            pending.extend(lambda.env.iter().flat_map(|(_, f)| f.iter().copied()));
+        }
+        false
+    }
+
+    /// The summary of `point`, capturing what `lambda` captured as well: a
+    /// lambda of the point among the captured functions is read as the
+    /// summary, and what it captured joins. The applications analyzed with
+    /// a smaller summary are forgotten, to be analyzed again with this one
+    fn summarize(&mut self, point: Point, lambda: Lambda<'a>) -> Function {
+        let summary = *self.summaries.entry(point).or_insert_with(|| {
+            self.lambdas.push(Lambda {
+                env: Vec::new(),
+                ..lambda.clone()
+            });
+            self.lambdas.len() - 1
+        });
+        let mut grew = false;
+        let mut folded = HashSet::from([summary]);
+        let mut pending = vec![lambda.env];
+        while let Some(env) = pending.pop() {
+            for (name, functions) in env {
+                for function in functions {
+                    let of_point = self
+                        .lambdas
+                        .get(function)
+                        .is_some_and(|l| (l.service, l.body as *const Expr) == point);
+                    if of_point && folded.insert(function) {
+                        pending.push(self.lambdas[function].env.clone());
+                    }
+                    let captured = if of_point { summary } else { function };
+                    let env = &mut self.lambdas[summary].env;
+                    match env.iter_mut().find(|(local, _)| *local == name) {
+                        Some((_, set)) => grew |= set.insert(captured),
+                        None => {
+                            env.push((name, BTreeSet::from([captured])));
+                            grew = true;
+                        }
+                    }
+                }
+            }
+        }
+        if grew {
+            self.applied.clear();
+        }
+        summary
     }
 
     /// Record a read of `member`, and return the functions it may hold
@@ -343,7 +472,7 @@ impl<'a> Effects<'a> {
             service,
             params,
             body,
-            env,
+            ..
         }) = self.lambdas.get(function).cloned()
         else {
             return Ok(BTreeSet::from([UNKNOWN]));
@@ -353,41 +482,78 @@ impl<'a> Effects<'a> {
             reads.activated.extend(more);
             return Ok(result.clone());
         }
-        // A recursive application reads what the application it reenters
-        // reads; the applications in between are not cached
+        // A recursive application returns what the application it reenters
+        // is assumed to; the applications in between are not cached
         let depth = self.applying.len();
         if let Some(position) = self
             .applying
             .iter()
-            .position(|(other, _)| *other == application)
+            .position(|other| other.application == application)
         {
-            if let Some((_, outermost)) = self.applying.last_mut() {
-                *outermost = position.min(*outermost);
+            self.applying[position].reentered = true;
+            if let Some(innermost) = self.applying.last_mut() {
+                innermost.outermost = position.min(innermost.outermost);
             }
-            return Ok(BTreeSet::from([UNKNOWN]));
+            return Ok(self.applying[position].assumed.clone());
         }
         // Propagation of this failure stops the member's analysis and leaves
         // every application enclosing it out of the cache
-        if depth >= MAX_SCOPE_DEPTH {
-            return Err(DepthLimit);
-        }
-        let mut locals = env;
-        locals.extend(
-            params
-                .iter()
-                .map(|param| param.name)
-                .zip(args.iter().cloned()),
-        );
-        self.applying.push((application, depth));
+        self.descend()?;
+        self.applying.push(Applying {
+            application,
+            outermost: depth,
+            assumed: Functions::new(),
+            reentered: false,
+        });
         let mut own = Reads::default();
-        let result = self.visit(body, service, &locals, &mut own);
-        let (application, outermost) = self.applying.pop().expect("pushed above");
+        let mut rounds = 0;
+        let result = loop {
+            // The function may be a summary that grows while its body is
+            // analyzed: the locals are what it captures as this round starts
+            let env = self.lambdas[function].env.clone();
+            let mut locals = env.clone();
+            locals.extend(
+                params
+                    .iter()
+                    .map(|param| param.name)
+                    .zip(args.iter().cloned()),
+            );
+            let result = self.visit(body, service, &locals, &mut own);
+            let widened = self.lambdas[function].env != env;
+            let current = self.applying.last_mut().expect("pushed above");
+            match result {
+                // Reentered under too small an assumption, or the function
+                // came to capture more: what it returns must include what it
+                // returns here. Each round adds to the assumption, the
+                // captured functions or the reads, so the rounds end
+                Ok(result)
+                    if widened || (current.reentered && !result.is_subset(&current.assumed)) =>
+                {
+                    rounds += 1;
+                    if rounds >= MAX_ANALYSIS_ROUNDS {
+                        break Err(DepthLimit);
+                    }
+                    current.assumed.extend(result);
+                    current.reentered = false;
+                    current.outermost = depth;
+                }
+                result => break result,
+            }
+        };
+        self.depth -= 1;
+        let Applying {
+            application,
+            outermost,
+            ..
+        } = self.applying.pop().expect("pushed above");
         let own: HashSet<Member> = own.all().collect();
         reads.activated.extend(&own);
         let result = result?;
         match self.applying.last_mut() {
             // Its reads lack those of the enclosing application it reentered
-            Some((_, enclosing)) if outermost < depth => *enclosing = outermost.min(*enclosing),
+            Some(enclosing) if outermost < depth => {
+                enclosing.outermost = outermost.min(enclosing.outermost)
+            }
             _ => {
                 self.applied.insert(application, (own, result.clone()));
             }
@@ -404,9 +570,32 @@ pub enum Error {
     ForwardReference(Symbol),
     /// This def reads itself, directly or through other defs
     Cycle { service: Symbol, member: Symbol },
-    /// The analysis of what this member reads nested applications
-    /// `MAX_SCOPE_DEPTH` deep
+    /// The analysis of what this member reads recursed `MAX_ANALYSIS_DEPTH`
+    /// deep, or a recursive application's result did not stand still within
+    /// `MAX_ANALYSIS_ROUNDS` rounds
     DepthLimitExceeded { service: Symbol, member: Symbol },
+}
+
+impl Error {
+    /// The error in program terms
+    pub(crate) fn message(&self, interner: &Interner) -> String {
+        match self {
+            Error::Cycle { service, member } => format!(
+                "dependency cycle detected at service '{}', member '{}'",
+                interner.get(*service),
+                interner.get(*member)
+            ),
+            Error::ForwardReference(member) => format!(
+                "illegal eager forward reference or dependency cycle on '{}'",
+                interner.get(*member)
+            ),
+            Error::DepthLimitExceeded { service, member } => depth_limit_message(&format!(
+                "{}.{}",
+                interner.get(*service),
+                interner.get(*member)
+            )),
+        }
+    }
 }
 
 /// A member of a program, in initialization order: services in program
@@ -439,21 +628,19 @@ pub(crate) fn check(program: &[Stmt]) -> Result<(), Error> {
             continue;
         };
         for (index, decl) in decls.iter().enumerate() {
-            let (Decl::VarDecl { name, .. }
-            | Decl::DefDecl { name, .. }
-            | Decl::TableDecl { name, .. }) = decl;
+            let name = decl.name();
             let reads = match effects.member_reads(service, decl) {
                 Some((_, _, false)) => {
                     return Err(Error::DepthLimitExceeded {
                         service,
-                        member: *name,
+                        member: name,
                     })
                 }
                 Some((_, reads, true)) => Some(reads),
                 None => None,
             };
             declared.push(Declared {
-                member: (service, *name),
+                member: (service, name),
                 at: (position, index),
                 def: matches!(decl, Decl::DefDecl { .. }),
                 reads,
@@ -512,11 +699,7 @@ fn dependency_cycle(declared: &[Declared]) -> Option<Member> {
             graph.add_edge(input, d.member, ());
         }
     }
-    let cyclic: HashSet<Member> = petgraph::algo::tarjan_scc(&graph)
-        .into_iter()
-        .filter(|component| component.len() > 1 || graph.contains_edge(component[0], component[0]))
-        .flatten()
-        .collect();
+    let cyclic: HashSet<Member> = cyclic_members(&graph).collect();
     declared
         .iter()
         .find(|d| d.def && cyclic.contains(&d.member))

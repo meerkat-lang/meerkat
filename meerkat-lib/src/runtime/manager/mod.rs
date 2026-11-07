@@ -546,11 +546,44 @@ impl Manager {
             .collect()
     }
 
-    /// Whether `graphs`, the graphs of every running service after a change
-    /// to the declarations or the remote code this node holds, can all be
+    /// The running services with a def reading one of `members`, directly or
+    /// through other defs: the only ones a change to those members can
+    /// rewire, as what a def reads follows from its code and the types of
+    /// the members it reads
+    pub(crate) fn services_reading(
+        &self,
+        members: impl IntoIterator<Item = (Symbol, Symbol)>,
+    ) -> HashSet<Symbol> {
+        let mut readers: HashMap<_, Vec<_>> = HashMap::new();
+        for service in self.running_services() {
+            let graphs = &self.services[&service].graphs;
+            for &def in &graphs.defs {
+                for input in graphs.inputs(service, def) {
+                    readers.entry(input).or_default().push((service, def));
+                }
+            }
+        }
+        let mut pending: Vec<_> = members.into_iter().collect();
+        let mut seen: HashSet<_> = pending.iter().copied().collect();
+        let mut services = HashSet::new();
+        while let Some(member) = pending.pop() {
+            for &(service, def) in readers.get(&member).into_iter().flatten() {
+                services.insert(service);
+                if seen.insert((service, def)) {
+                    pending.push((service, def));
+                }
+            }
+        }
+        services
+    }
+
+    /// Whether `graphs`, recomputed for the services a change to the
+    /// declarations or the remote code this node holds may rewire, can be
     /// installed: the analysis of each def within the depth limit and the
-    /// direct dependency graph acyclic (§2.1.4). Err names the first def
-    /// that cannot be
+    /// direct dependency graph acyclic (§2.1.4). A cycle the change closes
+    /// runs through a def it rewires, and every def on it reads that one,
+    /// directly or through others, so `graphs` holds the whole cycle. Err
+    /// names the first def that cannot be installed
     pub(crate) fn check_graphs(
         &self,
         graphs: &HashMap<Symbol, ServiceGraphs>,
@@ -596,8 +629,9 @@ impl Manager {
     /// by the declarations until a code update, so a function value written
     /// or overwritten is analyzed in place of the var's declared one, and no
     /// def may come to read more through it, or fail to be analyzed within
-    /// the depth limit. Nothing is analyzed for writes that store no
-    /// function and overwrite none
+    /// the depth limit. Only the services reading the vars written are
+    /// analyzed; nothing is for writes that store no function and overwrite
+    /// none
     fn check_function_writes<'a>(
         &self,
         writes: impl IntoIterator<Item = ((Symbol, Symbol), &'a Value)>,
@@ -609,7 +643,8 @@ impl Manager {
         if overrides.is_empty() {
             return Ok(());
         }
-        let graphs = self.graphs_of(&self.unified_ast, self.running_services(), &overrides);
+        let readers = self.services_reading(overrides.keys().copied());
+        let graphs = self.graphs_of(&self.unified_ast, readers, &overrides);
         for (&service, graphs) in &graphs {
             let installed = &self.services[&service].graphs;
             for &def in &graphs.defs {
@@ -1080,11 +1115,10 @@ impl Manager {
 
             // Commit only after every initializer succeeds; participant failures
             // take the same rollback path as failed initialization.
-            // With this service's defs, the graphs of every running service
-            // must stay complete and acyclic
-            let mut services = self.running_services();
-            services.push(svc_name);
-            self.check_graphs(&self.service_graphs(services))?;
+            // This service's graphs, with the remote code initialization
+            // read, must be complete and acyclic; those of the other services
+            // follow from the same declarations and do not change
+            self.check_graphs(&self.service_graphs([svc_name]))?;
             self.commit_txn(&txn).await.map_or(Ok(()), Err)
         }
         .await;
@@ -2192,7 +2226,7 @@ impl Manager {
             d.listener != listener_id || d.def != listener_def_sym || d.source != source
         });
         if let Some((held, entry)) = kept {
-            let graphs = self.service_graphs(self.running_services());
+            let graphs = self.service_graphs(self.services_reading([source]));
             // Nor is a function taken that would leave a def's reads
             // incomplete or close a cycle: the edge keeps the versions it
             // held, and the delivery waits for the graphs to change

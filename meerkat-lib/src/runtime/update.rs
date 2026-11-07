@@ -309,23 +309,23 @@ impl Transaction {
         let introduced = self.unvalued_defs(manager);
         // The declarations passed the static checks; with the remote code
         // the running services hold, their graphs must stay complete and
-        // acyclic as well
-        let graphs = manager.graphs_of(&self.ast, manager.running_services(), &HashMap::new());
+        // acyclic as well. Those of the services declared may change, as may
+        // those of every running service reading a member declared
+        let running = manager.running_services();
+        let mut services = manager.services_reading(
+            declared(&self.updates)
+                .flat_map(|(&name, decls)| decls.iter().map(move |decl| (name, decl.name()))),
+        );
+        services.extend(
+            declared(&self.updates)
+                .map(|(&name, _)| name)
+                .filter(|name| running.contains(name)),
+        );
+        let graphs = manager.graphs_of(&self.ast, services, &HashMap::new());
         manager.check_graphs(&graphs)?;
         self.commit(manager);
 
-        let updated_services: Vec<_> = self
-            .updates
-            .iter()
-            .filter_map(|stmt| match stmt {
-                Stmt::Service { name, decls }
-                | Stmt::Update {
-                    service_name: name,
-                    decls,
-                } => Some((name, decls)),
-                _ => None,
-            })
-            .collect();
+        let updated_services: Vec<_> = declared(&self.updates).collect();
         // The staged values and declarations were installed without
         // yielding; their checked graphs are still the ones to install
         manager.install_graphs(graphs).await;
@@ -710,6 +710,18 @@ pub fn format_update_source(service_name: Symbol, decls: &[Decl], interner: &Int
     let svc_str = interner.get(service_name);
     let decl_strs: Vec<String> = decls.iter().map(|d| format_decl(d, interner)).collect();
     format!("update {} {{\n  {}\n}}", svc_str, decl_strs.join("\n  "))
+}
+
+/// The services `updates` declares, each with its declarations
+fn declared(updates: &[Stmt]) -> impl Iterator<Item = (&Symbol, &Vec<Decl>)> {
+    updates.iter().filter_map(|stmt| match stmt {
+        Stmt::Service { name, decls }
+        | Stmt::Update {
+            service_name: name,
+            decls,
+        } => Some((name, decls)),
+        _ => None,
+    })
 }
 
 #[cfg(test)]

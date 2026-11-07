@@ -1579,13 +1579,10 @@ impl Manager {
     /// not caught up with the join of all selected clocks on a dimension its
     /// value depends on, select the least later candidate of that chain that
     /// has. Each step moves one chain forward and never back, so this ends.
-    /// While the clocks of every chain but one grow along it, as the
-    /// deliveries of one code generation do, it fails only when a chain has
-    /// no such candidate, and then no acceptable batch at or above
-    /// `selection` exists (DESIGN D-6). A code update can leave a chain with
-    /// pairs whose clocks do not grow, and when two chains have such pairs
-    /// an acceptable batch may be passed over until a later delivery closes
-    /// one
+    /// While the clocks of every chain grow along it, as the deliveries of
+    /// one code generation do (§5 of the semantics assumes fixed
+    /// generations), it fails only when a chain has no such candidate, and
+    /// then no acceptable batch at or above `selection` exists (DESIGN D-6)
     fn close_batch(chains: &[Chain], selection: &mut [usize]) -> bool {
         loop {
             let target =
@@ -1623,9 +1620,9 @@ impl Manager {
     }
 
     /// Evaluate `expr`, the code of `def`, against the least batch of its
-    /// static `inputs` rooted at a pending delivery of `root`, the earliest
-    /// from which one closes, or at or above the incorporated pairs when
-    /// there is no root, and install the result. `close_batch` selects the
+    /// static `inputs` at or above the first pending delivery of `root`, or
+    /// at or above the incorporated pairs when there is none, and install the
+    /// result. `close_batch` selects the
     /// batch, so its value agrees with the clock and Sources it is gated
     /// with; evaluation reads nothing but the batch. An input whose owner
     /// runs neither here nor remotely can never arrive: it is left out, and
@@ -1656,25 +1653,16 @@ impl Manager {
             };
             chains.push(Chain { input, state });
         }
-        // The deliveries of an input need not be comparable (a code update
-        // changes what the member reads), so a batch may close from a later
-        // delivery of the root when none closes from an earlier one. This
-        // finds the least batch while only the root's deliveries are
-        // incomparable; `close_batch` says what may be passed over otherwise
-        let rooted = root.and_then(|root| chains.iter().position(|chain| chain.input == root));
-        let mut first = rooted.map_or(0, |k| chains[k].state.incorporated());
-        let selection = loop {
-            let mut selection: Vec<_> = (0..chains.len())
-                .map(|k| if Some(k) == rooted { first } else { 0 })
-                .collect();
-            if Self::close_batch(&chains, &mut selection) {
-                break selection;
-            }
-            first += 1;
-            if rooted.is_none_or(|k| first >= chains[k].state.len()) {
-                return Ok(None);
-            }
-        };
+        let mut selection: Vec<_> = chains
+            .iter()
+            .map(|chain| match root {
+                Some(root) if chain.input == root => chain.state.incorporated(),
+                _ => 0,
+            })
+            .collect();
+        if !Self::close_batch(&chains, &mut selection) {
+            return Ok(None);
+        }
         let values = chains
             .iter()
             .zip(&selection)
@@ -2168,17 +2156,6 @@ impl Manager {
         source: (Symbol, Symbol),
         entry: ReadEntry,
     ) -> Option<(Symbol, bool)> {
-        // A delivery deferred for the edge is a version known on it: one
-        // behind it, or repeating it, is dropped as `offer` drops one behind
-        // the versions the edge holds
-        if self.deferred_deliveries.iter().any(|d| {
-            d.listener == listener_id
-                && d.def == listener_def_sym
-                && d.source == source
-                && (d.entry == entry || behind(&entry, &d.entry))
-        }) {
-            return None;
-        }
         let (&listener_svc, service) = self
             .services
             .iter()

@@ -1,0 +1,31 @@
+{
+  "settings": {
+    "startup_timeout": 60.0,
+    "monitor_poll_interval": 0.25,
+    "terminate_timeout": 5.0
+  },
+  "nodes": [
+    {
+      "alias": "B",
+      "type": "server",
+      "file": "scripts/tests/integration/transport/websocket/B.mkt",
+      "port": 9480
+    },
+    {
+      "alias": "A",
+      "type": "server",
+      "file": "scripts/tests/integration/transport/websocket/A.mkt",
+      "port": 9490,
+      "transport": "ws",
+      "imports": ["B.B"]
+    },
+    {
+      "alias": "ws_client",
+      "type": "client",
+      "file": "scripts/tests/integration/transport/websocket/client.mkt",
+      "timeout": 45,
+      "transport": "ws",
+      "imports": ["A.A", "B.B"]
+    }
+  ]
+}

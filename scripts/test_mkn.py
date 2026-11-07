@@ -218,6 +218,9 @@ VALIDATION_CASES = [
     ("circular_dependency",
      "test_mkn_circular_dependency.json",
      "Circular dependency detected in manifest"),
+    ("invalid_transport",
+     "test_mkn_invalid_transport.json",
+     "'transport' must be 'tcp' or 'ws'"),
 ]
 
 
@@ -563,6 +566,10 @@ def integration_tests():
         ("cascade_lock_success",      make_mkn_test(f"{IDIR}/lock_group/success.json")),
         ("cascade_abort_wait_die",    make_mkn_test(f"{IDIR}/lock_group/abort.json")),
         ("cascade_lock_wait",         make_mkn_test(f"{IDIR}/lock_group/wait.json")),
+        # --- transport integration tests ---
+        # Every node dials its imports over WebSocket, as browser clients
+        # do. A browser client itself is not exercised here.
+        ("websocket_transport",       make_mkn_test(f"{IDIR}/transport/websocket/websocket.json")),
     ]
 
 

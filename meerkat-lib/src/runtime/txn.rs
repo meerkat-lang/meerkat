@@ -249,6 +249,16 @@ impl VarState {
             sources: None,
         }
     }
+
+    /// The value with the clock and Sources paired with it, as a read of the
+    /// variable returns them
+    pub fn entry(&self) -> ReadEntry {
+        (
+            self.value.clone(),
+            Some(self.vector_clock.clone()),
+            self.sources.clone(),
+        )
+    }
 }
 
 /// Per-transaction state represented by `Transaction`

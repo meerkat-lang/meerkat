@@ -994,7 +994,7 @@ async fn test_update_waits_for_missing_input_without_publishing() {
     assert!(!manager.services[&local]
         .dep_cache
         .get(&result)
-        .and_then(|cache| cache.get(&(remote, current)))
+        .and_then(|cache| cache.get(&(remote, current))?.newest())
         .is_some_and(|entry| entry.1.is_some()));
 
     let (listener_service, listener_def, reply_to) = loop {
@@ -1038,7 +1038,7 @@ async fn test_update_waits_for_missing_input_without_publishing() {
         while !manager.services[&local]
             .dep_cache
             .get(&result)
-            .and_then(|cache| cache.get(&(remote, current)))
+            .and_then(|cache| cache.get(&(remote, current))?.newest())
             .is_some_and(|entry| entry.1.is_some())
         {
             manager.dispatch_network_events().await;
@@ -1050,7 +1050,10 @@ async fn test_update_waits_for_missing_input_without_publishing() {
 
     let clock = HashMap::from([((remote, input), 1)]);
     assert_eq!(
-        manager.services[&local].dep_cache[&result][&(remote, current)],
+        manager.services[&local].dep_cache[&result][&(remote, current)]
+            .retained
+            .clone()
+            .unwrap(),
         (
             Value::Int { val: 20 },
             Some(clock.clone()),

@@ -23,6 +23,7 @@ use meerkat_lib::net::{
     NodeType, ServiceNetId,
 };
 use meerkat_lib::runtime::ast::{ActionStmt, Expr, Value};
+use meerkat_lib::runtime::manager::InputState;
 use meerkat_lib::runtime::parser::parse_string;
 use meerkat_lib::runtime::txn::{Transaction, TxnId};
 use meerkat_lib::runtime::{Interner, Manager, Node};
@@ -95,7 +96,10 @@ async fn middle_node(net: NetworkActor, rc_net: &mut NetworkActor, rc_addr: &Add
         "before the transaction, mid_view is 0 + 1"
     );
     assert_eq!(
-        m.services[&mid].dep_cache[&mid_view][&(rc, gc)],
+        m.services[&mid].dep_cache[&mid_view][&(rc, gc)]
+            .retained
+            .clone()
+            .unwrap(),
         (
             Value::Int { val: 1 },
             Some(HashMap::new()),
@@ -122,6 +126,11 @@ async fn reply(net: &mut NetworkActor, reply_to: &str, msg: MeerkatMessage) {
 /// whose clock was zero. Runs forever.
 async fn serve_rc(rc_net: &mut NetworkActor) {
     let mut committed: Option<Vec<ClockEntry>> = None;
+    // The subscriber a real participant would propagate to; a
+    // participant's listener table outlives each stand-in invocation
+    // keyed by the originator's address (tests run in parallel, one originator each)
+    static SUBSCRIBERS: std::sync::Mutex<Vec<(String, String, String)>> =
+        std::sync::Mutex::new(Vec::new());
     loop {
         let value = NetValue::Int {
             val: if committed.is_some() { 11 } else { 1 },
@@ -148,6 +157,11 @@ async fn serve_rc(rc_net: &mut NetworkActor) {
                     reply_to,
                     ..
                 } => {
+                    SUBSCRIBERS.lock().unwrap().push((
+                        listener_service.clone(),
+                        listener_def.clone(),
+                        reply_to.clone(),
+                    ));
                     let msg = MeerkatMessage::Update {
                         listener_service,
                         listener_def,
@@ -186,6 +200,28 @@ async fn serve_rc(rc_net: &mut NetworkActor) {
                         error: None,
                     };
                     reply(rc_net, &reply_to, msg).await;
+                    // A real participant propagates the committed
+                    // write to the defs subscribed to it (commit_participant ->
+                    // propagate -> emit_update); the stand-in does the same
+                    let subscriber = SUBSCRIBERS
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .rev()
+                        .find(|(_, _, to)| *to == reply_to)
+                        .cloned();
+                    if let Some((listener_service, listener_def, to)) = subscriber {
+                        let msg = MeerkatMessage::Update {
+                            listener_service,
+                            listener_def,
+                            source_service: "rc".to_string(),
+                            member: "gc".to_string(),
+                            value: NetValue::Int { val: 11 },
+                            clock: committed.clone().unwrap_or_default(),
+                            sources: Some(vec![("rc".into(), "cv".into())]),
+                        };
+                        reply(rc_net, &to, msg).await;
+                    }
                 }
                 _ => {}
             },
@@ -201,7 +237,7 @@ async fn await_gc_update(m: &mut Manager, val: i32) {
     let [mid, mid_view, rc, gc] = ["mid", "mid_view", "rc", "gc"].map(|n| m.interner.insert(n));
     let cached = |m: &Manager| {
         let deps = m.services[&mid].dep_cache.get(&mid_view);
-        deps.and_then(|deps| deps.get(&(rc, gc)))
+        deps.and_then(|deps| deps.get(&(rc, gc))?.newest())
             .is_some_and(|entry| entry.0 == Value::Int { val } && entry.1.is_some())
     };
     let pump = async {
@@ -234,7 +270,10 @@ fn assert_committed_and_recomputed(m: &mut Manager) {
          advances the source clock of both writes (section 5.2)"
     );
     assert_eq!(
-        m.services[&mid].dep_cache[&mid_view][&(rc, gc)],
+        m.services[&mid].dep_cache[&mid_view][&(rc, gc)]
+            .retained
+            .clone()
+            .unwrap(),
         (
             Value::Int { val: 11 },
             Some(commit_clock),
@@ -329,11 +368,11 @@ async fn test_propagation_does_not_use_cached_participant_values() {
         .or_default()
         .insert(
             (rc, gc),
-            (
+            InputState::seeded((
                 Value::Int { val: 1 },
                 Some(HashMap::new()),
                 Some(HashSet::from([(rc, cv)])),
-            ),
+            )),
         );
 
     commit_as_participant(&mut m, &mut rc_net, &rc_addr).await;

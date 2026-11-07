@@ -17,6 +17,16 @@ pub const MAX_NET_REQUEST_STRING_LENGTH: usize = 4096;
 /// Maximum nesting depth of scope blocks to prevent stack overflows
 pub const MAX_SCOPE_DEPTH: usize = 64;
 
+/// Maximum depth of the dependency analysis' recursion (`graphs::effects`):
+/// every expression it visits within another and every application it
+/// analyzes within another is one level, so the stack the analysis takes is
+/// bounded whatever the shape of the code.
+pub const MAX_ANALYSIS_DEPTH: usize = 512;
+
+/// Maximum rounds the result of a recursive application may take to stand
+/// still in the dependency analysis before the member is given up on
+pub const MAX_ANALYSIS_ROUNDS: usize = 128;
+
 /// Maximum allowed time in seconds for an individual import attempt
 pub const INDIVIDUAL_IMPORT_TIMEOUT_SECS: u64 = 2;
 

@@ -134,6 +134,11 @@ pub enum Value {
 }
 
 impl Value {
+    /// Whether the value is a function: applying it reads what its body reads
+    pub fn is_function(&self) -> bool {
+        matches!(self, Value::Closure { .. })
+    }
+
     pub fn to_list_elements(&self) -> Option<Vec<Value>> {
         match self {
             Value::List { vals } => Some(vals.clone()),
@@ -300,6 +305,17 @@ pub enum Decl {
         name: Symbol,
         fields: Vec<Field>,
     },
+}
+
+impl Decl {
+    /// The member the declaration declares
+    pub fn name(&self) -> Symbol {
+        match self {
+            Decl::VarDecl { name, .. }
+            | Decl::DefDecl { name, .. }
+            | Decl::TableDecl { name, .. } => *name,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

@@ -171,7 +171,7 @@ async fn await_gc_update(m: &mut Manager, rc_net: &mut NetworkActor) {
     let [mid, mid_view, rc, gc] = ["mid", "mid_view", "rc", "gc"].map(|n| m.interner.insert(n));
     let cached = |m: &Manager| {
         let deps = m.services[&mid].dep_cache.get(&mid_view);
-        deps.and_then(|deps| deps.get(&(rc, gc)))
+        deps.and_then(|deps| deps.get(&(rc, gc))?.newest())
             .is_some_and(|entry| entry.1.is_some())
     };
     let pump = async {

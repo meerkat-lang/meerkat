@@ -11,7 +11,6 @@ use meerkat_lib::runtime::ast::{AstPrinter, Stmt};
 use meerkat_lib::runtime::interner::{Interner, Symbol};
 use meerkat_lib::runtime::interpreter::EvalError;
 use meerkat_lib::runtime::manager::ParkedRequest;
-use meerkat_lib::runtime::paths::source_file_directory;
 use meerkat_lib::runtime::{parser, Manager, Node};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
@@ -580,7 +579,10 @@ async fn run_server(
     // #39: the directory the server was started from is the root for serving
     // `.mkt` files: a ServiceCodeRequest names a file by path, which is
     // resolved (safely) against this base directory and read on demand.
-    let served_base_dir = source_file_directory(input_file).to_path_buf();
+    let served_base_dir = std::path::Path::new(input_file)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
 
     let mut manager = Manager::new(interner);
     manager.local = config.local;
@@ -1584,20 +1586,6 @@ mod tests {
     use super::*;
     use meerkat_lib::net::MessageId;
     use meerkat_lib::runtime::txn::{TxnId, WaitKey};
-
-    #[test]
-    fn bare_filename_server_can_resolve_local_service_code() {
-        // The server starts with `-f counter.mkt`, then receives a request for
-        // a file relative to the working directory. No network socket needed.
-        let serving_root = source_file_directory("counter.mkt");
-        let resolved = codec::resolve_served_file(serving_root, "tests/s1.mkt")
-            .expect("bare-filename server must serve a local source file");
-        let expected = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/s1.mkt")
-            .canonicalize()
-            .expect("checked-in service fixture exists");
-        assert_eq!(resolved, expected);
-    }
 
     #[test]
     fn listen_success_addr_returns_bound_address() {

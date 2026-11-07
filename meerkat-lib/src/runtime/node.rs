@@ -22,7 +22,6 @@ use crate::runtime::graphs::analysis::compute_dependencies;
 use crate::runtime::imports::Imports;
 use crate::runtime::interner::Interner;
 use crate::runtime::limits::{IMPORT_POLL_INTERVAL_MS, IMPORT_RETRY_DELAY_MS};
-use crate::runtime::paths::source_file_directory;
 use crate::runtime::tt::types::ServiceType;
 use crate::runtime::{nameres, tt, Env, Manager};
 
@@ -364,7 +363,7 @@ impl Node {
         identity: Option<Keypair>,
     ) -> Result<(Option<NetworkActor>, Vec<NetworkEvent>, Vec<Stmt>)> {
         let local_prog = self.load_file(file)?;
-        let base_dir = source_file_directory(file);
+        let base_dir = Path::new(file).parent().unwrap_or_else(|| Path::new("."));
 
         let mut opt_net = None;
         let mut buffered_events = Vec::new();
@@ -431,7 +430,7 @@ impl Node {
     ) -> Result<&mut Self> {
         debug_assert!(!file.is_empty(), "file path must not be empty");
         let local_prog = self.load_file(file)?;
-        let base_dir = source_file_directory(file);
+        let base_dir = Path::new(file).parent().unwrap_or_else(|| Path::new("."));
 
         let imported_ast = if remote_url_map.is_empty() {
             self.resolve_local_imports(&local_prog, base_dir)?

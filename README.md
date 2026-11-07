@@ -15,12 +15,7 @@ Core libraries for the Meerkat runtime:
 
 - **net** - Network layer with libp2p and circuit relay support for peer-to-peer communication
 
-### Building and Testing
-
-We use [`pre-commit`](https://pre-commit.com/) to ensure code quality.
-
-1. **Install pre-commit:** Run `sudo apt install pre-commit` or `pip install pre-commit` or `brew install pre-commit` (see [installation guide](https://pre-commit.com/#install)).
-2. **Set up hooks:** Run `pre-commit install` in the repository root before submitting a pull request.
+## Building and Testing
 
 ```bash
 # Build all packages
@@ -53,6 +48,15 @@ cargo run -- -f meerkat/tests/test_client.mkt --watch -i <Service URL>   # (in t
 cargo run -- -f meerkat/tests/test_client.mkt -i <Service URL>           # (in terminal 3): modifies a var on s1, triggers an update to the test_client in terminal 2
 
 ```
+
+## Contributing
+
+We use [`pre-commit`](https://pre-commit.com/) to ensure code quality.
+
+1. **Install pre-commit:** Run `sudo apt install pre-commit` or `pip install pre-commit` or `brew install pre-commit` (see [installation guide](https://pre-commit.com/#install)).
+2. **Set up hooks:** Run `pre-commit install` in the repository root before submitting a pull request.
+
+Note that pre-commit runs `cargo fmt`; a common issue is not running this before opening a PR.
 
 ## License
 

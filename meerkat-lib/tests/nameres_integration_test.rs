@@ -334,7 +334,7 @@ fn test_integration_insert_stmt() {
     assert!(res.is_ok());
 }
 
-/// Verify that insert statement with unbound table is ignored with warning
+/// Verify that insert into an unknown table is rejected
 #[test]
 fn test_integration_insert_unbound() {
     let mut interner = Interner::new();
@@ -349,7 +349,7 @@ fn test_integration_insert_unbound() {
     assert!(parse_result.is_ok());
     let stmts = parse_result.unwrap();
     let res = resolve(&stmts);
-    assert!(res.is_ok());
+    assert!(res.is_err());
 }
 
 /// Verify that insert statement row variables are resolved

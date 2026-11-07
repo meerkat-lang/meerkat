@@ -9,6 +9,7 @@ pub fn compute_dependencies(
     _pre_initialized: Option<&HashMap<Symbol, HashSet<Symbol>>>,
 ) -> Vec<ServiceGraphs> {
     let mut all_graphs = Vec::new();
+    let services = super::free_var::service_names(program);
     for stmt in program {
         if let Stmt::Service { decls, .. } = stmt {
             let mut graphs = ServiceGraphs::new();
@@ -37,7 +38,7 @@ pub fn compute_dependencies(
             for decl in decls.iter() {
                 match decl {
                     Decl::VarDecl { name, val, .. } | Decl::DefDecl { name, val, .. } => {
-                        let cross_deps = super::free_var::cross_service_deps(val);
+                        let cross_deps = super::free_var::cross_service_deps(val, &services);
                         if !cross_deps.is_empty() {
                             graphs.cross_deps.insert(*name, cross_deps);
                         }

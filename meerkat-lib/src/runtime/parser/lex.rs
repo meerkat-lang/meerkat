@@ -214,6 +214,8 @@ pub enum Token<'a> {
     INTO_KW,
     #[token("fold")]
     FOLD_KW,
+    #[token("map")]
+    MAP_KW,
     #[token("action")]
     ACTION_KW,
     #[token("fn")]

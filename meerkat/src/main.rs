@@ -1599,7 +1599,6 @@ mod tests {
         assert_eq!(resolved, expected);
     }
 
-
     #[test]
     fn listen_success_addr_returns_bound_address() {
         let addr = Address::new("/ip4/127.0.0.1/tcp/1234");

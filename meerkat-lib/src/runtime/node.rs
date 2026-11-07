@@ -18,12 +18,32 @@ use crate::net::{
     codec, Address, MessageId, NetworkActor, NetworkCommand, NetworkEvent, NetworkReply, NodeType,
 };
 use crate::runtime::ast::{apply_updates_to_ast, Stmt};
-use crate::runtime::graphs::analysis::compute_dependencies;
+use crate::runtime::graphs::effects;
 use crate::runtime::imports::Imports;
 use crate::runtime::interner::Interner;
 use crate::runtime::limits::{IMPORT_POLL_INTERVAL_MS, IMPORT_RETRY_DELAY_MS};
 use crate::runtime::tt::types::ServiceType;
 use crate::runtime::{nameres, tt, Env, Manager};
+
+/// The static checks a program passes before it runs or is installed, in
+/// order: names resolve, types check, the dependency graph is complete and
+/// acyclic. The typing environment of the checked program is the result
+pub(crate) fn check_program(
+    ast: &[Stmt],
+) -> std::result::Result<Env<'static, ServiceType>, StaticError> {
+    nameres::resolve(ast).map_err(StaticError::Names)?;
+    let mut types = Env::new(None);
+    tt::check(ast, &mut types).map_err(StaticError::Types)?;
+    effects::check(ast).map_err(StaticError::Effects)?;
+    Ok(types)
+}
+
+/// The failure of one of the static checks
+pub(crate) enum StaticError {
+    Names(nameres::Error),
+    Types(tt::check::Error),
+    Effects(effects::Error),
+}
 
 /// Root manager for executing a Meerkat node
 pub struct Node {
@@ -33,6 +53,10 @@ pub struct Node {
     pub imported_services: Env<'static, ServiceType>,
     /// Unified program statements AST
     pub unified_ast: Vec<Stmt>,
+    /// Statements of the imports read from local disk, in dependency order.
+    /// Startup runs them before the program's own; a network-fetched module
+    /// is its peer's program, so it is left out. See `Imports::finalize`.
+    pub local_imports: Vec<Stmt>,
     /// Services a peer serves because a network-fetched module declares them.
     /// Service name to serving URL, in the same shape as the `-i` map, which
     /// it is merged into at startup. See `Imports::remote_service_owners`.
@@ -51,6 +75,7 @@ impl Node {
             local_services: Env::new(None),
             imported_services: Env::new(None),
             unified_ast: Vec::new(),
+            local_imports: Vec::new(),
             discovered_remote_services: HashMap::new(),
             interner: Interner::new(),
         }
@@ -205,7 +230,9 @@ impl Node {
         // program does not keep the first one's peers and register this
         // import at a stale one.
         self.discovered_remote_services = imports.remote_service_owners();
-        Ok(imports.finalize())
+        let (stmts, local_imports) = imports.finalize();
+        self.local_imports = local_imports;
+        Ok(stmts)
     }
 
     /// Drive P2P network import resolution loop over an active network actor
@@ -324,8 +351,9 @@ impl Node {
 
         // Before `finalize`, which consumes the state machine.
         let owners = imports.remote_service_owners();
-        let stmts = imports.finalize();
+        let (stmts, local_imports) = imports.finalize();
         self.discovered_remote_services = owners;
+        self.local_imports = local_imports;
         Ok((stmts, buffered_events))
     }
 
@@ -496,13 +524,13 @@ impl Node {
         let mut manager = Manager::new(self.interner);
         manager.local = local;
         manager.network = network;
-        manager.unified_ast = self.unified_ast.clone();
+        manager.install_unified_ast(self.unified_ast);
         manager.local_services = self.local_services;
 
-        // Register the `-i` remotes and instantiate every locally resolved
-        // import, before the loop below creates this program's own services:
-        // a service may read an import, and `create_service` resolves that
-        // read immediately.
+        // Register the `-i` remotes and run every locally resolved import,
+        // before the loop below creates this program's own services: a
+        // service may read an import, and `create_service` resolves that read
+        // immediately.
         //
         // `local_ast`, not `self.unified_ast`, is what marks a service as
         // locally declared. The unified AST also holds the resolved bodies of
@@ -510,47 +538,15 @@ impl Node {
         // import as locally declared -- skipping its `-i` flag, and leaving it
         // to the loop below, which never sees it.
         manager
-            .register_and_instantiate_imports(local_ast, &remote_url_map)
+            .register_and_instantiate_imports(&self.local_imports, local_ast, &remote_url_map)
             .await
             .map_err(|e| Error::Message(format!("Import service error: {}", e)))?;
 
         for stmt in local_ast {
-            match stmt {
-                Stmt::Service { name, decls } => {
-                    manager
-                        .create_service(*name, decls.clone())
-                        .await
-                        .map_err(|e| Error::Message(format!("Service error: {}", e)))?;
-                    println!("Service '{}' loaded", manager.interner.get(*name));
-                }
-                Stmt::Update {
-                    service_name,
-                    decls: _,
-                } => {
-                    let mut txn = crate::runtime::update::Transaction::new(vec![stmt.clone()]);
-                    txn.poll(&mut manager)
-                        .await
-                        .map_err(|e| Error::Message(format!("Update error: {}", e)))?;
-                    println!("Service '{}' updated", manager.interner.get(*service_name));
-                }
-                Stmt::Atomic { updates } => {
-                    if !updates.is_empty() {
-                        let mut txn = crate::runtime::update::Transaction::new(updates.clone());
-                        txn.poll(&mut manager)
-                            .await
-                            .map_err(|e| Error::Message(format!("Atomic update error: {}", e)))?;
-                        println!(
-                            "Atomic update transaction completed ({} updates)",
-                            updates.len()
-                        );
-                    }
-                }
-                Stmt::Import { .. }
-                | Stmt::Test { .. }
-                | Stmt::ActionStmt(_)
-                | Stmt::Connect { .. }
-                | Stmt::Watch { .. } => {}
-            }
+            manager
+                .run_declaration(stmt)
+                .await
+                .map_err(Error::Message)?;
         }
 
         Ok(manager)
@@ -568,7 +564,7 @@ impl Node {
     ///   `Result<()>`: Ok if static checks pass, or error
     ///
     /// Errors:
-    ///   `Error`: If name resolution, type checking, or graph analysis fails
+    ///   `Error`: If name resolution or type checking fails
     pub fn static_checks(&mut self) -> Result<()> {
         let mut service_ast: Vec<Stmt> = Vec::new();
         let mut top_level_stmts: Vec<Stmt> = Vec::new();
@@ -594,23 +590,13 @@ impl Node {
         }
 
         if update_batches.is_empty() {
-            nameres::resolve(&self.unified_ast).map_err(|e| self.format_nameres_error(e))?;
-
-            let mut local_services = Env::new(None);
-            tt::check(&self.unified_ast, &mut local_services)
-                .map_err(|e| self.format_tt_error(e))?;
-            self.local_services = local_services;
-
-            compute_dependencies(&self.unified_ast, None);
-
+            self.local_services =
+                check_program(&self.unified_ast).map_err(|e| self.format_static_error(e))?;
             return Ok(());
         }
 
         // Initial validation of base service declarations
-        nameres::resolve(&service_ast).map_err(|e| self.format_nameres_error(e))?;
-        let mut initial_services = Env::new(None);
-        tt::check(&service_ast, &mut initial_services).map_err(|e| self.format_tt_error(e))?;
-        compute_dependencies(&service_ast, None);
+        check_program(&service_ast).map_err(|e| self.format_static_error(e))?;
 
         let last_batch = update_batches.pop().unwrap();
 
@@ -623,10 +609,7 @@ impl Node {
                 ))
             })?;
 
-            nameres::resolve(&service_ast).map_err(|e| self.format_nameres_error(e))?;
-            let mut step_services = Env::new(None);
-            tt::check(&service_ast, &mut step_services).map_err(|e| self.format_tt_error(e))?;
-            compute_dependencies(&service_ast, None);
+            check_program(&service_ast).map_err(|e| self.format_static_error(e))?;
         }
 
         // Process final atomic transaction batch
@@ -640,13 +623,9 @@ impl Node {
         let mut final_ast = service_ast;
         final_ast.extend(top_level_stmts);
 
-        nameres::resolve(&final_ast).map_err(|e| self.format_nameres_error(e))?;
-        let mut final_services = Env::new(None);
-        tt::check(&final_ast, &mut final_services).map_err(|e| self.format_tt_error(e))?;
-        compute_dependencies(&final_ast, None);
-
-        self.local_services = final_services;
-        self.unified_ast = final_ast;
+        self.local_services = check_program(&final_ast).map_err(|e| self.format_static_error(e))?;
+        // Validate future updates without installing their declarations.
+        // The runtime transaction installs each update only after evaluation.
 
         Ok(())
     }
@@ -708,13 +687,6 @@ impl Node {
                     service_str, member_str
                 ))
             }
-            tt::check::Error::IllegalDependency(member) => {
-                let member_str = self.interner.get(member);
-                Error::Message(format!(
-                    "type check error: illegal eager forward reference or dependency cycle on '{}'",
-                    member_str
-                ))
-            }
             tt::check::Error::UnboundVariable(s) => {
                 let var_str = self.interner.get(s);
                 Error::Message(format!(
@@ -745,6 +717,32 @@ impl Node {
             tt::check::Error::NotAFunction => {
                 Error::Message("type check error: not a function.".to_string())
             }
+        }
+    }
+
+    /// Format a dependency error into a user-facing error message,
+    /// resolving interned symbol identifiers to string representations
+    ///
+    /// Args:
+    ///     `err` (`effects::Error`): The dependency error to format
+    ///
+    /// Returns:
+    ///     `Error`: The formatted Error::Message
+    fn format_dependency_error(&self, err: effects::Error) -> Error {
+        let message = err.message(&self.interner);
+        Error::Message(match err {
+            // Ends a sentence, as the type checker's cycle text does
+            effects::Error::Cycle { .. } => format!("type check error: {}.", message),
+            _ => format!("type check error: {}", message),
+        })
+    }
+
+    /// Render a failed static check as the user sees it
+    fn format_static_error(&self, err: StaticError) -> Error {
+        match err {
+            StaticError::Names(e) => self.format_nameres_error(e),
+            StaticError::Types(e) => self.format_tt_error(e),
+            StaticError::Effects(e) => self.format_dependency_error(e),
         }
     }
 
@@ -783,6 +781,9 @@ impl Node {
 
     pub fn run_static_checks(&mut self, program: &[Stmt]) -> Result<()> {
         self.unified_ast = program.to_vec();
+        // `program` resolves no imports, so none from an earlier resolution
+        // may run with it.
+        self.local_imports.clear();
         self.static_checks()
     }
 
@@ -856,9 +857,10 @@ mod tests {
     /// services, on this path too.
     ///
     /// This is the shape `on_node_startup` produces: `unified_ast` holds the
-    /// imported modules ahead of the root program, and the `local_ast` handed
-    /// back names only the root program's own services. Creating `app` without
-    /// having created the `dep` it reads fails with `ServiceNotFound`.
+    /// imported modules ahead of the root program, `local_imports` the modules
+    /// read from disk, and the `local_ast` handed back names only the root
+    /// program's own services. Creating `app` without having created the
+    /// `dep` it reads fails with `ServiceNotFound`.
     #[tokio::test]
     async fn on_manager_startup_instantiates_locally_resolved_imports() {
         let mut node = Node::new();
@@ -891,6 +893,7 @@ mod tests {
         };
 
         let local_ast = vec![app_stmt.clone()];
+        node.local_imports = vec![dep_stmt.clone()];
         node.unified_ast = vec![dep_stmt, app_stmt];
 
         let manager = node

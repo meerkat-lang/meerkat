@@ -51,7 +51,7 @@ fn test_imports_local_resolution_and_circular_prevention() {
     assert!(new_cmds.is_empty());
     assert!(imports.is_done());
 
-    let final_ast = imports.finalize();
+    let (final_ast, _) = imports.finalize();
     let has_service_b = final_ast.iter().any(|stmt| {
         if let Stmt::Service { name, .. } = stmt {
             interner.get(*name) == "B"
@@ -139,7 +139,7 @@ fn test_imports_on_recv_source_merges_and_resolves() {
     assert!(new_cmds.is_empty());
     assert!(imports.is_done());
 
-    let imported_ast = imports.finalize();
+    let (imported_ast, _) = imports.finalize();
     let mut all_stmts = base_ast;
     all_stmts.extend(imported_ast);
 
@@ -291,8 +291,15 @@ fn test_imports_max_imported_services_limit() {
     let mut interner = Interner::new();
     let base_ast = Vec::new();
 
+    // A network arrival is only recorded for a service fetched from a peer
+    let remote_map: HashMap<String, String> = (0..MAX_IMPORTED_SERVICES)
+        .map(|i| format!("S{}", i))
+        .chain(std::iter::once("Overflow".to_string()))
+        .map(|name| (name, "/ip4/127.0.0.1/tcp/9000".to_string()))
+        .collect();
+
     let (mut imports, _initial_cmds) =
-        Imports::new(&mut interner, HashMap::new(), &base_ast, Path::new(""), "")
+        Imports::new(&mut interner, remote_map, &base_ast, Path::new(""), "")
             .expect("Imports::new success");
 
     // Populate visited_services up to the limit
@@ -506,6 +513,7 @@ fn test_network_imports_are_dependency_ordered_regardless_of_arrival() {
 
     let order: Vec<String> = imports
         .finalize()
+        .0
         .iter()
         .filter_map(|s| match s {
             Stmt::Service { name, .. } => Some(node.interner.get(*name).to_string()),

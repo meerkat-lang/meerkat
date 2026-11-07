@@ -45,7 +45,8 @@ struct ImportedModule {
     /// Address of the peer this file was fetched from, if it came over the
     /// network. That peer runs the file as its own program, so it serves
     /// every service the file declares -- not only the one that was asked
-    /// for. `None` for a file read from local disk, which this node serves.
+    /// for. `None` for a file read from local disk, which this node serves
+    /// and runs.
     remote_peer: Option<Address>,
 }
 
@@ -191,6 +192,20 @@ impl<'a> Imports<'a> {
         service_name: &str,
         base_dir: &Path,
     ) -> Result<Vec<ImportCommand>> {
+        // The peer that served this file owns everything the file declares.
+        // Only a service with a remote URL is ever fetched, so a file for any
+        // other name has no owner to record it under: it would pass for one
+        // read from local disk, which this node runs. Ignore it, before any
+        // state changes, as nothing this resolution asked for.
+        let Some(url) = self.remote_url_map.get(service_name) else {
+            println!(
+                "Ignoring response for service '{}', which is not imported from any peer",
+                service_name
+            );
+            return Ok(Vec::new());
+        };
+        let remote_peer = Address::new(url.as_str()).node_address(service_name);
+
         if !self.pending_services.contains(service_name) {
             // Log unsolicited response rather than failing, which aids testing
             // and speculative pushes
@@ -204,13 +219,7 @@ impl<'a> Imports<'a> {
         self.pending_network
             .retain(|_, req| req.service_name != service_name);
 
-        // The peer that served this file owns everything the file declares.
-        let remote_peer = self
-            .remote_url_map
-            .get(service_name)
-            .map(|url| Address::new(url.as_str()).node_address(service_name));
-
-        self.record_source(source, base_dir, remote_peer)
+        self.record_source(source, base_dir, Some(remote_peer))
     }
 
     /// Record a resolved import's source and resolve its own imports in turn
@@ -417,9 +426,15 @@ impl<'a> Imports<'a> {
     /// (`main -> a -> b` records `[a, b]`, but `a` reads `b`), so emit them in
     /// post-order over the import graph instead.
     ///
+    /// The statements of the modules read from local disk are also returned
+    /// on their own, in the same order: they are the imports this node runs
+    /// at startup. A module fetched from a peer is that peer's own program, so
+    /// only the peer runs it; here it only informs the static checks.
+    ///
     /// Returns:
-    ///   `Vec<Stmt>`: Dependency-ordered AST of all imported services
-    pub fn finalize(self) -> Vec<Stmt> {
+    ///   `(Vec<Stmt>, Vec<Stmt>)`: Dependency-ordered AST of all imported
+    ///   services, and the statements of the local disk modules among them
+    pub fn finalize(self) -> (Vec<Stmt>, Vec<Stmt>) {
         // Which module declares each service, so an import edge can be
         // followed to the module that satisfies it. First declaration wins.
         let mut owner: HashMap<Symbol, usize> = HashMap::new();
@@ -431,12 +446,15 @@ impl<'a> Imports<'a> {
 
         // Split the modules apart so the walk can hand out each one's
         // statements without cloning them while still reading its import edges.
+        // Only a local module's statements are copied, once, for startup.
         let count = self.modules.len();
         let mut imports: Vec<Vec<Symbol>> = Vec::with_capacity(count);
         let mut stmts: Vec<Option<Vec<Stmt>>> = Vec::with_capacity(count);
+        let mut local: Vec<bool> = Vec::with_capacity(count);
         for module in self.modules {
             imports.push(module.imports);
             stmts.push(Some(module.stmts));
+            local.push(module.remote_peer.is_none());
         }
 
         // Iterative DFS post-order -- import chains are user-controlled depth,
@@ -444,6 +462,7 @@ impl<'a> Imports<'a> {
         // breaks import cycles, which the type checker reports properly once it
         // can see the services (a better diagnostic than looping here).
         let mut ordered: Vec<Stmt> = Vec::new();
+        let mut local_ordered: Vec<Stmt> = Vec::new();
         let mut done = vec![false; count];
         let mut on_stack = vec![false; count];
 
@@ -461,6 +480,9 @@ impl<'a> Imports<'a> {
                     done[idx] = true;
                     on_stack[idx] = false;
                     if let Some(module_stmts) = stmts[idx].take() {
+                        if local[idx] {
+                            local_ordered.extend_from_slice(&module_stmts);
+                        }
                         ordered.extend(module_stmts);
                     }
                     continue;
@@ -479,7 +501,7 @@ impl<'a> Imports<'a> {
             }
         }
 
-        ordered
+        (ordered, local_ordered)
     }
 
     /// Services owned by a peer because a network-fetched module declares them

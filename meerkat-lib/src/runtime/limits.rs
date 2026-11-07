@@ -17,6 +17,16 @@ pub const MAX_NET_REQUEST_STRING_LENGTH: usize = 4096;
 /// Maximum nesting depth of scope blocks to prevent stack overflows
 pub const MAX_SCOPE_DEPTH: usize = 64;
 
+/// Maximum depth of the dependency analysis' recursion (`graphs::effects`):
+/// every expression it visits within another and every application it
+/// analyzes within another is one level, so the stack the analysis takes is
+/// bounded whatever the shape of the code.
+pub const MAX_ANALYSIS_DEPTH: usize = 512;
+
+/// Maximum rounds the result of a recursive application may take to stand
+/// still in the dependency analysis before the member is given up on
+pub const MAX_ANALYSIS_ROUNDS: usize = 128;
+
 /// Maximum allowed time in seconds for an individual import attempt
 pub const INDIVIDUAL_IMPORT_TIMEOUT_SECS: u64 = 2;
 
@@ -31,6 +41,10 @@ pub const IMPORT_POLL_INTERVAL_MS: u64 = 10;
 
 /// Maximum length of source code received over network in bytes
 pub const MAX_NET_REQUEST_SOURCE_LENGTH: usize = 1_048_576;
+
+/// Maximum number of source-identity pairs accepted from a network message.
+/// Two 64-byte identifiers per pair allow at most 1 MiB of identifier bytes.
+pub const MAX_NET_SOURCE_PAIRS: usize = 8192;
 
 /// Maximum number of services allowed to be imported
 pub const MAX_IMPORTED_SERVICES: usize = 256;

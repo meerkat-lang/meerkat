@@ -58,8 +58,8 @@ pub struct Imports<'a> {
     pending_services: HashSet<String>,
     remote_url_map: HashMap<String, String>,
     modules: Vec<ImportedModule>,
-    /// Services the root program declares itself. This node serves them, so a
-    /// peer that happens to declare the same name does not own them here.
+    /// Services declared by the root program or local disk modules. This node
+    /// serves them, so a peer declaring the same name does not own them here.
     local_declares: HashSet<Symbol>,
     request_counter: u64,
     my_addr: String,
@@ -260,6 +260,9 @@ impl<'a> Imports<'a> {
         for stmt in &parsed_stmts {
             if let Stmt::Service { name, .. } = stmt {
                 self.visited_services.insert(*name);
+                if remote_peer.is_none() {
+                    self.local_declares.insert(*name);
+                }
             }
         }
 
@@ -442,6 +445,9 @@ impl<'a> Imports<'a> {
         let mut owner: HashMap<Symbol, usize> = HashMap::new();
         for (idx, module) in self.modules.iter().enumerate() {
             for svc in &module.declares {
+                if module.remote_peer.is_some() && self.local_declares.contains(svc) {
+                    continue;
+                }
                 owner.entry(*svc).or_insert(idx);
             }
         }
@@ -492,6 +498,8 @@ impl<'a> Imports<'a> {
                                     Stmt::Update { .. } | Stmt::Atomic { .. } => {
                                         peer_updates.push(stmt)
                                     }
+                                    Stmt::Service { name, .. }
+                                        if self.local_declares.contains(&name) => {}
                                     _ => ordered.push(stmt),
                                 }
                             }
@@ -513,32 +521,25 @@ impl<'a> Imports<'a> {
             }
         }
 
+        let is_peer_service = |stmt: &Stmt| matches!(stmt, Stmt::Service { name, .. } if !self.local_declares.contains(name));
         let peer_services: Vec<Stmt> = ordered
             .iter()
-            .filter(|stmt| {
-                matches!(stmt, Stmt::Service { name, .. } if owner.get(name).is_some_and(|&idx| !local[idx]))
-            })
+            .filter(|stmt| is_peer_service(stmt))
             .cloned()
             .collect();
-        let mut folded: HashMap<Symbol, Stmt> = apply_updates_to_ast(&peer_services, &peer_updates)
-            .map_err(|name| {
-                Error::Message(format!(
-                    "a module fetched from a peer updates service '{}', which that peer does not serve",
-                    self.interner.get(name)
-                ))
-            })?
-            .into_iter()
-            .filter_map(|stmt| match &stmt {
-                Stmt::Service { name, .. } => Some((*name, stmt)),
-                _ => None,
-            })
-            .collect();
-        for stmt in &mut ordered {
-            if let Stmt::Service { name, .. } = stmt {
-                if let Some(service) = folded.remove(name) {
-                    *stmt = service;
-                }
-            }
+        let folded = apply_updates_to_ast(&peer_services, &peer_updates).map_err(|name| {
+            Error::Message(format!(
+                "a module fetched from a peer updates service '{}', which that peer does not serve",
+                self.interner.get(name)
+            ))
+        })?;
+        // Folding preserves the declarations' order, including repeated names.
+        for (stmt, service) in ordered
+            .iter_mut()
+            .filter(|stmt| is_peer_service(stmt))
+            .zip(folded)
+        {
+            *stmt = service;
         }
         Ok((ordered, local_ordered))
     }
@@ -555,11 +556,9 @@ impl<'a> Imports<'a> {
     /// merges directly into the `-i` map. Empty unless imports were fetched
     /// over the network: a module read from local disk is served by this node.
     ///
-    /// A name the root program declares itself is never reported, even when a
-    /// peer's module happens to declare it too: this node serves its own
-    /// declaration. Reporting it would put an entry the user never asked for
-    /// into the `-i` map, where `Manager::register_remote_services` would
-    /// discard it and blame a `-i` flag that was never typed.
+    /// A name declared by the root program or a disk module is never reported,
+    /// even when a peer's module declares it too: this node serves its own
+    /// declaration.
     ///
     /// Returns:
     ///   `HashMap<String, String>`: Service name to serving URL

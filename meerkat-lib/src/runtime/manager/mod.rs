@@ -2023,7 +2023,6 @@ impl Manager {
     }
 
     /// Drive a top-level code update until its new defs have first values.
-    /// Only pauses count against this nominal reply-timeout budget.
     pub async fn await_first_values(&mut self, defs: &[(Symbol, Symbol)]) -> Result<(), EvalError> {
         let deadline = web_time::Instant::now() + std::time::Duration::from_secs(15);
         let mut keepalive = web_time::Instant::now() + std::time::Duration::from_secs(5);

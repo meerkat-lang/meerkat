@@ -140,7 +140,6 @@ async fn test_aborted_txn_leaves_def_unchanged() {
 /// `var` must not take part in. A def over another service read in the same
 /// transaction as the write is the next test.
 #[tokio::test]
-#[ignore = "requires #230: a var initialised from another service is still registered as a listener"]
 async fn test_var_initialized_from_another_service_is_not_reactive() {
     let (mut m, tests) = setup(
         "

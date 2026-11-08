@@ -9,7 +9,7 @@ use std::time::Instant;
 use crate::error::{Error, Result};
 use crate::net::types::MeerkatMessage;
 use crate::net::{Address, MessageId, NetworkCommand};
-use crate::runtime::ast::Stmt;
+use crate::runtime::ast::{apply_updates_to_ast, Stmt};
 use crate::runtime::interner::{Interner, Symbol};
 use crate::runtime::limits::{
     INDIVIDUAL_IMPORT_TIMEOUT_SECS, MAX_IMPORTED_SERVICES, MAX_IMPORT_RETRIES,
@@ -429,12 +429,14 @@ impl<'a> Imports<'a> {
     /// The statements of the modules read from local disk are also returned
     /// on their own, in the same order: they are the imports this node runs
     /// at startup. A module fetched from a peer is that peer's own program, so
-    /// only the peer runs it; here it only informs the static checks.
+    /// only the peer runs it: its startup updates are folded into the
+    /// declarations they complete, which is how the peer serves them, and
+    /// one updating a service the peer does not serve is refused
     ///
     /// Returns:
     ///   `(Vec<Stmt>, Vec<Stmt>)`: Dependency-ordered AST of all imported
     ///   services, and the statements of the local disk modules among them
-    pub fn finalize(self) -> (Vec<Stmt>, Vec<Stmt>) {
+    pub fn finalize(self) -> Result<(Vec<Stmt>, Vec<Stmt>)> {
         // Which module declares each service, so an import edge can be
         // followed to the module that satisfies it. First declaration wins.
         let mut owner: HashMap<Symbol, usize> = HashMap::new();
@@ -463,6 +465,7 @@ impl<'a> Imports<'a> {
         // can see the services (a better diagnostic than looping here).
         let mut ordered: Vec<Stmt> = Vec::new();
         let mut local_ordered: Vec<Stmt> = Vec::new();
+        let mut peer_updates: Vec<Stmt> = Vec::new();
         let mut done = vec![false; count];
         let mut on_stack = vec![false; count];
 
@@ -482,8 +485,17 @@ impl<'a> Imports<'a> {
                     if let Some(module_stmts) = stmts[idx].take() {
                         if local[idx] {
                             local_ordered.extend_from_slice(&module_stmts);
+                            ordered.extend(module_stmts);
+                        } else {
+                            for stmt in module_stmts {
+                                match stmt {
+                                    Stmt::Update { .. } | Stmt::Atomic { .. } => {
+                                        peer_updates.push(stmt)
+                                    }
+                                    _ => ordered.push(stmt),
+                                }
+                            }
                         }
-                        ordered.extend(module_stmts);
                     }
                     continue;
                 }
@@ -501,7 +513,34 @@ impl<'a> Imports<'a> {
             }
         }
 
-        (ordered, local_ordered)
+        let peer_services: Vec<Stmt> = ordered
+            .iter()
+            .filter(|stmt| {
+                matches!(stmt, Stmt::Service { name, .. } if owner.get(name).is_some_and(|&idx| !local[idx]))
+            })
+            .cloned()
+            .collect();
+        let mut folded: HashMap<Symbol, Stmt> = apply_updates_to_ast(&peer_services, &peer_updates)
+            .map_err(|name| {
+                Error::Message(format!(
+                    "a module fetched from a peer updates service '{}', which that peer does not serve",
+                    self.interner.get(name)
+                ))
+            })?
+            .into_iter()
+            .filter_map(|stmt| match &stmt {
+                Stmt::Service { name, .. } => Some((*name, stmt)),
+                _ => None,
+            })
+            .collect();
+        for stmt in &mut ordered {
+            if let Stmt::Service { name, .. } = stmt {
+                if let Some(service) = folded.remove(name) {
+                    *stmt = service;
+                }
+            }
+        }
+        Ok((ordered, local_ordered))
     }
 
     /// Services owned by a peer because a network-fetched module declares them

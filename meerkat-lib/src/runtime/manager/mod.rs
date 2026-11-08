@@ -414,7 +414,9 @@ fn caught_up(target: &VClock, clock: &VClock, sources: Option<&Sources>) -> bool
 /// §5.2's `V_new`: the joined history `v_base` advanced once in each written var
 fn advance(mut v_base: VClock, write_set: &HashSet<(Symbol, Symbol)>) -> VClock {
     for &var in write_set {
-        *v_base.entry(var).or_insert(0) += 1;
+        let counter = v_base.entry(var).or_insert(0);
+        // Wire counters are bounded far below the maximum (`MAX_NET_CLOCK_COUNTER`)
+        *counter = counter.checked_add(1).expect("a clock counter overflowed");
     }
     v_base
 }
@@ -2023,20 +2025,22 @@ impl Manager {
     /// Drive a top-level code update until its new defs have first values.
     /// Only pauses count against this nominal reply-timeout budget.
     pub async fn await_first_values(&mut self, defs: &[(Symbol, Symbol)]) -> Result<(), EvalError> {
-        let mut remaining_ms: i64 = 15_000;
+        let deadline = web_time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut keepalive = web_time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             self.serve_network_events().await;
             let Some(waiting) = self.first_values(defs).await? else {
                 return Ok(());
             };
-            if remaining_ms <= 0 {
+            let now = web_time::Instant::now();
+            if now >= deadline {
                 return Err(self.uninitialized(waiting));
             }
-            if remaining_ms % 5_000 == 0 {
+            if now >= keepalive {
                 self.keepalive_waiters().await;
+                keepalive = now + std::time::Duration::from_secs(5);
             }
             retry_backoff(10).await;
-            remaining_ms -= 10;
         }
     }
 
@@ -7474,6 +7478,114 @@ mod tests {
             "the attempt released the lock it had taken on `a`, so the request \
              parked on it must be reported for waking"
         );
+    }
+
+    /// A participant run that parks must leave its own writes unbuffered.
+    ///
+    /// The whole action is re-run from its first statement when the lock
+    /// frees, so a write left behind would be read back by the re-run:
+    /// `x = x + 1` would be applied twice and commit `2`
+    #[tokio::test]
+    async fn test_parked_participant_run_rolls_back_what_it_buffered() {
+        let mut tc = manager_with_a_and_x().await;
+        let a = tc.manager.interner.insert("a");
+        let sid = tc.manager.service_net_id_for_name(tc.foo);
+
+        // A younger transaction holds `a`, so the older one below waits on it
+        let lock_a = |tc: &mut TestContext, lock| {
+            tc.manager
+                .services
+                .get_mut(&tc.foo)
+                .unwrap()
+                .vars
+                .get_mut(&a)
+                .unwrap()
+                .lock = lock;
+        };
+        let younger = TxnId {
+            timestamp: u128::MAX,
+            node_id: tc.manager.node_id,
+            iteration: 0,
+        };
+        lock_a(&mut tc, crate::runtime::txn::VarLock::WriteLocked(younger));
+        let older = TxnId {
+            timestamp: 1,
+            node_id: tc.manager.node_id,
+            iteration: 0,
+        };
+        let stmts = vec![
+            incr_x(&tc),
+            ActionStmt::Assign {
+                name: a,
+                expr: Expr::Literal {
+                    val: Value::Int { val: 1 },
+                },
+            },
+        ];
+
+        // First attempt: `x` is buffered, then the write to `a` parks
+        let parked = tc
+            .manager
+            .execute_action_participant(tc.foo, &stmts, &[], older.clone())
+            .await;
+        assert!(
+            matches!(parked, Err(EvalError::WaitOn(_))),
+            "writing `a` must wait, got {parked:?}"
+        );
+        let txn = &tc.manager.pending_txns[&older];
+        assert_eq!(txn.written.get(&(sid.clone(), tc.x)), None);
+        assert_eq!(txn.read_cache.get(&(sid.clone(), tc.x)), None);
+        // The write lock on `x` is kept: it holds this transaction's place
+        assert!(matches!(
+            tc.manager.services[&tc.foo].vars[&tc.x].lock,
+            crate::runtime::txn::VarLock::WriteLocked(_)
+        ));
+
+        // `a` frees and the parked action is re-run from the top
+        lock_a(&mut tc, crate::runtime::txn::VarLock::Unlocked);
+        tc.manager
+            .execute_action_participant(tc.foo, &stmts, &[], older.clone())
+            .await
+            .expect("with `a` free the action completes");
+        assert_eq!(
+            tc.manager.pending_txns[&older].written[&(sid, tc.x)],
+            Value::Int { val: 1 },
+            "2 means the re-run read the value the parked attempt buffered"
+        );
+    }
+
+    /// A second action composed onto the same participant under one
+    /// transaction id must keep what the first one wrote, which is why a
+    /// parked run restores its buffers rather than clearing them
+    #[tokio::test]
+    async fn test_second_action_under_one_txn_keeps_the_first_write() {
+        let mut tc = manager_with_a_and_x().await;
+        let a = tc.manager.interner.insert("a");
+        let sid = tc.manager.service_net_id_for_name(tc.foo);
+        let tid = TxnId::new(tc.manager.node_id);
+
+        tc.manager
+            .execute_action_participant(
+                tc.foo,
+                &[ActionStmt::Assign {
+                    name: a,
+                    expr: Expr::Literal {
+                        val: Value::Int { val: 7 },
+                    },
+                }],
+                &[],
+                tid.clone(),
+            )
+            .await
+            .unwrap();
+        tc.manager
+            .execute_action_participant(tc.foo, &[incr_x(&tc)], &[], tid.clone())
+            .await
+            .unwrap();
+
+        let written = &tc.manager.pending_txns[&tid].written;
+        assert_eq!(written[&(sid.clone(), a)], Value::Int { val: 7 });
+        assert_eq!(written[&(sid, tc.x)], Value::Int { val: 1 });
     }
 
     async fn start_local_manager(code: &str) -> Manager {

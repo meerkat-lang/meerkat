@@ -13,8 +13,9 @@ use crate::net::ClockEntry;
 use crate::runtime::ast::{ActionStmt, BinOp, Expr, Field, TableType, UnOp, Value};
 use crate::runtime::interner::{Interner, Symbol};
 use crate::runtime::limits::{
-    MAX_IDENTIFIER_LENGTH, MAX_NET_REQUEST_SOURCE_LENGTH, MAX_NET_REQUEST_STRING_LENGTH,
-    MAX_NET_SOURCE_PAIRS, MAX_STRING_LITERAL_LENGTH, MAX_TYPE_DEPTH,
+    MAX_IDENTIFIER_LENGTH, MAX_NET_CLOCK_COUNTER, MAX_NET_CLOCK_ENTRIES,
+    MAX_NET_REQUEST_SOURCE_LENGTH, MAX_NET_REQUEST_STRING_LENGTH, MAX_NET_SOURCE_PAIRS,
+    MAX_STRING_LITERAL_LENGTH, MAX_TYPE_DEPTH,
 };
 use crate::runtime::tt::{Param, ServiceType, TupleType, Type};
 use crate::runtime::txn::{Sources, VClock};
@@ -281,12 +282,27 @@ pub fn decode_request_updates(
         interner.insert(listener_def),
     ))
 }
-/// Decode a network ClockEntry to a runtime VClock
+/// Decode a network ClockEntry to a runtime VClock. The size and counters are
+/// bounded before any dimension name is interned
 pub fn clock_entry_to_vclock(clock: Vec<ClockEntry>, interner: &mut Interner) -> Result<VClock> {
-    let mut vclock: VClock = HashMap::new();
-    for entry in clock {
+    if clock.len() > MAX_NET_CLOCK_ENTRIES {
+        return Err(Error::LimitExceeded(format!(
+            "clock exceeds maximum count of {} dimensions",
+            MAX_NET_CLOCK_ENTRIES
+        )));
+    }
+    for entry in &clock {
         validate_identifier(&entry.service)?;
         validate_identifier(&entry.member)?;
+        if entry.counter > MAX_NET_CLOCK_COUNTER {
+            return Err(Error::LimitExceeded(format!(
+                "clock counter of ({}, {}) exceeds {}",
+                entry.service, entry.member, MAX_NET_CLOCK_COUNTER
+            )));
+        }
+    }
+    let mut vclock: VClock = HashMap::new();
+    for entry in clock {
         let key = (
             interner.insert(&entry.service),
             interner.insert(&entry.member),
@@ -1806,8 +1822,7 @@ mod tests {
         assert!(decode_update("z", "svc", "y", &mut interner, vec![], None).is_ok());
     }
 
-    /// Vector-clock PR: a clock survives an encode/decode round-trip through the
-    /// wire form. Using one interner means the re-interned `(service, member)`
+    /// A clock survives an encode/decode round-trip through the wire form. Using one interner means the re-interned `(service, member)`
     /// keys resolve to the same `Symbol`s, so the decoded clock equals the
     /// original.
     #[test]
@@ -1823,8 +1838,8 @@ mod tests {
         assert_eq!(decoded, original);
     }
 
-    /// Vector-clock PR: a wire clock carrying a non-identifier dimension name is
-    /// rejected wholesale, so a remote peer cannot intern junk via the clock
+    /// A wire clock carrying a non-identifier dimension name is rejected
+    /// wholesale, so a remote peer cannot intern junk via the clock
     /// (mirrors the guarantee `decode_update` gives for the message's own name
     /// fields).
     #[test]
@@ -1840,6 +1855,58 @@ mod tests {
             res.is_err(),
             "decode_update should reject a clock with a non-identifier dimension"
         );
+    }
+
+    /// The numeric id of a symbol, from its debug form
+    fn symbol_id(symbol: Symbol) -> u32 {
+        let text = format!("{symbol:?}");
+        text.trim_matches(|c: char| !c.is_ascii_digit())
+            .parse()
+            .expect("a symbol prints its id")
+    }
+
+    fn clock_of(dimensions: usize, counter: u64) -> Vec<ClockEntry> {
+        (0..dimensions)
+            .map(|i| ClockEntry {
+                service: format!("s{i}"),
+                member: "x".to_string(),
+                counter,
+            })
+            .collect()
+    }
+
+    /// A clock with more dimensions than allowed is refused before any of its
+    /// names is interned; one at the limit is accepted
+    #[test]
+    fn test_codec_clock_bounds_its_dimensions_before_interning() {
+        let mut interner = Interner::new();
+        let before = symbol_id(interner.insert("probe"));
+        let res = clock_entry_to_vclock(clock_of(MAX_NET_CLOCK_ENTRIES + 1, 1), &mut interner);
+        assert!(matches!(res, Err(Error::LimitExceeded(_))), "{res:?}");
+        assert_eq!(
+            symbol_id(interner.insert("next")),
+            before + 1,
+            "the refused clock must not have interned any name"
+        );
+        let at_limit = clock_entry_to_vclock(clock_of(MAX_NET_CLOCK_ENTRIES, 1), &mut interner)
+            .expect("a clock at the limit decodes");
+        assert_eq!(at_limit.len(), MAX_NET_CLOCK_ENTRIES);
+    }
+
+    /// A counter above the wire bound is refused, as a message handler would,
+    /// so no local write can overflow a counter afterwards
+    #[test]
+    fn test_codec_clock_rejects_an_over_bound_counter() {
+        let mut interner = Interner::new();
+        let res = decode_update(
+            "ldef",
+            "svc",
+            "member",
+            &mut interner,
+            clock_of(1, MAX_NET_CLOCK_COUNTER + 1),
+            None,
+        );
+        assert!(res.is_err(), "an over-bound counter must be refused");
     }
 
     /// Verify that encoding a value with an oversized string

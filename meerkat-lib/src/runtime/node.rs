@@ -298,7 +298,7 @@ impl Node {
         // program does not keep the first one's peers and register this
         // import at a stale one.
         self.discovered_remote_services = imports.remote_service_owners();
-        let (stmts, local_imports) = imports.finalize();
+        let (stmts, local_imports) = imports.finalize()?;
         self.local_imports = local_imports;
         Ok(stmts)
     }
@@ -419,7 +419,7 @@ impl Node {
 
         // Before `finalize`, which consumes the state machine.
         let owners = imports.remote_service_owners();
-        let (stmts, local_imports) = imports.finalize();
+        let (stmts, local_imports) = imports.finalize()?;
         self.discovered_remote_services = owners;
         self.local_imports = local_imports;
         Ok((stmts, buffered_events))

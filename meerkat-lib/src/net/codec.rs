@@ -216,18 +216,29 @@ pub fn serve_service_code(
     }
 }
 
+/// True if the path's extension is `.mkt`, compared case-insensitively:
+/// `canonicalize` returns the casing stored on disk (e.g. `.MKT` on Windows),
+/// and a file saved as `Counter.MKT` must be servable like any other.
+fn has_mkt_extension(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("mkt"))
+}
+
 /// #39: Safely resolve a client-requested file path against a server base
 /// directory, for serving `.mkt` source over the network.
 ///
 /// This is a zero-trust boundary: the path comes from the network, so it is
 /// validated to prevent directory traversal. An absolute path is rejected, and
-/// the resolved path is canonicalized and required to stay within the
-/// canonicalized base directory (blocking `..` and symlink escapes). The
-/// canonicalized target must also be a regular file with a `.mkt` extension,
-/// so only Meerkat source files are served (a symlink named `evil.mkt` that
-/// points at another file is rejected, as are directories, FIFOs and device
-/// files). Returns the validated path to read, or an error describing why it
-/// was rejected. An empty base directory means the current working directory.
+/// the requested path must end in `.mkt` (case-insensitively) before any
+/// filesystem access, so a peer cannot probe which files exist. The resolved
+/// path is canonicalized and required to stay within the canonicalized base
+/// directory (blocking `..` and symlink escapes). The canonicalized target
+/// must also be a regular file with a `.mkt` extension, so only Meerkat
+/// source files are served (a symlink named `evil.mkt` that points at another
+/// file is rejected, as are directories, FIFOs and device files). Returns the
+/// validated path to read, or an error describing why it was rejected. An
+/// empty base directory means the current working directory.
 pub fn resolve_served_file(
     base_dir: &std::path::Path,
     requested: &str,
@@ -245,6 +256,17 @@ pub fn resolve_served_file(
     if Path::new(requested).is_absolute() {
         return Err(Error::LimitExceeded(format!(
             "requested path must be relative, got absolute: {:?}",
+            requested
+        )));
+    }
+
+    // Refuse a non-`.mkt` request before touching the filesystem: otherwise a
+    // peer could tell "exists as a non-`.mkt` file" from "not found" and probe
+    // which files the server has. The canonicalized check below still catches
+    // a symlink named `*.mkt` pointing at a non-`.mkt` file.
+    if !has_mkt_extension(Path::new(requested)) {
+        return Err(Error::LimitExceeded(format!(
+            "requested file is not a .mkt source file: {:?}",
             requested
         )));
     }
@@ -269,7 +291,7 @@ pub fn resolve_served_file(
     // Only `.mkt` source files are served. Check the canonicalized target, not
     // the requested string, so a symlink named `evil.mkt` pointing at another
     // file is still rejected.
-    if canon_target.extension().and_then(|e| e.to_str()) != Some("mkt") {
+    if !has_mkt_extension(&canon_target) {
         return Err(Error::LimitExceeded(format!(
             "requested file is not a .mkt source file: {:?}",
             requested
@@ -277,10 +299,10 @@ pub fn resolve_served_file(
     }
 
     // The target must be a regular file, so the server never blocks on a FIFO
-    // or reads a device file.
-    let meta = std::fs::metadata(&canon_target).map_err(|e| {
-        Error::LimitExceeded(format!("requested file is unavailable: {}", e))
-    })?;
+    // or reads a device file. A fixed message keeps the operating system's
+    // error text from leaking to the peer.
+    let meta = std::fs::metadata(&canon_target)
+        .map_err(|_| Error::LimitExceeded("requested file is unavailable".to_string()))?;
     if !meta.is_file() {
         return Err(Error::LimitExceeded(format!(
             "requested path is not a regular file: {:?}",
@@ -1959,6 +1981,21 @@ mod service_code_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #239: the extension check is case-insensitive — `canonicalize` returns
+    /// the casing stored on disk (e.g. `.MKT` on Windows), which must be
+    /// accepted the same as `.mkt`.
+    #[test]
+    fn test_resolve_served_file_accepts_uppercase_mkt() {
+        let dir = unique_temp_dir("uppermkt");
+        let file = dir.join("counter.MKT");
+        std::fs::write(&file, "service counter {}").unwrap();
+
+        let resolved = resolve_served_file(&dir, "counter.MKT").expect("should resolve");
+        assert_eq!(resolved, file.canonicalize().unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #221: a bare server filename yields an empty base; serve from cwd.
     #[test]
     fn test_resolve_served_file_empty_base() {
@@ -1978,7 +2015,12 @@ mod service_code_tests {
         std::fs::write(dir.join("secret.txt"), "secret").unwrap();
 
         let res = resolve_served_file(&dir, "secret.txt");
-        assert!(res.is_err(), "non-.mkt file must be rejected");
+        let err = res.expect_err("non-.mkt file must be rejected");
+        assert!(
+            err.to_string().contains("not a .mkt source file"),
+            "unexpected error: {}",
+            err
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1992,7 +2034,12 @@ mod service_code_tests {
         std::os::unix::fs::symlink(".env", dir.join("link.mkt")).unwrap();
 
         let res = resolve_served_file(&dir, "link.mkt");
-        assert!(res.is_err(), "symlink to a non-.mkt file must be rejected");
+        let err = res.expect_err("symlink to a non-.mkt file must be rejected");
+        assert!(
+            err.to_string().contains("not a .mkt source file"),
+            "unexpected error: {}",
+            err
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2004,7 +2051,35 @@ mod service_code_tests {
         std::fs::create_dir_all(dir.join("dir.mkt")).unwrap();
 
         let res = resolve_served_file(&dir, "dir.mkt");
-        assert!(res.is_err(), "a directory must be rejected");
+        let err = res.expect_err("a directory must be rejected");
+        assert!(
+            err.to_string().contains("not a regular file"),
+            "unexpected error: {}",
+            err
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #239: a FIFO named `pipe.mkt` is refused as not a regular file — a
+    /// weaker "not a directory" check would pass the directory test above
+    /// while letting FIFOs through.
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_served_file_rejects_fifo() {
+        let dir = unique_temp_dir("fifomkt");
+        let status = std::process::Command::new("mkfifo")
+            .arg(dir.join("pipe.mkt"))
+            .status()
+            .expect("mkfifo must be available on unix");
+        assert!(status.success(), "mkfifo failed");
+
+        let res = resolve_served_file(&dir, "pipe.mkt");
+        let err = res.expect_err("a FIFO must be rejected");
+        assert!(
+            err.to_string().contains("not a regular file"),
+            "unexpected error: {}",
+            err
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2037,7 +2112,12 @@ mod service_code_tests {
     fn test_resolve_served_file_missing() {
         let dir = unique_temp_dir("missing");
         let res = resolve_served_file(&dir, "nope.mkt");
-        assert!(res.is_err(), "missing file must be rejected");
+        let err = res.expect_err("missing file must be rejected");
+        assert!(
+            err.to_string().contains("not found"),
+            "unexpected error: {}",
+            err
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

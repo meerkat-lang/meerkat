@@ -54,6 +54,12 @@
       "groupName": "rust minor and patch dependencies"
     },
     {
+      "description": "Keep the wasm-bindgen crates in a group of their own. They are released together and depend on each other's exact versions, so they must move together, and other crates can pin them too (libp2p-swarm 0.48 pins wasm-bindgen-futures exactly). On their own, an update that can't resolve yet doesn't hold up the rest. Placed after the Rust rules so it takes precedence",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["wasm-bindgen", "wasm-bindgen-futures", "js-sys", "web-sys"],
+      "groupName": "wasm-bindgen crates"
+    },
+    {
       "description": "Group pre-commit hook updates",
       "matchManagers": ["pre-commit"],
       "groupName": "pre-commit hooks"

@@ -62,6 +62,10 @@ async fn run_test_block(
 
 /// A transaction that writes `x` must see `def y = x + 1` refreshed, including
 /// through a chain of defs, and the committed values must agree afterwards.
+///
+/// The second write checks invalidation (task 12, §3a): the defs refreshed
+/// after the first write must be refreshed again, not served from the
+/// transaction's cache.
 #[tokio::test]
 #[ignore = "requires compute-on-read: see tasks/12-compute-on-read.md"]
 async fn test_local_def_chain_refreshed_within_transaction() {
@@ -78,11 +82,14 @@ async fn test_local_def_chain_refreshed_within_transaction() {
             x = 4;
             assert(y == 5);
             assert(z == 10);
+            x = 6;
+            assert(y == 7);
+            assert(z == 14);
         }
         @test(s) {
-            assert(x == 4);
-            assert(y == 5);
-            assert(z == 10);
+            assert(x == 6);
+            assert(y == 7);
+            assert(z == 14);
         }
         ",
     )
@@ -343,8 +350,11 @@ async fn test_failed_recompute_aborts_the_transaction() {
 ///
 /// `z` is read after the write, because an unread def is never recomputed, and
 /// the read expects the value the cache would give. Served from the cache, the
-/// assertion passes and the transaction commits, which `expect_err` catches;
-/// the error must then be the failed remote read, not an assertion.
+/// assertion passes and the transaction commits, which `expect_err` catches.
+/// The error must then be the failed remote read: with no network layer, that
+/// is `LocalDispatchFailed`. Requiring it, rather than any error other than a
+/// failed assertion, means an unrelated failure before the read (such as
+/// `VarNotFound`) can't satisfy the test.
 #[tokio::test]
 #[ignore = "requires compute-on-read: see tasks/12-compute-on-read.md"]
 async fn test_remote_dependency_is_never_served_from_dep_cache() {
@@ -396,7 +406,7 @@ async fn test_remote_dependency_is_never_served_from_dep_cache() {
         .await
         .expect_err("recomputing `z` must attempt a real read of the remote dependency");
     assert!(
-        !matches!(err, EvalError::AssertionError(_)),
+        matches!(err, EvalError::LocalDispatchFailed(_)),
         "expected the failed remote read to surface, got: {err}"
     );
 

@@ -282,24 +282,36 @@ pub fn decode_request_updates(
         interner.insert(listener_def),
     ))
 }
-/// Decode a network ClockEntry to a runtime VClock. The size and counters are
-/// bounded before any dimension name is interned
-pub fn clock_entry_to_vclock(clock: Vec<ClockEntry>, interner: &mut Interner) -> Result<VClock> {
-    if clock.len() > MAX_NET_CLOCK_ENTRIES {
+/// The bounds shared by incoming clocks and locally computed commit stamps.
+pub(crate) fn validate_clock_bounds(
+    dimensions: usize,
+    counters: impl IntoIterator<Item = u64>,
+) -> Result<()> {
+    if dimensions > MAX_NET_CLOCK_ENTRIES {
         return Err(Error::LimitExceeded(format!(
             "clock exceeds maximum count of {} dimensions",
             MAX_NET_CLOCK_ENTRIES
         )));
     }
+    if counters
+        .into_iter()
+        .any(|counter| counter > MAX_NET_CLOCK_COUNTER)
+    {
+        return Err(Error::LimitExceeded(format!(
+            "clock counter exceeds {}",
+            MAX_NET_CLOCK_COUNTER
+        )));
+    }
+    Ok(())
+}
+
+/// Decode a network ClockEntry to a runtime VClock. The size and counters are
+/// bounded before any dimension name is interned
+pub fn clock_entry_to_vclock(clock: Vec<ClockEntry>, interner: &mut Interner) -> Result<VClock> {
+    validate_clock_bounds(clock.len(), clock.iter().map(|entry| entry.counter))?;
     for entry in &clock {
         validate_identifier(&entry.service)?;
         validate_identifier(&entry.member)?;
-        if entry.counter > MAX_NET_CLOCK_COUNTER {
-            return Err(Error::LimitExceeded(format!(
-                "clock counter of ({}, {}) exceeds {}",
-                entry.service, entry.member, MAX_NET_CLOCK_COUNTER
-            )));
-        }
     }
     let mut vclock: VClock = HashMap::new();
     for entry in clock {

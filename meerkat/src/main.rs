@@ -668,7 +668,12 @@ async fn run_client(
 
     if watch {
         println!("Watching for changes, press Ctrl+C to stop...");
+        let mut last_keepalive = tokio::time::Instant::now();
         loop {
+            if last_keepalive.elapsed() >= std::time::Duration::from_secs(5) {
+                manager.keepalive_waiters().await;
+                last_keepalive = tokio::time::Instant::now();
+            }
             manager.complete_code_updates().await;
             manager.wake_freed().await;
             let msg = manager.try_recv_event().and_then(|ev| match ev {

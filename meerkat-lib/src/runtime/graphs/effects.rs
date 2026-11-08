@@ -26,8 +26,8 @@
 //! summary, one lambda capturing what every such lambda captured
 //!
 //! The analysis is bounded all the same: recursion `MAX_ANALYSIS_DEPTH` deep,
-//! counting every expression visited within another and every application
-//! analyzed within another, or a result that does not stand still within
+//! counting nested expressions, applications and captured closures, or a
+//! result that does not stand still within
 //! `MAX_ANALYSIS_ROUNDS` rounds, exceeds the depth limit, which ends that
 //! member's analysis at once. Its reads are then reported incomplete rather
 //! than used: `check` rejects such a program, and the runtime refuses a
@@ -67,6 +67,9 @@ struct DepthLimit;
 /// A code point: a lambda expression of a service
 type Point = (Symbol, *const Expr);
 
+/// The service and member positions in initialization order.
+type Position = (usize, usize);
+
 type Locals = Vec<(Symbol, Functions)>;
 
 /// The members evaluating some code reads: those its own code names, and
@@ -83,8 +86,9 @@ impl Reads {
     }
 }
 
-/// A function applied to the functions each argument may be
-type Application = (Function, Vec<Functions>);
+/// A function applied to the functions each argument may be, at initialization
+/// or with all members present. Captures can differ between these contexts.
+type Application = (Function, Vec<Functions>, Option<Position>);
 
 /// An application being analyzed
 struct Applying {
@@ -111,8 +115,13 @@ struct Lambda<'a> {
 #[derive(Default)]
 pub(crate) struct Effects<'a> {
     services: HashMap<Symbol, &'a [Decl]>,
-    /// Each member's declaration: the first of its name in its service
-    decls: HashMap<Member, &'a Decl>,
+    /// Each member's position and declaration: the first of its name in its service
+    decls: HashMap<Member, (Position, &'a Decl)>,
+    /// A declaration's initializer sees only members before this position;
+    /// ordinary reactive evaluation sees the fully initialized services.
+    initializing: Option<Position>,
+    /// Capturing a local named like a member can differ during initialization.
+    shadowing: bool,
     /// Functions members hold besides those their declarations evaluate to,
     /// analyzed with them: the versions of its code a remote owner delivered
     /// (while a new one is on its way to some readers, a member may hold any
@@ -123,21 +132,22 @@ pub(crate) struct Effects<'a> {
     /// same function when they are the same code with the same captured locals
     lambdas: Vec<Lambda<'a>>,
     functions: HashMap<(Symbol, *const Expr, Locals), Function>,
-    /// The summary of each code point some lambda of which captured a lambda
-    /// of the point: the one function every such lambda is
-    summaries: HashMap<Point, Function>,
+    /// Summaries preserve which names are captured: a missing capture must
+    /// remain a service-member read, even when a nested lambda captured it.
+    summaries: HashMap<(Point, Vec<Symbol>, Option<Position>), Function>,
     /// The depth of the recursion: the expressions being visited and the
     /// applications being analyzed, each within the one before
     depth: usize,
-    /// Each member's functions, or the failure to analyze them within the limit
-    values: HashMap<Member, Result<Functions, DepthLimit>>,
+    /// Each member's initial or reactive functions and whether captures depend
+    /// on initialization order, or failure to analyze them within the limit.
+    values: HashMap<(Member, bool), (Result<Functions, DepthLimit>, bool)>,
     /// Members whose value is being computed
-    computing: HashSet<Member>,
+    computing: HashSet<(Member, bool)>,
     /// Applications being analyzed, innermost last
     applying: Vec<Applying>,
-    /// The reads and result of each application whose analysis did not
-    /// reenter an application enclosing it
-    applied: HashMap<Application, (HashSet<Member>, Functions)>,
+    /// The reads, result and capture sensitivity of each application whose
+    /// analysis did not reenter an application enclosing it
+    applied: HashMap<Application, (HashSet<Member>, Functions, bool)>,
 }
 
 impl<'a> Effects<'a> {
@@ -150,9 +160,14 @@ impl<'a> Effects<'a> {
             })
             .collect();
         let mut decls = HashMap::new();
-        for (&service, declarations) in &services {
-            for decl in *declarations {
-                decls.entry((service, decl.name())).or_insert(decl);
+        for (position, stmt) in program.iter().enumerate() {
+            let Stmt::Service { name, .. } = stmt else {
+                continue;
+            };
+            for (index, decl) in services[name].iter().enumerate() {
+                decls
+                    .entry((*name, decl.name()))
+                    .or_insert(((position, index), decl));
             }
         }
         Effects {
@@ -182,7 +197,7 @@ impl<'a> Effects<'a> {
             let Decl::DefDecl { .. } = decl else {
                 continue;
             };
-            let Some((name, reads, complete)) = self.member_reads(service, decl) else {
+            let Some((name, reads, complete)) = self.member_reads(service, decl, false) else {
                 continue;
             };
             if !complete {
@@ -205,17 +220,56 @@ impl<'a> Effects<'a> {
 
     /// What evaluating the code of `decl`, a declaration of `service`, reads,
     /// and whether the analysis found all of it within the depth limit
-    fn member_reads(&mut self, service: Symbol, decl: &'a Decl) -> Option<(Symbol, Reads, bool)> {
-        let (Decl::VarDecl { name, val, .. } | Decl::DefDecl { name, val, .. }) = decl else {
+    fn member_reads(
+        &mut self,
+        service: Symbol,
+        decl: &'a Decl,
+        initializing: bool,
+    ) -> Option<(Symbol, Reads, bool)> {
+        if matches!(decl, Decl::TableDecl { .. }) {
             return None;
-        };
+        }
+        self.shadowing = false;
         let mut reads = Reads::default();
-        let complete = self.visit(val, service, &[], &mut reads).is_ok();
-        Some((*name, reads, complete))
+        let complete = self
+            .member_value(service, decl, initializing, &mut reads)
+            .is_ok();
+        Some((decl.name(), reads, complete))
     }
 
-    fn decl(&self, (service, member): Member) -> Option<&'a Decl> {
-        self.decls.get(&(service, member)).copied()
+    fn decl(&self, member: Member) -> Option<&'a Decl> {
+        self.decls.get(&member).map(|(_, decl)| *decl)
+    }
+
+    /// A var keeps its initialized value. A def can be evaluated both during
+    /// initialization and later, when all its service's members exist.
+    fn member_value(
+        &mut self,
+        service: Symbol,
+        decl: &'a Decl,
+        initializing: bool,
+        reads: &mut Reads,
+    ) -> Result<Functions, DepthLimit> {
+        let (Decl::VarDecl { val, .. } | Decl::DefDecl { val, .. }) = decl else {
+            return Ok(Functions::new());
+        };
+        let position = self.decls[&(service, decl.name())].0;
+        let previous = self.initializing;
+        self.initializing = initializing.then_some(position);
+        let result = self.visit(val, service, &[], reads);
+        // Usually these contexts are identical. Only a local shadowing a
+        // service member can make the initial captures differ from later ones.
+        let result = if !initializing && self.shadowing {
+            self.initializing = Some(position);
+            result.and_then(|mut functions| {
+                functions.extend(self.visit(val, service, &[], reads)?);
+                Ok(functions)
+            })
+        } else {
+            result
+        };
+        self.initializing = previous;
+        result
     }
 
     /// Add to `reads` what evaluating `expr` in `service` reads, and return the
@@ -250,7 +304,7 @@ impl<'a> Effects<'a> {
         reads: &mut Reads,
     ) -> Result<Functions, DepthLimit> {
         Ok(match expr {
-            Expr::Literal { val } => self.literal(val),
+            Expr::Literal { val } => self.literal(val)?,
             // A name that is not a local is a member of the code's service,
             // declared here or not
             Expr::Variable { name } => match locals.iter().rev().find(|(local, _)| local == name) {
@@ -263,13 +317,20 @@ impl<'a> Effects<'a> {
             } => self.read((service_name, member_name), reads)?,
             Expr::Func { params, body, .. } => {
                 // As in `eval`, a closure captures the locals free in its body,
-                // except one named like a member of its service
+                // except one named like a member that already exists.
                 let bound = params.iter().map(|param| param.name).collect();
                 let free = free_var(body, &bound);
                 let env = locals
                     .iter()
                     .filter(|(local, _)| {
-                        free.contains(local) && self.decl((service, *local)).is_none()
+                        if !free.contains(local) {
+                            return false;
+                        }
+                        let Some(&(position, _)) = self.decls.get(&(service, *local)) else {
+                            return true;
+                        };
+                        self.shadowing = true;
+                        self.initializing.is_some_and(|at| position >= at)
                     })
                     .cloned()
                     .collect();
@@ -318,7 +379,7 @@ impl<'a> Effects<'a> {
         })
     }
 
-    fn literal(&mut self, val: &'a Value) -> Functions {
+    fn literal(&mut self, val: &'a Value) -> Result<Functions, DepthLimit> {
         match val {
             Value::Closure {
                 params,
@@ -327,18 +388,23 @@ impl<'a> Effects<'a> {
                 service_name,
                 ..
             } => {
-                let env = env
+                self.descend()?;
+                let result = env
                     .iter()
-                    .map(|(name, value)| (*name, self.literal(value)))
-                    .collect();
-                BTreeSet::from([self.function(Lambda {
-                    service: *service_name,
-                    params,
-                    body,
-                    env,
-                })])
+                    .map(|(name, value)| self.literal(value).map(|functions| (*name, functions)))
+                    .collect::<Result<_, _>>()
+                    .map(|env| {
+                        BTreeSet::from([self.function(Lambda {
+                            service: *service_name,
+                            params,
+                            body,
+                            env,
+                        })])
+                    });
+                self.depth -= 1;
+                result
             }
-            _ => Functions::new(),
+            _ => Ok(Functions::new()),
         }
     }
 
@@ -365,8 +431,8 @@ impl<'a> Effects<'a> {
         })
     }
 
-    /// Whether a function some local of `env` may be is a lambda of `point`,
-    /// itself or through what it captured
+    /// Whether a function some local of `env` may be is a lambda of `point`
+    /// with the same captured names, itself or through what it captured.
     fn nests(&self, point: Point, env: &Locals) -> bool {
         let mut seen = HashSet::new();
         let mut pending: Vec<Function> = env.iter().flat_map(|(_, f)| f.iter().copied()).collect();
@@ -377,7 +443,13 @@ impl<'a> Effects<'a> {
             if !seen.insert(function) {
                 continue;
             }
-            if (lambda.service, lambda.body as *const Expr) == point {
+            if (lambda.service, lambda.body as *const Expr) == point
+                && lambda
+                    .env
+                    .iter()
+                    .map(|(name, _)| name)
+                    .eq(env.iter().map(|(name, _)| name))
+            {
                 return true;
             }
             pending.extend(lambda.env.iter().flat_map(|(_, f)| f.iter().copied()));
@@ -386,27 +458,35 @@ impl<'a> Effects<'a> {
     }
 
     /// The summary of `point`, capturing what `lambda` captured as well: a
-    /// lambda of the point among the captured functions is read as the
+    /// lambda of the point with the same captured names is read as the
     /// summary, and what it captured joins. The applications analyzed with
     /// a smaller summary are forgotten, to be analyzed again with this one
     fn summarize(&mut self, point: Point, lambda: Lambda<'a>) -> Function {
-        let summary = *self.summaries.entry(point).or_insert_with(|| {
-            self.lambdas.push(Lambda {
-                env: Vec::new(),
-                ..lambda.clone()
+        let names: Vec<_> = lambda.env.iter().map(|(name, _)| *name).collect();
+        let summary = *self
+            .summaries
+            .entry((
+                point,
+                names.clone(),
+                self.initializing.filter(|_| self.shadowing),
+            ))
+            .or_insert_with(|| {
+                self.lambdas.push(Lambda {
+                    env: Vec::new(),
+                    ..lambda.clone()
+                });
+                self.lambdas.len() - 1
             });
-            self.lambdas.len() - 1
-        });
         let mut grew = false;
         let mut folded = HashSet::from([summary]);
         let mut pending = vec![lambda.env];
         while let Some(env) = pending.pop() {
             for (name, functions) in env {
                 for function in functions {
-                    let of_point = self
-                        .lambdas
-                        .get(function)
-                        .is_some_and(|l| (l.service, l.body as *const Expr) == point);
+                    let of_point = self.lambdas.get(function).is_some_and(|l| {
+                        (l.service, l.body as *const Expr) == point
+                            && l.env.iter().map(|(name, _)| name).eq(names.iter())
+                    });
                     if of_point && folded.insert(function) {
                         pending.push(self.lambdas[function].env.clone());
                     }
@@ -431,39 +511,46 @@ impl<'a> Effects<'a> {
     /// Record a read of `member`, and return the functions it may hold
     fn read(&mut self, member: Member, reads: &mut Reads) -> Result<Functions, DepthLimit> {
         reads.direct.insert(member);
-        if let Some(functions) = self.values.get(&member) {
+        let decl = self.decl(member);
+        let initializing =
+            self.initializing.is_some() || matches!(decl, Some(Decl::VarDecl { .. }));
+        let key = (member, initializing);
+        if let Some((functions, shadowing)) = self.values.get(&key) {
+            self.shadowing |= shadowing;
             return functions.clone();
         }
         let mut published = Functions::new();
         for value in self.published.get(&member).cloned().into_iter().flatten() {
-            published.extend(self.literal(value));
+            published.extend(self.literal(value)?);
         }
-        let code = match self.decl(member) {
-            Some(Decl::VarDecl { val, .. } | Decl::DefDecl { val, .. }) => val,
+        let decl = match decl {
             Some(Decl::TableDecl { .. }) => return Ok(Functions::new()),
+            Some(decl) => decl,
             // A member of a service known here only by name may hold any
             // function, unless its owner published what it holds
             None if published.is_empty() => return Ok(BTreeSet::from([UNKNOWN])),
             None => {
-                self.values.insert(member, Ok(published.clone()));
+                self.values.insert(key, (Ok(published.clone()), false));
                 return Ok(published);
             }
         };
-        if !self.computing.insert(member) {
+        if !self.computing.insert(key) {
             return Ok(BTreeSet::from([UNKNOWN]));
         }
         // What the member's own code reads belongs to that member, not here,
         // and what it holds does not depend on the applications enclosing this
         let applying = std::mem::take(&mut self.applying);
-        let functions =
-            self.visit(code, member.0, &[], &mut Reads::default())
-                .map(|mut declared| {
-                    declared.append(&mut published);
-                    declared
-                });
+        let outer_shadowing = std::mem::take(&mut self.shadowing);
+        let functions = self
+            .member_value(member.0, decl, initializing, &mut Reads::default())
+            .map(|mut declared| {
+                declared.append(&mut published);
+                declared
+            });
         self.applying = applying;
-        self.computing.remove(&member);
-        self.values.insert(member, functions.clone());
+        self.computing.remove(&key);
+        self.values.insert(key, (functions.clone(), self.shadowing));
+        self.shadowing |= outer_shadowing;
         functions
     }
 
@@ -484,9 +571,18 @@ impl<'a> Effects<'a> {
         else {
             return Ok(BTreeSet::from([UNKNOWN]));
         };
-        let application = (function, args.to_vec());
-        if let Some((more, result)) = self.applied.get(&application) {
+        let application = (function, args.to_vec(), self.initializing);
+        let cached = self.applied.get(&application).or_else(|| {
+            // Calls whose captures do not depend on initialization order keep
+            // sharing one result across all declarations, as before.
+            let shared = (function, args.to_vec(), None);
+            self.applied
+                .get(&shared)
+                .filter(|(_, _, shadowing)| !shadowing)
+        });
+        if let Some((more, result, shadowing)) = cached {
             reads.activated.extend(more);
+            self.shadowing |= shadowing;
             return Ok(result.clone());
         }
         // A recursive application returns what the application it reenters
@@ -512,6 +608,7 @@ impl<'a> Effects<'a> {
             assumed: Functions::new(),
             reentered: false,
         });
+        let outer_shadowing = std::mem::take(&mut self.shadowing);
         let mut own = Reads::default();
         let mut rounds = 0;
         let result = loop {
@@ -549,12 +646,14 @@ impl<'a> Effects<'a> {
         };
         self.depth -= 1;
         let Applying {
-            application,
+            mut application,
             outermost,
             ..
         } = self.applying.pop().expect("pushed above");
         let own: HashSet<Member> = own.all().collect();
         reads.activated.extend(&own);
+        let shadowing = self.shadowing;
+        self.shadowing |= outer_shadowing;
         let result = result?;
         match self.applying.last_mut() {
             // Its reads lack those of the enclosing application it reentered
@@ -562,7 +661,11 @@ impl<'a> Effects<'a> {
                 enclosing.outermost = outermost.min(enclosing.outermost)
             }
             _ => {
-                self.applied.insert(application, (own, result.clone()));
+                if !shadowing {
+                    application.2 = None;
+                }
+                self.applied
+                    .insert(application, (own, result.clone(), shadowing));
             }
         }
         Ok(result)
@@ -612,6 +715,8 @@ struct Declared {
     /// The position of its service in the program, and its index in the service
     at: (usize, usize),
     def: bool,
+    /// Initial captures can differ from the ones made by later evaluations.
+    shadowing: bool,
     /// What its code reads; None for a table
     reads: Option<Reads>,
 }
@@ -636,7 +741,7 @@ pub(crate) fn check(program: &[Stmt]) -> Result<(), Error> {
         };
         for (index, decl) in decls.iter().enumerate() {
             let name = decl.name();
-            let reads = match effects.member_reads(service, decl) {
+            let reads = match effects.member_reads(service, decl, true) {
                 Some((_, _, false)) => {
                     return Err(Error::DepthLimitExceeded {
                         service,
@@ -650,12 +755,30 @@ pub(crate) fn check(program: &[Stmt]) -> Result<(), Error> {
                 member: (service, name),
                 at: (position, index),
                 def: matches!(decl, Decl::DefDecl { .. }),
+                shadowing: effects.shadowing,
                 reads,
             });
         }
     }
     if let Some(member) = forward_reference(&declared) {
         return Err(Error::ForwardReference(member));
+    }
+    for member in declared
+        .iter_mut()
+        .filter(|member| member.def && member.shadowing)
+    {
+        let decl = effects.decl(member.member).expect("collected above");
+        let Some((name, reads, complete)) = effects.member_reads(member.member.0, decl, false)
+        else {
+            continue;
+        };
+        if !complete {
+            return Err(Error::DepthLimitExceeded {
+                service: member.member.0,
+                member: name,
+            });
+        }
+        member.reads = Some(reads);
     }
     match dependency_cycle(&declared) {
         Some((service, member)) => Err(Error::Cycle { service, member }),

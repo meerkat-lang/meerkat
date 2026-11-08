@@ -1047,6 +1047,11 @@ impl Manager {
         decls: Vec<Decl>,
     ) -> Result<(), EvalError> {
         self.ensure_service_visible(name, None)?;
+        crate::runtime::tt::check::check_unique_members(name, &decls).map_err(|e| {
+            EvalError::RuntimeError(
+                crate::runtime::node::StaticError::Types(e).message(&self.interner),
+            )
+        })?;
         let id = self.compute_service_net_id(name);
         let mut txn = Transaction::new(TxnId::new(self.node_id));
         txn.service_locked.insert(id.clone());
@@ -1168,6 +1173,11 @@ impl Manager {
                         )));
                     }
                     let (vector_clock, sources) = join_receipts(selected(&chains, &selection));
+                    codec::validate_clock_bounds(
+                        vector_clock.len(),
+                        vector_clock.values().copied(),
+                    )
+                    .map_err(|e| EvalError::RuntimeError(e.to_string()))?;
                     var_value.vector_clock = vector_clock;
                     var_value.sources = sources.filter(|_| chains.len() == inputs.len());
                 } else {

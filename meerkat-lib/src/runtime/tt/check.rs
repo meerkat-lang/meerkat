@@ -147,6 +147,20 @@ impl std::fmt::Display for Error {
     }
 }
 
+/// Service members have one declaration, both for type queries and installation.
+pub(crate) fn check_unique_members(service: Symbol, decls: &[Decl]) -> Result<(), Error> {
+    let mut members = HashSet::new();
+    for decl in decls {
+        if !members.insert(decl.name()) {
+            return Err(Error::DuplicateMember {
+                service,
+                member: decl.name(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Type checking context containing environment and limits tracking
 pub struct Context<'a, 'b> {
     depth: usize,
@@ -212,16 +226,7 @@ impl<'a, 'b> Context<'a, 'b> {
         // unified AST passed from Node::static_checks.
         for stmt in self.program {
             if let Stmt::Service { name, decls } = stmt {
-                // Member names must be unique before types are cached by name.
-                let mut members = HashSet::new();
-                for decl in decls {
-                    if !members.insert(decl.name()) {
-                        return Err(Error::DuplicateMember {
-                            service: *name,
-                            member: decl.name(),
-                        });
-                    }
-                }
+                check_unique_members(*name, decls)?;
                 if self.local_services.find(*name).is_none() {
                     self.local_services.bind(*name, ServiceType::default());
                 }

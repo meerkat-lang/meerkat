@@ -503,7 +503,7 @@ async fn run_server(
 
         // Periodically reassure parked waiters (wait-die wait) that they are
         // still queued, so their reply timeout never fires while we hold them.
-        if last_keepalive.elapsed() >= std::time::Duration::from_secs(5) {
+        if last_keepalive.elapsed() >= meerkat_lib::runtime::limits::KEEPALIVE_INTERVAL {
             manager.keepalive_waiters().await;
             last_keepalive = tokio::time::Instant::now();
         }
@@ -670,7 +670,7 @@ async fn run_client(
         println!("Watching for changes, press Ctrl+C to stop...");
         let mut last_keepalive = tokio::time::Instant::now();
         loop {
-            if last_keepalive.elapsed() >= std::time::Duration::from_secs(5) {
+            if last_keepalive.elapsed() >= meerkat_lib::runtime::limits::KEEPALIVE_INTERVAL {
                 manager.keepalive_waiters().await;
                 last_keepalive = tokio::time::Instant::now();
             }

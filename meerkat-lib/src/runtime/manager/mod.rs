@@ -421,6 +421,18 @@ fn advance(mut v_base: VClock, write_set: &HashSet<(Symbol, Symbol)>) -> VClock 
     v_base
 }
 
+/// Admit the complete stamp before installing any of the values it describes.
+/// Valid input clocks need not have a wire-representable join or successor.
+fn commit_clock(
+    v_base: VClock,
+    write_set: &HashSet<(Symbol, Symbol)>,
+) -> Result<VClock, EvalError> {
+    let clock = advance(v_base, write_set);
+    codec::validate_clock_bounds(clock.len(), clock.values().copied())
+        .map_err(|e| EvalError::RuntimeError(e.to_string()))?;
+    Ok(clock)
+}
+
 impl Manager {
     pub fn new(interner: Interner) -> Self {
         Manager {
@@ -1473,10 +1485,11 @@ impl Manager {
         // A function value is stored only if the defs applying it keep the
         // reads they were installed with
         self.check_function_writes([((service_name, var_name), &value)])?;
+        let clock = self.write_clock(VClock::new(), &HashSet::from([(service_name, var_name)]))?;
         if let Some(service) = self.services.get_mut(&service_name) {
             if let Some(var_state) = service.vars.get_mut(&var_name) {
                 var_state.value = value;
-                self.simultaneous_bump(VClock::new(), &HashSet::from([(service_name, var_name)]));
+                var_state.vector_clock = clock;
             } else {
                 // in theory we should never encounter this after nameres is fully integrated
                 // keep this in mind to guide future development
@@ -1505,12 +1518,12 @@ impl Manager {
         Some(&vars.vector_clock)
     }
 
-    // helper function to apply a simultaneous bump, as described in section 5.2 of vector clock semantics
-    pub(super) fn simultaneous_bump(
-        &mut self,
+    /// Compute and admit the simultaneous write stamp before changing any value.
+    pub(super) fn write_clock(
+        &self,
         read_clock: VClock,
         write_set: &HashSet<(Symbol, Symbol)>,
-    ) {
+    ) -> Result<VClock, EvalError> {
         let v_base = join_clocks(
             std::iter::once(&read_clock).chain(
                 write_set
@@ -1518,12 +1531,7 @@ impl Manager {
                     .filter_map(|(svc, var)| self.get_clock(svc, var)),
             ),
         );
-        let v_new = advance(v_base, write_set);
-        for (svc, var) in write_set {
-            if let Some(vs) = self.services.get_mut(svc).and_then(|s| s.vars.get_mut(var)) {
-                vs.vector_clock = v_new.clone(); // write the new base vector clock back to everything in the write set
-            }
-        }
+        commit_clock(v_base, write_set)
     }
 
     /// §5.2's `V_base` and `W` for everything `txn` has done so far, on this
@@ -3978,7 +3986,18 @@ impl Manager {
     /// `V_new` of §5.2, computed from what the participants reported
     async fn commit_txn(&mut self, txn: &Transaction) -> Option<EvalError> {
         let (v_base, write_set) = self.transaction_history(txn);
-        self.commit_stamped(txn, &advance(v_base, &write_set)).await
+        if write_set.is_empty() {
+            // Read-only transactions install no stamp; Commit just releases locks.
+            return self.commit_participants(txn, &VClock::new()).await;
+        }
+        let clock = match commit_clock(v_base, &write_set) {
+            Ok(clock) => clock,
+            Err(e) => {
+                self.abort_participants(txn).await;
+                return Some(e);
+            }
+        };
+        self.commit_stamped(txn, &clock).await
     }
 
     /// Store `txn`'s writes on this node with `clock`, the transaction's
@@ -4127,7 +4146,7 @@ impl Manager {
     }
 
     /// Tell every participant of `txn` to abort
-    async fn abort_participants(&mut self, txn: &Transaction) {
+    pub(super) async fn abort_participants(&mut self, txn: &Transaction) {
         for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
             self.send_abort(addr, &txn.id).await;
         }
@@ -5854,8 +5873,22 @@ mod tests {
         ];
         tc.manager.create_service(tc.foo, decls).await.unwrap();
 
-        let w = HashSet::from([(tc.foo, tc.x), (tc.foo, tc.y)]);
-        tc.manager.simultaneous_bump(VClock::new(), &w);
+        tc.manager
+            .execute_action(
+                tc.foo,
+                &[
+                    ActionStmt::Assign {
+                        name: tc.x,
+                        expr: lit_int(3),
+                    },
+                    ActionStmt::Assign {
+                        name: tc.y,
+                        expr: lit_int(4),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
 
         let foo = tc.manager.services.get(&tc.foo).unwrap();
         let xc = foo.vars.get(&tc.x).unwrap().vector_clock.clone();
@@ -5891,9 +5924,16 @@ mod tests {
             .await
             .unwrap();
         // now write x having READ y
-        let read_clock = tc.manager.get_clock(&tc.foo, &tc.y).unwrap().clone();
         tc.manager
-            .simultaneous_bump(read_clock, &HashSet::from([(tc.foo, tc.x)]));
+            .execute_action(
+                tc.foo,
+                &[ActionStmt::Assign {
+                    name: tc.x,
+                    expr: Expr::Variable { name: tc.y },
+                }],
+            )
+            .await
+            .unwrap();
 
         let xc = &tc
             .manager

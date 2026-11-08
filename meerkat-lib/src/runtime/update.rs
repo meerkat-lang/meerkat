@@ -275,7 +275,12 @@ impl Transaction {
             .collect();
         let graphs = manager.graphs_of(&self.ast, services, &staged);
         manager.check_graphs(&graphs)?;
-        self.commit(manager);
+        if let Err(e) = self.commit(manager) {
+            if let Some(txn) = &self.lock_txn {
+                manager.abort_participants(txn).await;
+            }
+            return Err(e);
+        }
 
         let updated_services: Vec<_> = declared(&self.updates).collect();
         // The staged values and declarations were installed without
@@ -408,30 +413,41 @@ impl Transaction {
     ///
     /// Args:
     ///     `manager` (`&mut Manager`): The active runtime manager
-    fn commit(&mut self, manager: &mut Manager) {
-        let mut write_set = HashSet::new();
+    fn commit(&mut self, manager: &mut Manager) -> Result<(), EvalError> {
+        let write_set: HashSet<_> = self
+            .values
+            .keys()
+            .filter(|(svc, _)| manager.services.contains_key(svc))
+            .copied()
+            .collect();
+        // Include initializer reads and the prior clocks of overwritten vars,
+        // and admit the complete stamp before installing values or declarations.
+        let clock = if write_set.is_empty() {
+            // Remote owners stamp their own writes; this node installs no clock.
+            VClock::new()
+        } else {
+            let read_clock = self
+                .lock_txn
+                .as_ref()
+                .map(|txn| manager.transaction_history(txn).0)
+                .unwrap_or_default();
+            manager.write_clock(read_clock, &write_set)?
+        };
         for ((svc_name, var_name), val) in std::mem::take(&mut self.values) {
             if let Some(service) = manager.services.get_mut(&svc_name) {
                 if let Some(var_state) = service.vars.get_mut(&var_name) {
                     var_state.value = val;
+                    var_state.vector_clock = clock.clone();
                     var_state.sources = Some(HashSet::from([(svc_name, var_name)]));
                     var_state.lock = VarLock::Unlocked;
                 } else {
                     let mut state = crate::runtime::txn::VarState::new(val);
+                    state.vector_clock = clock.clone();
                     state.sources = Some(HashSet::from([(svc_name, var_name)]));
                     service.vars.insert(var_name, state);
                 }
-                write_set.insert((svc_name, var_name));
             }
         }
-        // What the initializers read, here and on other owners, as for any
-        // transaction; `simultaneous_bump` adds the overwritten vars' clocks
-        let read_clock = self
-            .lock_txn
-            .as_ref()
-            .map(|txn| manager.transaction_history(txn).0)
-            .unwrap_or_default();
-        manager.simultaneous_bump(read_clock, &write_set);
 
         for (name, stmt) in service_declarations(&self.ast) {
             if let (Some(service), Stmt::Service { decls, .. }) =
@@ -447,6 +463,7 @@ impl Transaction {
             }
         }
         manager.install_unified_ast(std::mem::take(&mut self.ast));
+        Ok(())
     }
 }
 

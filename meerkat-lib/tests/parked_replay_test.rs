@@ -237,12 +237,23 @@ async fn child_peer(net: &mut NetworkActor, child: &mut Manager, served: &mut Ve
                 let tid = txn_id.expect("a composed action carries the shared transaction id");
                 served.push(tid.clone());
                 let outcome = child
-                    .execute_action_participant(svc, &local, &[], tid)
+                    .execute_action_participant(svc, &local, &[], tid.clone())
                     .await;
+                let (history, writes) = if outcome.is_ok() {
+                    let (history, writes) = child.transaction_history(&child.pending_txns[&tid]);
+                    (
+                        codec::encode_clock(&history, &child.interner),
+                        codec::encode_sources(&writes, &child.interner),
+                    )
+                } else {
+                    (Vec::new(), Vec::new())
+                };
                 let response = MeerkatMessage::ActionResponse {
                     request_id,
                     success: outcome.is_ok(),
                     error: outcome.err().map(|e| e.to_string()),
+                    history,
+                    writes,
                 };
                 (reply_to, response)
             }

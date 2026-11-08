@@ -85,6 +85,13 @@ impl ServiceNetId {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClockEntry {
+    pub service: String,
+    pub member: String,
+    pub counter: u64,
+}
+
 /// Message types in the `Meerkat` protocol
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MeerkatMessage {
@@ -117,7 +124,14 @@ pub enum MeerkatMessage {
     },
 
     /// Response to a `LookupRequest` with the serialized value
-    LookupResponse { request_id: u64, value: NetValue },
+    LookupResponse {
+        request_id: u64,
+        value: NetValue,
+        /// Clock paired with value. None means an unstamped buffered write
+        /// or a reply from a peer that does not provide clocks.
+        clock: Option<Vec<ClockEntry>>,
+        sources: Option<Vec<(String, String)>>,
+    },
 
     /// Response indicating lookup failed
     LookupError { request_id: u64, error: String },
@@ -141,6 +155,12 @@ pub enum MeerkatMessage {
         request_id: u64,
         success: bool,
         error: Option<String>,
+        /// Inside a transaction, the clocks of everything the participant and
+        /// the nodes it composed onto have read or overwritten in it so far.
+        /// Empty outside a transaction
+        history: Vec<ClockEntry>,
+        /// The vars they have written, as `(service, member)`
+        writes: Vec<(String, String)>,
     },
 
     /// Tell a participant node to commit a distributed transaction:
@@ -150,6 +170,9 @@ pub enum MeerkatMessage {
         request_id: u64,
         txn_id: TxnId,
         reply_to: String,
+        /// The clock every write of the transaction is stamped with, on
+        /// every node
+        clock: Vec<ClockEntry>,
     },
 
     /// Acknowledgement that a `Commit` was applied (or failed) on a
@@ -205,6 +228,8 @@ pub enum MeerkatMessage {
         source_service: String,
         member: String,
         value: NetValue,
+        clock: Vec<ClockEntry>,
+        sources: Option<Vec<(String, String)>>,
     },
 
     /// #39: request the source of a `.mkt` file by path. A (browser) client

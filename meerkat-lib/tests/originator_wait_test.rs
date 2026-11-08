@@ -164,6 +164,8 @@ async fn test_originator_retries_the_transaction_on_a_wait() {
                                     request_id,
                                     success: true,
                                     error: None,
+                                    history: Vec::new(),
+                                    writes: Vec::new(),
                                 },
                             })
                             .await;

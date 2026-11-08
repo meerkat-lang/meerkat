@@ -7,36 +7,18 @@
 
 use crate::net::LockGroup;
 use crate::runtime::ast::{apply_updates_to_ast, Decl, Expr, Stmt, Value};
-use crate::runtime::env::Env;
-use crate::runtime::graphs::{analysis::compute_dependencies, ServiceGraphs};
+use crate::runtime::graphs::analysis::service_declarations;
 use crate::runtime::interner::{Interner, Symbol};
 use crate::runtime::interpreter::evaluator::{eval, EvalContext, EvalError};
 use crate::runtime::manager::Manager;
-use crate::runtime::nameres;
-use crate::runtime::tt::check::{self as tt};
-use crate::runtime::tt::types::ServiceType;
-use crate::runtime::txn::{Transaction as LockTxn, TxnId, VarLock};
+use crate::runtime::txn::{Transaction as LockTxn, TxnId, VClock, VarLock};
 use std::collections::{HashMap, HashSet};
-
-/// The current execution state of an atomic update transaction
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransactionState {
-    /// Initial unstarted state before locks are acquired
-    Init,
-    /// Lock acquisition phase completed successfully
-    LocksAcquired,
-    /// Expressions evaluated successfully against the old state
-    Evaluated,
-}
 
 /// Encapsulates the temporary isolated state during an atomic update
 pub struct Transaction {
-    state: TransactionState,
     updates: Vec<Stmt>,
     ast: Vec<Stmt>,
-    types: Env<'static, ServiceType>,
     values: HashMap<(Symbol, Symbol), Value>,
-    deps: HashMap<Symbol, ServiceGraphs>,
     lock_txn: Option<LockTxn>,
 }
 
@@ -50,12 +32,9 @@ impl Transaction {
     ///     `Self`: The initialized `Transaction` instance
     pub fn new(updates: Vec<Stmt>) -> Self {
         Self {
-            state: TransactionState::Init,
             updates,
             ast: Vec::new(),
-            types: Env::new(None),
             values: HashMap::new(),
-            deps: HashMap::new(),
             lock_txn: None,
         }
     }
@@ -70,12 +49,9 @@ impl Transaction {
     ///     `Self`: The initialized `Transaction` instance
     pub fn new_with_id(txn_id: TxnId, updates: Vec<Stmt>) -> Self {
         Self {
-            state: TransactionState::Init,
             updates,
             ast: Vec::new(),
-            types: Env::new(None),
             values: HashMap::new(),
-            deps: HashMap::new(),
             lock_txn: Some(LockTxn::new(txn_id)),
         }
     }
@@ -90,7 +66,8 @@ impl Transaction {
         }
     }
 
-    /// Drives the transaction forward through its state machine stages
+    /// Applies the update, then waits until every def it introduces has a
+    /// first value (see `apply`)
     ///
     /// Args:
     ///     `manager` (`&mut Manager`): The active runtime manager
@@ -99,388 +76,394 @@ impl Transaction {
     ///     `Result<(), EvalError>`: `Ok(())` on completion or `Err`
     ///
     /// Raises:
-    ///     `EvalError`: If lock acquisition, validation, or eval fails
+    ///     `EvalError`: If lock acquisition, validation, or eval fails, or a
+    ///     committed new def gets no value (`Manager::await_first_values`)
     pub async fn poll(&mut self, manager: &mut Manager) -> Result<(), EvalError> {
-        match self.state {
-            TransactionState::Init => {
-                let mut lock_groups: HashMap<String, LockGroup> = HashMap::new();
-                for stmt in &self.updates {
-                    let (name, decls) = match stmt {
-                        Stmt::Service { name, decls } => (name, decls),
-                        Stmt::Update {
-                            service_name: name,
-                            decls,
-                        } => (name, decls),
-                        _ => continue,
+        let introduced = self.apply(manager).await?;
+        manager.await_first_values(&introduced).await
+    }
+
+    /// Takes the locks, validates and installs the update, forwards it to the
+    /// remote owners it changes, and releases the locks
+    ///
+    /// Args:
+    ///     `manager` (`&mut Manager`): The active runtime manager
+    ///
+    /// Returns:
+    ///     `Result<Vec<(Symbol, Symbol)>, EvalError>`: The defs the committed
+    ///     update introduces. A def whose inputs only its own publication can
+    ///     complete takes its first value after this returns, through ordinary
+    ///     propagation (`Manager::first_values`)
+    ///
+    /// Raises:
+    ///     `EvalError`: If lock acquisition, validation, or eval fails
+    pub async fn apply(
+        &mut self,
+        manager: &mut Manager,
+    ) -> Result<Vec<(Symbol, Symbol)>, EvalError> {
+        let result = self.try_apply(manager).await;
+        // Whatever the outcome, the member locks and the participants' locks
+        // this update holds are released here, once. A failure before the
+        // local commit leaves nothing installed; one a remote owner reports
+        // afterwards leaves the local part installed and is returned
+        self.release_lock_txn(manager);
+        result
+    }
+
+    /// `apply` up to the release of its locks
+    async fn try_apply(
+        &mut self,
+        manager: &mut Manager,
+    ) -> Result<Vec<(Symbol, Symbol)>, EvalError> {
+        let mut lock_groups: HashMap<String, LockGroup> = HashMap::new();
+        for stmt in &self.updates {
+            let (name, decls) = match stmt {
+                Stmt::Service { name, decls } => (name, decls),
+                Stmt::Update {
+                    service_name: name,
+                    decls,
+                } => (name, decls),
+                _ => continue,
+            };
+            let svc_name_str = manager.interner.get(*name).to_string();
+            let mut has_new_field = false;
+            if let Some(service) = manager.services.get(name) {
+                for decl in decls {
+                    let decl_name = match decl {
+                        Decl::VarDecl { name: n, .. } | Decl::DefDecl { name: n, .. } => *n,
+                        Decl::TableDecl { .. } => continue,
                     };
-                    let svc_name_str = manager.interner.get(*name).to_string();
-                    let mut has_new_field = false;
-                    if let Some(service) = manager.services.get(name) {
-                        for decl in decls {
-                            let decl_name = match decl {
-                                Decl::VarDecl { name: n, .. } | Decl::DefDecl { name: n, .. } => *n,
-                                Decl::TableDecl { .. } => continue,
-                            };
-                            if !service.vars.contains_key(&decl_name)
-                                && !service.defs.contains_key(&decl_name)
-                            {
-                                has_new_field = true;
-                                break;
-                            }
-                        }
-                    } else {
-                        // If service doesn't exist yet, request service-level lock
+                    if !service.vars.contains_key(&decl_name)
+                        && !service.defs.contains_key(&decl_name)
+                    {
                         has_new_field = true;
-                    }
-
-                    let mut group = LockGroup {
-                        service_level_lock: has_new_field,
-                        reads: HashSet::new(),
-                        writes: HashSet::new(),
-                    };
-                    for decl in decls {
-                        match decl {
-                            Decl::VarDecl { name: var_name, .. }
-                            | Decl::DefDecl { name: var_name, .. } => {
-                                let var_str = manager.interner.get(*var_name).to_string();
-                                group.writes.insert(var_str);
-                            }
-                            Decl::TableDecl { .. } => {
-                                self.release_lock_txn(manager);
-                                return Err(EvalError::NotImplemented);
-                            }
-                        }
-                    }
-                    lock_groups.insert(svc_name_str, group);
-                }
-
-                let mut txn = self
-                    .lock_txn
-                    .take()
-                    .unwrap_or_else(|| LockTxn::new(TxnId::new(manager.node_id)));
-
-                loop {
-                    let lock_res = manager
-                        .acquire_lock_group_internal(&mut txn, &lock_groups)
-                        .await;
-
-                    if let Err(e) = lock_res {
-                        manager.release_all_locks(&txn);
-                        if matches!(e, EvalError::WaitDieAbort(_))
-                            && txn.id.iteration < crate::runtime::manager::MAX_WAIT_DIE_RETRIES
-                        {
-                            txn = LockTxn::new(txn.id.retry());
-                            continue;
-                        }
-                        return Err(EvalError::RuntimeError(format!(
-                            "Lock acquisition conflict during update: {}",
-                            e
-                        )));
-                    }
-                    break;
-                }
-
-                self.lock_txn = Some(txn);
-                self.state = TransactionState::LocksAcquired;
-                match apply_updates_to_ast(&manager.unified_ast, &self.updates) {
-                    Ok(patched) => self.ast = patched,
-                    Err(sym) => {
-                        self.release_lock_txn(manager);
-                        let name_str = manager.interner.get(sym);
-                        return Err(EvalError::RuntimeError(format!(
-                            "Target service '{}' for update not found",
-                            name_str
-                        )));
+                        break;
                     }
                 }
-
-                if let Err(e) = nameres::resolve(&self.ast) {
-                    self.release_lock_txn(manager);
-                    let msg = match &e {
-                        nameres::Error::ForwardReference(sym) => {
-                            format!("ForwardReference({})", manager.interner.get(*sym))
-                        }
-                        nameres::Error::UnknownIdentifier { .. } | nameres::Error::DepthLimit => {
-                            format!("{}", e)
-                        }
-                    };
-                    return Err(EvalError::RuntimeError(format!(
-                        "Name resolution failed on update: {}",
-                        msg
-                    )));
-                }
-
-                let mut types = Env::new(None);
-                if let Err(e) = tt::check(&self.ast, &mut types) {
-                    self.release_lock_txn(manager);
-                    let msg = match &e {
-                        tt::Error::UnknownUpdateTarget(s) => {
-                            format!(
-                                "Target service '{}' for update not found",
-                                manager.interner.get(*s)
-                            )
-                        }
-                        tt::Error::UnboundVariable(s) => {
-                            format!("UnboundVariable({})", manager.interner.get(*s))
-                        }
-                        tt::Error::RecursiveTypeInference { service, member } => {
-                            format!(
-                                "dependency cycle detected at service '{}', member '{}'",
-                                manager.interner.get(*service),
-                                manager.interner.get(*member)
-                            )
-                        }
-                        tt::Error::IllegalDependency(member) => {
-                            format!(
-                                "illegal eager forward reference or dependency cycle on '{}'",
-                                manager.interner.get(*member)
-                            )
-                        }
-                        tt::Error::TypeMismatch { expected, found } => {
-                            format!("type mismatch: expected {}, found {}", expected, found)
-                        }
-                        tt::Error::CannotInferType
-                        | tt::Error::DepthLimitExceeded
-                        | tt::Error::InvalidTupleArity
-                        | tt::Error::NotAFunction => format!("{}", e),
-                    };
-                    return Err(EvalError::RuntimeError(format!(
-                        "Type check failed on update: {}",
-                        msg
-                    )));
-                }
-                let mut pre_initialized = HashMap::new();
-                for (svc_name, svc_state) in &manager.services {
-                    let members: HashSet<Symbol> = svc_state
-                        .vars
-                        .keys()
-                        .chain(svc_state.defs.keys())
-                        .copied()
-                        .collect();
-                    pre_initialized.insert(*svc_name, members);
-                }
-
-                let service_graphs_vec = compute_dependencies(&self.ast, Some(&pre_initialized));
-
-                let service_stmts: Vec<Symbol> = self
-                    .ast
-                    .iter()
-                    .filter_map(|stmt| match stmt {
-                        Stmt::Service { name, .. } => Some(*name),
-                        Stmt::ActionStmt(_)
-                        | Stmt::Atomic { .. }
-                        | Stmt::Update { .. }
-                        | Stmt::Connect { .. }
-                        | Stmt::Import { .. }
-                        | Stmt::Test { .. }
-                        | Stmt::Watch { .. } => None,
-                    })
-                    .collect();
-
-                debug_assert_eq!(
-                    service_stmts.len(),
-                    service_graphs_vec.len(),
-                    "Service statement count must match graph count"
-                );
-
-                for (name, graphs) in service_stmts.into_iter().zip(service_graphs_vec) {
-                    self.deps.insert(name, graphs);
-                }
-
-                for stmt in &self.updates {
-                    let (svc_name, decls) = match stmt {
-                        Stmt::Service { name, decls } => (name, decls),
-                        Stmt::Update {
-                            service_name: name,
-                            decls,
-                        } => (name, decls),
-                        Stmt::ActionStmt(_)
-                        | Stmt::Atomic { .. }
-                        | Stmt::Connect { .. }
-                        | Stmt::Import { .. }
-                        | Stmt::Test { .. }
-                        | Stmt::Watch { .. } => continue,
-                    };
-                    for decl in decls {
-                        let (var_name, expr) = match decl {
-                            Decl::VarDecl { name, val, .. } => (*name, val),
-                            Decl::DefDecl { .. } => continue,
-                            Decl::TableDecl { .. } => {
-                                self.release_lock_txn(manager);
-                                return Err(EvalError::NotImplemented);
-                            }
-                        };
-
-                        let env: Vec<(Symbol, Value)> = Vec::new();
-                        let eval_res = {
-                            let mut ctx = EvalContext {
-                                manager,
-                                service_name: *svc_name,
-                                txn: self.lock_txn.as_mut(),
-                            };
-                            eval(expr, &env, &mut ctx).await
-                        };
-
-                        let val = match eval_res {
-                            Ok(v) => v,
-                            Err(e) => {
-                                self.release_lock_txn(manager);
-                                return Err(e);
-                            }
-                        };
-                        self.values.insert((*svc_name, var_name), val);
-                    }
-                }
-
-                self.state = TransactionState::Evaluated;
-                self.commit(manager);
-
-                let updated_svc_names: HashSet<Symbol> = self
-                    .updates
-                    .iter()
-                    .filter_map(|stmt| match stmt {
-                        Stmt::Service { name, .. } => Some(*name),
-                        Stmt::Update {
-                            service_name: name, ..
-                        } => Some(*name),
-                        Stmt::ActionStmt(_)
-                        | Stmt::Atomic { .. }
-                        | Stmt::Connect { .. }
-                        | Stmt::Import { .. }
-                        | Stmt::Test { .. }
-                        | Stmt::Watch { .. } => None,
-                    })
-                    .collect();
-
-                for updated_svc_name in updated_svc_names {
-                    if let Some(dep) = self.deps.remove(&updated_svc_name) {
-                        manager.update_service_graphs(updated_svc_name, dep).await;
-                        if let Some(service) = manager.services.get_mut(&updated_svc_name) {
-                            service.service_lock = None;
-                        }
-                    }
-                }
-
-                for stmt in &self.updates {
-                    let (svc_name, decls) = match stmt {
-                        Stmt::Service { name, decls } => (name, decls),
-                        Stmt::Update {
-                            service_name: name,
-                            decls,
-                        } => (name, decls),
-                        Stmt::ActionStmt(_)
-                        | Stmt::Atomic { .. }
-                        | Stmt::Connect { .. }
-                        | Stmt::Import { .. }
-                        | Stmt::Test { .. }
-                        | Stmt::Watch { .. } => continue,
-                    };
-                    if manager.services.contains_key(svc_name) {
-                        for decl in decls {
-                            match decl {
-                                Decl::VarDecl {
-                                    name: decl_name, ..
-                                } => {
-                                    manager.propagate(*svc_name, *decl_name).await;
-                                }
-                                Decl::DefDecl {
-                                    name: decl_name, ..
-                                } => {
-                                    manager.recompute_def(*svc_name, *decl_name).await;
-                                    manager.propagate(*svc_name, *decl_name).await;
-                                }
-                                Decl::TableDecl { .. } => {}
-                            }
-                        }
-                    }
-                    if let Some(addr) = manager.remote_services.get(svc_name).cloned() {
-                        let source = format_update_source(*svc_name, decls, &manager.interner);
-                        let svc_str = manager.interner.get(*svc_name).to_string();
-                        static NEXT_UPDATE_REQ_ID: std::sync::atomic::AtomicU64 =
-                            std::sync::atomic::AtomicU64::new(1);
-                        let request_id =
-                            NEXT_UPDATE_REQ_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        let reply_to = manager.local_reply_addr().await;
-                        let msg = crate::net::types::MeerkatMessage::UpdateServiceRequest {
-                            request_id,
-                            txn_id: self.lock_txn.as_ref().map(|t| t.id.clone()),
-                            service_name: svc_str.clone(),
-                            source,
-                            reply_to,
-                        };
-                        let timeout = format!(
-                            "Timeout waiting for service update response for '{}'",
-                            svc_str
-                        );
-                        let res =
-                            Box::pin(manager.send_and_await_reply(addr, msg, request_id, timeout))
-                                .await;
-                        if let Err(ref e) = res {
-                            eprintln!(
-                                "Warning: remote service update to {} failed: {}",
-                                svc_str, e
-                            );
-                        }
-                    }
-                }
-                if let Some(lock_txn) = &self.lock_txn {
-                    let _ = manager.commit_participants(lock_txn).await;
-                }
-                self.release_lock_txn(manager);
-
-                Ok(())
+            } else {
+                // If service doesn't exist yet, request service-level lock
+                has_new_field = true;
             }
-            TransactionState::LocksAcquired => {
-                debug_assert!(false, "Unreachable poll call in LocksAcquired state");
-                Ok(())
+
+            let mut group = LockGroup {
+                service_level_lock: has_new_field,
+                reads: HashSet::new(),
+                writes: HashSet::new(),
+            };
+            for decl in decls {
+                match decl {
+                    Decl::VarDecl { name: var_name, .. } | Decl::DefDecl { name: var_name, .. } => {
+                        let var_str = manager.interner.get(*var_name).to_string();
+                        group.writes.insert(var_str);
+                    }
+                    Decl::TableDecl { .. } => {
+                        return Err(EvalError::NotImplemented);
+                    }
+                }
             }
-            TransactionState::Evaluated => Ok(()),
+            lock_groups.insert(svc_name_str, group);
         }
+
+        let mut txn = self
+            .lock_txn
+            .take()
+            .unwrap_or_else(|| LockTxn::new(TxnId::new(manager.node_id)));
+
+        loop {
+            let lock_res = manager
+                .acquire_lock_group_internal(&mut txn, &lock_groups)
+                .await;
+
+            if let Err(e) = lock_res {
+                manager.release_all_locks(&txn);
+                if matches!(e, EvalError::WaitDieAbort(_))
+                    && txn.id.iteration < crate::runtime::manager::MAX_WAIT_DIE_RETRIES
+                {
+                    txn = LockTxn::new(txn.id.retry());
+                    continue;
+                }
+                return Err(EvalError::RuntimeError(format!(
+                    "Lock acquisition conflict during update: {}",
+                    e
+                )));
+            }
+            break;
+        }
+
+        self.lock_txn = Some(txn);
+        match apply_updates_to_ast(manager.unified_ast(), &self.updates) {
+            Ok(patched) => self.ast = patched,
+            Err(sym) => {
+                let name_str = manager.interner.get(sym);
+                return Err(EvalError::RuntimeError(format!(
+                    "Target service '{}' for update not found",
+                    name_str
+                )));
+            }
+        }
+
+        if let Err(e) = crate::runtime::node::check_program(&self.ast) {
+            return Err(EvalError::RuntimeError(format!(
+                "Static check failed on update: {}",
+                e.message(&manager.interner)
+            )));
+        }
+        for stmt in &self.updates {
+            let (svc_name, decls) = match stmt {
+                Stmt::Service { name, decls } => (name, decls),
+                Stmt::Update {
+                    service_name: name,
+                    decls,
+                } => (name, decls),
+                Stmt::ActionStmt(_)
+                | Stmt::Atomic { .. }
+                | Stmt::Connect { .. }
+                | Stmt::Import { .. }
+                | Stmt::Test { .. }
+                | Stmt::Watch { .. } => continue,
+            };
+            for decl in decls {
+                let (var_name, expr) = match decl {
+                    Decl::VarDecl { name, val, .. } => (*name, val),
+                    Decl::DefDecl { .. } => continue,
+                    Decl::TableDecl { .. } => {
+                        return Err(EvalError::NotImplemented);
+                    }
+                };
+
+                let env: Vec<(Symbol, Value)> = Vec::new();
+                let eval_res = {
+                    let mut ctx = EvalContext {
+                        manager,
+                        service_name: *svc_name,
+                        txn: self.lock_txn.as_mut(),
+                    };
+                    eval(expr, &env, &mut ctx).await
+                };
+
+                let val = match eval_res {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Err(e);
+                    }
+                };
+                self.values.insert((*svc_name, var_name), val);
+            }
+        }
+
+        let introduced = self.unvalued_defs(manager);
+        // The declarations passed the static checks; with the remote code
+        // the running services hold, their graphs must stay complete and
+        // acyclic as well. Those of the services declared may change, as may
+        // those of every running service reading a member declared
+        let running = manager.running_services();
+        let mut services = manager.services_reading(
+            declared(&self.updates)
+                .flat_map(|(&name, decls)| decls.iter().map(move |decl| (name, decl.name()))),
+        );
+        services.extend(
+            declared(&self.updates)
+                .map(|(&name, _)| name)
+                .filter(|name| running.contains(name)),
+        );
+        // The values the declarations evaluated to stand in for those the
+        // vars hold
+        let staged = self
+            .values
+            .iter()
+            .map(|(&var, value)| (var, value))
+            .collect();
+        let graphs = manager.graphs_of(&self.ast, services, &staged);
+        manager.check_graphs(&graphs)?;
+        if let Err(e) = self.commit(manager) {
+            if let Some(txn) = &self.lock_txn {
+                manager.abort_participants(txn).await;
+            }
+            return Err(e);
+        }
+
+        let updated_services: Vec<_> = declared(&self.updates).collect();
+        // The staged values and declarations were installed without
+        // yielding; their checked graphs are still the ones to install
+        manager.install_graphs(graphs).await;
+        manager.retry_deferred_deliveries().await;
+        // The service lock guarded the structural change: with the
+        // declarations and graphs installed it is released here,
+        // before the remote owners are told, so a reader of another
+        // member is not held up by the forwarding
+        for (svc_name, _) in &updated_services {
+            if let Some(service) = manager.services.get_mut(*svc_name) {
+                service.service_lock = None;
+            }
+        }
+        let mut remote_failure = None;
+
+        for (svc_name, decls) in updated_services {
+            if manager.services.contains_key(svc_name) {
+                for decl in decls {
+                    match decl {
+                        Decl::VarDecl {
+                            name: decl_name, ..
+                        } => {
+                            manager.propagate(*svc_name, *decl_name).await;
+                        }
+                        Decl::DefDecl {
+                            name: decl_name, ..
+                        } => {
+                            if manager.recompute_def(*svc_name, *decl_name).await {
+                                manager.propagate(*svc_name, *decl_name).await;
+                            }
+                        }
+                        Decl::TableDecl { .. } => {}
+                    }
+                }
+            }
+            if let Some(addr) = manager.remote_services.get(svc_name).cloned() {
+                let source = format_update_source(*svc_name, decls, &manager.interner);
+                let svc_str = manager.interner.get(*svc_name).to_string();
+                static NEXT_UPDATE_REQ_ID: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(1);
+                let request_id =
+                    NEXT_UPDATE_REQ_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let reply_to = manager.local_reply_addr().await;
+                let msg = crate::net::types::MeerkatMessage::UpdateServiceRequest {
+                    request_id,
+                    txn_id: self.lock_txn.as_ref().map(|t| t.id.clone()),
+                    service_name: svc_str.clone(),
+                    source,
+                    reply_to,
+                };
+                let timeout = format!(
+                    "Timeout waiting for service update response for '{}'",
+                    svc_str
+                );
+                let res =
+                    Box::pin(manager.send_and_await_reply(addr, msg, request_id, timeout)).await;
+                match res {
+                    // No answer, so no confirmed outcome either way
+                    Err(ref e) => {
+                        eprintln!(
+                            "Warning: remote service update to {} failed: {}",
+                            svc_str, e
+                        );
+                        remote_failure.get_or_insert(EvalError::RuntimeError(format!(
+                            "Remote service update to '{}' was not confirmed and may have \
+                                     been applied: {}",
+                            svc_str, e
+                        )));
+                    }
+                    // The owner reports a failed or incomplete update
+                    Ok(crate::net::types::MeerkatMessage::UpdateServiceResponse {
+                        error: Some(error),
+                        ..
+                    }) => {
+                        remote_failure.get_or_insert(EvalError::RuntimeError(format!(
+                            "Remote service update to '{}' failed: {}",
+                            svc_str, error
+                        )));
+                    }
+                    Ok(_) => {}
+                }
+            }
+        }
+        // Only releases the participants' locks: they buffered no
+        // writes to stamp, and the vars this update changed were
+        // stamped in `commit`
+        if let Some(lock_txn) = &self.lock_txn {
+            let _ = manager.commit_participants(lock_txn, &VClock::new()).await;
+        }
+
+        remote_failure.map_or(Ok(introduced), Err)
+    }
+
+    /// The defs this update declares on local services that have no value
+    ///
+    /// Args:
+    ///     `manager` (`&Manager`): The active runtime manager
+    ///
+    /// Returns:
+    ///     `Vec<(Symbol, Symbol)>`: `(service, def)` pairs
+    fn unvalued_defs(&self, manager: &Manager) -> Vec<(Symbol, Symbol)> {
+        self.updates
+            .iter()
+            .filter_map(|stmt| match stmt {
+                Stmt::Service { name, decls }
+                | Stmt::Update {
+                    service_name: name,
+                    decls,
+                } => Some((*name, decls)),
+                _ => None,
+            })
+            .flat_map(|(svc, decls)| {
+                decls.iter().filter_map(move |decl| match decl {
+                    Decl::DefDecl { name, .. } => Some((svc, *name)),
+                    Decl::VarDecl { .. } | Decl::TableDecl { .. } => None,
+                })
+            })
+            .filter(|(svc, def)| {
+                manager
+                    .services
+                    .get(svc)
+                    .is_some_and(|service| !service.vars.contains_key(def))
+            })
+            .collect()
     }
 
     /// Consumes the fully evaluated isolated state and overwrites Manager
     ///
     /// Args:
     ///     `manager` (`&mut Manager`): The active runtime manager
-    fn commit(&mut self, manager: &mut Manager) {
-        debug_assert_eq!(self.state, TransactionState::Evaluated);
-        manager.unified_ast = std::mem::take(&mut self.ast);
-        manager.local_services = std::mem::replace(&mut self.types, Env::new(None));
-
+    fn commit(&mut self, manager: &mut Manager) -> Result<(), EvalError> {
+        let write_set: HashSet<_> = self
+            .values
+            .keys()
+            .filter(|(svc, _)| manager.services.contains_key(svc))
+            .copied()
+            .collect();
+        // Include initializer reads and the prior clocks of overwritten vars,
+        // and admit the complete stamp before installing values or declarations.
+        let clock = if write_set.is_empty() {
+            // Remote owners stamp their own writes; this node installs no clock.
+            VClock::new()
+        } else {
+            let read_clock = self
+                .lock_txn
+                .as_ref()
+                .map(|txn| manager.transaction_history(txn).0)
+                .unwrap_or_default();
+            manager.write_clock(read_clock, &write_set)?
+        };
         for ((svc_name, var_name), val) in std::mem::take(&mut self.values) {
             if let Some(service) = manager.services.get_mut(&svc_name) {
                 if let Some(var_state) = service.vars.get_mut(&var_name) {
                     var_state.value = val;
+                    var_state.vector_clock = clock.clone();
+                    var_state.sources = Some(HashSet::from([(svc_name, var_name)]));
                     var_state.lock = VarLock::Unlocked;
                 } else {
-                    service.vars.insert(
-                        var_name,
-                        crate::runtime::txn::VarState {
-                            value: val,
-                            lock: VarLock::Unlocked,
-                            latest_write_txn: None,
-                        },
-                    );
+                    let mut state = crate::runtime::txn::VarState::new(val);
+                    state.vector_clock = clock.clone();
+                    state.sources = Some(HashSet::from([(svc_name, var_name)]));
+                    service.vars.insert(var_name, state);
                 }
             }
         }
 
-        for stmt in &manager.unified_ast {
-            if let Stmt::Service { name, decls } = stmt {
-                if let Some(service) = manager.services.get_mut(name) {
-                    for decl in decls {
-                        if let Decl::DefDecl {
-                            name: def_name,
-                            val,
-                            ..
-                        } = decl
-                        {
-                            service.defs.insert(*def_name, val.clone());
-                        }
-                    }
-                }
+        for (name, stmt) in service_declarations(&self.ast) {
+            if let (Some(service), Stmt::Service { decls, .. }) =
+                (manager.services.get_mut(&name), stmt)
+            {
+                service.defs = decls
+                    .iter()
+                    .filter_map(|decl| match decl {
+                        Decl::DefDecl { name, val, .. } => Some((*name, val.clone())),
+                        _ => None,
+                    })
+                    .collect();
             }
         }
+        manager.install_unified_ast(std::mem::take(&mut self.ast));
+        Ok(())
     }
 }
 
@@ -696,6 +679,18 @@ pub fn format_update_source(service_name: Symbol, decls: &[Decl], interner: &Int
     format!("update {} {{\n  {}\n}}", svc_str, decl_strs.join("\n  "))
 }
 
+/// The services `updates` declares, each with its declarations
+fn declared(updates: &[Stmt]) -> impl Iterator<Item = (&Symbol, &Vec<Decl>)> {
+    updates.iter().filter_map(|stmt| match stmt {
+        Stmt::Service { name, decls }
+        | Stmt::Update {
+            service_name: name,
+            decls,
+        } => Some((name, decls)),
+        _ => None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -720,7 +715,7 @@ mod tests {
         };
 
         let txn = Transaction::new(vec![update_stmt]);
-        assert_eq!(txn.state, TransactionState::Init);
+        assert!(txn.lock_txn.is_none());
     }
 
     /// Test lock release when `nameres` fails during update transaction

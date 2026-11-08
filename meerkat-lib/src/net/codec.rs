@@ -9,13 +9,16 @@ use crate::net::ast::{
     NetUnOp, NetValue,
 };
 use crate::net::types::{LockGroup, MeerkatMessage};
+use crate::net::ClockEntry;
 use crate::runtime::ast::{ActionStmt, BinOp, Expr, Field, TableType, UnOp, Value};
 use crate::runtime::interner::{Interner, Symbol};
 use crate::runtime::limits::{
-    MAX_IDENTIFIER_LENGTH, MAX_NET_REQUEST_SOURCE_LENGTH, MAX_NET_REQUEST_STRING_LENGTH,
+    MAX_IDENTIFIER_LENGTH, MAX_NET_CLOCK_COUNTER, MAX_NET_CLOCK_ENTRIES,
+    MAX_NET_REQUEST_SOURCE_LENGTH, MAX_NET_REQUEST_STRING_LENGTH, MAX_NET_SOURCE_PAIRS,
     MAX_STRING_LITERAL_LENGTH, MAX_TYPE_DEPTH,
 };
 use crate::runtime::tt::{Param, ServiceType, TupleType, Type};
+use crate::runtime::txn::{Sources, VClock};
 use std::collections::HashMap;
 
 fn validate_identifier(s: &str) -> Result<()> {
@@ -224,11 +227,19 @@ pub fn serve_service_code(
 /// the resolved path is canonicalized and required to stay within the
 /// canonicalized base directory (blocking `..` and symlink escapes). Returns
 /// the validated path to read, or an error describing why it was rejected.
+/// An empty base directory means the current working directory.
 pub fn resolve_served_file(
     base_dir: &std::path::Path,
     requested: &str,
 ) -> Result<std::path::PathBuf> {
     use std::path::Path;
+
+    // A bare server entrypoint has an empty parent; serve from the current directory.
+    let base_dir = if base_dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        base_dir
+    };
 
     // Reject absolute paths outright; served files are always relative to base.
     if Path::new(requested).is_absolute() {
@@ -279,19 +290,85 @@ pub fn decode_request_updates(
         interner.insert(listener_def),
     ))
 }
+/// The bounds shared by incoming clocks and locally computed commit stamps.
+pub(crate) fn validate_clock_bounds(
+    dimensions: usize,
+    counters: impl IntoIterator<Item = u64>,
+) -> Result<()> {
+    if dimensions > MAX_NET_CLOCK_ENTRIES {
+        return Err(Error::LimitExceeded(format!(
+            "clock exceeds maximum count of {} dimensions",
+            MAX_NET_CLOCK_ENTRIES
+        )));
+    }
+    if counters
+        .into_iter()
+        .any(|counter| counter > MAX_NET_CLOCK_COUNTER)
+    {
+        return Err(Error::LimitExceeded(format!(
+            "clock counter exceeds {}",
+            MAX_NET_CLOCK_COUNTER
+        )));
+    }
+    Ok(())
+}
+
+/// Decode a network ClockEntry to a runtime VClock. The size and counters are
+/// bounded before any dimension name is interned
+pub fn clock_entry_to_vclock(clock: Vec<ClockEntry>, interner: &mut Interner) -> Result<VClock> {
+    validate_clock_bounds(clock.len(), clock.iter().map(|entry| entry.counter))?;
+    for entry in &clock {
+        validate_identifier(&entry.service)?;
+        validate_identifier(&entry.member)?;
+    }
+    let mut vclock: VClock = HashMap::new();
+    for entry in clock {
+        let key = (
+            interner.insert(&entry.service),
+            interner.insert(&entry.member),
+        );
+        if vclock.insert(key, entry.counter).is_some() {
+            return Err(Error::LimitExceeded(format!(
+                "duplicate clock dimension: ({}, {})",
+                entry.service, entry.member
+            )));
+        }
+    }
+    Ok(vclock)
+}
+
+/// Decode the source identities paired with a network value.
+pub fn decode_sources(sources: Vec<(String, String)>, interner: &mut Interner) -> Result<Sources> {
+    if sources.len() > MAX_NET_SOURCE_PAIRS {
+        return Err(Error::LimitExceeded(format!(
+            "sources exceed maximum count of {} pairs",
+            MAX_NET_SOURCE_PAIRS
+        )));
+    }
+    for (service, member) in &sources {
+        validate_identifier(service)?;
+        validate_identifier(member)?;
+    }
+    Ok(sources
+        .into_iter()
+        .map(|(service, member)| (interner.insert(&service), interner.insert(&member)))
+        .collect())
+}
 
 /// #24: validate and intern the identifier fields of an `Update` message
 /// arriving over the wire (the `value` is decoded separately via
 /// `decode_value`). As with `decode_request_updates`, all interning of
 /// network-sourced names happens here after validation.
 ///
-/// Returns `(listener_def, source_service, member)` as interned `Symbol`s.
+/// Returns the interned identifiers, vector clock and paired source identities.
 pub fn decode_update(
     listener_def: &str,
     source_service: &str,
     member: &str,
     interner: &mut Interner,
-) -> Result<(Symbol, Symbol, Symbol)> {
+    clock: Vec<ClockEntry>,
+    sources: Option<Vec<(String, String)>>,
+) -> Result<(Symbol, Symbol, Symbol, VClock, Option<Sources>)> {
     validate_identifier(listener_def)?;
     validate_identifier(source_service)?;
     validate_identifier(member)?;
@@ -299,6 +376,10 @@ pub fn decode_update(
         interner.insert(listener_def),
         interner.insert(source_service),
         interner.insert(member),
+        clock_entry_to_vclock(clock, interner)?,
+        sources
+            .map(|sources| decode_sources(sources, interner))
+            .transpose()?,
     ))
 }
 
@@ -334,7 +415,7 @@ fn encode_type_internal(ty: &Type, depth: usize) -> Result<NetType> {
             }
             Ok(NetType::Tuple(encoded_ts))
         }
-        Type::Func(t1, t2, _) => {
+        Type::Func(t1, t2) => {
             let et1 = encode_type_internal(t1, depth + 1)?;
             let et2 = encode_type_internal(t2, depth + 1)?;
             Ok(NetType::Func(Box::new(et1), Box::new(et2)))
@@ -442,11 +523,7 @@ fn decode_type_internal(ty: NetType, depth: usize) -> Result<Type> {
         NetType::Func(t1, t2) => {
             let dt1 = decode_type_internal(*t1, depth + 1)?;
             let dt2 = decode_type_internal(*t2, depth + 1)?;
-            Ok(Type::Func(
-                Box::new(dt1),
-                Box::new(dt2),
-                std::collections::HashSet::new(),
-            ))
+            Ok(Type::Func(Box::new(dt1), Box::new(dt2)))
         }
         NetType::List(t) => {
             let dt = decode_type_internal(*t, depth + 1)?;
@@ -616,6 +693,40 @@ pub fn encode_value(val: &Value, interner: &Interner) -> Result<NetValue> {
             end: *end,
         }),
     }
+}
+
+/// Encode a vector clock into a network representation
+///
+/// Args:
+///     clock (`&VClock`): The vector clock to encode
+///     interner (`&Interner`): The `Interner` for symbol lookup
+///
+/// Returns:
+///     Vec<ClockEntry>: The resulting encoded vector clock, which is a vector of
+///     ClockEntry { service, member, counter } structs. Note that this is the direct mechanical
+///     translation of the key-value mappings in a vector clock.
+pub fn encode_clock(clock: &VClock, interner: &Interner) -> Vec<ClockEntry> {
+    let clock_vec = clock.iter();
+    clock_vec
+        .map(|((svc_sym, var_sym), i)| ClockEntry {
+            service: interner.get(*svc_sym).to_string(),
+            member: interner.get(*var_sym).to_string(),
+            counter: *i,
+        })
+        .collect()
+}
+
+/// Encode the source identities paired with a runtime value.
+pub fn encode_sources(sources: &Sources, interner: &Interner) -> Vec<(String, String)> {
+    sources
+        .iter()
+        .map(|(service, member)| {
+            (
+                interner.get(*service).to_string(),
+                interner.get(*member).to_string(),
+            )
+        })
+        .collect()
 }
 
 /// Decode a network `NetValue` representation into a runtime `Value`
@@ -1277,6 +1388,7 @@ pub fn decode_tabletype(t: NetTableType) -> TableType {
 mod tests {
     use super::*;
     use crate::net::ServiceNetId;
+    use std::collections::HashMap;
 
     /// Verify round-trip encoding, serialization, deserialization, and decoding of `AST` types
     #[test]
@@ -1718,7 +1830,7 @@ mod tests {
                 "decode_request_updates should reject service {:?}",
                 bad
             );
-            let res = decode_update("ldef", bad, "member", &mut interner);
+            let res = decode_update("ldef", bad, "member", &mut interner, vec![], None);
             assert!(
                 res.is_err(),
                 "decode_update should reject source_service {:?}",
@@ -1727,7 +1839,94 @@ mod tests {
         }
         // A well-formed identifier is accepted.
         assert!(decode_request_updates("svc", "y", "z", &mut interner).is_ok());
-        assert!(decode_update("z", "svc", "y", &mut interner).is_ok());
+        assert!(decode_update("z", "svc", "y", &mut interner, vec![], None).is_ok());
+    }
+
+    /// A clock survives an encode/decode round-trip through the wire form. Using one interner means the re-interned `(service, member)`
+    /// keys resolve to the same `Symbol`s, so the decoded clock equals the
+    /// original.
+    #[test]
+    fn test_codec_clock_roundtrip() {
+        let mut interner = Interner::new();
+        let (svc_a, x) = (interner.insert("svc"), interner.insert("x"));
+        let (svc_b, y) = (interner.insert("other"), interner.insert("y"));
+        let original: VClock = HashMap::from([((svc_a, x), 3u64), ((svc_b, y), 7u64)]);
+
+        let wire = encode_clock(&original, &interner);
+        assert_eq!(wire.len(), 2);
+        let decoded = clock_entry_to_vclock(wire, &mut interner).expect("valid clock decodes");
+        assert_eq!(decoded, original);
+    }
+
+    /// A wire clock carrying a non-identifier dimension name is rejected
+    /// wholesale, so a remote peer cannot intern junk via the clock
+    /// (mirrors the guarantee `decode_update` gives for the message's own name
+    /// fields).
+    #[test]
+    fn test_codec_clock_rejects_bad_dimension() {
+        let mut interner = Interner::new();
+        let bad = vec![ClockEntry {
+            service: "bad name".to_string(),
+            member: "x".to_string(),
+            counter: 1,
+        }];
+        let res = decode_update("ldef", "svc", "member", &mut interner, bad, None);
+        assert!(
+            res.is_err(),
+            "decode_update should reject a clock with a non-identifier dimension"
+        );
+    }
+
+    /// The numeric id of a symbol, from its debug form
+    fn symbol_id(symbol: Symbol) -> u32 {
+        let text = format!("{symbol:?}");
+        text.trim_matches(|c: char| !c.is_ascii_digit())
+            .parse()
+            .expect("a symbol prints its id")
+    }
+
+    fn clock_of(dimensions: usize, counter: u64) -> Vec<ClockEntry> {
+        (0..dimensions)
+            .map(|i| ClockEntry {
+                service: format!("s{i}"),
+                member: "x".to_string(),
+                counter,
+            })
+            .collect()
+    }
+
+    /// A clock with more dimensions than allowed is refused before any of its
+    /// names is interned; one at the limit is accepted
+    #[test]
+    fn test_codec_clock_bounds_its_dimensions_before_interning() {
+        let mut interner = Interner::new();
+        let before = symbol_id(interner.insert("probe"));
+        let res = clock_entry_to_vclock(clock_of(MAX_NET_CLOCK_ENTRIES + 1, 1), &mut interner);
+        assert!(matches!(res, Err(Error::LimitExceeded(_))), "{res:?}");
+        assert_eq!(
+            symbol_id(interner.insert("next")),
+            before + 1,
+            "the refused clock must not have interned any name"
+        );
+        let at_limit = clock_entry_to_vclock(clock_of(MAX_NET_CLOCK_ENTRIES, 1), &mut interner)
+            .expect("a clock at the limit decodes");
+        assert_eq!(at_limit.len(), MAX_NET_CLOCK_ENTRIES);
+    }
+
+    /// A counter above the wire bound is refused, as a message handler would,
+    /// so no local write can overflow a counter afterwards
+    #[test]
+    fn test_codec_clock_rejects_an_over_bound_counter() {
+        let mut interner = Interner::new();
+        let res = decode_update(
+            "ldef",
+            "svc",
+            "member",
+            &mut interner,
+            clock_of(1, MAX_NET_CLOCK_COUNTER + 1),
+            None,
+        );
+        assert!(res.is_err(), "an over-bound counter must be refused");
     }
 
     /// Verify that encoding a value with an oversized string
@@ -1792,17 +1991,8 @@ mod tests {
 
         // Construct `Type::Func(Int -> String, Bool -> Unit)`
         let original_type = Type::Func(
-            Box::new(Type::Func(
-                Box::new(Type::Int),
-                Box::new(Type::String),
-                std::collections::HashSet::new(),
-            )),
-            Box::new(Type::Func(
-                Box::new(Type::Bool),
-                Box::new(Type::Unit),
-                std::collections::HashSet::new(),
-            )),
-            std::collections::HashSet::new(),
+            Box::new(Type::Func(Box::new(Type::Int), Box::new(Type::String))),
+            Box::new(Type::Func(Box::new(Type::Bool), Box::new(Type::Unit))),
         );
 
         let original_param = Param {
@@ -1843,11 +2033,7 @@ mod tests {
         // Construct a `Type` that exceeds `MAX_TYPE_DEPTH` (16)
         let mut current_type = Type::Int;
         for _ in 0..(MAX_TYPE_DEPTH + 1) {
-            current_type = Type::Func(
-                Box::new(Type::Bool),
-                Box::new(current_type),
-                std::collections::HashSet::new(),
-            );
+            current_type = Type::Func(Box::new(Type::Bool), Box::new(current_type));
         }
 
         let res = encode_type(&current_type);
@@ -1924,6 +2110,18 @@ mod service_code_tests {
         assert_eq!(resolved, file.canonicalize().unwrap());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #221: a bare server filename yields an empty base; serve from cwd.
+    #[test]
+    fn test_resolve_served_file_empty_base() {
+        let resolved = resolve_served_file(std::path::Path::new(""), "Cargo.toml")
+            .expect("empty base must resolve against the current directory");
+        let expected = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("Cargo.toml")
+            .canonicalize()
+            .expect("the library crate manifest must exist");
+        assert_eq!(resolved, expected);
     }
 
     /// #39: an absolute path is rejected.
@@ -2017,11 +2215,7 @@ mod service_code_tests {
         let field_func = interner.insert("f");
 
         let tuple_ty = Type::Tuple(TupleType::new(vec![Type::Int, Type::String]).unwrap());
-        let func_ty = Type::Func(
-            Box::new(Type::Bool),
-            Box::new(Type::Unit),
-            std::collections::HashSet::new(),
-        );
+        let func_ty = Type::Func(Box::new(Type::Bool), Box::new(Type::Unit));
 
         let mut original_type = ServiceType::default();
         original_type.add_field(field_tuple, tuple_ty).unwrap();

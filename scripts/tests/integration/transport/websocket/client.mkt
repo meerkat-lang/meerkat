@@ -1,0 +1,15 @@
+import A
+import B
+
+service WsClient {}
+
+// Every node in this test dials its imports over WebSocket (see
+// websocket.json), so each step below crosses the WebSocket transport:
+// fetching A's and B's code, reading remote values, and an action that
+// A forwards to B.
+@test(WsClient) {
+    assert(B.get_stock == 100);
+    assert(A.remote_stock == 100);
+    do A.buy;
+    assert(B.get_stock == 99);
+}

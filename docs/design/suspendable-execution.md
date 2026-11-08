@@ -22,7 +22,7 @@ Issue #28 asks for a related but smaller thing: a node that listens for input
 and network events at the same time.  This document argues that the two goals
 above need more than that, namely execution that can be suspended and resumed.
 It then proposes an order for that work, for #28, and for task 10 (parked
-action replay safety, PR #209), which is in review now.
+action replay safety, PR #209, since merged).
 
 ## How execution works today
 
@@ -97,8 +97,8 @@ Manager`.  There are two ways to get there.
 
 **Share the `Manager` and borrow it briefly.**  The interpreter keeps its
 current recursive `async` structure, but holds a handle to a shared `Manager`
-(`Arc<Mutex<_>>`, or `Rc<RefCell<_>>` on wasm) and borrows it only between
-awaits.  A suspended action is then an ordinary future, waiting on a channel.
+and borrows it only between awaits (see "How actions share the `Manager`"
+below).  A suspended action is then an ordinary future, waiting on a channel.
 
 **Make the interpreter a state machine.**  The interpreter becomes a step
 function over an explicit stack of frames, and a suspended action's
@@ -112,7 +112,110 @@ conversions, and `reactive_cache`.  Changing that part is mostly mechanical.
 The real work is in the `Manager` methods that await while holding `&mut self`:
 `send_and_await_reply`, remote `lookup`, `remote_action`,
 `commit_participants`, and `recompute_def`.  Each has to become: borrow, change
-state, send, release the borrow, await the reply, and borrow again.
+state, send, release the borrow, await the reply, and borrow again.  With the
+handle described next, that is the only structure that compiles.
+
+### How actions share the `Manager`
+
+**Run on one thread.**  Meerkat's logic runs on tokio's single-threaded
+runtime inside a `tokio::task::LocalSet`, and suspended actions are spawned
+with `spawn_local`.  Tasks spawned that way need not be `Send`, so the shared
+`Manager` is an `Rc<RefCell<Manager>>` on native and wasm alike.
+
+**Reach the `Manager` only through a closure.**  The `Rc<RefCell<_>>` is a
+private field of a `ManagerHandle`, whose only access is synchronous:
+
+```rust
+impl ManagerHandle {
+    pub fn with<R>(&mut self, f: impl FnOnce(&mut Manager) -> R) -> R {
+        f(&mut self.0.borrow_mut())
+    }
+}
+
+// in an action: borrow, release, await, borrow again
+let reply = handle.with(|m| m.start_lookup(…));
+let value = reply.await;
+handle.with(|m| m.finish_lookup(value));
+```
+
+The compiler then rules out holding the `Manager` across an `await`.  The
+closure is not `async`, so it cannot contain an `.await`, and its result
+cannot borrow from its argument, so the `&mut Manager` cannot escape it,
+not even inside a returned future.  Because `with` takes `&mut self`, a closure
+cannot call `with` on the same handle again; each task gets exactly one
+handle.  A nested borrow through a second handle would still panic, but it
+panics every time that path runs, so any test of the path finds it.  Holding a
+borrow across an `await` is the dangerous mistake: it only fails when another
+task happens to run in the gap, and the handle makes it impossible.
+
+Clippy's `await_holding_refcell_ref` lint, on by default and therefore an error
+under CI's `-D warnings`, backs this up inside the handle's own module.  It
+is not enough by itself: it sees a `Ref` or `RefMut` held directly in a
+variable across an `await`, but not one wrapped in another type.
+
+**What this buys.**  This is what meets the second goal: a node keeps
+handling network messages and user input while its actions wait for replies.
+Once step 4 is in place, a remote call goes like this:
+
+1. The action sends its request and gets back the receiving end of a reply
+   channel, `let reply = handle.with(|m| m.start_lookup(…));`.  The borrow
+   ends with the closure.
+2. The action awaits the reply.  As a local task, awaiting hands the thread
+   back to the scheduler.
+3. The event loop, another task on the same `LocalSet`, runs meanwhile.  It
+   takes the next event from its channel (a request from another node, a REPL
+   line, a GUI action) and handles it through its own `with` call.  Nothing
+   blocks it, because no action holds the `Manager` while it waits.
+4. When the reply arrives, the network layer completes the action's reply
+   channel (see step 3 below), and the action resumes on its next turn on the
+   thread.
+
+A request from another node that starts an action, such as a participant
+running part of a transaction, is spawned the same way, so it too can wait
+without blocking anything.  Responsiveness comes at `await` points: on one
+thread, a long stretch of pure computation, such as a large `fold` with no
+network access, holds the thread until it finishes.  That is inherent to
+cooperative scheduling, and sharing the `Manager` across threads would not
+avoid it, since other tasks would still wait for the `Manager`.  If it ever
+matters, the interpreter can yield periodically with
+`tokio::task::yield_now()`.
+
+**Why.**  The design removes the `Send` bounds that `#[async_recursion]` puts
+on `eval` and `execute`, the `SendWrapper`s that wasm needs today to pass
+browser timers through those bounds (`manager/mod.rs`), and most of the
+`#[cfg]` splits for spawning.  Native and wasm then run the same code, so
+native tests exercise wasm's paths too.  A single thread rules out data races.
+It does not rule out interleaving: another action can run at every `await`,
+so an action must re-check anything it relied on before an `await`.  That
+holds for any design that releases the `Manager` while waiting.
+
+**Cost.**  Meerkat's logic gets no parallelism, but it has none today: every
+action holds `&mut Manager`.  What the multi-threaded runtime does
+parallelise is libp2p's own work: connections, encryption and stream sends.
+On one thread that competes with interpretation.  For Meerkat's small
+messages this should not matter.  If it ever does, run the `LocalSet` with the
+`Manager` on a dedicated thread and keep the multi-threaded runtime for
+libp2p.  libp2p's tasks are already `Send`, and `.with_tokio()` spawns them
+with `tokio::spawn`, which should work unchanged on a single-threaded runtime.
+
+**Alternatives considered.**
+
+- **`Arc<Mutex<Manager>>` on the multi-threaded runtime**, with
+  `Rc<RefCell<_>>` on wasm, as this page first proposed.  It keeps the `Send`
+  bounds and two code paths.  A `std::sync::Mutex` held across an `await`
+  blocks the thread or deadlocks.  A `tokio::sync::Mutex` may legitimately be
+  held across an `await`, so nothing enforces releasing it, and an action
+  holding it would stall every other action.
+- **A bare `RefCell` borrowed by convention, with the Clippy lint as the only
+  check.**  The lint misses a borrow wrapped in another type, and a missed one
+  fails only when tasks interleave.
+- **The state machine** ("exterior" rather than interior mutability): suspended
+  actions are data, and the loop lends `&mut Manager` to each step, so no
+  `RefCell` is needed.  It costs a rewrite of the evaluator and executor as
+  step functions; see Open questions.
+
+The single-threaded runtime and the event-loop shape in step 3 were suggested
+by Dustin Juliano; see the discussion on #28 and #213.
 
 State that assumes one action runs at a time also has to change:
 
@@ -147,8 +250,8 @@ We propose this order:
 
 1. **Merge #209 (task 10).**  Parked participant actions replay correctly,
    and wait-die holds for participants.
-2. **Tasks 06, 11 and 12.**  Compute-on-read lands, and
-   `meerkat/tests/s1.mkt` passes.
+2. **Tasks 06, 11 and 12.**  Compute-on-read lands, so an action that writes
+   a var and then reads a def over it sees the new value.
 3. **#28: one event loop.**  Input and network are handled together.
    An originator that must wait parks until the lock frees and then
    restarts, instead of retrying on a timer, so wait-die holds for
@@ -167,24 +270,71 @@ cleanly.
 
 **Step 2: do not hold compute-on-read for the refactor.**  Task 12 extends
 #209's replay path a little (`ComposedCall` gains `touched_services`), and that
-code will later be deleted.  The cost is small, and `s1.mkt` stays broken until
-task 12 lands.  #202's retry cap is a temporary conflict with the first goal,
-but it should stay until step 3.  Without it, a wait can hang the node.  The
-lock may be held by a participant transaction on this node, which releases it
-only when its originator's `Commit` or `Abort` arrives, and an originator in
-the retry loop may process no network messages at all: with no participants
-to abort, it awaits nothing but its backoff.  #202's comment on
-`retry_backoff` notes this case.  The cap turns the hang into a failure after
-about 200ms of backoff.  Processing messages during the backoff would avoid
-the hang, but that is waiting in place, which can deadlock as shown above.
-Step 3 removes the cap for waits, because a parked originator leaves the loop
-free to process the release.
+code will later be deleted.  The cost is small, and until task 12 lands, an
+action that writes a var and then reads a def over it sees the def's old
+value: with `def y = x + 1`, `action { x = 5; assert(y == 6); }` fails.
+(`meerkat/tests/s1.mkt`, the regression that opened PR #189, no longer shows
+this.  Since PR #201 each `do` in an `@test` is its own transaction, so its
+writes commit between statements and it passes.)  #202's retry cap is a
+temporary conflict with the first goal, but it should stay until step 3.
+Without it, a wait can hang the node.  The lock may be held by a participant
+transaction on this node, which releases it only when its originator's
+`Commit` or `Abort` arrives, and an originator in the retry loop may process
+no network messages at all: with no participants to abort, it awaits nothing
+but its backoff.  #202's comment on `retry_backoff` notes this case.  The cap
+turns the hang into a failure after about 200ms of backoff.  Processing
+messages during the backoff would avoid the hang, but that is waiting in
+place, which can deadlock as shown above.  Step 3 removes the cap for waits,
+because a parked originator leaves the loop free to process the release.
 
-**Step 3: build the loop so that step 4 fits into it.**  Three choices matter:
+**Step 3: build the loop so that step 4 fits into it.**  Five choices matter:
 
-- The loop should deliver network replies to the existing `pending_replies`
-  channels, instead of `send_and_await_reply` processing events itself.  Those
-  channels already are a table of continuations.
+- The loop is one channel and a `match`.  Every source of events (the
+  network actor, a thread reading stdin, timers, later the GUI) forwards into
+  a single channel, and the loop is
+  `while let Some(event) = rx.recv().await { match event { … } }`.  Nothing
+  is raced, so nothing is cancelled; events are handled in the order they
+  arrived; the `match` over one `Event` enum is exhaustive; and tests can drive
+  the loop by pushing events into the channel.  Within step 3 an action still
+  runs to completion in the loop's body; in step 4 the loop spawns it with
+  `spawn_local` instead.
+
+  Alternatives considered: a `tokio::select!` over the sources, as #28
+  suggests, works only if every raced future is safe to drop, since the
+  branches that lose are cancelled mid-flight, and it is easy to break that
+  rule later; one channel cannot break it.  Its advantage, preferring one
+  source over another, can be had with a second channel if ever needed.  An
+  actor framework (#28's other suggestion) gives the same shape with more
+  machinery than this needs.
+- Network replies bypass the loop.  The network actor delivers each reply
+  directly to its request's `pending_replies` channel, instead of
+  `send_and_await_reply` finding it among the events it processes.  Those
+  channels already are a table of continuations, but today `pending_replies`
+  is a field of the `Manager`, which the network actor cannot reach, so the
+  table moves into the network actor, or into a small registry shared with
+  it; requests register there.  A reply must never queue behind the loop:
+  until step 4 an action runs to completion inside the loop, and an action
+  waiting for a reply that sits in the loop's own queue would wait forever.
+- Incoming requests stay served during a remote wait, until step 4.  While an
+  action runs inside the loop, nothing else handles them, and some are
+  needed for its own reply: the request it sent may trigger a `LockRequest`
+  back to this node, as cascading lock groups do
+  (`acquire_lock_group_internal`), and that callback must be served before the
+  reply can come.  So `send_and_await_reply` keeps serving, while it waits,
+  what `dispatch_network_events` serves today: `LockRequest`,
+  `RequestUpdates`, `Update` and `UpdateServiceRequest`, now taken from the
+  loop's channel.  Everything else, including REPL input, `ActionRequest`,
+  `Commit` and `Abort`, stays queued for the loop until the action finishes;
+  today it is dropped.  `Commit` and `Abort` are not served during the wait
+  on purpose: committing a participant can forward the commit to the nodes
+  below and wait for them, which nests one wait inside another, the waiting
+  in place shown above to deadlock.
+
+  This is no worse than today, and loses nothing that today drops.  It does
+  not help a request that starts an action and calls back (an action on A
+  composes onto B, which composes back onto A): that still waits until A's
+  action finishes.  Step 4 fixes it, since the loop then runs while A's action
+  waits.
 - Originator transactions should live in a table while they run, keyed by id,
   like `pending_txns`.  Task 12 already needs the originator's transaction to
   be reachable by id while it runs, and it names #28 as the fix.
@@ -215,14 +365,15 @@ free to process the release.
   still never dies, and step 4 removes both costs: a suspended originator
   keeps its locks and resumes where it stopped.
 
-Either design in #28 works for this, as long as the loop owns event dispatch:
-the `tokio::select!` loop that owns the `Manager`, or the actor design.  With
-the `select!` loop, step 4 changes the loop's handlers from running an action
-to completion to spawning it; the loop itself stays.
+The loop itself stays the same in step 4; only its handlers change, from
+running an action to completion to spawning it.
 
-**Step 4: make execution suspendable.**  A park becomes a wait on a lock-grant
-channel, and a remote call becomes a wait on its reply channel with the
-`Manager` released.  #209's rollback and position records, and task 09's
+**Step 4: make execution suspendable.**  The runtime becomes the
+single-threaded one described in "How actions share the `Manager`", actions
+run as `spawn_local` tasks holding a `ManagerHandle`, and the `Manager`'s
+awaiting methods are split around their awaits.  A park becomes a wait on a
+lock-grant channel, and a remote call becomes a wait on its reply channel with
+the `Manager` released.  #209's rollback and position records, and task 09's
 re-dispatch, go away.  This step is tracked in #213.
 
 ## Cleanup
@@ -239,7 +390,6 @@ to the new.
   abort before parking stays until step 4, and so does the restart, which
   the lock freeing now triggers instead of a timer.  The die retry stays:
   that is wait-die itself.
-- `send_and_await_reply` processing network events itself.
 - The separate places that handle network messages outside the loop: the
   `--watch` loop and the server loop in `main.rs`, and the REPL's lack of
   any.
@@ -255,6 +405,8 @@ to the new.
   actions.
 - The originator's abort and restart on a wait, from step 3.  A waiting
   originator suspends with its locks held, as a participant does.
+- `send_and_await_reply` serving incoming requests while it waits, from
+  step 3.  The loop itself runs during the wait now, so it serves them.
 - `reactive_cache` as a field on the `Manager`, which moves into each
   execution's context.
 
@@ -266,14 +418,18 @@ comments on `MAX_WAIT_DIE_RETRIES` already do.
 ## Open questions
 
 - **Shared `Manager` or state machine.**  This document recommends the shared
-  `Manager`; the state machine deserves a closer look if a table of
-  continuations turns out to be needed for other reasons, such as persisting
-  them.
+  `Manager`, reached only through a `ManagerHandle`; the state machine deserves
+  a closer look if a table of continuations turns out to be needed for other
+  reasons, such as persisting them.
+- **libp2p on one thread.**  To confirm when step 4 is built: that
+  `.with_tokio()` needs no change on a single-threaded runtime, and whether
+  libp2p's work competes with interpretation enough to need the `LocalSet` on
+  a thread of its own.
 - **Abort of a suspended action.**  What the action is told, and how its
   partial state is discarded.
 - **Results that arrive later.**  Once a REPL command or a GUI action can
   finish after other input has been handled, the interface needs a way to
   report its result asynchronously.
 - **Fairness of wakeups.**  Waking oldest first matches wait-die; it should be
-  checked that nothing else, such as the order the event loop handles
-  messages, undoes that.
+  checked that nothing else undoes that.  A single channel at least handles
+  events in arrival order, with no random choice between sources.

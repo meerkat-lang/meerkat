@@ -1,13 +1,13 @@
-//! Dependency graph analysis module powered by `petgraph`
+//! Dependency graphs of a service
 
-pub mod analysis;
+pub(crate) mod analysis;
+pub(crate) mod effects;
 pub mod free_var;
 
 use crate::runtime::interner::Symbol;
-use petgraph::algo::{has_path_connecting, tarjan_scc, toposort, Cycle};
 use petgraph::graphmap::DiGraphMap;
-use petgraph::visit::{Dfs, DfsPostOrder, Reversed};
-use std::collections::{HashMap, HashSet};
+use petgraph::Direction;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Pre-computed dependency graphs and analysis state for a service
 pub struct ServiceGraphs {
@@ -21,6 +21,9 @@ pub struct ServiceGraphs {
     pub defs: HashSet<Symbol>,
     /// Set of table symbols defined in the service
     pub tables: HashSet<Symbol>,
+    /// Defs whose analysis exceeded the depth limit; their edges are what it
+    /// found. Never part of installed graphs
+    pub incomplete: HashSet<Symbol>,
 }
 
 impl ServiceGraphs {
@@ -35,83 +38,106 @@ impl ServiceGraphs {
             vars: HashSet::new(),
             defs: HashSet::new(),
             tables: HashSet::new(),
+            incomplete: HashSet::new(),
         }
     }
 
-    /// Extract all reactive propagation listener edges as `(owner, listener)`
-    ///
-    /// Returns:
-    ///   `Vec<(Symbol, Symbol)>`: List of `(owner, listener_def)` pairs
-    pub fn reactive_edges(&self) -> Vec<(Symbol, Symbol)> {
-        let mut edges = Vec::new();
-        for (src, target, _) in self.reactive_graph.all_edges() {
-            edges.push((src, target));
-        }
-        edges
-    }
-
-    /// Extract all transitive dependencies of a member using `petgraph::visit::Dfs`
+    /// The static inputs of `member` as `(service, member)` pairs: its
+    /// predecessors in the reactive graph, which belong to `service`, and its
+    /// cross-service dependencies
     ///
     /// Args:
-    ///   `member` (`Symbol`): The target member symbol
+    ///   `service` (`Symbol`): The service these graphs belong to
+    ///   `member` (`Symbol`): The member whose inputs are listed
     ///
     /// Returns:
-    ///   `HashSet<Symbol>`: Set of transitive dependency symbols
-    pub fn transitive_dependencies_of(&self, member: Symbol) -> HashSet<Symbol> {
-        let mut visited = HashSet::new();
-        let reversed = Reversed(&self.reactive_graph);
-        let mut dfs = Dfs::new(reversed, member);
-        while let Some(node) = dfs.next(reversed) {
-            if node != member {
-                visited.insert(node);
+    ///   `impl Iterator<Item = (Symbol, Symbol)>`: The inputs of `member`
+    pub(crate) fn inputs(
+        &self,
+        service: Symbol,
+        member: Symbol,
+    ) -> impl Iterator<Item = (Symbol, Symbol)> + '_ {
+        self.reactive_graph
+            .neighbors_directed(member, Direction::Incoming)
+            .map(move |input| (service, input))
+            .chain(self.cross_deps.get(&member).into_iter().flatten().copied())
+    }
+
+    /// Whether `member` of `service` reads `input`: the relation `inputs`
+    /// lists, an edge of the reactive graph for a member of `service` and a
+    /// cross-service dependency otherwise
+    pub(crate) fn reads(
+        &self,
+        service: Symbol,
+        member: Symbol,
+        (owner, input): (Symbol, Symbol),
+    ) -> bool {
+        if owner == service {
+            self.reactive_graph.contains_edge(input, member)
+        } else {
+            self.cross_deps
+                .get(&member)
+                .is_some_and(|inputs| inputs.contains(&(owner, input)))
+        }
+    }
+}
+
+/// Graphs are equal when they declare the same members with the same edges
+impl PartialEq for ServiceGraphs {
+    fn eq(&self, other: &Self) -> bool {
+        self.vars == other.vars
+            && self.defs == other.defs
+            && self.tables == other.tables
+            && self.cross_deps == other.cross_deps
+            && self.incomplete == other.incomplete
+            && self.reactive_graph.edge_count() == other.reactive_graph.edge_count()
+            && self
+                .reactive_graph
+                .all_edges()
+                .all(|(input, member, _)| other.reactive_graph.contains_edge(input, member))
+    }
+}
+
+/// The members on a cycle of `graph`: in a strongly connected component of
+/// several members, or reading themselves
+pub(crate) fn cyclic_members(
+    graph: &DiGraphMap<(Symbol, Symbol), ()>,
+) -> impl Iterator<Item = (Symbol, Symbol)> + '_ {
+    petgraph::algo::tarjan_scc(graph)
+        .into_iter()
+        .filter(|component| component.len() > 1 || graph.contains_edge(component[0], component[0]))
+        .flatten()
+}
+
+/// Why a def cannot be installed
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Uninstallable {
+    /// Its analysis exceeded the depth limit
+    Incomplete,
+    /// It is on a cycle of the direct dependency graph (§2.1.4)
+    Cycle,
+}
+
+/// The defs of `graphs`, the graphs of every running service, that cannot
+/// be installed, as `(service, def)`
+pub(crate) fn uninstallable(
+    graphs: &HashMap<Symbol, ServiceGraphs>,
+) -> BTreeMap<(Symbol, Symbol), Uninstallable> {
+    let mut graph = DiGraphMap::<(Symbol, Symbol), ()>::new();
+    let mut failing = BTreeMap::new();
+    for (&service, graphs) in graphs {
+        for &def in &graphs.defs {
+            graph.add_node((service, def));
+            for input in graphs.inputs(service, def) {
+                graph.add_edge(input, (service, def), ());
             }
         }
-        visited
-    }
-
-    /// Compute strongly connected components using `petgraph::algo::tarjan_scc`
-    ///
-    /// Returns:
-    ///   `Vec<Vec<Symbol>>`: List of strongly connected components
-    pub fn strongly_connected_components(&self) -> Vec<Vec<Symbol>> {
-        tarjan_scc(&self.reactive_graph)
-    }
-
-    /// Compute topological sorting order using `petgraph::algo::toposort`
-    ///
-    /// Returns:
-    ///   `Result<Vec<Symbol>, Cycle<Symbol>>`: Topological ordering or cycle error
-    pub fn topological_sort(&self) -> Result<Vec<Symbol>, Cycle<Symbol>> {
-        toposort(&self.reactive_graph, None)
-    }
-
-    /// Check if a path exists between two symbols using `petgraph::algo::has_path_connecting`
-    ///
-    /// Args:
-    ///   `from` (`Symbol`): Source symbol
-    ///   `to` (`Symbol`): Target symbol
-    ///
-    /// Returns:
-    ///   `bool`: True if a directed path exists
-    pub fn has_path(&self, from: Symbol, to: Symbol) -> bool {
-        has_path_connecting(&self.reactive_graph, from, to, None)
-    }
-
-    /// Compute post-order DFS traversal sequence using `petgraph::visit::DfsPostOrder`
-    ///
-    /// Args:
-    ///   `start` (`Symbol`): Starting symbol
-    ///
-    /// Returns:
-    ///   `Vec<Symbol>`: Sequence of visited symbols in post-order
-    pub fn dfs_post_order(&self, start: Symbol) -> Vec<Symbol> {
-        let mut order = Vec::new();
-        let mut dfs = DfsPostOrder::new(&self.reactive_graph, start);
-        while let Some(node) = dfs.next(&self.reactive_graph) {
-            order.push(node);
+        for &def in &graphs.incomplete {
+            failing.insert((service, def), Uninstallable::Incomplete);
         }
-        order
     }
+    failing.extend(cyclic_members(&graph).map(|def| (def, Uninstallable::Cycle)));
+    failing
 }
 
 impl Default for ServiceGraphs {
@@ -127,7 +153,6 @@ impl Default for ServiceGraphs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::interner::Interner;
 
     #[test]
     fn test_service_graphs_default_and_new() {
@@ -139,59 +164,5 @@ mod tests {
         assert!(sg_def.defs.is_empty());
         assert!(sg_def.tables.is_empty());
         assert!(sg_def.cross_deps.is_empty());
-    }
-
-    #[test]
-    fn test_service_graphs_petgraph_algorithms() {
-        let mut interner = Interner::new();
-        let mut sg = ServiceGraphs::new();
-        let a = interner.insert("a");
-        let b = interner.insert("b");
-        let c = interner.insert("c");
-
-        sg.reactive_graph.add_edge(a, b, ());
-        sg.reactive_graph.add_edge(b, c, ());
-
-        let edges = sg.reactive_edges();
-        assert_eq!(edges.len(), 2);
-        assert!(edges.contains(&(a, b)));
-        assert!(edges.contains(&(b, c)));
-
-        assert!(sg.has_path(a, c));
-        assert!(!sg.has_path(c, a));
-
-        let trans = sg.transitive_dependencies_of(c);
-        assert_eq!(trans.len(), 2);
-        assert!(trans.contains(&a));
-        assert!(trans.contains(&b));
-
-        let topo = sg.topological_sort();
-        assert!(topo.is_ok());
-        let topo_nodes = topo.unwrap();
-        assert_eq!(topo_nodes.len(), 3);
-
-        let scc = sg.strongly_connected_components();
-        assert_eq!(scc.len(), 3);
-
-        let post = sg.dfs_post_order(a);
-        assert_eq!(post.len(), 3);
-    }
-
-    #[test]
-    fn test_service_graphs_cycle_detection() {
-        let mut interner = Interner::new();
-        let mut sg = ServiceGraphs::new();
-        let a = interner.insert("a");
-        let b = interner.insert("b");
-
-        sg.reactive_graph.add_edge(a, b, ());
-        sg.reactive_graph.add_edge(b, a, ());
-
-        let topo = sg.topological_sort();
-        assert!(topo.is_err());
-
-        let scc = sg.strongly_connected_components();
-        assert_eq!(scc.len(), 1);
-        assert_eq!(scc[0].len(), 2);
     }
 }

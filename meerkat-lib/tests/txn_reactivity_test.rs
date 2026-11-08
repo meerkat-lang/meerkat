@@ -8,8 +8,9 @@
 
 use meerkat_lib::runtime::ast::{ActionStmt, Stmt, Value};
 use meerkat_lib::runtime::interpreter::EvalError;
+use meerkat_lib::runtime::manager::InputState;
 use meerkat_lib::runtime::parser::parse_string;
-use meerkat_lib::runtime::txn::TxnId;
+use meerkat_lib::runtime::txn::{TxnId, VClock};
 use meerkat_lib::runtime::{Interner, Manager, Node};
 use std::collections::HashMap;
 
@@ -270,7 +271,7 @@ async fn test_participant_transactional_read_sees_buffered_def() {
         .await
         .unwrap();
     assert_eq!(
-        seen,
+        seen.0,
         Value::Int { val: 2 },
         "a transactional remote read must see the participant's buffered write through a def"
     );
@@ -371,14 +372,18 @@ async fn test_remote_dependency_is_never_served_from_dep_cache() {
     let q = m.interner.insert("q");
     let z = m.interner.insert("z");
 
-    // A cache entry the old behaviour would have reused instead of reading.
+    // A cache entry the old behaviour would have reused instead of reading:
+    // a retained pair with a clock, which the batch gate would accept.
     m.services
         .get_mut(&q)
         .unwrap()
         .dep_cache
         .entry(z)
         .or_default()
-        .insert((rmt, gb), Value::Int { val: 100 });
+        .insert(
+            (rmt, gb),
+            InputState::seeded((Value::Int { val: 100 }, Some(VClock::new()), None)),
+        );
 
     // Re-point `rmt` at another node. `lookup` consults `remote_services`
     // first, so reads must now go over a network that is not there.

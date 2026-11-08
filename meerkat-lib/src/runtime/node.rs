@@ -88,6 +88,11 @@ impl StaticError {
                 "Target service '{}' for update not found",
                 interner.get(*service)
             ),
+            StaticError::Types(tt::check::Error::DuplicateMember { service, member }) => format!(
+                "type check error: duplicate member '{}' in service '{}'.",
+                interner.get(*member),
+                interner.get(*service)
+            ),
             StaticError::Types(tt::check::Error::TypeMismatch { expected, found }) => format!(
                 "type check error: type mismatch: expected {}, found {}.",
                 expected, found

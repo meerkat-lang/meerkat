@@ -472,7 +472,7 @@ impl<'a> Effects<'a> {
             ))
             .or_insert_with(|| {
                 self.lambdas.push(Lambda {
-                    env: Vec::new(),
+                    env: names.iter().map(|&name| (name, Functions::new())).collect(),
                     ..lambda.clone()
                 });
                 self.lambdas.len() - 1

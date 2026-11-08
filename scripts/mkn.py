@@ -114,7 +114,14 @@ class Node:
         self.relay = manifest_def.get("relay")
         self.timeout = manifest_def.get("timeout", 0)
         self.imports = manifest_def.get("imports", [])
+        # How this node dials its imports: "tcp" (the default) uses each
+        # service's TCP Service URL; "ws" uses the WebSocket address the
+        # server prints for browser clients, so the test exercises the
+        # WebSocket transport between native nodes.
+        self.transport = manifest_def.get("transport", "tcp")
         self.peer_id = None
+        # The WebSocket listen address a server prints, ending in /p2p/<id>
+        self.ws_url = None
 
         self.is_started = False
         self.is_online = False
@@ -231,6 +238,10 @@ class Manifest:
                 relay = node_def["relay"]
                 if not isinstance(relay, str) or not relay:
                     raise ValueError(f"Node '{alias}' 'relay' must be a non-empty string")
+
+            # transport check
+            if "transport" in node_def and node_def["transport"] not in ("tcp", "ws"):
+                raise ValueError(f"Node '{alias}' 'transport' must be 'tcp' or 'ws', got {node_def['transport']!r}")
 
             # imports check
             imports = node_def.get("imports", [])
@@ -405,7 +416,14 @@ class NetworkOrchestrator:
                 svc = dep_node.relayed_services.get(svc_name)
 
             node.remote_services[svc_name] = svc
-            import_flags.extend(["-i", svc.url])
+            url = svc.url
+            if node.transport == "ws":
+                if svc.is_relayed:
+                    raise RuntimeError(f"Node '{node.alias}' imports relayed service '{svc_name}', which has no WebSocket address")
+                if not dep_node.ws_url:
+                    raise RuntimeError(f"Node '{node.alias}' imports '{svc_name}' over WebSocket, but '{alias}' printed no WebSocket address")
+                url = f"{dep_node.ws_url}/{svc_name}"
+            import_flags.extend(["-i", url])
 
         if node.cmd:
             cmd = _resolve_python_command(node.cmd)
@@ -459,6 +477,11 @@ class NetworkOrchestrator:
                 node.peer_id = peer_id
                 self.nodes_by_peer_id[peer_id] = node
                 print(f"[{node.alias}] Discovered PeerID: {peer_id}")
+
+        # 1b. Parse the WebSocket address: Browser clients connect at: <url>
+        match_ws = re.match(r'^Browser clients connect at:\s+(\S+)$', line)
+        if match_ws:
+            node.ws_url = match_ws.group(1)
 
         # 2. Parse service URLs: Service URL: <url>
         match_svc = re.match(r'^Service URL:\s+(\S+)$', line)

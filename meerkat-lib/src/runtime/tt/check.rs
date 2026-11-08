@@ -48,6 +48,7 @@ use crate::runtime::ast::{ActionStmt, BinOp, Decl, Expr, Stmt, UnOp, Value};
 use crate::runtime::interner::Symbol;
 use crate::runtime::tt::types::{Param, ServiceType, TupleType, Type};
 use crate::runtime::Env;
+use std::collections::HashSet;
 
 /// Validate the structural depth of a type representation
 ///
@@ -86,6 +87,10 @@ fn check_type(ty: &Type, depth: usize) -> Result<(), Error> {
 pub enum Error {
     UnboundVariable(Symbol),
     UnknownUpdateTarget(Symbol),
+    DuplicateMember {
+        service: Symbol,
+        member: Symbol,
+    },
     TypeMismatch {
         expected: Box<Type>,
         found: Box<Type>,
@@ -108,6 +113,13 @@ impl std::fmt::Display for Error {
             }
             Error::UnknownUpdateTarget(s) => {
                 write!(f, "target service '{:?}' for update not found.", s)
+            }
+            Error::DuplicateMember { service, member } => {
+                write!(
+                    f,
+                    "duplicate member '{:?}' in service '{:?}'.",
+                    member, service
+                )
             }
             Error::TypeMismatch { expected, found } => {
                 write!(f, "type mismatch: expected {}, found {}.", expected, found)
@@ -199,7 +211,17 @@ impl<'a, 'b> Context<'a, 'b> {
         // Both local and imported Stmt::Service nodes are present in the
         // unified AST passed from Node::static_checks.
         for stmt in self.program {
-            if let Stmt::Service { name, .. } = stmt {
+            if let Stmt::Service { name, decls } = stmt {
+                // Member names must be unique before types are cached by name.
+                let mut members = HashSet::new();
+                for decl in decls {
+                    if !members.insert(decl.name()) {
+                        return Err(Error::DuplicateMember {
+                            service: *name,
+                            member: decl.name(),
+                        });
+                    }
+                }
                 if self.local_services.find(*name).is_none() {
                     self.local_services.bind(*name, ServiceType::default());
                 }

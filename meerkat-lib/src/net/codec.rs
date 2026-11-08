@@ -20,6 +20,7 @@ use crate::runtime::limits::{
 use crate::runtime::tt::{Param, ServiceType, TupleType, Type};
 use crate::runtime::txn::{Sources, VClock};
 use std::collections::HashMap;
+use std::io::Read;
 
 fn validate_identifier(s: &str) -> Result<()> {
     if s.len() > MAX_IDENTIFIER_LENGTH {
@@ -202,10 +203,7 @@ pub fn serve_service_code(
 ) -> MeerkatMessage {
     let result = validate_service_code_request(&path, reply_to)
         .and_then(|()| resolve_served_file(base_dir, &path))
-        .and_then(|file| {
-            std::fs::read_to_string(&file)
-                .map_err(|e| Error::LimitExceeded(format!("failed to read requested file: {}", e)))
-        });
+        .and_then(|file| read_served_file(&file));
     match result {
         Ok(source) => MeerkatMessage::ServiceCodeResponse {
             request_id,
@@ -217,6 +215,50 @@ pub fn serve_service_code(
             error: e.to_string(),
         },
     }
+}
+
+/// Open and read a served source file through one stable file handle.
+///
+/// Resolving a path and then opening it separately leaves a time-of-check to
+/// time-of-use race: a writer can replace the validated path with a symlink or
+/// special file before the read. Platform-specific no-follow/non-blocking flags
+/// protect the final path component where the OS supports them; the metadata is
+/// checked on the opened handle rather than on the path.
+fn read_served_file(path: &std::path::Path) -> Result<String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Do not follow a final reparse point (the Windows equivalent of a
+        // symlink/junction at the requested path).
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+
+    let mut file = options
+        .open(path)
+        .map_err(|e| Error::LimitExceeded(format!("failed to read requested file: {}", e)))?;
+    if !file
+        .metadata()
+        .map_err(|e| Error::LimitExceeded(format!("failed to inspect requested file: {}", e)))?
+        .is_file()
+    {
+        return Err(Error::LimitExceeded(
+            "requested path is not a regular file".to_string(),
+        ));
+    }
+    let mut source = String::new();
+    file.read_to_string(&mut source)
+        .map_err(|e| Error::LimitExceeded(format!("failed to read requested file: {}", e)))?;
+    Ok(source)
 }
 
 /// #39: Safely resolve a client-requested file path against a server base
@@ -2154,6 +2196,48 @@ mod service_code_tests {
         let dir = unique_temp_dir("missing");
         let res = resolve_served_file(&dir, "nope.mkt");
         assert!(res.is_err(), "missing file must be rejected");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_served_file_reads_regular_file_from_open_handle() {
+        let dir = unique_temp_dir("read");
+        let file = dir.join("counter.mkt");
+        std::fs::write(&file, "service counter {}").unwrap();
+
+        assert_eq!(read_served_file(&file).unwrap(), "service counter {}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_read_served_file_rejects_symlink_without_following() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_temp_dir("symlink");
+        let outside = root.join("outside.txt");
+        let link = root.join("link.mkt");
+        std::fs::write(&outside, "secret").unwrap();
+        symlink(&outside, &link).unwrap();
+
+        let result = read_served_file(&link);
+        assert!(result.is_err(), "symlinks must not be followed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_read_served_file_rejects_fifo_without_blocking() {
+        let dir = unique_temp_dir("fifo");
+        let fifo = dir.join("pipe.mkt");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo must be available on Unix");
+        assert!(status.success(), "mkfifo failed");
+
+        let result = read_served_file(&fifo);
+        assert!(result.is_err(), "FIFOs must not be served");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

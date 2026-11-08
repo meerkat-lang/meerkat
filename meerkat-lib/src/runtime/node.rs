@@ -377,8 +377,17 @@ impl Node {
                             path,
                             reply_to,
                         } => {
-                            let response =
-                                codec::serve_service_code(request_id, path, &reply_to, base_dir);
+                            let base_dir = base_dir.to_path_buf();
+                            let response = tokio::task::spawn_blocking(move || {
+                                codec::serve_service_code(request_id, path, &reply_to, &base_dir)
+                            })
+                            .await
+                            .map_err(|error| {
+                                Error::Message(format!(
+                                    "failed to serve requested file: {}",
+                                    error
+                                ))
+                            })?;
                             Self::send_message(net, Address::new(&reply_to), response).await?;
                         }
                         MeerkatMessage::ServiceCodeError {

@@ -11,7 +11,7 @@ use std::hash::{Hash, Hasher};
 ///
 /// This enum models all valid types including primitives,
 /// tuples, and function signatures
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     Int,
     String,
@@ -21,41 +21,6 @@ pub enum Type {
     Func(Box<Type>, Box<Type>),
     List(Box<Type>),
     UnresolvedService(Symbol),
-}
-
-impl PartialEq for Type {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Type::Int, Type::Int) => true,
-            (Type::String, Type::String) => true,
-            (Type::Bool, Type::Bool) => true,
-            (Type::Unit, Type::Unit) => true,
-            (Type::Tuple(a), Type::Tuple(b)) => a == b,
-            (Type::Func(p1, r1), Type::Func(p2, r2)) => p1 == p2 && r1 == r2,
-            (Type::List(a), Type::List(b)) => a == b,
-            (Type::UnresolvedService(a), Type::UnresolvedService(b)) => a == b,
-            _ => false,
-        }
-    }
-}
-
-impl Eq for Type {}
-
-impl Hash for Type {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        // We use discriminant values internally to hash the variant
-        core::mem::discriminant(self).hash(state);
-        match self {
-            Type::Tuple(t) => t.hash(state),
-            Type::Func(p, r) => {
-                p.hash(state);
-                r.hash(state);
-            }
-            Type::List(t) => t.hash(state),
-            Type::UnresolvedService(s) => s.hash(state),
-            Type::Int | Type::String | Type::Bool | Type::Unit => {}
-        }
-    }
 }
 
 /// Type representation of a Meerkat service

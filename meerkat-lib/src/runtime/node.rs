@@ -45,6 +45,74 @@ pub(crate) enum StaticError {
     Effects(effects::Error),
 }
 
+impl StaticError {
+    /// The failure as the user sees it, with the interned names resolved
+    pub(crate) fn message(&self, interner: &Interner) -> String {
+        match self {
+            StaticError::Names(nameres::Error::UnknownIdentifier {
+                name,
+                expected,
+                context_name,
+            }) => match context_name {
+                Some(ctx) => format!(
+                    "Unknown identifier '{}' (expected {}) in service '{}'",
+                    interner.get(*name),
+                    expected,
+                    interner.get(*ctx)
+                ),
+                None => format!(
+                    "Unknown identifier '{}' (expected {})",
+                    interner.get(*name),
+                    expected
+                ),
+            },
+            StaticError::Names(nameres::Error::ForwardReference(name)) => format!(
+                "Invalid forward reference to uninitialized value '{}'",
+                interner.get(*name)
+            ),
+            StaticError::Names(e @ nameres::Error::DepthLimit) => e.to_string(),
+            StaticError::Types(tt::check::Error::RecursiveTypeInference { service, member }) => {
+                format!(
+                    "type check error: dependency cycle detected at service '{}', member '{}'.",
+                    interner.get(*service),
+                    interner.get(*member)
+                )
+            }
+            StaticError::Types(tt::check::Error::UnboundVariable(s)) => {
+                format!(
+                    "type check error: unbound variable: '{}'.",
+                    interner.get(*s)
+                )
+            }
+            StaticError::Types(tt::check::Error::UnknownUpdateTarget(service)) => format!(
+                "Target service '{}' for update not found",
+                interner.get(*service)
+            ),
+            StaticError::Types(tt::check::Error::TypeMismatch { expected, found }) => format!(
+                "type check error: type mismatch: expected {}, found {}.",
+                expected, found
+            ),
+            StaticError::Types(tt::check::Error::CannotInferType) => {
+                "type check error: cannot infer type.".to_string()
+            }
+            StaticError::Types(tt::check::Error::DepthLimitExceeded) => {
+                "type check error: depth limit exceeded.".to_string()
+            }
+            StaticError::Types(tt::check::Error::InvalidTupleArity) => {
+                "type check error: invalid tuple arity.".to_string()
+            }
+            StaticError::Types(tt::check::Error::NotAFunction) => {
+                "type check error: not a function.".to_string()
+            }
+            // Ends a sentence, as the type checker's cycle text does
+            StaticError::Effects(e @ effects::Error::Cycle { .. }) => {
+                format!("type check error: {}.", e.message(interner))
+            }
+            StaticError::Effects(e) => format!("type check error: {}", e.message(interner)),
+        }
+    }
+}
+
 /// Root manager for executing a Meerkat node
 pub struct Node {
     /// Local services registered on this node
@@ -230,7 +298,7 @@ impl Node {
         // program does not keep the first one's peers and register this
         // import at a stale one.
         self.discovered_remote_services = imports.remote_service_owners();
-        let (stmts, local_imports) = imports.finalize();
+        let (stmts, local_imports) = imports.finalize()?;
         self.local_imports = local_imports;
         Ok(stmts)
     }
@@ -351,7 +419,7 @@ impl Node {
 
         // Before `finalize`, which consumes the state machine.
         let owners = imports.remote_service_owners();
-        let (stmts, local_imports) = imports.finalize();
+        let (stmts, local_imports) = imports.finalize()?;
         self.discovered_remote_services = owners;
         self.local_imports = local_imports;
         Ok((stmts, buffered_events))
@@ -525,7 +593,6 @@ impl Node {
         manager.local = local;
         manager.network = network;
         manager.install_unified_ast(self.unified_ast);
-        manager.local_services = self.local_services;
 
         // Register the `-i` remotes and run every locally resolved import,
         // before the loop below creates this program's own services: a
@@ -630,120 +697,9 @@ impl Node {
         Ok(())
     }
 
-    /// Format a name resolution error into a user-facing error message
-    ///
-    /// Args:
-    ///     `err` (`nameres::Error`): The name resolution error to format
-    ///
-    /// Returns:
-    ///     `Error`: The formatted Error::Message
-    fn format_nameres_error(&self, err: nameres::Error) -> Error {
-        match err {
-            nameres::Error::UnknownIdentifier {
-                name,
-                expected,
-                context_name,
-            } => {
-                let name_str = self.interner.get(name);
-                let msg = match context_name {
-                    Some(ctx) => {
-                        let ctx_str = self.interner.get(ctx);
-                        format!(
-                            "Unknown identifier '{}' (expected {}) in service '{}'",
-                            name_str, expected, ctx_str
-                        )
-                    }
-                    None => format!("Unknown identifier '{}' (expected {})", name_str, expected),
-                };
-                Error::Message(msg)
-            }
-            nameres::Error::ForwardReference(name) => {
-                let name_str = self.interner.get(name);
-                let msg = format!(
-                    "Invalid forward reference to uninitialized value '{}'",
-                    name_str
-                );
-                Error::Message(msg)
-            }
-            nameres::Error::DepthLimit => Error::Message(nameres::Error::DepthLimit.to_string()),
-        }
-    }
-
-    /// Format a type checking error into a user-facing error message,
-    /// resolving interned symbol identifiers to string representations
-    ///
-    /// Args:
-    ///     `err` (`tt::check::Error`): The type checking error to format
-    ///
-    /// Returns:
-    ///     `Error`: The formatted Error::Message
-    fn format_tt_error(&self, err: tt::check::Error) -> Error {
-        match err {
-            tt::check::Error::RecursiveTypeInference { service, member } => {
-                let service_str = self.interner.get(service);
-                let member_str = self.interner.get(member);
-                Error::Message(format!(
-                    "type check error: dependency cycle detected at service '{}', member '{}'.",
-                    service_str, member_str
-                ))
-            }
-            tt::check::Error::UnboundVariable(s) => {
-                let var_str = self.interner.get(s);
-                Error::Message(format!(
-                    "type check error: unbound variable: '{}'.",
-                    var_str
-                ))
-            }
-            tt::check::Error::UnknownUpdateTarget(service) => {
-                let service_str = self.interner.get(service);
-                Error::Message(format!(
-                    "Target service '{}' for update not found",
-                    service_str
-                ))
-            }
-            tt::check::Error::TypeMismatch { expected, found } => Error::Message(format!(
-                "type check error: type mismatch: expected {}, found {}.",
-                expected, found
-            )),
-            tt::check::Error::CannotInferType => {
-                Error::Message("type check error: cannot infer type.".to_string())
-            }
-            tt::check::Error::DepthLimitExceeded => {
-                Error::Message("type check error: depth limit exceeded.".to_string())
-            }
-            tt::check::Error::InvalidTupleArity => {
-                Error::Message("type check error: invalid tuple arity.".to_string())
-            }
-            tt::check::Error::NotAFunction => {
-                Error::Message("type check error: not a function.".to_string())
-            }
-        }
-    }
-
-    /// Format a dependency error into a user-facing error message,
-    /// resolving interned symbol identifiers to string representations
-    ///
-    /// Args:
-    ///     `err` (`effects::Error`): The dependency error to format
-    ///
-    /// Returns:
-    ///     `Error`: The formatted Error::Message
-    fn format_dependency_error(&self, err: effects::Error) -> Error {
-        let message = err.message(&self.interner);
-        Error::Message(match err {
-            // Ends a sentence, as the type checker's cycle text does
-            effects::Error::Cycle { .. } => format!("type check error: {}.", message),
-            _ => format!("type check error: {}", message),
-        })
-    }
-
     /// Render a failed static check as the user sees it
     fn format_static_error(&self, err: StaticError) -> Error {
-        match err {
-            StaticError::Names(e) => self.format_nameres_error(e),
-            StaticError::Types(e) => self.format_tt_error(e),
-            StaticError::Effects(e) => self.format_dependency_error(e),
-        }
+        Error::Message(err.message(&self.interner))
     }
 
     /// Perform static analysis checks on external program statements
@@ -1003,14 +959,14 @@ mod tests {
         );
     }
 
-    /// Verify that format_tt_error properly formats UnknownUpdateTarget errors
+    /// Verify that an UnknownUpdateTarget error is formatted with its name
     #[test]
     fn test_format_tt_error_unknown_update_target() {
         let mut node = Node::new();
         let sym = node.interner.insert("unknown_s");
 
         let err = tt::check::Error::UnknownUpdateTarget(sym);
-        let res = node.format_tt_error(err);
+        let res = node.format_static_error(StaticError::Types(err));
         assert_eq!(
             res,
             Error::Message("Target service 'unknown_s' for update not found".to_string())

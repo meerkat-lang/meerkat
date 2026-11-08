@@ -1,12 +1,10 @@
 use super::ast::{ActionStmt, Decl, Expr, Stmt, Value};
-use super::env::Env;
 use super::graphs::{
     analysis::service_declarations,
     effects::{self, Effects},
     uninstallable, ServiceGraphs, Uninstallable,
 };
 use super::interpreter::{eval, execute_seq, EvalContext, EvalError, WAIT_DIE_DISPLAY_PREFIX};
-use super::tt::types::ServiceType;
 use crate::net::ast::{NetActionStmt, NetValue};
 use crate::net::network_layer::NetworkLayer;
 use crate::net::{
@@ -374,7 +372,6 @@ pub struct Manager {
     /// Installed declarations and imports, excluding executable program statements
     unified_ast: Vec<Stmt>,
     /// Global local services type environment
-    pub local_services: Env<'static, ServiceType>,
     /// Directory whose files a server answers code requests from (#39); None
     /// on a node that serves no files
     pub served_base_dir: Option<std::path::PathBuf>,
@@ -417,7 +414,9 @@ fn caught_up(target: &VClock, clock: &VClock, sources: Option<&Sources>) -> bool
 /// §5.2's `V_new`: the joined history `v_base` advanced once in each written var
 fn advance(mut v_base: VClock, write_set: &HashSet<(Symbol, Symbol)>) -> VClock {
     for &var in write_set {
-        *v_base.entry(var).or_insert(0) += 1;
+        let counter = v_base.entry(var).or_insert(0);
+        // Wire counters are bounded far below the maximum (`MAX_NET_CLOCK_COUNTER`)
+        *counter = counter.checked_add(1).expect("a clock counter overflowed");
     }
     v_base
 }
@@ -441,7 +440,6 @@ impl Manager {
             interner,
             listener_addrs: HashMap::new(),
             unified_ast: Vec::new(),
-            local_services: Env::new(None),
             served_base_dir: None,
         }
     }
@@ -504,12 +502,15 @@ impl Manager {
             publish(&mut published, member, value);
         }
         for service in self.services.values() {
-            // The function a local member holds is part of its type, as a
+            // The function a local var holds is part of its type, as a
             // version a remote owner delivered is of its member's; a write's
-            // override stands in for what it would overwrite
-            for (&member, state) in &service.vars {
-                if !overrides.contains_key(&(service.name, member)) {
-                    publish(&mut published, (service.name, member), &state.value);
+            // override stands in for what it would overwrite. A def's value
+            // follows from its declaration
+            for &var in &service.graphs.vars {
+                if let Some(state) = service.vars.get(&var) {
+                    if !overrides.contains_key(&(service.name, var)) {
+                        publish(&mut published, (service.name, var), &state.value);
+                    }
                 }
             }
             for (def, cache) in &service.dep_cache {
@@ -554,23 +555,20 @@ impl Manager {
             .collect()
     }
 
-    /// The pairs `txn` read from remote owners for the inputs the graphs of
-    /// `service` name, with the def reading each
-    fn remote_reads<'t>(
+    /// The functions `txn` read from remote owners, by member
+    fn remote_functions_read<'t>(
         &self,
-        service: Symbol,
         txn: &'t Transaction,
-    ) -> Vec<(Symbol, (Symbol, Symbol), &'t ReadEntry)> {
-        self.services[&service]
-            .graphs
-            .cross_deps
+    ) -> HashMap<(Symbol, Symbol), &'t Value> {
+        let remote: HashMap<_, _> = self
+            .remote_services
+            .keys()
+            .map(|&owner| (self.service_net_id_for_name(owner), owner))
+            .collect();
+        txn.read_cache
             .iter()
-            .flat_map(|(&def, inputs)| inputs.iter().map(move |&input| (def, input)))
-            .filter(|(_, (owner, _))| self.remote_services.contains_key(owner))
-            .filter_map(|(def, input)| {
-                let key = (self.service_net_id_for_name(input.0), input.1);
-                txn.read_cache.get(&key).map(|entry| (def, input, entry))
-            })
+            .filter(|(_, entry)| entry.0.is_function())
+            .filter_map(|((id, member), entry)| Some(((*remote.get(id)?, *member), &entry.0)))
             .collect()
     }
 
@@ -697,11 +695,52 @@ impl Manager {
         Ok(())
     }
 
-    /// `check_function_writes` for the writes `txn` buffered on this node
-    fn check_buffered_writes(&self, txn: &Transaction) -> Result<(), EvalError> {
-        self.check_function_writes(txn.written.iter().filter_map(|((sid, var), value)| {
-            Some(((self.service_name_for_net_id(sid)?, *var), value))
-        }))
+    /// `check_function_writes` for the writes `txn` buffered on this node.
+    /// The functions the check analyzed in place of their vars' stay until
+    /// the transaction ends: it takes read locks on the local vars holding
+    /// functions that the defs it analyzed read, so a transaction replacing
+    /// one of them waits or dies, as for any other conflicting write
+    fn check_buffered_writes(&mut self, txn: &mut Transaction) -> Result<(), EvalError> {
+        let writes: HashMap<_, _> = txn
+            .written
+            .iter()
+            .filter_map(|((sid, var), value)| {
+                Some(((self.service_name_for_net_id(sid)?, *var), value))
+            })
+            .filter(|&(member, value)| self.code_changes(member, value))
+            .collect();
+        if writes.is_empty() {
+            return Ok(());
+        }
+        let holders: HashSet<_> = self
+            .services_reading(writes.keys().copied())
+            .into_iter()
+            .flat_map(|service| {
+                let graphs = &self.services[&service].graphs;
+                graphs
+                    .defs
+                    .iter()
+                    .flat_map(move |&def| graphs.inputs(service, def))
+            })
+            .filter(|input| !writes.contains_key(input))
+            .filter(|&(owner, var)| {
+                self.services.get(&owner).is_some_and(|service| {
+                    service.graphs.vars.contains(&var)
+                        && service
+                            .vars
+                            .get(&var)
+                            .is_some_and(|state| state.value.is_function())
+                })
+            })
+            .collect();
+        for (owner, var) in holders {
+            let key = (self.service_net_id_for_name(owner), var);
+            if !txn.locked.contains(&key) {
+                self.acquire_read_lock(owner, var, &txn.id)?;
+                txn.locked.insert(key);
+            }
+        }
+        self.check_function_writes(writes)
     }
 
     /// Park a request on the wait queue for the contended `WaitKey`
@@ -897,21 +936,7 @@ impl Manager {
                     self.create_service(*name, decls).await?;
                     println!("Imported service '{}'", self.interner.get(*name));
                 }
-                Stmt::Update { service_name, .. } => {
-                    let mut txn = crate::runtime::update::Transaction::new(vec![stmt.clone()]);
-                    txn.poll(self).await?;
-                    println!("Service '{}' updated", self.interner.get(*service_name));
-                }
-                Stmt::Atomic { updates } => {
-                    if !updates.is_empty() {
-                        let mut txn = crate::runtime::update::Transaction::new(updates.clone());
-                        txn.poll(self).await?;
-                        println!(
-                            "Atomic update transaction completed ({} updates)",
-                            updates.len()
-                        );
-                    }
-                }
+                Stmt::Update { .. } | Stmt::Atomic { .. } => self.run_update(stmt).await?,
                 Stmt::Import { .. }
                 | Stmt::Connect { .. }
                 | Stmt::Test { .. }
@@ -934,24 +959,38 @@ impl Manager {
                     .map_err(|e| format!("Service error: {}", e))?;
                 println!("Service '{}' loaded", self.interner.get(*name));
             }
-            Stmt::Update { service_name, .. } => {
-                let mut txn = crate::runtime::update::Transaction::new(vec![stmt.clone()]);
-                txn.poll(self)
-                    .await
-                    .map_err(|e| format!("Update error: {}", e))?;
-                println!("Service '{}' updated", self.interner.get(*service_name));
-            }
-            Stmt::Atomic { updates } if !updates.is_empty() => {
-                let mut txn = crate::runtime::update::Transaction::new(updates.clone());
-                txn.poll(self)
-                    .await
-                    .map_err(|e| format!("Atomic update error: {}", e))?;
-                println!(
-                    "Atomic update transaction completed ({} updates)",
-                    updates.len()
-                );
-            }
+            Stmt::Update { .. } => self
+                .run_update(stmt)
+                .await
+                .map_err(|e| format!("Update error: {}", e))?,
+            Stmt::Atomic { .. } => self
+                .run_update(stmt)
+                .await
+                .map_err(|e| format!("Atomic update error: {}", e))?,
             _ => {}
+        }
+        Ok(())
+    }
+
+    /// Run `stmt`, an `update` or `atomic` statement, as a code update that
+    /// waits for the first values of the defs it introduces
+    async fn run_update(&mut self, stmt: &Stmt) -> Result<(), EvalError> {
+        let updates = match stmt {
+            Stmt::Update { .. } => vec![stmt.clone()],
+            Stmt::Atomic { updates } => updates.clone(),
+            _ => return Ok(()),
+        };
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let count = updates.len();
+        let mut txn = crate::runtime::update::Transaction::new(updates);
+        txn.poll(self).await?;
+        match stmt {
+            Stmt::Update { service_name, .. } => {
+                println!("Service '{}' updated", self.interner.get(*service_name))
+            }
+            _ => println!("Atomic update transaction completed ({} updates)", count),
         }
         Ok(())
     }
@@ -1082,16 +1121,8 @@ impl Manager {
                     // The functions initialization read from remote owners are
                     // part of the types of the members read: the graphs follow
                     // them before the def's inputs are settled
-                    loop {
-                        let read: HashMap<_, _> = self
-                            .remote_reads(svc_name, &txn)
-                            .into_iter()
-                            .filter(|(_, _, entry)| entry.0.is_function())
-                            .map(|(_, input, entry)| (input, &entry.0))
-                            .collect();
-                        if read.len() <= published {
-                            break;
-                        }
+                    let read = self.remote_functions_read(&txn);
+                    if read.len() > published {
                         published = read.len();
                         let mut graphs = self.graphs_of(&self.unified_ast, [svc_name], &read);
                         self.check_graphs(&graphs)?;
@@ -1142,10 +1173,18 @@ impl Manager {
 
             // The remote pairs initialization read stay each def's incorporated
             // inputs, with their clocks, including those its calls reached
-            let remote_inputs: Vec<_> = self
-                .remote_reads(svc_name, &txn)
-                .into_iter()
-                .map(|(def, input, entry)| (def, input, entry.clone()))
+            let remote_inputs: Vec<_> = self.services[&svc_name]
+                .graphs
+                .cross_deps
+                .iter()
+                .flat_map(|(&def, inputs)| inputs.iter().map(move |&input| (def, input)))
+                .filter(|(_, (owner, _))| self.remote_services.contains_key(owner))
+                .filter_map(|(def, input)| {
+                    let key = (self.service_net_id_for_name(input.0), input.1);
+                    txn.read_cache
+                        .get(&key)
+                        .map(|entry| (def, input, entry.clone()))
+                })
                 .collect();
             let service = self.services.get_mut(&svc_name).unwrap();
             for (def, input, entry) in remote_inputs {
@@ -1765,7 +1804,7 @@ impl Manager {
     }
 
     /// Advance `def` through the batches its inputs allow (§3.3.2): the base
-    /// observation first, unless `trigger` names the input whose delivery is
+    /// observation first, unless `delivered` says a pending delivery is
     /// the only change, then each input with a pending delivery roots a
     /// batch, until no root yields one. Each batch adopted consumes a
     /// delivery, so this ends. A batch whose evaluation fails is adopted all
@@ -1776,7 +1815,7 @@ impl Manager {
     async fn advance_def(
         &mut self,
         (svc, def): (Symbol, Symbol),
-        trigger: Option<(Symbol, Symbol)>,
+        delivered: bool,
     ) -> (bool, Option<EvalError>) {
         let Some(expr) = self
             .services
@@ -1798,7 +1837,7 @@ impl Manager {
         let inputs: Vec<_> = service.graphs.inputs(svc, def).collect();
         let mut changed = false;
         let mut failed = None;
-        let mut base = trigger.is_none();
+        let mut base = !delivered;
         let mut waited = HashSet::new();
         loop {
             let root =
@@ -1836,20 +1875,15 @@ impl Manager {
     /// Recompute `def` from the paired snapshots of its inputs: whether its
     /// value, clock or Sources changed
     pub(crate) async fn recompute_def(&mut self, svc: Symbol, def: Symbol) -> bool {
-        self.recompute_from(svc, def, None).await
+        self.recompute_from(svc, def, false).await
     }
 
-    /// `recompute_def` after a delivery of `trigger`: the pending deliveries,
+    /// `recompute_def` after a delivery (`delivered`): the pending deliveries,
     /// not the base observation, are what can advance `def`. A failed
     /// evaluation is logged, as for any propagation; the batches installed
     /// before and after it are notified all the same
-    async fn recompute_from(
-        &mut self,
-        svc: Symbol,
-        def: Symbol,
-        trigger: Option<(Symbol, Symbol)>,
-    ) -> bool {
-        let (changed, failed) = self.advance_def((svc, def), trigger).await;
+    async fn recompute_from(&mut self, svc: Symbol, def: Symbol, delivered: bool) -> bool {
+        let (changed, failed) = self.advance_def((svc, def), delivered).await;
         if let Some(e) = failed {
             log::warn!(
                 "propagation of def '{}' failed: {}",
@@ -1879,7 +1913,7 @@ impl Manager {
             if !service.defs.contains_key(&def) {
                 return Ok(Some((svc, def)));
             }
-            match self.advance_def((svc, def), None).await {
+            match self.advance_def((svc, def), false).await {
                 (false, Some(e)) => {
                     return Err(EvalError::RuntimeError(format!(
                         "Update committed, but '{}.{}' cannot be initialized: {}",
@@ -1989,22 +2023,23 @@ impl Manager {
     }
 
     /// Drive a top-level code update until its new defs have first values.
-    /// Only pauses count against this nominal reply-timeout budget.
     pub async fn await_first_values(&mut self, defs: &[(Symbol, Symbol)]) -> Result<(), EvalError> {
-        let mut remaining_ms: i64 = 15_000;
+        let deadline = web_time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut keepalive = web_time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             self.serve_network_events().await;
             let Some(waiting) = self.first_values(defs).await? else {
                 return Ok(());
             };
-            if remaining_ms <= 0 {
+            let now = web_time::Instant::now();
+            if now >= deadline {
                 return Err(self.uninitialized(waiting));
             }
-            if remaining_ms % 5_000 == 0 {
+            if now >= keepalive {
                 self.keepalive_waiters().await;
+                keepalive = now + std::time::Duration::from_secs(5);
             }
             retry_backoff(10).await;
-            remaining_ms -= 10;
         }
     }
 
@@ -2143,7 +2178,7 @@ impl Manager {
         // created declares. Without this guard, an unknown member from
         // untrusted network input would permanently grow listeners,
         // listener_addrs, and the interner with no-op subscriptions.
-        let Some(service) = self.services.get(&service_sym) else {
+        let Some(service) = self.services.get_mut(&service_sym) else {
             return;
         };
         let has_value = service.vars.contains_key(&member_sym);
@@ -2155,14 +2190,11 @@ impl Manager {
         {
             return;
         }
-        if let Some(svc) = self.services.get_mut(&service_sym) {
-            svc.listeners
-                .entry(member_sym)
-                .or_default()
-                .insert((listener_id.clone(), listener_def_sym));
-        } else {
-            return;
-        }
+        service
+            .listeners
+            .entry(member_sym)
+            .or_default()
+            .insert((listener_id.clone(), listener_def_sym));
         self.listener_addrs
             .insert(listener_id.clone(), reply_to.clone());
 
@@ -2210,7 +2242,7 @@ impl Manager {
         entry: ReadEntry,
     ) -> Option<bool> {
         let (svc, new_code) = self.accept_delivery(listener, def, source, entry).await?;
-        if self.recompute_from(svc, def, Some(source)).await {
+        if self.recompute_from(svc, def, true).await {
             self.propagate(svc, def).await;
         }
         Some(new_code)
@@ -2233,6 +2265,11 @@ impl Manager {
             .services
             .iter()
             .find(|(_, s)| s.id == listener_id && s.defs.contains_key(&listener_def_sym))?;
+        // A member of the def's own service is read in place and has no
+        // queue (`input_candidates`): nothing delivered for it is taken
+        if source.0 == listener_svc {
+            return None;
+        }
         // A member the def no longer reads: nothing it could incorporate
         if !service.graphs.reads(listener_svc, listener_def_sym, source) {
             return None;
@@ -2506,21 +2543,17 @@ impl Manager {
                     // Everything else is a reply: route it to its waiter.
                     other => {
                         let rid = match &other {
-                            MeerkatMessage::LookupResponse { request_id, .. } => Some(*request_id),
-                            MeerkatMessage::LookupError { request_id, .. } => Some(*request_id),
-                            MeerkatMessage::ActionResponse { request_id, .. } => Some(*request_id),
-                            MeerkatMessage::CommitResponse { request_id, .. } => Some(*request_id),
-                            MeerkatMessage::AbortResponse { request_id, .. } => Some(*request_id),
-                            MeerkatMessage::LockResponse { request_id, .. } => Some(*request_id),
-                            MeerkatMessage::WaitParked { request_id, .. } => Some(*request_id),
                             // #39: code responses are replies routed to the waiting client.
-                            MeerkatMessage::ServiceCodeResponse { request_id, .. } => {
-                                Some(*request_id)
-                            }
-                            MeerkatMessage::ServiceCodeError { request_id, .. } => {
-                                Some(*request_id)
-                            }
-                            MeerkatMessage::UpdateServiceResponse { request_id, .. } => {
+                            MeerkatMessage::LookupResponse { request_id, .. }
+                            | MeerkatMessage::LookupError { request_id, .. }
+                            | MeerkatMessage::ActionResponse { request_id, .. }
+                            | MeerkatMessage::CommitResponse { request_id, .. }
+                            | MeerkatMessage::AbortResponse { request_id, .. }
+                            | MeerkatMessage::LockResponse { request_id, .. }
+                            | MeerkatMessage::WaitParked { request_id, .. }
+                            | MeerkatMessage::ServiceCodeResponse { request_id, .. }
+                            | MeerkatMessage::ServiceCodeError { request_id, .. }
+                            | MeerkatMessage::UpdateServiceResponse { request_id, .. } => {
                                 Some(*request_id)
                             }
                             MeerkatMessage::Ping { .. }
@@ -3568,16 +3601,6 @@ impl Manager {
                 services,
                 reply_to,
             } => {
-                if let Err(e) = codec::validate_lock_request(&services) {
-                    let response = MeerkatMessage::LockResponse {
-                        request_id,
-                        txn_id,
-                        success: false,
-                        error: Some(e.to_string()),
-                    };
-                    self.send_oneway(Address::new(&reply_to), response).await;
-                    return None;
-                }
                 self.run_and_reply_or_park(ParkedRequest::Lock {
                     request_id,
                     reply_to,
@@ -3873,7 +3896,7 @@ impl Manager {
             // A function value written is committed only if the defs
             // applying it keep the reads they were installed with
             if exec_error.is_none() {
-                exec_error = self.check_buffered_writes(&txn).err();
+                exec_error = self.check_buffered_writes(&mut txn).err();
             }
 
             // Both wait-die outcomes retry the whole transaction. A participant
@@ -4036,7 +4059,7 @@ impl Manager {
             .await
             .err();
         if exec_error.is_none() {
-            exec_error = self.check_buffered_writes(&txn).err();
+            exec_error = self.check_buffered_writes(&mut txn).err();
         }
         // Positions are dense, so a completed run that did not reach every
         // recorded one branched past a composed action the parked run made,
@@ -7454,6 +7477,114 @@ mod tests {
             "the attempt released the lock it had taken on `a`, so the request \
              parked on it must be reported for waking"
         );
+    }
+
+    /// A participant run that parks must leave its own writes unbuffered.
+    ///
+    /// The whole action is re-run from its first statement when the lock
+    /// frees, so a write left behind would be read back by the re-run:
+    /// `x = x + 1` would be applied twice and commit `2`
+    #[tokio::test]
+    async fn test_parked_participant_run_rolls_back_what_it_buffered() {
+        let mut tc = manager_with_a_and_x().await;
+        let a = tc.manager.interner.insert("a");
+        let sid = tc.manager.service_net_id_for_name(tc.foo);
+
+        // A younger transaction holds `a`, so the older one below waits on it
+        let lock_a = |tc: &mut TestContext, lock| {
+            tc.manager
+                .services
+                .get_mut(&tc.foo)
+                .unwrap()
+                .vars
+                .get_mut(&a)
+                .unwrap()
+                .lock = lock;
+        };
+        let younger = TxnId {
+            timestamp: u128::MAX,
+            node_id: tc.manager.node_id,
+            iteration: 0,
+        };
+        lock_a(&mut tc, crate::runtime::txn::VarLock::WriteLocked(younger));
+        let older = TxnId {
+            timestamp: 1,
+            node_id: tc.manager.node_id,
+            iteration: 0,
+        };
+        let stmts = vec![
+            incr_x(&tc),
+            ActionStmt::Assign {
+                name: a,
+                expr: Expr::Literal {
+                    val: Value::Int { val: 1 },
+                },
+            },
+        ];
+
+        // First attempt: `x` is buffered, then the write to `a` parks
+        let parked = tc
+            .manager
+            .execute_action_participant(tc.foo, &stmts, &[], older.clone())
+            .await;
+        assert!(
+            matches!(parked, Err(EvalError::WaitOn(_))),
+            "writing `a` must wait, got {parked:?}"
+        );
+        let txn = &tc.manager.pending_txns[&older];
+        assert_eq!(txn.written.get(&(sid.clone(), tc.x)), None);
+        assert_eq!(txn.read_cache.get(&(sid.clone(), tc.x)), None);
+        // The write lock on `x` is kept: it holds this transaction's place
+        assert!(matches!(
+            tc.manager.services[&tc.foo].vars[&tc.x].lock,
+            crate::runtime::txn::VarLock::WriteLocked(_)
+        ));
+
+        // `a` frees and the parked action is re-run from the top
+        lock_a(&mut tc, crate::runtime::txn::VarLock::Unlocked);
+        tc.manager
+            .execute_action_participant(tc.foo, &stmts, &[], older.clone())
+            .await
+            .expect("with `a` free the action completes");
+        assert_eq!(
+            tc.manager.pending_txns[&older].written[&(sid, tc.x)],
+            Value::Int { val: 1 },
+            "2 means the re-run read the value the parked attempt buffered"
+        );
+    }
+
+    /// A second action composed onto the same participant under one
+    /// transaction id must keep what the first one wrote, which is why a
+    /// parked run restores its buffers rather than clearing them
+    #[tokio::test]
+    async fn test_second_action_under_one_txn_keeps_the_first_write() {
+        let mut tc = manager_with_a_and_x().await;
+        let a = tc.manager.interner.insert("a");
+        let sid = tc.manager.service_net_id_for_name(tc.foo);
+        let tid = TxnId::new(tc.manager.node_id);
+
+        tc.manager
+            .execute_action_participant(
+                tc.foo,
+                &[ActionStmt::Assign {
+                    name: a,
+                    expr: Expr::Literal {
+                        val: Value::Int { val: 7 },
+                    },
+                }],
+                &[],
+                tid.clone(),
+            )
+            .await
+            .unwrap();
+        tc.manager
+            .execute_action_participant(tc.foo, &[incr_x(&tc)], &[], tid.clone())
+            .await
+            .unwrap();
+
+        let written = &tc.manager.pending_txns[&tid].written;
+        assert_eq!(written[&(sid.clone(), a)], Value::Int { val: 7 });
+        assert_eq!(written[&(sid, tc.x)], Value::Int { val: 1 });
     }
 
     async fn start_local_manager(code: &str) -> Manager {

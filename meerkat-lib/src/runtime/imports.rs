@@ -9,7 +9,7 @@ use std::time::Instant;
 use crate::error::{Error, Result};
 use crate::net::types::MeerkatMessage;
 use crate::net::{Address, MessageId, NetworkCommand};
-use crate::runtime::ast::Stmt;
+use crate::runtime::ast::{apply_updates_to_ast, Stmt};
 use crate::runtime::interner::{Interner, Symbol};
 use crate::runtime::limits::{
     INDIVIDUAL_IMPORT_TIMEOUT_SECS, MAX_IMPORTED_SERVICES, MAX_IMPORT_RETRIES,
@@ -58,8 +58,8 @@ pub struct Imports<'a> {
     pending_services: HashSet<String>,
     remote_url_map: HashMap<String, String>,
     modules: Vec<ImportedModule>,
-    /// Services the root program declares itself. This node serves them, so a
-    /// peer that happens to declare the same name does not own them here.
+    /// Services declared by the root program or local disk modules. This node
+    /// serves them, so a peer declaring the same name does not own them here.
     local_declares: HashSet<Symbol>,
     request_counter: u64,
     my_addr: String,
@@ -260,6 +260,9 @@ impl<'a> Imports<'a> {
         for stmt in &parsed_stmts {
             if let Stmt::Service { name, .. } = stmt {
                 self.visited_services.insert(*name);
+                if remote_peer.is_none() {
+                    self.local_declares.insert(*name);
+                }
             }
         }
 
@@ -429,17 +432,22 @@ impl<'a> Imports<'a> {
     /// The statements of the modules read from local disk are also returned
     /// on their own, in the same order: they are the imports this node runs
     /// at startup. A module fetched from a peer is that peer's own program, so
-    /// only the peer runs it; here it only informs the static checks.
+    /// only the peer runs it: its startup updates are folded into the
+    /// declarations they complete, which is how the peer serves them, and
+    /// one updating a service the peer does not serve is refused
     ///
     /// Returns:
     ///   `(Vec<Stmt>, Vec<Stmt>)`: Dependency-ordered AST of all imported
     ///   services, and the statements of the local disk modules among them
-    pub fn finalize(self) -> (Vec<Stmt>, Vec<Stmt>) {
+    pub fn finalize(self) -> Result<(Vec<Stmt>, Vec<Stmt>)> {
         // Which module declares each service, so an import edge can be
         // followed to the module that satisfies it. First declaration wins.
         let mut owner: HashMap<Symbol, usize> = HashMap::new();
         for (idx, module) in self.modules.iter().enumerate() {
             for svc in &module.declares {
+                if module.remote_peer.is_some() && self.local_declares.contains(svc) {
+                    continue;
+                }
                 owner.entry(*svc).or_insert(idx);
             }
         }
@@ -463,6 +471,7 @@ impl<'a> Imports<'a> {
         // can see the services (a better diagnostic than looping here).
         let mut ordered: Vec<Stmt> = Vec::new();
         let mut local_ordered: Vec<Stmt> = Vec::new();
+        let mut peer_updates: Vec<Stmt> = Vec::new();
         let mut done = vec![false; count];
         let mut on_stack = vec![false; count];
 
@@ -482,8 +491,19 @@ impl<'a> Imports<'a> {
                     if let Some(module_stmts) = stmts[idx].take() {
                         if local[idx] {
                             local_ordered.extend_from_slice(&module_stmts);
+                            ordered.extend(module_stmts);
+                        } else {
+                            for stmt in module_stmts {
+                                match stmt {
+                                    Stmt::Update { .. } | Stmt::Atomic { .. } => {
+                                        peer_updates.push(stmt)
+                                    }
+                                    Stmt::Service { name, .. }
+                                        if self.local_declares.contains(&name) => {}
+                                    _ => ordered.push(stmt),
+                                }
+                            }
                         }
-                        ordered.extend(module_stmts);
                     }
                     continue;
                 }
@@ -501,7 +521,27 @@ impl<'a> Imports<'a> {
             }
         }
 
-        (ordered, local_ordered)
+        let is_peer_service = |stmt: &Stmt| matches!(stmt, Stmt::Service { name, .. } if !self.local_declares.contains(name));
+        let peer_services: Vec<Stmt> = ordered
+            .iter()
+            .filter(|stmt| is_peer_service(stmt))
+            .cloned()
+            .collect();
+        let folded = apply_updates_to_ast(&peer_services, &peer_updates).map_err(|name| {
+            Error::Message(format!(
+                "a module fetched from a peer updates service '{}', which that peer does not serve",
+                self.interner.get(name)
+            ))
+        })?;
+        // Folding preserves the declarations' order, including repeated names.
+        for (stmt, service) in ordered
+            .iter_mut()
+            .filter(|stmt| is_peer_service(stmt))
+            .zip(folded)
+        {
+            *stmt = service;
+        }
+        Ok((ordered, local_ordered))
     }
 
     /// Services owned by a peer because a network-fetched module declares them
@@ -516,11 +556,9 @@ impl<'a> Imports<'a> {
     /// merges directly into the `-i` map. Empty unless imports were fetched
     /// over the network: a module read from local disk is served by this node.
     ///
-    /// A name the root program declares itself is never reported, even when a
-    /// peer's module happens to declare it too: this node serves its own
-    /// declaration. Reporting it would put an entry the user never asked for
-    /// into the `-i` map, where `Manager::register_remote_services` would
-    /// discard it and blame a `-i` flag that was never typed.
+    /// A name declared by the root program or a disk module is never reported,
+    /// even when a peer's module declares it too: this node serves its own
+    /// declaration.
     ///
     /// Returns:
     ///   `HashMap<String, String>`: Service name to serving URL

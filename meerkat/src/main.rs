@@ -333,13 +333,7 @@ async fn init_server_services(
         .map_err(|e| format!("Import service error: {}", e))?;
 
     for stmt in prog {
-        if let Stmt::Service { name, decls } = stmt {
-            manager
-                .create_service(*name, decls.clone())
-                .await
-                .map_err(|e| format!("Service error: {}", e))?;
-            println!("Service '{}' loaded", manager.interner.get(*name));
-        }
+        manager.run_declaration(stmt).await?;
     }
     Ok(())
 }
@@ -699,9 +693,9 @@ async fn run_client(
                     println!("[update] {}.{} = {:?}", source_service, member, parsed);
                 }
                 let lid = ServiceNetId(listener_service);
-                // #24: validate + intern wire names through codec; skip on bad input.
-                // Vector-clock PR: the clock's dimension names are interned here
-                // too, so a bad one drops the whole message.
+                // #24: validate + intern wire names through codec; skip on bad
+                // input. The clock's dimension names are interned here too, so
+                // a bad one drops the whole message.
                 let (def_sym, source_sym, member_sym, vclock, sources) = match codec::decode_update(
                     &listener_def,
                     &source_service,
@@ -1304,6 +1298,45 @@ mod tests {
         assert!(
             manager.services.contains_key(&dep),
             "an unrelated -i flag must not strip the program's imports"
+        );
+    }
+
+    /// Server mode runs the program's own startup `update` statements, not
+    /// only its `service` declarations
+    #[tokio::test]
+    async fn init_server_services_runs_the_programs_startup_updates() {
+        let mut interner = Interner::new();
+        let full = parser::parse_string(
+            "service dep { var x = 1; } service app { def y = dep.x + 1; } update app { pub def z = y + 1; }",
+            &mut interner,
+        )
+        .expect("fixture parses");
+        let imports = parser::parse_string("service dep { var x = 1; }", &mut interner)
+            .expect("fixture parses");
+        let prog = parser::parse_string(
+            "service app { def y = dep.x + 1; } update app { pub def z = y + 1; }",
+            &mut interner,
+        )
+        .expect("fixture parses");
+        let app = interner.insert("app");
+        let z = interner.insert("z");
+
+        let mut manager = Manager::new(interner);
+        manager.local = true;
+        init_server_services(
+            &mut manager,
+            full,
+            &imports,
+            &prog,
+            &std::collections::HashMap::new(),
+        )
+        .await
+        .expect("server startup succeeds");
+
+        assert_eq!(
+            manager.services[&app].vars[&z].value,
+            meerkat_lib::ast::Value::Int { val: 3 },
+            "the startup update must be applied"
         );
     }
 

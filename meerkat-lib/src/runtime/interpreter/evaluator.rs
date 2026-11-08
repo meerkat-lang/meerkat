@@ -17,7 +17,7 @@ pub enum EvalError {
     WaitOn(WaitKey),
     AssertionError(String),
     RuntimeError(String),
-    InputNotReady((Symbol, Symbol)),
+    InputNotReady(String),
 }
 
 /// The text `EvalError::WaitDieAbort` displays itself with.
@@ -53,7 +53,7 @@ impl std::fmt::Display for EvalError {
             }
             EvalError::AssertionError(s) => write!(f, "Assertion failed: {}", s),
             EvalError::RuntimeError(s) => write!(f, "Runtime error: {}", s),
-            EvalError::InputNotReady(input) => write!(f, "Reactive input {:?} is not ready", input),
+            EvalError::InputNotReady(s) => write!(f, "Reactive input '{}' is not ready", s),
         }
     }
 }
@@ -90,10 +90,13 @@ async fn lookup_input(
     inputs: Option<&HashMap<(Symbol, Symbol), Value>>,
 ) -> Result<Value, EvalError> {
     if let Some(inputs) = inputs {
-        return inputs
-            .get(&input)
-            .cloned()
-            .ok_or(EvalError::InputNotReady(input));
+        return inputs.get(&input).cloned().ok_or_else(|| {
+            EvalError::InputNotReady(format!(
+                "{}.{}",
+                ctx.manager.interner.get(input.0),
+                ctx.manager.interner.get(input.1)
+            ))
+        });
     }
     ctx.manager
         .lookup(input.1, input.0, ctx.txn.as_deref_mut())

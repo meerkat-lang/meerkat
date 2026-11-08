@@ -102,10 +102,13 @@ impl Transaction {
         manager: &mut Manager,
     ) -> Result<Vec<(Symbol, Symbol)>, EvalError> {
         let result = self.try_apply(manager).await;
-        // Whatever the outcome, the member locks and the participants' locks
-        // this update holds are released here, once. A failure before the
-        // local commit leaves nothing installed; one a remote owner reports
-        // afterwards leaves the local part installed and is returned
+        // Whatever the outcome, the locks this update holds on this node are
+        // released here, once. Remote participants are told only on the paths
+        // that do so themselves: commit sends them `Commit`, and a failure in
+        // `commit` aborts them. Other failures before the local commit leave
+        // their locks held (to be fixed separately). A failure before the
+        // local commit leaves nothing installed here; one a remote owner
+        // reports afterwards leaves the local part installed and is returned
         self.release_lock_txn(manager);
         result
     }

@@ -12,6 +12,7 @@ use crate::net::{
     NetworkReply, ServiceNetId,
 };
 use crate::runtime::interner::{Interner, Symbol};
+use crate::runtime::limits::{FIRST_VALUE_TIMEOUT, KEEPALIVE_INTERVAL, REPLY_TIMEOUT};
 use crate::runtime::txn::{
     ComposedCall, ReadEntry, Sources, Transaction, TxnId, VClock, VarState, WaitKey,
 };
@@ -1979,7 +1980,7 @@ impl Manager {
                 request_id,
                 reply_to,
                 introduced,
-                web_time::Instant::now() + std::time::Duration::from_secs(15),
+                web_time::Instant::now() + FIRST_VALUE_TIMEOUT,
             )),
             Err(error) => {
                 self.reply_update_service(request_id, &reply_to, Some(error))
@@ -2042,8 +2043,8 @@ impl Manager {
 
     /// Drive a top-level code update until its new defs have first values.
     pub async fn await_first_values(&mut self, defs: &[(Symbol, Symbol)]) -> Result<(), EvalError> {
-        let deadline = web_time::Instant::now() + std::time::Duration::from_secs(15);
-        let mut keepalive = web_time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = web_time::Instant::now() + FIRST_VALUE_TIMEOUT;
+        let mut keepalive = web_time::Instant::now() + KEEPALIVE_INTERVAL;
         loop {
             self.serve_network_events().await;
             let Some(waiting) = self.first_values(defs).await? else {
@@ -2055,7 +2056,7 @@ impl Manager {
             }
             if now >= keepalive {
                 self.keepalive_waiters().await;
-                keepalive = now + std::time::Duration::from_secs(5);
+                keepalive = now + KEEPALIVE_INTERVAL;
             }
             retry_backoff(10).await;
         }
@@ -2688,12 +2689,12 @@ impl Manager {
         // way spawn_event_loop is split between tokio and wasm_bindgen_futures.
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let timeout = tokio::time::sleep(Duration::from_secs(15));
+            let timeout = tokio::time::sleep(REPLY_TIMEOUT);
             tokio::pin!(timeout);
 
             loop {
                 self.dispatch_network_events().await;
-                if last_keepalive.elapsed() >= std::time::Duration::from_secs(5) {
+                if last_keepalive.elapsed() >= KEEPALIVE_INTERVAL {
                     self.keepalive_waiters().await;
                     last_keepalive = web_time::Instant::now();
                 }
@@ -2710,7 +2711,7 @@ impl Manager {
                                 rx = nrx;
                                 timeout
                                     .as_mut()
-                                    .reset(tokio::time::Instant::now() + Duration::from_secs(15));
+                                    .reset(tokio::time::Instant::now() + REPLY_TIMEOUT);
                             }
                             Ok(msg) => return Ok(msg),
                             Err(_) => {
@@ -2735,10 +2736,10 @@ impl Manager {
 
             // Deadline tracked with performance.now() via instant/web-time-free
             // arithmetic: recreate the timeout each iteration rather than reset.
-            let mut remaining_ms: i64 = 15_000;
+            let mut remaining_ms = REPLY_TIMEOUT.as_millis() as i64;
             loop {
                 self.dispatch_network_events().await;
-                if last_keepalive.elapsed() >= std::time::Duration::from_secs(5) {
+                if last_keepalive.elapsed() >= KEEPALIVE_INTERVAL {
                     self.keepalive_waiters().await;
                     last_keepalive = web_time::Instant::now();
                 }
@@ -2762,7 +2763,7 @@ impl Manager {
                                 let (ntx, nrx) = oneshot::channel::<MeerkatMessage>();
                                 self.pending_replies.insert(request_id, ntx);
                                 rx = nrx;
-                                remaining_ms = 15_000;
+                                remaining_ms = REPLY_TIMEOUT.as_millis() as i64;
                             }
                             Ok(msg) => return Ok(msg),
                             Err(_) => {

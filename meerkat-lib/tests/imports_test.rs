@@ -908,3 +908,60 @@ async fn test_imports_fold_a_peers_startup_updates_into_its_declarations() {
         .expect("the update resolves dep.y, which the peer declares");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Resolve the imports of a program that imports `dep` from a peer and
+/// `helper` from disk, with `peer_source` as the code the peer sends for
+/// `dep`, and return what `finalize` reports
+fn finalize_with_peer_source(label: &str, peer_source: &str) -> Result<(), String> {
+    let dir = unique_temp_dir(label);
+    std::fs::write(dir.join("helper.mkt"), "service helper { var v = 1; }\n").unwrap();
+    let mut interner = Interner::new();
+    let base_ast = parser::parse_string(
+        "import dep\nimport helper\nservice app { var x = 0; }",
+        &mut interner,
+    )
+    .expect("program parses");
+    let mut remote_map = HashMap::new();
+    remote_map.insert("dep".to_string(), "/ip4/127.0.0.1/tcp/9000".to_string());
+    let (mut imports, _) = Imports::new(
+        &mut interner,
+        remote_map,
+        &base_ast,
+        &dir,
+        "/ip4/127.0.0.1/tcp/8000/p2p/peer_a",
+    )
+    .expect("Imports::new success");
+    imports
+        .on_recv_source(peer_source, "dep", &dir)
+        .expect("on_recv_source success");
+    let result = imports.finalize().map(|_| ()).map_err(|e| e.to_string());
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+/// A module fetched from a peer may only update the services that peer
+/// serves. One updating a service this node declares, in its own program or
+/// in a module read from disk, is refused rather than folded into local code
+#[test]
+fn test_imports_refuse_a_peers_update_to_a_local_service() {
+    for (label, target) in [
+        ("peer_updates_root", "app"),
+        ("peer_updates_disk", "helper"),
+    ] {
+        let source = format!("service dep {{ var x = 1; }}\nupdate {target} {{ pub def q = 2; }}");
+        let error = finalize_with_peer_source(label, &source)
+            .expect_err("a peer's update to a local service must be refused");
+        assert!(
+            error.contains(&format!(
+                "updates service '{target}', which that peer does not serve"
+            )),
+            "unexpected error for '{target}': {error}"
+        );
+    }
+    // The same update aimed at the peer's own service is folded as usual
+    finalize_with_peer_source(
+        "peer_updates_own",
+        "service dep { var x = 1; }\nupdate dep { pub def q = 2; }",
+    )
+    .expect("a peer's update to its own service is folded");
+}

@@ -36,6 +36,9 @@ pub type ImportCommand = (NetworkCommand, String, String, u8);
 /// One imported file, kept whole so the resolved AST can be emitted in
 /// dependency order rather than in the order replies happened to arrive.
 struct ImportedModule {
+    /// The name the module was requested under, used to name it when
+    /// refusing an update that points the wrong way.
+    name: Symbol,
     /// Services this file declares.
     declares: Vec<Symbol>,
     /// Services this file imports.
@@ -61,6 +64,9 @@ pub struct Imports<'a> {
     /// Services declared by the root program or local disk modules. This node
     /// serves them, so a peer declaring the same name does not own them here.
     local_declares: HashSet<Symbol>,
+    /// Services declared by the root program itself. Disk modules start before
+    /// it, so a module may not update these.
+    root_declares: HashSet<Symbol>,
     request_counter: u64,
     my_addr: String,
 }
@@ -100,6 +106,7 @@ impl<'a> Imports<'a> {
         let mut imports = Imports {
             interner,
             local_declares: visited_services.clone(),
+            root_declares: visited_services.clone(),
             visited_services,
             pending_network: HashMap::new(),
             pending_services: HashSet::new(),
@@ -219,7 +226,8 @@ impl<'a> Imports<'a> {
         self.pending_network
             .retain(|_, req| req.service_name != service_name);
 
-        self.record_source(source, base_dir, Some(remote_peer))
+        let name = self.interner.insert(service_name);
+        self.record_source(source, base_dir, Some(remote_peer), name)
     }
 
     /// Record a resolved import's source and resolve its own imports in turn
@@ -234,6 +242,8 @@ impl<'a> Imports<'a> {
     /// Args:
     ///   `source` (`&str`): Raw source text of the imported file
     ///   `base_dir` (`&Path`): Directory for local imports
+    ///   `remote_peer` (`Option<Address>`): Peer serving the file, if any
+    ///   `name` (`Symbol`): The name the module was requested under
     ///
     /// Returns:
     ///   `Result<Vec<ImportCommand>>`: Fetch commands for its own imports
@@ -245,6 +255,7 @@ impl<'a> Imports<'a> {
         source: &str,
         base_dir: &Path,
         remote_peer: Option<Address>,
+        name: Symbol,
     ) -> Result<Vec<ImportCommand>> {
         if self.visited_services.len() >= MAX_IMPORTED_SERVICES {
             return Err(Error::LimitExceeded(format!(
@@ -271,6 +282,7 @@ impl<'a> Imports<'a> {
         // it is recorded, so a dependency always lands *after* its dependent.
         // `finalize` sorts this out.
         self.modules.push(ImportedModule {
+            name,
             declares: parsed_stmts
                 .iter()
                 .filter_map(|s| match s {
@@ -452,6 +464,65 @@ impl<'a> Imports<'a> {
             }
         }
 
+        // Which modules each module imports, followed to the end of the chain.
+        // A module's startup updates may target its own services and those of
+        // anything it imports, directly or transitively: startup creates those
+        // first. It may not target a service declared by the root program or
+        // by a module that imports it -- an imported module starts before its
+        // importer, so that service does not exist yet -- which today fails at
+        // startup with a message about a service not being found. Refuse the
+        // reversed update here, before anything runs.
+        let mut reach: Vec<HashSet<usize>> = Vec::with_capacity(self.modules.len());
+        for (idx, module) in self.modules.iter().enumerate() {
+            let mut seen: HashSet<usize> = HashSet::new();
+            let mut pending: Vec<Symbol> = module.imports.clone();
+            while let Some(svc) = pending.pop() {
+                let Some(&dep) = owner.get(&svc) else {
+                    continue;
+                };
+                if dep != idx && seen.insert(dep) {
+                    pending.extend(self.modules[dep].imports.iter().copied());
+                }
+            }
+            reach.push(seen);
+        }
+        for (idx, module) in self.modules.iter().enumerate() {
+            if module.remote_peer.is_some() {
+                continue;
+            }
+            let mut allowed: HashSet<Symbol> = module.declares.iter().copied().collect();
+            for dep in &reach[idx] {
+                allowed.extend(self.modules[*dep].declares.iter().copied());
+            }
+            let mut targets: Vec<Symbol> = Vec::new();
+            collect_update_targets(&module.stmts, &mut targets);
+            for target in targets {
+                if allowed.contains(&target) {
+                    continue;
+                }
+                let module_name = self.interner.get(module.name);
+                let service = self.interner.get(target);
+                if self.root_declares.contains(&target) {
+                    return Err(Error::Message(format!(
+                        "module '{module_name}' updates service '{service}', which is declared by the importing program"
+                    )));
+                }
+                let Some(&declared_by) = owner.get(&target) else {
+                    // Nobody here declares it: the static checks own that
+                    // diagnostic, not import resolution.
+                    continue;
+                };
+                let whose = if reach[declared_by].contains(&idx) {
+                    "a module that imports it"
+                } else {
+                    "a module it does not import"
+                };
+                return Err(Error::Message(format!(
+                    "module '{module_name}' updates service '{service}', which is declared by {whose}"
+                )));
+            }
+        }
+
         // Split the modules apart so the walk can hand out each one's
         // statements without cloning them while still reading its import edges.
         // Only a local module's statements are copied, once, for startup.
@@ -624,6 +695,19 @@ impl<'a> Imports<'a> {
         // disk, so there is no outstanding network request to clear. Going
         // through the network entry point would report it as an unsolicited
         // response on every startup that resolves a local import.
-        self.record_source(&source, base_dir, None)
+        self.record_source(&source, base_dir, None, service_sym)
+    }
+}
+
+/// Collect the services `stmts` update, including the ones inside `atomic`
+/// blocks: an atomic block commits as one transaction but each `update` in it
+/// names a service just the same.
+fn collect_update_targets(stmts: &[Stmt], targets: &mut Vec<Symbol>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Update { service_name, .. } => targets.push(*service_name),
+            Stmt::Atomic { updates } => collect_update_targets(updates, targets),
+            _ => {}
+        }
     }
 }

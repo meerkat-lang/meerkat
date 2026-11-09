@@ -965,3 +965,96 @@ fn test_imports_refuse_a_peers_update_to_a_local_service() {
     )
     .expect("a peer's update to its own service is folded");
 }
+
+/// Resolve a program that imports `main_imports` from disk with the given
+/// files written in its directory, and return what `finalize` reports
+fn finalize_with_disk_module(
+    label: &str,
+    program: &str,
+    files: &[(&str, &str)],
+) -> Result<(), String> {
+    let dir = unique_temp_dir(label);
+    for (name, source) in files {
+        std::fs::write(dir.join(name), source).unwrap();
+    }
+    let mut interner = Interner::new();
+    let base_ast = parser::parse_string(program, &mut interner).expect("program parses");
+    let (imports, _) = Imports::new(&mut interner, HashMap::new(), &base_ast, &dir, "")
+        .expect("Imports::new success");
+    let result = imports.finalize().map(|_| ()).map_err(|e| e.to_string());
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+/// A module may not update a service declared by the program that imports it.
+/// Startup runs the imported module first, so that service does not exist yet,
+/// and the failure it causes names a missing service rather than the reversed
+/// dependency. Refuse it at import resolution, naming the module and service
+#[test]
+fn test_imports_refuse_a_modules_update_to_its_importers_service() {
+    for (label, update) in [
+        ("disk_module_updates_root", "update app { pub def z = 1; }"),
+        (
+            "disk_module_updates_root_atomically",
+            "atomic {\n    update app { pub def z = 1; }\n}",
+        ),
+    ] {
+        let helper = format!("service helper {{ var v = 1; }}\n{update}\n");
+        let error = finalize_with_disk_module(
+            label,
+            "import helper\nservice app { var x = 0; }",
+            &[("helper.mkt", helper.as_str())],
+        )
+        .expect_err("a module's update to the importing program's service must be refused");
+        assert!(
+            error.contains("module 'helper'")
+                && error.contains("service 'app'")
+                && error.contains("importing program"),
+            "unexpected error for {label}: {error}"
+        );
+    }
+}
+
+/// A module may not update a service declared by a module that imports it
+/// either: that importer starts after it. The error says which way the
+/// dependency points so the fix is obvious
+#[test]
+fn test_imports_refuse_a_modules_update_to_a_service_from_its_importer() {
+    let error = finalize_with_disk_module(
+        "disk_module_updates_importer",
+        "import a\nservice root { var r = 0; }",
+        &[
+            ("a.mkt", "import b\nservice a { var x = 0; }\n"),
+            (
+                "b.mkt",
+                "service b { var v = 1; }\nupdate a { pub def z = 1; }\n",
+            ),
+        ],
+    )
+    .expect_err("a module's update to a service from its importer must be refused");
+    assert!(
+        error.contains("module 'b'")
+            && error.contains("service 'a'")
+            && error.contains("imports it"),
+        "unexpected error: {error}"
+    );
+}
+
+/// The dependency pointing the right way stays allowed: a module may update
+/// its own services and the services of the modules it imports, at startup and
+/// inside an atomic block
+#[test]
+fn test_imports_accept_a_modules_update_to_its_own_and_imported_services() {
+    finalize_with_disk_module(
+        "disk_module_own_updates",
+        "import helper\nservice app { var x = 0; }",
+        &[
+            ("base.mkt", "service base { var v = 1; }\n"),
+            (
+                "helper.mkt",
+                "import base\nservice helper { var w = 2; }\nupdate helper { pub def h = 1; }\natomic {\n    update base { pub def b = 3; }\n}\n",
+            ),
+        ],
+    )
+    .expect("a module may update its own services and those of the modules it imports");
+}

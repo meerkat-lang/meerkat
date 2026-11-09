@@ -613,6 +613,12 @@ impl Display for Decl {
 /// in-place with new or modified declarations, and `Stmt::Update` and
 /// `Stmt::Atomic` nodes are removed from the top level
 ///
+/// A modified declaration keeps its position. A new one keeps its place in
+/// the update: it goes just before the first existing declaration that follows
+/// it there, or at the end if none does. A member may only read members
+/// declared before it, so this is what lets an update add a member and change
+/// an existing def to read it in the same update
+///
 /// Args:
 ///     `base_ast` (`&[Stmt]`): The original AST statements
 ///     `updates` (`&[Stmt]`): The update statements to apply
@@ -658,30 +664,23 @@ pub fn apply_updates_to_ast(base_ast: &[Stmt], updates: &[Stmt]) -> Result<Vec<S
             {
                 if *existing_svc_name == *updated_svc_name {
                     found_service = true;
-                    for up_decl in updated_decls {
-                        let up_name = match up_decl {
-                            Decl::VarDecl { name: n, .. }
-                            | Decl::DefDecl { name: n, .. }
-                            | Decl::TableDecl { name: n, .. } => *n,
-                        };
-
-                        let mut matched_existing = false;
-                        for ex_decl in existing_decls.iter_mut() {
-                            let ex_name = match ex_decl {
-                                Decl::VarDecl { name: n, .. }
-                                | Decl::DefDecl { name: n, .. }
-                                | Decl::TableDecl { name: n, .. } => *n,
-                            };
-                            if ex_name == up_name {
-                                *ex_decl = up_decl.clone();
-                                matched_existing = true;
-                                break;
-                            }
+                    for (k, up_decl) in updated_decls.iter().enumerate() {
+                        let up_name = up_decl.name();
+                        if let Some(ex_decl) =
+                            existing_decls.iter_mut().find(|d| d.name() == up_name)
+                        {
+                            *ex_decl = up_decl.clone();
+                            continue;
                         }
-
-                        if !matched_existing {
-                            existing_decls.push(up_decl.clone());
-                        }
+                        // New: just before the first existing declaration
+                        // that follows it in the update, else at the end
+                        let at = updated_decls[k + 1..]
+                            .iter()
+                            .find_map(|later| {
+                                existing_decls.iter().position(|d| d.name() == later.name())
+                            })
+                            .unwrap_or(existing_decls.len());
+                        existing_decls.insert(at, up_decl.clone());
                     }
                 }
             }
@@ -715,5 +714,56 @@ mod tests {
 
         let result = apply_updates_to_ast(&base_ast, &updates);
         assert_eq!(result, Err(target_sym));
+    }
+
+    /// The member names of the one service in `program` after applying the
+    /// updates that follow it
+    fn names_after_update(program: &str) -> Vec<String> {
+        let mut interner = Interner::new();
+        let stmts = crate::runtime::parser::parse_string(program, &mut interner).unwrap();
+        let (base, updates): (Vec<Stmt>, Vec<Stmt>) = stmts
+            .into_iter()
+            .partition(|s| matches!(s, Stmt::Service { .. }));
+        let patched = apply_updates_to_ast(&base, &updates).unwrap();
+        let Some(Stmt::Service { decls, .. }) = patched.first() else {
+            panic!("expected the service");
+        };
+        decls
+            .iter()
+            .map(|d| interner.get(d.name()).to_string())
+            .collect()
+    }
+
+    /// A new member goes just before the first existing member that follows
+    /// it in the update, so a changed def can read it (as in
+    /// `meerkat/tests/test_update.mkt`)
+    #[test]
+    fn test_apply_updates_places_new_member_before_the_def_reading_it() {
+        let names = names_after_update(
+            "service s { var t = 1; pub def warm = t > 0; }
+             update s { var t = 2; var c = true; pub def warm = if c then t > 0 else t > 1; }",
+        );
+        assert_eq!(names, ["t", "c", "warm"]);
+    }
+
+    /// Several new members keep their order in the update
+    #[test]
+    fn test_apply_updates_keeps_the_order_of_new_members() {
+        let names = names_after_update(
+            "service s { var t = 1; pub def warm = t > 0; }
+             update s { var a = 1; var b = 2; pub def warm = a + b > t; }",
+        );
+        assert_eq!(names, ["t", "a", "b", "warm"]);
+    }
+
+    /// A new member that no existing member follows in the update goes at the
+    /// end, and a changed member keeps its position
+    #[test]
+    fn test_apply_updates_appends_trailing_new_members() {
+        let names = names_after_update(
+            "service s { var t = 1; pub def warm = t > 0; }
+             update s { var t = 5; pub def hot = t > 9; }",
+        );
+        assert_eq!(names, ["t", "warm", "hot"]);
     }
 }

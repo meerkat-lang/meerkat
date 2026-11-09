@@ -575,6 +575,7 @@ def integration_tests():
         # to read it; and an update to a service another node owns.
         ("local_update",              make_mkn_test(f"{IDIR}/updates/local_update.json")),
         ("remote_update",             make_mkn_test(f"{IDIR}/updates/remote_update/remote_update.json")),
+        ("remote_atomic_update",      make_mkn_test(f"{IDIR}/updates/remote_update/remote_atomic_update.json")),
     ]
 
 

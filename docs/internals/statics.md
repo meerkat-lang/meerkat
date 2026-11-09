@@ -1,6 +1,6 @@
 # Meerkat Static Semantics Overview
 
-The statics in Meerkat support type safety and execution stability in a reactive environment. Because the language supports live code updates, the statics are modularized to be invoked both during initial node startup and incrementally at runtime. 
+The statics in Meerkat support type safety and execution stability in a reactive environment. Because the language supports live code updates, the statics are modularized to be invoked both during initial node startup and incrementally at runtime.
 
 It is important to distinguish between two distinct forms of runtime updates:
 
@@ -53,7 +53,7 @@ The atomic update lifecycle is managed by a state machine that proceeds through 
 
 1. **Init:** The runtime computes lock requirements based on the requested update to determine necessary service-level and member-level locks.
 2. **LocksAcquired:** Once all locks are secured, the system merges the proposed AST updates into a unified AST. The statics pipeline (name resolution, type checking, and dependency analysis) then scans this unified AST.
-3. **Evaluated:** If static checks pass, the initial expressions of the new members are evaluated against the locked old state.
+3. **Evaluated:** If static checks pass, the initializers of the vars the update declares, new or changed, are evaluated in the merged member order. Each sees the values the update has already given its own vars (staged reads); every other member is read from the locked old state. See "Evaluating an update" in `docs/design/code-updates.md`.
 4. **Committed:** If evaluation succeeds without errors or cycles, the transaction is committed. The old state is replaced, locks are released, and the updates are broadcast to the rest of the system.
 
 ## Type Inference
@@ -80,6 +80,6 @@ What applying a function reads is part of the function's type (§1.1 of the sema
 
 ## Historical Context: The Old `dep_analysis` Module
 
-Initially, dependency analysis was decoupled from the type checker and performed entirely via heuristic AST traversals in a separate `dep_analysis` module. While this pure AST traversal worked for direct, first-order function calls, it was limited when handling the dynamic nature of higher-order functions. Without access to the typing environment, a pure AST traversal cannot trace which closure is actually being invoked when a function parameter is called. 
+Initially, dependency analysis was decoupled from the type checker and performed entirely via heuristic AST traversals in a separate `dep_analysis` module. While this pure AST traversal worked for direct, first-order function calls, it was limited when handling the dynamic nature of higher-order functions. Without access to the typing environment, a pure AST traversal cannot trace which closure is actually being invoked when a function parameter is called.
 
 Because of these limitations, the old `dep_analysis` module was removed and dependency tracking was integrated into the type checker, which tracks environment bindings and parameter flows. That integration was later undone: the reads pass follows the functions a value may be through those same bindings and flows itself, which also lets it analyze the functions the runtime holds, and it names members by service, which the type-level sets did not.

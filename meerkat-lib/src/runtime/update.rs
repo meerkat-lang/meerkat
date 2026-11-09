@@ -298,7 +298,11 @@ impl Transaction {
             return Err(e);
         }
 
-        let updated_services: Vec<_> = declared(&self.updates).collect();
+        // Each service's final declarations, so a remote owner is sent one
+        // update and evaluates the same batch this node did
+        let finals = final_declarations(&self.updates);
+        let updated_services: Vec<(&Symbol, &Vec<Decl>)> =
+            finals.iter().map(|(svc, decls)| (svc, decls)).collect();
         // The staged values and declarations were installed without
         // yielding; their checked graphs are still the ones to install
         manager.install_graphs(graphs).await;
@@ -710,6 +714,33 @@ fn flatten_atomic(updates: Vec<Stmt>) -> Vec<Stmt> {
         .collect()
 }
 
+/// The final declarations `updates` gives each service, in the order the
+/// services first appear: a later declaration of a member replaces an
+/// earlier one in place, and a new one goes after the rest, as merging them
+/// into the service does. Forwarding these as one update to a remote owner
+/// makes it evaluate the same batch as this node: two updates to the same
+/// service in an `atomic` block are one update there too
+fn final_declarations(updates: &[Stmt]) -> Vec<(Symbol, Vec<Decl>)> {
+    let mut finals: Vec<(Symbol, Vec<Decl>)> = Vec::new();
+    for (svc, decls) in declared(updates) {
+        let at = match finals.iter().position(|(s, _)| s == svc) {
+            Some(at) => at,
+            None => {
+                finals.push((*svc, Vec::new()));
+                finals.len() - 1
+            }
+        };
+        let merged = &mut finals[at].1;
+        for decl in decls {
+            match merged.iter().position(|d| d.name() == decl.name()) {
+                Some(i) => merged[i] = decl.clone(),
+                None => merged.push(decl.clone()),
+            }
+        }
+    }
+    finals
+}
+
 /// The services `updates` declares, each with its declarations
 fn declared(updates: &[Stmt]) -> impl Iterator<Item = (&Symbol, &Vec<Decl>)> {
     updates.iter().filter_map(|stmt| match stmt {
@@ -817,5 +848,36 @@ mod tests {
         let service = manager.services.get(&s1_sym).unwrap();
         let var_state = service.vars.get(&x_sym).unwrap();
         assert!(matches!(var_state.lock, VarLock::Unlocked));
+    }
+    /// Two updates to the same service combine into its final declarations,
+    /// in the order a merge gives them: what a remote owner is sent
+    #[test]
+    fn test_final_declarations_combine_updates_to_the_same_service() {
+        let mut interner = Interner::new();
+        let updates = crate::runtime::parser::parse_string(
+            "atomic { update counter { var c = 1; var r = c; } update other { var o = 0; } update counter { var c = 2; } }",
+            &mut interner,
+        )
+        .unwrap();
+        let finals = final_declarations(&flatten_atomic(updates));
+        let shown: Vec<(String, Vec<String>)> = finals
+            .iter()
+            .map(|(svc, decls)| {
+                (
+                    interner.get(*svc).to_string(),
+                    decls.iter().map(|d| format_decl(d, &interner)).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                (
+                    "counter".to_string(),
+                    vec!["var c = 2;".to_string(), "var r = c;".to_string()]
+                ),
+                ("other".to_string(), vec!["var o = 0;".to_string()]),
+            ]
+        );
     }
 }

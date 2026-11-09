@@ -1,7 +1,9 @@
 use crate::net::ServiceNetId;
+use crate::runtime::graphs::free_var::free_var;
 use crate::runtime::html::{Html, HtmlTemplate};
 use crate::runtime::interner::Symbol;
 use crate::runtime::tt::{Param, Type};
+use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 
 pub mod printer;
@@ -613,11 +615,9 @@ impl Display for Decl {
 /// in-place with new or modified declarations, and `Stmt::Update` and
 /// `Stmt::Atomic` nodes are removed from the top level
 ///
-/// A modified declaration keeps its position. A new one keeps its place in
-/// the update: it goes just before the first existing declaration that follows
-/// it there, or at the end if none does. A member may only read members
-/// declared before it, so this is what lets an update add a member and change
-/// an existing def to read it in the same update
+/// A modified declaration keeps its position. A new one goes at the end, as
+/// before, unless a member reads it: see `merge_update_decls`, which lets an
+/// update add a member and change an existing def to read it
 ///
 /// Args:
 ///     `base_ast` (`&[Stmt]`): The original AST statements
@@ -664,24 +664,7 @@ pub fn apply_updates_to_ast(base_ast: &[Stmt], updates: &[Stmt]) -> Result<Vec<S
             {
                 if *existing_svc_name == *updated_svc_name {
                     found_service = true;
-                    for (k, up_decl) in updated_decls.iter().enumerate() {
-                        let up_name = up_decl.name();
-                        if let Some(ex_decl) =
-                            existing_decls.iter_mut().find(|d| d.name() == up_name)
-                        {
-                            *ex_decl = up_decl.clone();
-                            continue;
-                        }
-                        // New: just before the first existing declaration
-                        // that follows it in the update, else at the end
-                        let at = updated_decls[k + 1..]
-                            .iter()
-                            .find_map(|later| {
-                                existing_decls.iter().position(|d| d.name() == later.name())
-                            })
-                            .unwrap_or(existing_decls.len());
-                        existing_decls.insert(at, up_decl.clone());
-                    }
+                    merge_update_decls(existing_decls, updated_decls);
                 }
             }
         }
@@ -692,6 +675,91 @@ pub fn apply_updates_to_ast(base_ast: &[Stmt], updates: &[Stmt]) -> Result<Vec<S
     }
 
     Ok(patched_ast)
+}
+
+/// The names a declaration's code mentions directly, among them the members
+/// of its service it reads
+fn direct_reads(decl: &Decl) -> HashSet<Symbol> {
+    match decl {
+        Decl::VarDecl { val, .. } | Decl::DefDecl { val, .. } => free_var(val, &HashSet::new()),
+        Decl::TableDecl { .. } => HashSet::new(),
+    }
+}
+
+/// Merge an update's declarations into a service's
+///
+/// A changed declaration keeps its position. A member may only read members
+/// declared before it, so a new declaration goes just before the first member
+/// that reads it directly, provided every member it reads is already before
+/// that point; otherwise it goes at the end, in the update's order. New
+/// declarations are placed last first, so a chain works: a new `c`, a new `f`
+/// reading `c`, and a changed `warm` reading `f` give `c, f, warm`.
+///
+/// A new declaration is only moved when a member already in the service reads
+/// it directly, and the check would then reject the old placement at the end,
+/// so this never breaks an update that appending accepted. A reader that
+/// reaches the new member only through a function isn't seen, and the new
+/// member then goes at the end, as before.
+fn merge_update_decls(decls: &mut Vec<Decl>, updated: &[Decl]) {
+    let index: HashMap<Symbol, usize> = decls
+        .iter()
+        .enumerate()
+        .map(|(i, d)| (d.name(), i))
+        .collect();
+    let mut new: Vec<&Decl> = Vec::new();
+    let mut new_index: HashMap<Symbol, usize> = HashMap::new();
+    for up in updated {
+        let name = up.name();
+        if let Some(&i) = index.get(&name) {
+            decls[i] = up.clone();
+        } else if let Some(&j) = new_index.get(&name) {
+            // Declared twice in the update: the later one wins, at the first
+            // one's place
+            new[j] = up;
+        } else {
+            new_index.insert(name, new.len());
+            new.push(up);
+        }
+    }
+    if new.is_empty() {
+        return;
+    }
+
+    let mut list_reads: Vec<HashSet<Symbol>> = decls.iter().map(direct_reads).collect();
+    // Which entries of `decls` this merge placed
+    let mut placed = vec![false; decls.len()];
+    let new_reads: Vec<HashSet<Symbol>> = new.iter().map(|d| direct_reads(d)).collect();
+    // Lets a new member nothing reads skip the search for a reader
+    let read_by_any: HashSet<Symbol> = list_reads
+        .iter()
+        .chain(&new_reads)
+        .flatten()
+        .copied()
+        .collect();
+    let mut at_end = Vec::new();
+    for j in (0..new.len()).rev() {
+        let name = new[j].name();
+        let reader = read_by_any
+            .contains(&name)
+            .then(|| list_reads.iter().position(|reads| reads.contains(&name)))
+            .flatten();
+        let last_read = decls.iter().rposition(|d| new_reads[j].contains(&d.name()));
+        match reader.filter(|&r| last_read.is_none_or(|l| l < r)) {
+            Some(reader) => {
+                // Ahead of the new members placed just before the reader,
+                // which come later in the update, when its reads allow
+                let mut at = reader;
+                while at > 0 && placed[at - 1] && last_read.is_none_or(|l| l < at - 1) {
+                    at -= 1;
+                }
+                decls.insert(at, new[j].clone());
+                list_reads.insert(at, new_reads[j].clone());
+                placed.insert(at, true);
+            }
+            None => at_end.push(j),
+        }
+    }
+    decls.extend(at_end.into_iter().rev().map(|j| new[j].clone()));
 }
 
 #[cfg(test)]
@@ -756,8 +824,8 @@ mod tests {
         assert_eq!(names, ["t", "a", "b", "warm"]);
     }
 
-    /// A new member that no existing member follows in the update goes at the
-    /// end, and a changed member keeps its position
+    /// A new member that nothing reads goes at the end, and a changed member
+    /// keeps its position
     #[test]
     fn test_apply_updates_appends_trailing_new_members() {
         let names = names_after_update(
@@ -765,5 +833,28 @@ mod tests {
              update s { var t = 5; pub def hot = t > 9; }",
         );
         assert_eq!(names, ["t", "warm", "hot"]);
+    }
+
+    /// A new member nothing reads goes at the end, even when the update lists
+    /// it before a changed member: placing it earlier would put it ahead of a
+    /// member it reads (a regression found in review of #266)
+    #[test]
+    fn test_apply_updates_keeps_an_unread_new_member_after_its_dependencies() {
+        let names = names_after_update(
+            "service s { var x = 1; pub def flag = x > 0; var tail = 10; }
+             update s { var added = tail + 1; pub def flag = x > 1; }",
+        );
+        assert_eq!(names, ["x", "flag", "tail", "added"]);
+    }
+
+    /// A chain of new members, the last read by a changed def, is placed
+    /// before that def in dependency order
+    #[test]
+    fn test_apply_updates_places_a_chain_of_new_members() {
+        let names = names_after_update(
+            "service s { var t = 1; pub def warm = t > 0; }
+             update s { var c = 2; pub def f = c + t; pub def warm = f > 0; }",
+        );
+        assert_eq!(names, ["t", "c", "f", "warm"]);
     }
 }

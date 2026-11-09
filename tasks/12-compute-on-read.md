@@ -350,6 +350,14 @@ naming will otherwise invite someone to restore the symmetry.
     `do` in an `@test` its own transaction, so it no longer exercises
     read-your-own-writes and is only a regression check. Tests 1 and 3 are
     the ones that show compute-on-read working.
+11. **New — a code update and its remote owner agree on a def they read** (see
+    the last note). A client's update to remote service `r` adds `var v = d`,
+    where `d` is a def on `r` over `r`'s var `w`, and the same update has a
+    local var read `r.v`. While the update runs, another transaction writes
+    `w`. The local var and the owner's `r.v` must hold the same value. An
+    mkn scenario next to `scripts/tests/integration/updates/remote_update/`
+    (#266) is the natural home; the concurrent write needs a deterministic
+    hook, like the stand-in peers in `participant_commit_order_test`.
 
 ## Notes
 
@@ -360,3 +368,16 @@ naming will otherwise invite someone to restore the symmetry.
   dependencies costs N round trips; subsequent reads in the same transaction
   cost nothing until a composed action touches one of those services. That is
   the price of fully transactional semantics and it was accepted deliberately.
+- **Code updates rely on this too (#266).** A code update evaluates the var
+  initializers of a remote service on the client, staging the values for its
+  other initializers, and the remote owner then re-evaluates them itself
+  under the same transaction id. The two agree only if every input they read
+  stays fixed in between. Remote vars do: the update's read locks are held
+  until after forwarding. A remote **def** does not yet: today a transactional
+  read of a def locks the def but not its inputs, so a concurrent write to an
+  input recomputes it. With compute-on-read, a participant's read of a def
+  (`remote_read_participant`, §3c) must lock the def's inputs under the shared
+  transaction id, so the owner's re-evaluation sees the same values. That is
+  the requirement test 11 checks. The alternative, forwarding the staged
+  values with `UpdateServiceRequest` instead of re-evaluating, is not needed
+  if this holds.

@@ -103,7 +103,7 @@ async fn test_step2_locking_conflict() {
     ";
     let update_ast = parse_string(update_code, &mut manager.interner).unwrap();
 
-    let mut txn = Transaction::new(update_ast);
+    let txn = Transaction::new(update_ast);
     let poll_res = txn.poll(&mut manager).await;
     assert!(poll_res.is_err());
 
@@ -131,7 +131,7 @@ async fn test_step3_nonexistent_service_rejection() {
     ";
     let update_ast = parse_string(invalid_update_code, &mut manager.interner).unwrap();
 
-    let mut txn = Transaction::new(update_ast);
+    let txn = Transaction::new(update_ast);
     let poll_res = txn.poll(&mut manager).await;
     assert!(poll_res.is_err());
 
@@ -163,7 +163,7 @@ async fn test_step4_and_5_static_validation_rejection() {
     ";
     let update_ast = parse_string(ill_typed_update_code, &mut manager.interner).unwrap();
 
-    let mut txn = Transaction::new(update_ast);
+    let txn = Transaction::new(update_ast);
     let poll_res = txn.poll(&mut manager).await;
     assert!(poll_res.is_err());
 
@@ -195,7 +195,7 @@ async fn test_step6_old_state_evaluation_failure() {
     ";
     let update_ast = parse_string(eval_fail_update_code, &mut manager.interner).unwrap();
 
-    let mut txn = Transaction::new(update_ast);
+    let txn = Transaction::new(update_ast);
     let poll_res = txn.poll(&mut manager).await;
     assert!(poll_res.is_err());
 
@@ -227,7 +227,7 @@ async fn test_step8_and_9_success_and_propagation() {
     ";
     let update_ast = parse_string(update_code, &mut manager.interner).unwrap();
 
-    let mut txn = Transaction::new(update_ast);
+    let txn = Transaction::new(update_ast);
     let poll_res = txn.poll(&mut manager).await;
     assert!(poll_res.is_ok());
 
@@ -273,7 +273,7 @@ async fn test_type_change_incompatible_rejection() {
     ";
     let update_ast = parse_string(incompatible_update_code, &mut manager.interner).unwrap();
 
-    let mut txn = Transaction::new(update_ast);
+    let txn = Transaction::new(update_ast);
     let poll_res = txn.poll(&mut manager).await;
     assert!(poll_res.is_err());
 
@@ -323,7 +323,7 @@ async fn test_type_change_valid_shift() {
     ";
     let update_ast = parse_string(update_code, &mut manager.interner).unwrap();
 
-    let mut txn = Transaction::new(update_ast);
+    let txn = Transaction::new(update_ast);
     let poll_res = txn.poll(&mut manager).await;
     assert!(poll_res.is_ok());
 
@@ -376,7 +376,7 @@ async fn test_update_supports_introducing_new_field() {
     ";
     let update_ast = parse_string(add_field_update_code, &mut manager.interner).unwrap();
 
-    let mut txn = Transaction::new(update_ast);
+    let txn = Transaction::new(update_ast);
     let poll_res = txn.poll(&mut manager).await;
     assert!(poll_res.is_ok(), "poll error: {:?}", poll_res);
 
@@ -425,7 +425,7 @@ async fn test_update_rejects_removing_existing_field() {
     ";
     let update_ast = parse_string(update_code, &mut manager.interner).unwrap();
 
-    let mut txn = Transaction::new(update_ast);
+    let txn = Transaction::new(update_ast);
     let poll_res = txn.poll(&mut manager).await;
     assert!(poll_res.is_ok());
 
@@ -467,7 +467,7 @@ async fn test_update_new_field_conflict_service_lock_rejection() {
     ";
     let update_ast = parse_string(update_code, &mut manager.interner).unwrap();
 
-    let mut txn = Transaction::new(update_ast);
+    let txn = Transaction::new(update_ast);
     let poll_res = txn.poll(&mut manager).await;
     assert!(poll_res.is_err());
 
@@ -497,7 +497,7 @@ async fn test_update_multiple_new_fields_and_reactive_defs_success() {
     ";
     let update_ast = parse_string(update_code, &mut manager.interner).unwrap();
 
-    let mut txn = Transaction::new(update_ast);
+    let txn = Transaction::new(update_ast);
     let poll_res = txn.poll(&mut manager).await;
     assert!(poll_res.is_ok(), "poll error: {:?}", poll_res);
 
@@ -559,7 +559,7 @@ async fn test_atomic_block_multiple_services_update() {
     assert_eq!(ast.len(), 1);
 
     if let meerkat_lib::runtime::ast::Stmt::Atomic { updates } = &ast[0] {
-        let mut txn = Transaction::new(updates.clone());
+        let txn = Transaction::new(updates.clone());
         let poll_res = txn.poll(&mut manager).await;
         assert!(poll_res.is_ok(), "poll error: {:?}", poll_res);
     } else {
@@ -616,7 +616,7 @@ async fn test_update_listener_rewiring_propagation() {
         }
     ";
     let update_ast = parse_string(update_code, &mut manager.interner).unwrap();
-    let mut txn = Transaction::new(update_ast);
+    let txn = Transaction::new(update_ast);
     let poll_res = txn.poll(&mut manager).await;
     assert!(poll_res.is_ok(), "poll error: {:?}", poll_res);
 
@@ -667,7 +667,7 @@ async fn test_update_cross_service_listener_rewiring() {
         }
     ";
     let update_ast = parse_string(update_code, &mut manager.interner).unwrap();
-    let mut txn = Transaction::new(update_ast);
+    let txn = Transaction::new(update_ast);
     let poll_res = txn.poll(&mut manager).await;
     assert!(poll_res.is_ok(), "poll error: {:?}", poll_res);
 
@@ -723,7 +723,7 @@ async fn test_update_adds_new_cross_service_listener_edge() {
         }
     ";
     let update_ast = parse_string(update_code, &mut manager.interner).unwrap();
-    let mut txn = Transaction::new(update_ast);
+    let txn = Transaction::new(update_ast);
     let poll_res = txn.poll(&mut manager).await;
     assert!(poll_res.is_ok(), "poll error: {:?}", poll_res);
 
@@ -761,7 +761,7 @@ async fn manager_after_update(
         .unwrap();
 
     let update_ast = parse_string(update_code, &mut manager.interner).unwrap();
-    let mut txn = Transaction::new(update_ast);
+    let txn = Transaction::new(update_ast);
     let poll_res = txn.poll(&mut manager).await;
     assert!(poll_res.is_ok(), "poll error: {:?}", poll_res);
     manager
@@ -930,7 +930,7 @@ async fn test_update_def_to_var_ignores_update_from_stale_subscription() {
 async fn test_update_empty_statements_no_panic() {
     let interner = Interner::new();
     let mut manager = meerkat_lib::runtime::Manager::new(interner);
-    let mut txn = Transaction::new(Vec::new());
+    let txn = Transaction::new(Vec::new());
     let poll_res = txn.poll(&mut manager).await;
     assert!(
         poll_res.is_ok(),

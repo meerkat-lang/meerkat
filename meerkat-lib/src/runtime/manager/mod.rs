@@ -997,7 +997,7 @@ impl Manager {
             return Ok(());
         }
         let count = updates.len();
-        let mut txn = crate::runtime::update::Transaction::new(updates);
+        let txn = crate::runtime::update::Transaction::new(updates);
         txn.poll(self).await?;
         match stmt {
             Stmt::Update { service_name, .. } => {
@@ -1986,7 +1986,7 @@ impl Manager {
     ) {
         let result = match crate::runtime::parser::parse_string(source, &mut self.interner) {
             Ok(stmts) => {
-                let mut txn = match txn_id {
+                let txn = match txn_id {
                     Some(tid) => crate::runtime::update::Transaction::new_with_id(tid, stmts),
                     None => crate::runtime::update::Transaction::new(stmts),
                 };

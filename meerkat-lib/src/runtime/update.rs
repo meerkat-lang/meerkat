@@ -78,13 +78,17 @@ impl Transaction {
     /// Raises:
     ///     `EvalError`: If lock acquisition, validation, or eval fails, or a
     ///     committed new def gets no value (`Manager::await_first_values`)
-    pub async fn poll(&mut self, manager: &mut Manager) -> Result<(), EvalError> {
+    pub async fn poll(self, manager: &mut Manager) -> Result<(), EvalError> {
         let introduced = self.apply(manager).await?;
         manager.await_first_values(&introduced).await
     }
 
     /// Takes the locks, validates and installs the update, forwards it to the
     /// remote owners it changes, and releases the locks
+    ///
+    /// Consumes the update: an attempt's lock transaction, with its staged
+    /// values, read cache and locks, belongs to that attempt, so retrying
+    /// after a failure means building a new `Transaction`
     ///
     /// Args:
     ///     `manager` (`&mut Manager`): The active runtime manager
@@ -98,7 +102,7 @@ impl Transaction {
     /// Raises:
     ///     `EvalError`: If lock acquisition, validation, or eval fails
     pub async fn apply(
-        &mut self,
+        mut self,
         manager: &mut Manager,
     ) -> Result<Vec<(Symbol, Symbol)>, EvalError> {
         let result = self.try_apply(manager).await;
@@ -819,7 +823,7 @@ mod tests {
         let update_ast =
             crate::runtime::parser::parse_string(update_code, &mut manager.interner).unwrap();
 
-        let mut txn = Transaction::new(update_ast);
+        let txn = Transaction::new(update_ast);
         let res = txn.poll(&mut manager).await;
         assert!(res.is_err());
 
@@ -854,7 +858,7 @@ mod tests {
         let update_ast =
             crate::runtime::parser::parse_string(update_code, &mut manager.interner).unwrap();
 
-        let mut txn = Transaction::new(update_ast);
+        let txn = Transaction::new(update_ast);
         let res = txn.poll(&mut manager).await;
         assert!(res.is_err());
 

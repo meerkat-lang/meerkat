@@ -1334,3 +1334,139 @@ async fn test_update_unchanged_result_still_initializes_subscription() {
     );
     assert_update(&mut peer, 2, &[]).await;
 }
+
+/// Start a manager on `initial_code`, then apply `update_code`, unwrapping
+/// an `atomic` block into its updates as `Manager::run_update` does, and
+/// return the manager or the update's error
+async fn try_update(
+    initial_code: &str,
+    update_code: &str,
+) -> Result<meerkat_lib::runtime::Manager, String> {
+    let mut interner = Interner::new();
+    let initial_ast = parse_string(initial_code, &mut interner).unwrap();
+    let mut node = Node::new();
+    node.interner = interner;
+    node.unified_ast = initial_ast;
+    node.static_checks().unwrap();
+    let local_ast = node.unified_ast.clone();
+    let mut manager = node
+        .on_manager_startup(true, None, HashMap::new(), &local_ast)
+        .await
+        .unwrap();
+    let updates: Vec<Stmt> = parse_string(update_code, &mut manager.interner)
+        .unwrap()
+        .into_iter()
+        .flat_map(|stmt| match stmt {
+            Stmt::Atomic { updates } => updates,
+            other => vec![other],
+        })
+        .collect();
+    Transaction::new(updates)
+        .poll(&mut manager)
+        .await
+        .map(|()| manager)
+        .map_err(|e| e.to_string())
+}
+
+/// The value of `service.member` in `manager`
+async fn value_of(
+    manager: &mut meerkat_lib::runtime::Manager,
+    service: &str,
+    member: &str,
+) -> Value {
+    let service = manager.interner.insert(service);
+    let member = manager.interner.insert(member);
+    manager.lookup(member, service, None).await.unwrap()
+}
+
+/// An update's var initializers see the vars the same update adds: a new var
+/// reading another new var
+#[tokio::test]
+async fn test_update_var_reads_a_var_the_update_adds() {
+    let mut m = try_update(
+        "service s { var a = 0; }",
+        "update s { var c = 1; var d = c + 1; }",
+    )
+    .await
+    .expect("the update applies");
+    assert_eq!(value_of(&mut m, "s", "d").await, Value::Int { val: 2 });
+}
+
+/// A changed var can read a var the same update adds
+#[tokio::test]
+async fn test_update_changed_var_reads_a_var_the_update_adds() {
+    let mut m = try_update(
+        "service s { var result = 0; }",
+        "update s { var c = 2; var result = c + 1; }",
+    )
+    .await
+    .expect("the update applies");
+    assert_eq!(value_of(&mut m, "s", "c").await, Value::Int { val: 2 });
+    assert_eq!(value_of(&mut m, "s", "result").await, Value::Int { val: 3 });
+}
+
+/// An update's var initializers see the update's new value of a var it
+/// changes, not the running one (staged reads)
+#[tokio::test]
+async fn test_update_var_reads_the_updated_value_of_a_changed_var() {
+    let mut m = try_update(
+        "service s { var a = 1; var b = 0; }",
+        "update s { var a = 10; var b = a; }",
+    )
+    .await
+    .expect("the update applies");
+    assert_eq!(value_of(&mut m, "s", "b").await, Value::Int { val: 10 });
+}
+
+/// A qualified read of the service's own member (`s.c`) sees the staged value
+/// too
+#[tokio::test]
+async fn test_update_var_reads_a_staged_var_by_qualified_name() {
+    let mut m = try_update(
+        "service s { var r = 0; }",
+        "update s { var c = 4; var r = s.c + 1; }",
+    )
+    .await
+    .expect("the update applies");
+    assert_eq!(value_of(&mut m, "s", "r").await, Value::Int { val: 5 });
+}
+
+/// A function called from an initializer reads the staged value of the
+/// members it reads
+#[tokio::test]
+async fn test_update_var_sees_staged_values_through_a_called_function() {
+    let mut m = try_update(
+        "service s { var c = 0; pub def get = fn () => c; var r = 0; }",
+        "update s { var c = 7; var r = get() + 1; }",
+    )
+    .await
+    .expect("the update applies");
+    assert_eq!(value_of(&mut m, "s", "r").await, Value::Int { val: 8 });
+}
+
+/// In an `atomic` block, one service's var can read a var another update in
+/// the block adds to another service
+#[tokio::test]
+async fn test_update_atomic_block_reads_a_var_added_to_another_service() {
+    let mut m = try_update(
+        "service p { var a = 0; } service q { var b = 0; }",
+        "atomic { update p { var c = 5; } update q { var b = p.c * 2; } }",
+    )
+    .await
+    .expect("the update applies");
+    assert_eq!(value_of(&mut m, "q", "b").await, Value::Int { val: 10 });
+}
+
+/// Defs aren't staged: a var initializer reading a def the same update adds
+/// fails, since the def has no value until after the commit
+#[tokio::test]
+async fn test_update_var_cannot_read_a_def_the_update_adds() {
+    let err = try_update(
+        "service s { var a = 0; }",
+        "update s { pub def d = 5; var r = d; }",
+    )
+    .await
+    .err()
+    .expect("reading a new def from a var initializer fails");
+    assert!(err.contains("'d' not found"), "unexpected error: {err}");
+}

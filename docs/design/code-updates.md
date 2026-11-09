@@ -95,6 +95,39 @@ The type checker is run after locks are acquired but before applying the code
 update, and if there are type errors, the locks are released, the update is
 canceled, and error messages are reported to the developer.
 
+## Evaluating an update
+
+**Member order.**  A member may only read members declared before it.  An
+update keeps a changed member where it was and adds new members at the end, in
+the order the update declares them; members are then reordered only as far as
+needed for each one to follow the members it reads, keeping the existing
+members' order and the update's order.  So an update can add a member and
+change an existing def to read it, while a forward reference among the
+update's own members is still an error (#265).
+
+**Staged reads.**  The initializers of the vars an update declares, new or
+changed, are evaluated in that member order, and each one sees the values the
+update has already given its own vars.  With `var a = 1` running,
+
+```meerkat
+update s {
+    var a = 10;
+    var b = a;
+}
+```
+
+gives `b == 10`.  This holds however a member is read: by its plain name, by a
+qualified name such as `s.a`, or inside a function the initializer calls.  The
+staged values live in the update's transaction, not in the initializer's local
+scope, so a closure doesn't capture them; it reads the member when it runs.
+Members the update doesn't declare keep their running values, read under the
+update's locks.
+
+**Defs aren't staged.**  A def's first value is computed after the update
+commits, so a var initializer that reads a def the same update adds fails, and
+one that reads a def the update changes sees the def's value from before the
+update.  Staging defs too is tracked in #267.
+
 ## Errors due to code update races
 
 A code update is transactional; if it succeeds, it will always preserve

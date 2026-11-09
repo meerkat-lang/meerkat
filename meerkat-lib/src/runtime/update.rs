@@ -211,47 +211,62 @@ impl Transaction {
                 e.message(&manager.interner)
             )));
         }
-        for stmt in &self.updates {
-            let (svc_name, decls) = match stmt {
-                Stmt::Service { name, decls } => (name, decls),
-                Stmt::Update {
-                    service_name: name,
-                    decls,
-                } => (name, decls),
-                Stmt::ActionStmt(_)
-                | Stmt::Atomic { .. }
-                | Stmt::Connect { .. }
-                | Stmt::Import { .. }
-                | Stmt::Test { .. }
-                | Stmt::Watch { .. } => continue,
-            };
+        // The vars the update declares, each evaluated once, in its final form
+        let mut staged_vars: HashSet<(Symbol, Symbol)> = HashSet::new();
+        for (svc_name, decls) in declared(&self.updates) {
             for decl in decls {
-                let (var_name, expr) = match decl {
-                    Decl::VarDecl { name, val, .. } => (*name, val),
-                    Decl::DefDecl { .. } => continue,
-                    Decl::TableDecl { .. } => {
-                        return Err(EvalError::NotImplemented);
+                match decl {
+                    Decl::VarDecl { name, .. } => {
+                        staged_vars.insert((*svc_name, *name));
                     }
-                };
-
-                let env: Vec<(Symbol, Value)> = Vec::new();
-                let eval_res = {
-                    let mut ctx = EvalContext {
-                        manager,
-                        service_name: *svc_name,
-                        txn: self.lock_txn.as_mut(),
-                    };
-                    eval(expr, &env, &mut ctx).await
-                };
-
-                let val = match eval_res {
-                    Ok(v) => v,
-                    Err(e) => {
-                        return Err(e);
-                    }
-                };
-                self.values.insert((*svc_name, var_name), val);
+                    Decl::DefDecl { .. } => {}
+                    Decl::TableDecl { .. } => return Err(EvalError::NotImplemented),
+                }
             }
+        }
+        // Evaluate their initializers in the merged order, staging each value
+        // in the transaction's read cache as it is computed. Every member read
+        // in the update then sees the update's own vars, new or changed,
+        // whether by plain or qualified name or from inside a called function,
+        // and the running state for the rest. Staged entries carry no clock:
+        // the update's stamp absorbs the clocks of the running state it read.
+        // Defs are not staged: their first values come after the commit, so a
+        // var reading a def the update adds or changes fails or sees the old
+        // value (see docs/design/code-updates.md)
+        let initializers: Vec<(Symbol, Symbol, Expr)> = self
+            .ast
+            .iter()
+            .filter_map(|stmt| match stmt {
+                Stmt::Service { name, decls } => Some((name, decls)),
+                _ => None,
+            })
+            .flat_map(|(svc_name, decls)| {
+                decls.iter().filter_map(|decl| match decl {
+                    Decl::VarDecl { name, val, .. }
+                        if staged_vars.contains(&(*svc_name, *name)) =>
+                    {
+                        Some((*svc_name, *name, val.clone()))
+                    }
+                    _ => None,
+                })
+            })
+            .collect();
+        for (svc_name, var_name, expr) in initializers {
+            let val = {
+                let mut ctx = EvalContext {
+                    manager,
+                    service_name: svc_name,
+                    txn: self.lock_txn.as_mut(),
+                };
+                eval(&expr, &[], &mut ctx).await?
+            };
+            if let Some(txn) = self.lock_txn.as_mut() {
+                txn.read_cache.insert(
+                    (manager.service_net_id_for_name(svc_name), var_name),
+                    (val.clone(), None, None),
+                );
+            }
+            self.values.insert((svc_name, var_name), val);
         }
 
         let introduced = self.unvalued_defs(manager);

@@ -140,6 +140,13 @@ will, if there is one.
 Transitivity is required (`z` derives from `y` derives from `x`), as is
 following listeners into other services on this node.
 
+Staging a var in a code update (`Transaction::staged`) counts as a write here:
+run the same walk. Today an update's initializers can't read a def before
+staging its inputs, since they run in member order and a member reads only
+earlier members, so no Meerkat program can exercise this; the walk keeps the
+cache sound without relying on that order. If it needs a test, it is a unit
+test that drives the transaction directly.
+
 #### 3b. Invalidate on composed action
 
 That is exactly what `touched_services` reports, so bring that plumbing back —

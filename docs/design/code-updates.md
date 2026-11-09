@@ -126,9 +126,12 @@ Vars the update doesn't declare keep their running values, read under the
 update's locks.
 
 **Defs: the intended semantics.**  A code update is a transaction, and its
-staged vars are its writes.  So any def read *during* the update, by anyone,
-should reflect them: a def the update adds or changes, and also an unchanged
-def whose inputs the update changes.  With `def d = w` running on `s`,
+staged vars are its writes.  So any def read in the update's transaction, on
+any node (its remote participants included), should reflect them: a def the
+update adds or changes, and also an unchanged def whose inputs the update
+changes.  Other transactions never see the staged values: they read the state
+from before the update, or wait under its locks and read it after the commit.
+With `def d = w` running on `s`,
 
 ```meerkat
 update s {

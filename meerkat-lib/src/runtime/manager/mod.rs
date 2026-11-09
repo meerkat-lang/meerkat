@@ -1418,6 +1418,17 @@ impl Manager {
         service_name: Symbol,
         mut txn: Option<&mut Transaction>,
     ) -> Result<ReadEntry, EvalError> {
+        // A value a code update has staged comes first, as in `lookup`. It
+        // has no read-cache entry to take a clock from, and its member may be
+        // on another node; staged values carry no clock
+        // (`Transaction::staged`). No caller passes an update's transaction
+        // today, but nothing else would stop this reading past the value
+        if let Some(staged) = txn
+            .as_deref()
+            .and_then(|t| t.staged.get(&(service_name, var_name)))
+        {
+            return Ok((staged.clone(), None, None));
+        }
         if self.remote_services.contains_key(&service_name) {
             return self
                 .remote_lookup_with_clock(service_name, var_name, txn)
@@ -7722,5 +7733,33 @@ mod tests {
         assert_eq!(manager.services[&s].vars[&a].vector_clock, clock);
         assert_eq!(manager.services[&s].vars[&b].value, Value::Int { val: 8 });
         assert_eq!(manager.services[&s].vars[&b].vector_clock, clock);
+    }
+    /// `lookup_with_clock` returns a value a code update has staged, without
+    /// a clock, both for a local member not installed yet (rather than
+    /// panicking on the missing read-cache entry) and for a member of a
+    /// remote service (rather than reading it over the network)
+    #[tokio::test]
+    async fn test_lookup_with_clock_returns_staged_values() {
+        let mut tc = TestContext::new();
+        tc.manager.create_service(tc.foo, vec![]).await.unwrap();
+        tc.manager
+            .remote_services
+            .insert(tc.s2, Address::new("/ip4/127.0.0.1/tcp/1/p2p/12D3KooWTest"));
+        let mut txn = Transaction::new(TxnId::new(tc.manager.node_id));
+        txn.staged.insert((tc.foo, tc.w), Value::Int { val: 3 });
+        txn.staged.insert((tc.s2, tc.y), Value::Int { val: 4 });
+
+        let local = tc
+            .manager
+            .lookup_with_clock(tc.w, tc.foo, Some(&mut txn))
+            .await
+            .expect("a staged local member is read");
+        assert_eq!(local, (Value::Int { val: 3 }, None, None));
+        let remote = tc
+            .manager
+            .lookup_with_clock(tc.y, tc.s2, Some(&mut txn))
+            .await
+            .expect("a staged member of a remote service is read without the network");
+        assert_eq!(remote, (Value::Int { val: 4 }, None, None));
     }
 }

@@ -122,13 +122,46 @@ service on another node that the update changes.  An `atomic` block is
 evaluated as one update, using each var's final declaration in the block.  The
 staged values live in the update's transaction, not in the initializer's local
 scope, so a closure doesn't capture them; it reads the member when it runs.
-Members the update doesn't declare keep their running values, read under the
+Vars the update doesn't declare keep their running values, read under the
 update's locks.
 
-**Defs aren't staged.**  A def's first value is computed after the update
-commits, so a var initializer that reads a def the same update adds fails, and
-one that reads a def the update changes sees the def's value from before the
-update.  Staging defs too is tracked in #267.
+**Defs: the intended semantics.**  A code update is a transaction, and its
+staged vars are its writes.  So any def read *during* the update, by anyone,
+should reflect them: a def the update adds or changes, and also an unchanged
+def whose inputs the update changes.  With `def d = w` running on `s`,
+
+```meerkat
+update s {
+    var w = 2;
+    var v = d;
+}
+```
+
+should give `v == 2`.  Defs that nobody reads during the update don't need to
+be recomputed then: they catch up after the commit, through ordinary
+propagation.
+
+**Defs today: a limitation.**  For now, defs aren't staged, and reading one
+during an update doesn't take the update's writes into account.  A var
+initializer that reads a def the same update adds fails, since the def's
+first value is computed only after the commit; one that reads any other def,
+including one the update changes or whose inputs it changes, sees the def's
+value from before the update (so the example above gives `v == 1`).  Closing
+this takes three pieces:
+
+- reads on the updating node: compute-on-read (task 12,
+  `tasks/12-compute-on-read.md`), treating the update's staged values as the
+  transaction's writes, so a def read during the update is recomputed from
+  them;
+- defs the update declares: evaluated in member order alongside its vars
+  (#267);
+- reads on other nodes: a remote owner answering a read during the update has
+  to see the update's staged values for its own service.  Today the updating
+  node evaluates everything and forwards the update only after its own commit,
+  so the owner can't.  The fix is for each owner to evaluate its service's
+  part of the update as a participant inside the transaction, buffering it
+  like a remote action's writes, and install it at commit: two-phase commit
+  for code updates (#180).
 
 ## Errors due to code update races
 

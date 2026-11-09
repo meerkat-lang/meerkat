@@ -241,9 +241,11 @@ impl Transaction {
         // service on another node, and the running state for the rest. Staged
         // values carry no clock: the update's stamp absorbs the clocks of the
         // running state it read.
-        // Defs are not staged: their first values come after the commit, so a
-        // var reading a def the update adds or changes fails or sees the old
-        // value (see docs/design/code-updates.md)
+        // Defs aren't staged yet, so a def read here doesn't reflect the
+        // update's writes: one the update adds fails, any other gives its value
+        // from before the update. That is a known limitation, not the intended
+        // semantics (docs/design/code-updates.md, "Evaluating an update"; task
+        // 12, #267, #180)
         let initializers: Vec<(Symbol, Symbol, Expr)> = self
             .ast
             .iter()

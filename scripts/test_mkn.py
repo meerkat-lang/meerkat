@@ -576,6 +576,7 @@ def integration_tests():
         ("local_update",              make_mkn_test(f"{IDIR}/updates/local_update.json")),
         ("remote_update",             make_mkn_test(f"{IDIR}/updates/remote_update/remote_update.json")),
         ("remote_atomic_update",      make_mkn_test(f"{IDIR}/updates/remote_update/remote_atomic_update.json")),
+        ("remote_cross_update",       make_mkn_test(f"{IDIR}/updates/remote_update/remote_cross_update.json")),
     ]
 
 

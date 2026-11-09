@@ -1,0 +1,29 @@
+import counter
+import other
+
+// Updates to two remote services, interleaved: the second update to `other`
+// reads `counter.x`, which the update to `counter` changes. The client
+// evaluates the block in the program's service order (`counter` before
+// `other`, which imports it), so `r` is 5; the owners must be sent the
+// updates in that order too, or `other`'s owner reads the old `x`.
+atomic {
+    update other {
+        var b = 1;
+    }
+    update counter {
+        var x = 5;
+    }
+    update other {
+        var r = counter.x;
+    }
+}
+
+service app {
+    var unused = 0;
+}
+
+@test(app) {
+    assert(counter.x == 5);
+    assert(other.b == 1);
+    assert(other.r == 5);
+}

@@ -291,6 +291,11 @@ impl Transaction {
             .collect();
         let graphs = manager.graphs_of(&self.ast, services, &staged);
         manager.check_graphs(&graphs)?;
+        // Each service's final declarations, so a remote owner is sent one
+        // update and evaluates the same batch this node did, in the order the
+        // services were staged in. Taken before the commit, which installs
+        // the merged program in the manager and leaves `self.ast` empty
+        let finals = final_declarations(&self.updates, &self.ast);
         if let Err(e) = self.commit(manager) {
             if let Some(txn) = &self.lock_txn {
                 manager.abort_participants(txn).await;
@@ -298,9 +303,6 @@ impl Transaction {
             return Err(e);
         }
 
-        // Each service's final declarations, so a remote owner is sent one
-        // update and evaluates the same batch this node did
-        let finals = final_declarations(&self.updates);
         let updated_services: Vec<(&Symbol, &Vec<Decl>)> =
             finals.iter().map(|(svc, decls)| (svc, decls)).collect();
         // The staged values and declarations were installed without
@@ -714,13 +716,19 @@ fn flatten_atomic(updates: Vec<Stmt>) -> Vec<Stmt> {
         .collect()
 }
 
-/// The final declarations `updates` gives each service, in the order the
-/// services first appear: a later declaration of a member replaces an
-/// earlier one in place, and a new one goes after the rest, as merging them
-/// into the service does. Forwarding these as one update to a remote owner
-/// makes it evaluate the same batch as this node: two updates to the same
-/// service in an `atomic` block are one update there too
-fn final_declarations(updates: &[Stmt]) -> Vec<(Symbol, Vec<Decl>)> {
+/// The final declarations `updates` gives each service: a later declaration
+/// of a member replaces an earlier one in place, and a new one goes after the
+/// rest, as merging them into the service does. Forwarding these as one
+/// update to a remote owner makes it evaluate the same batch as this node:
+/// two updates to the same service in an `atomic` block are one update there
+/// too.
+///
+/// The services come in the order `ast`, the merged program, declares them:
+/// the order their initializers were evaluated and staged in. Forwarded in
+/// that order, an owner reading another service's member sees the update
+/// this node's staged evaluation saw, whatever order the updates were
+/// written in
+fn final_declarations(updates: &[Stmt], ast: &[Stmt]) -> Vec<(Symbol, Vec<Decl>)> {
     let mut finals: Vec<(Symbol, Vec<Decl>)> = Vec::new();
     for (svc, decls) in declared(updates) {
         let at = match finals.iter().position(|(s, _)| s == svc) {
@@ -738,6 +746,13 @@ fn final_declarations(updates: &[Stmt]) -> Vec<(Symbol, Vec<Decl>)> {
             }
         }
     }
+    let mut position: HashMap<Symbol, usize> = HashMap::new();
+    for (at, stmt) in ast.iter().enumerate() {
+        if let Stmt::Service { name, .. } = stmt {
+            position.entry(*name).or_insert(at);
+        }
+    }
+    finals.sort_by_key(|(svc, _)| position.get(svc).copied().unwrap_or(usize::MAX));
     finals
 }
 
@@ -859,7 +874,12 @@ mod tests {
             &mut interner,
         )
         .unwrap();
-        let finals = final_declarations(&flatten_atomic(updates));
+        let ast = crate::runtime::parser::parse_string(
+            "service counter { var x = 0; } service other { var a = 0; }",
+            &mut interner,
+        )
+        .unwrap();
+        let finals = final_declarations(&flatten_atomic(updates), &ast);
         let shown: Vec<(String, Vec<String>)> = finals
             .iter()
             .map(|(svc, decls)| {
@@ -879,5 +899,27 @@ mod tests {
                 ("other".to_string(), vec!["var o = 0;".to_string()]),
             ]
         );
+    }
+    /// Batches follow the merged program's service order, not the order the
+    /// updates were written in, so they are forwarded in the order their
+    /// initializers were staged
+    #[test]
+    fn test_final_declarations_follow_the_program_service_order() {
+        let mut interner = Interner::new();
+        let ast = crate::runtime::parser::parse_string(
+            "service counter { var x = 3; } service other { var a = 0; }",
+            &mut interner,
+        )
+        .unwrap();
+        let updates = crate::runtime::parser::parse_string(
+            "atomic { update other { var b = 1; } update counter { var x = 5; } update other { var r = counter.x; } }",
+            &mut interner,
+        )
+        .unwrap();
+        let order: Vec<String> = final_declarations(&flatten_atomic(updates), &ast)
+            .iter()
+            .map(|(svc, _)| interner.get(*svc).to_string())
+            .collect();
+        assert_eq!(order, ["counter", "other"]);
     }
 }

@@ -1,0 +1,6 @@
+// Served by the `other_owner` node, which imports `counter` from `owner`.
+import counter
+
+service other {
+    var a = 0;
+}

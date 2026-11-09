@@ -351,13 +351,24 @@ naming will otherwise invite someone to restore the symmetry.
     read-your-own-writes and is only a regression check. Tests 1 and 3 are
     the ones that show compute-on-read working.
 11. **New — a code update and its remote owner agree on a def they read** (see
-    the last note). A client's update to remote service `r` adds `var v = d`,
-    where `d` is a def on `r` over `r`'s var `w`, and the same update has a
-    local var read `r.v`. While the update runs, another transaction writes
-    `w`. The local var and the owner's `r.v` must hold the same value. An
-    mkn scenario next to `scripts/tests/integration/updates/remote_update/`
-    (#266) is the natural home; the concurrent write needs a deterministic
-    hook, like the stand-in peers in `participant_commit_order_test`.
+    the last note). Service `src` has `var w`; remote service `r` has
+    `def d = src.w`. A client's update to `r` adds `var v = d`, and the same
+    update has a local var read `r.v`. The update does not touch `src`.
+    Between the client's staged read of `d` and the owner's re-evaluation of
+    `v`, another transaction writes `src.w`. The local var and the owner's
+    `r.v` must hold the same value.
+    - **Keep `w` outside `r`.** Adding `v` takes a whole-service lock on `r`,
+      which already keeps any member of `r` from being written during the
+      update, so a `w` inside `r` would make the test pass without the fix
+      (or leave its concurrent writer blocked). Only an input in a service the
+      update doesn't lock exposes the gap.
+    - **Force the timing.** The concurrent write has to land in that window,
+      not merely during the update: use a deterministic hook, like the
+      stand-in peers in `participant_commit_order_test`, rather than a sleep.
+    - Without the fix, the test must fail: the owner's `r.v` follows the new
+      `w` while the local var keeps the old one. An mkn scenario next to
+      `scripts/tests/integration/updates/remote_update/` (#266) is the
+      natural home.
 
 ## Notes
 
@@ -373,9 +384,11 @@ naming will otherwise invite someone to restore the symmetry.
   other initializers, and the remote owner then re-evaluates them itself
   under the same transaction id. The two agree only if every input they read
   stays fixed in between. Remote vars do: the update's read locks are held
-  until after forwarding. A remote **def** does not yet: today a transactional
-  read of a def locks the def but not its inputs, so a concurrent write to an
-  input recomputes it. With compute-on-read, a participant's read of a def
+  until after forwarding, and a service the update adds members to is
+  locked whole. A remote **def** whose inputs lie in a service the update
+  doesn't lock does not yet: today a transactional read of a def locks the
+  def but not its inputs, so a concurrent write to such an input recomputes
+  it. With compute-on-read, a participant's read of a def
   (`remote_read_participant`, §3c) must lock the def's inputs under the shared
   transaction id, so the owner's re-evaluation sees the same values. That is
   the requirement test 11 checks. The alternative, forwarding the staged

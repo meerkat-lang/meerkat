@@ -1058,3 +1058,69 @@ fn test_imports_accept_a_modules_update_to_its_own_and_imported_services() {
     )
     .expect("a module may update its own services and those of the modules it imports");
 }
+
+/// A module may update a service declared by a module it imports transitively,
+/// not only directly: the dependency chain still points the right way
+#[test]
+fn test_imports_accept_a_transitive_update_to_an_imported_service() {
+    finalize_with_disk_module(
+        "disk_module_transitive_updates",
+        "import helper\nservice app { var x = 0; }",
+        &[
+            ("base.mkt", "service base { var v = 1; }\n"),
+            ("middle.mkt", "import base\nservice middle { var m = 2; }\n"),
+            (
+                "helper.mkt",
+                "import middle\nservice helper { var w = 3; }\nupdate base { pub def b = 4; }\n",
+            ),
+        ],
+    )
+    .expect("a module may update a service from a module it imports transitively");
+}
+
+/// A peer module may declare a name the root program also declares, but that
+/// declaration is not the peer's on this node. A disk module importing the peer
+/// may still not update the root's service of that name
+#[test]
+fn test_imports_refuse_a_root_service_a_peer_merely_shadows() {
+    let dir = unique_temp_dir("disk_update_root_shadowed_by_peer");
+    std::fs::write(
+        dir.join("helper.mkt"),
+        "import dep\nservice helper { var v = 1; }\nupdate app { pub def z = 2; }\n",
+    )
+    .unwrap();
+    let mut interner = Interner::new();
+    let base_ast = parser::parse_string(
+        "import dep\nimport helper\nservice app { var x = 0; }",
+        &mut interner,
+    )
+    .expect("program parses");
+    let mut remote_map = HashMap::new();
+    remote_map.insert("dep".to_string(), "/ip4/127.0.0.1/tcp/9000".to_string());
+    let (mut imports, _) = Imports::new(
+        &mut interner,
+        remote_map,
+        &base_ast,
+        &dir,
+        "/ip4/127.0.0.1/tcp/8000/p2p/peer_a",
+    )
+    .expect("Imports::new success");
+    imports
+        .on_recv_source(
+            "service dep { var x = 1; }\nservice app { var y = 2; }",
+            "dep",
+            &dir,
+        )
+        .expect("on_recv_source success");
+    let error = imports
+        .finalize()
+        .expect_err("the peer's shadow of app does not make app the peer's to update")
+        .to_string();
+    assert!(
+        error.contains("module 'helper'")
+            && error.contains("service 'app'")
+            && error.contains("importing program"),
+        "unexpected error: {error}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -472,34 +472,57 @@ impl<'a> Imports<'a> {
         // importer, so that service does not exist yet -- which today fails at
         // startup with a message about a service not being found. Refuse the
         // reversed update here, before anything runs.
-        let mut reach: Vec<HashSet<usize>> = Vec::with_capacity(self.modules.len());
-        for (idx, module) in self.modules.iter().enumerate() {
-            let mut seen: HashSet<usize> = HashSet::new();
-            let mut pending: Vec<Symbol> = module.imports.clone();
-            while let Some(svc) = pending.pop() {
-                let Some(&dep) = owner.get(&svc) else {
-                    continue;
-                };
-                if dep != idx && seen.insert(dep) {
-                    pending.extend(self.modules[dep].imports.iter().copied());
-                }
+        //
+        // Only a disk module's updates need this: a peer module's updates are
+        // folded into its declarations further down. Collect the targets first
+        // so a program with none pays nothing for the walk below.
+        let mut disk_targets: Vec<Vec<Symbol>> = Vec::with_capacity(self.modules.len());
+        let mut any_updates = false;
+        for module in &self.modules {
+            let mut targets = Vec::new();
+            if module.remote_peer.is_none() {
+                collect_update_targets(&module.stmts, &mut targets);
             }
-            reach.push(seen);
+            any_updates |= !targets.is_empty();
+            disk_targets.push(targets);
         }
+
+        let mut reach: Vec<HashSet<usize>> = vec![HashSet::new(); self.modules.len()];
+        if any_updates {
+            for (idx, module) in self.modules.iter().enumerate() {
+                let mut seen: HashSet<usize> = HashSet::new();
+                let mut pending: Vec<Symbol> = module.imports.clone();
+                while let Some(svc) = pending.pop() {
+                    let Some(&dep) = owner.get(&svc) else {
+                        continue;
+                    };
+                    if dep != idx && seen.insert(dep) {
+                        pending.extend(self.modules[dep].imports.iter().copied());
+                    }
+                }
+                reach[idx] = seen;
+            }
+        }
+
         for (idx, module) in self.modules.iter().enumerate() {
             if module.remote_peer.is_some() {
                 continue;
             }
             let mut allowed: HashSet<Symbol> = module.declares.iter().copied().collect();
             for dep in &reach[idx] {
-                allowed.extend(self.modules[*dep].declares.iter().copied());
+                // A declaration owned locally is not the peer's to lend: this
+                // node serves its own, and its startup order is what it is.
+                for svc in &self.modules[*dep].declares {
+                    if owner.get(svc) == Some(dep) {
+                        allowed.insert(*svc);
+                    }
+                }
             }
-            let mut targets: Vec<Symbol> = Vec::new();
-            collect_update_targets(&module.stmts, &mut targets);
-            for target in targets {
-                if allowed.contains(&target) {
+            for target in &disk_targets[idx] {
+                if allowed.contains(target) {
                     continue;
                 }
+                let target = *target;
                 let module_name = self.interner.get(module.name);
                 let service = self.interner.get(target);
                 if self.root_declares.contains(&target) {

@@ -365,6 +365,12 @@ naming will otherwise invite someone to restore the symmetry.
     - **Force the timing.** The concurrent write has to land in that window,
       not merely during the update: use a deterministic hook, like the
       stand-in peers in `participant_commit_order_test`, rather than a sleep.
+      Start the write in that window, but don't make the update wait for it:
+      with compute-on-read, the update's read lock on `src.w` makes the
+      writer wait or die (wait-die), and a harness that blocked forwarding
+      until the write committed would deadlock the correct implementation.
+      Assert that the values agree and that the write did not commit before
+      the owner's re-evaluation; don't require it to succeed.
     - Without the fix, the test must fail: the owner's `r.v` follows the new
       `w` while the local var keeps the old one. An mkn scenario next to
       `scripts/tests/integration/updates/remote_update/` (#266) is the

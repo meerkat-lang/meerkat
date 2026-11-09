@@ -32,7 +32,7 @@ impl Transaction {
     ///     `Self`: The initialized `Transaction` instance
     pub fn new(updates: Vec<Stmt>) -> Self {
         Self {
-            updates,
+            updates: flatten_atomic(updates),
             ast: Vec::new(),
             values: HashMap::new(),
             lock_txn: None,
@@ -49,7 +49,7 @@ impl Transaction {
     ///     `Self`: The initialized `Transaction` instance
     pub fn new_with_id(txn_id: TxnId, updates: Vec<Stmt>) -> Self {
         Self {
-            updates,
+            updates: flatten_atomic(updates),
             ast: Vec::new(),
             values: HashMap::new(),
             lock_txn: Some(LockTxn::new(txn_id)),
@@ -225,11 +225,12 @@ impl Transaction {
             }
         }
         // Evaluate their initializers in the merged order, staging each value
-        // in the transaction's read cache as it is computed. Every member read
-        // in the update then sees the update's own vars, new or changed,
-        // whether by plain or qualified name or from inside a called function,
-        // and the running state for the rest. Staged entries carry no clock:
-        // the update's stamp absorbs the clocks of the running state it read.
+        // in the lock transaction as it is computed. Every member read in the
+        // update then sees the update's own vars, new or changed, whether by
+        // plain or qualified name, from inside a called function, or in a
+        // service on another node, and the running state for the rest. Staged
+        // values carry no clock: the update's stamp absorbs the clocks of the
+        // running state it read.
         // Defs are not staged: their first values come after the commit, so a
         // var reading a def the update adds or changes fails or sees the old
         // value (see docs/design/code-updates.md)
@@ -261,10 +262,7 @@ impl Transaction {
                 eval(&expr, &[], &mut ctx).await?
             };
             if let Some(txn) = self.lock_txn.as_mut() {
-                txn.read_cache.insert(
-                    (manager.service_net_id_for_name(svc_name), var_name),
-                    (val.clone(), None, None),
-                );
+                txn.staged.insert((svc_name, var_name), val.clone());
             }
             self.values.insert((svc_name, var_name), val);
         }
@@ -695,6 +693,21 @@ pub fn format_update_source(service_name: Symbol, decls: &[Decl], interner: &Int
     let svc_str = interner.get(service_name);
     let decl_strs: Vec<String> = decls.iter().map(|d| format_decl(d, interner)).collect();
     format!("update {} {{\n  {}\n}}", svc_str, decl_strs.join("\n  "))
+}
+
+/// `updates` with every `atomic` block, nested ones included, replaced by
+/// the updates it contains, as `Manager::run_update` unwraps one. A
+/// transaction locks, stages and merges the same flat list, so an `atomic`
+/// block arriving here (from a peer's `UpdateServiceRequest`, say) can't
+/// install declarations without their values
+fn flatten_atomic(updates: Vec<Stmt>) -> Vec<Stmt> {
+    updates
+        .into_iter()
+        .flat_map(|stmt| match stmt {
+            Stmt::Atomic { updates } => flatten_atomic(updates),
+            other => vec![other],
+        })
+        .collect()
 }
 
 /// The services `updates` declares, each with its declarations

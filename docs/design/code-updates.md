@@ -117,7 +117,9 @@ update s {
 ```
 
 gives `b == 10`.  This holds however a member is read: by its plain name, by a
-qualified name such as `s.a`, or inside a function the initializer calls.  The
+qualified name such as `s.a`, inside a function the initializer calls, or in a
+service on another node that the update changes.  An `atomic` block is
+evaluated as one update, using each var's final declaration in the block.  The
 staged values live in the update's transaction, not in the initializer's local
 scope, so a closure doesn't capture them; it reads the member when it runs.
 Members the update doesn't declare keep their running values, read under the

@@ -1470,3 +1470,57 @@ async fn test_update_var_cannot_read_a_def_the_update_adds() {
     .expect("reading a new def from a var initializer fails");
     assert!(err.contains("'d' not found"), "unexpected error: {err}");
 }
+
+/// An `atomic` block given to a transaction as it is, without unwrapping it
+/// first (as a peer's `UpdateServiceRequest` can carry it), still stages and
+/// installs its vars' values
+#[tokio::test]
+async fn test_update_atomic_block_given_directly_installs_its_values() {
+    let mut m = manager_after_update(
+        "service s { var a = 0; }",
+        "atomic { update s { var c = 5; var d = c + 1; } }",
+    )
+    .await;
+    assert_eq!(value_of(&mut m, "s", "c").await, Value::Int { val: 5 });
+    assert_eq!(value_of(&mut m, "s", "d").await, Value::Int { val: 6 });
+}
+
+/// A nested `atomic` block, which the parser rejects but code can build, is
+/// flattened like any other
+#[tokio::test]
+async fn test_update_nested_atomic_block_installs_its_values() {
+    let mut interner = Interner::new();
+    let initial_ast = parse_string("service s { var a = 0; }", &mut interner).unwrap();
+    let mut node = Node::new();
+    node.interner = interner;
+    node.unified_ast = initial_ast;
+    node.static_checks().unwrap();
+    let local_ast = node.unified_ast.clone();
+    let mut m = node
+        .on_manager_startup(true, None, HashMap::new(), &local_ast)
+        .await
+        .unwrap();
+    let inner = parse_string("update s { var c = 7; }", &mut m.interner).unwrap();
+    let nested = vec![Stmt::Atomic {
+        updates: vec![Stmt::Atomic { updates: inner }],
+    }];
+    Transaction::new(nested)
+        .poll(&mut m)
+        .await
+        .expect("the nested update applies");
+    assert_eq!(value_of(&mut m, "s", "c").await, Value::Int { val: 7 });
+}
+
+/// Updates in one `atomic` block that change the same var are evaluated in
+/// their final form: `b` reads the last value given to `a`
+#[tokio::test]
+async fn test_update_atomic_block_overlapping_updates_use_final_values() {
+    let mut m = try_update(
+        "service s { var a = 0; var b = 0; }",
+        "atomic { update s { var a = 1; var b = a; } update s { var a = 2; } }",
+    )
+    .await
+    .expect("the update applies");
+    assert_eq!(value_of(&mut m, "s", "a").await, Value::Int { val: 2 });
+    assert_eq!(value_of(&mut m, "s", "b").await, Value::Int { val: 2 });
+}

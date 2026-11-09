@@ -1364,6 +1364,14 @@ impl Manager {
         service_name: Symbol,
         mut txn: Option<&mut Transaction>,
     ) -> Result<Value, EvalError> {
+        // A value a code update has staged for one of the vars it declares
+        // comes first, wherever the service lives (`Transaction::staged`)
+        if let Some(staged) = txn
+            .as_deref()
+            .and_then(|t| t.staged.get(&(service_name, var_name)))
+        {
+            return Ok(staged.clone());
+        }
         // Check if service is remote
         if self.remote_services.contains_key(&service_name) {
             return self.remote_lookup(service_name, var_name, txn).await;

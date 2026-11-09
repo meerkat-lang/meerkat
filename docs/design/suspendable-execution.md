@@ -231,6 +231,13 @@ State that assumes one action runs at a time also has to change:
 - Suspended actions get dropped when their transaction aborts.  The comment in
   `recompute_def` already notes that its cache restore is not
   cancellation-safe; that becomes a normal path to handle.
+- A code update in progress (`update::Transaction::apply`) must not be dropped
+  either.  It holds local locks, and remote participants' locks, until it
+  returns, and releases them only on its normal paths; every caller today
+  awaits it to completion.  If the event loop runs updates as tasks, it has to
+  run each one to completion, or give updates cleanup that survives being
+  dropped.  (Releasing remote participants' locks when an update fails before
+  committing is #257.)
 
 ## Sequencing
 

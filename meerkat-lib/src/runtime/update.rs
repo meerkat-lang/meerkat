@@ -90,6 +90,12 @@ impl Transaction {
     /// values, read cache and locks, belongs to that attempt, so retrying
     /// after a failure means building a new `Transaction`
     ///
+    /// Not cancellation-safe: callers must drive it to completion. Its locks
+    /// are released on its normal paths only, so dropping the future part way
+    /// (in a `select!`, say) would leave them held. No caller does today; see
+    /// `docs/design/suspendable-execution.md` for what the event loop of #28
+    /// has to respect
+    ///
     /// Args:
     ///     `manager` (`&mut Manager`): The active runtime manager
     ///

@@ -617,7 +617,7 @@ impl Display for Decl {
 ///
 /// Members keep their order unless one must follow a member it reads, which
 /// lets an update add a member and change an existing def to read it: see
-/// `merge_update_decls`
+/// `order_members`
 ///
 /// Args:
 ///     `base_ast` (`&[Stmt]`): The original AST statements
@@ -634,7 +634,26 @@ pub fn apply_updates_to_ast(base_ast: &[Stmt], updates: &[Stmt]) -> Result<Vec<S
         .filter(|stmt| !matches!(stmt, Stmt::Update { .. } | Stmt::Atomic { .. }))
         .cloned()
         .collect();
+    // For each service changed, how many members it had before: members are
+    // ordered once, after every update (an `atomic` block's included) is in
+    let mut before: HashMap<usize, usize> = HashMap::new();
+    merge_updates(&mut patched_ast, updates, &mut before)?;
+    for (at, existing) in before {
+        if let Stmt::Service { name, decls } = &mut patched_ast[at] {
+            order_members(decls, *name, existing);
+        }
+    }
+    Ok(patched_ast)
+}
 
+/// `apply_updates_to_ast` before ordering: merge each update's declarations
+/// into its service, recording in `before` the service's member count before
+/// its first change
+fn merge_updates(
+    patched_ast: &mut [Stmt],
+    updates: &[Stmt],
+    before: &mut HashMap<usize, usize>,
+) -> Result<(), Symbol> {
     for stmt in updates {
         let (updated_svc_name, updated_decls) = match stmt {
             Stmt::Service { name, decls } => (name, decls),
@@ -645,7 +664,7 @@ pub fn apply_updates_to_ast(base_ast: &[Stmt], updates: &[Stmt]) -> Result<Vec<S
             Stmt::Atomic {
                 updates: inner_updates,
             } => {
-                patched_ast = apply_updates_to_ast(&patched_ast, inner_updates)?;
+                merge_updates(patched_ast, inner_updates, before)?;
                 continue;
             }
             Stmt::Connect { .. }
@@ -656,7 +675,7 @@ pub fn apply_updates_to_ast(base_ast: &[Stmt], updates: &[Stmt]) -> Result<Vec<S
         };
 
         let mut found_service = false;
-        for existing_stmt in &mut patched_ast {
+        for (at, existing_stmt) in patched_ast.iter_mut().enumerate() {
             if let Stmt::Service {
                 name: existing_svc_name,
                 decls: existing_decls,
@@ -664,7 +683,8 @@ pub fn apply_updates_to_ast(base_ast: &[Stmt], updates: &[Stmt]) -> Result<Vec<S
             {
                 if *existing_svc_name == *updated_svc_name {
                     found_service = true;
-                    merge_update_decls(existing_decls, *updated_svc_name, updated_decls);
+                    before.entry(at).or_insert(existing_decls.len());
+                    merge_update_decls(existing_decls, updated_decls);
                 }
             }
         }
@@ -673,8 +693,7 @@ pub fn apply_updates_to_ast(base_ast: &[Stmt], updates: &[Stmt]) -> Result<Vec<S
             return Err(*updated_svc_name);
         }
     }
-
-    Ok(patched_ast)
+    Ok(())
 }
 
 /// Add to `reads` the members of `service` that evaluating `expr` certainly
@@ -709,31 +728,15 @@ fn eager_reads(expr: &Expr, service: Symbol, reads: &mut HashSet<Symbol>) {
     }
 }
 
-/// Merge an update's declarations into the declarations of `service`
-///
-/// A changed declaration replaces the old one in place, and a new one goes at
-/// the end, in the update's order. A member may only read members declared
-/// before it, so the two sequences are then interleaved, each keeping its own
-/// order (the existing members theirs, the new members the update's), so that
-/// each member follows the members it certainly reads (`eager_reads`),
-/// preferring the order above: a stable topological sort. That lets an update
-/// add a member and change an existing def to read it, while a forward
-/// reference among the update's own members, or among existing members, stays
-/// an error for the check to report.
-///
-/// The order above already keeps both sequences in order, so if it also
-/// satisfies these reads it is left as it is; and they are a subset of the
-/// reads the forward-reference check counts, so any update the check accepted
-/// without sorting is merged exactly as before. Members only move when that
-/// order would certainly be rejected. If the constraints form a cycle, the
-/// order is left for the check to report.
-fn merge_update_decls(decls: &mut Vec<Decl>, service: Symbol, updated: &[Decl]) {
+/// Merge an update's declarations into a service's: a changed declaration
+/// replaces the old one in place, and a new one goes at the end, in the
+/// update's order
+fn merge_update_decls(decls: &mut Vec<Decl>, updated: &[Decl]) {
     let mut index: HashMap<Symbol, usize> = decls
         .iter()
         .enumerate()
         .map(|(i, d)| (d.name(), i))
         .collect();
-    let existing = decls.len();
     for up in updated {
         match index.get(&up.name()) {
             Some(&i) => decls[i] = up.clone(),
@@ -743,6 +746,33 @@ fn merge_update_decls(decls: &mut Vec<Decl>, service: Symbol, updated: &[Decl]) 
             }
         }
     }
+}
+
+/// Order the members of `service` after its updates are merged, the first
+/// `existing` of them being those it had before
+///
+/// A member may only read members declared before it, so the two sequences,
+/// existing members and new ones, are interleaved, each keeping its own order
+/// (the existing members theirs, the new members the updates'), so that each
+/// member follows the members it certainly reads (`eager_reads`), preferring
+/// the merged order: a stable topological sort. That lets an update add a
+/// member and change an existing def to read it, while a forward reference
+/// among the updates' own members, or among existing members, stays an error
+/// for the check to report. It runs once for all the updates merged together,
+/// so an `atomic` block is ordered by its final declarations.
+///
+/// The merged order already keeps both sequences in order, so if it also
+/// satisfies these reads it is left as it is; and they are a subset of the
+/// reads the forward-reference check counts, so any update the check accepted
+/// without ordering is merged exactly as before. Members only move when that
+/// order would certainly be rejected. If the constraints form a cycle, the
+/// order is left for the check to report.
+fn order_members(decls: &mut Vec<Decl>, service: Symbol, existing: usize) {
+    let index: HashMap<Symbol, usize> = decls
+        .iter()
+        .enumerate()
+        .map(|(i, d)| (d.name(), i))
+        .collect();
 
     // `readers[j]`: the members that read member `j`; `waiting[i]`: how many
     // members member `i` reads that are not placed yet
@@ -905,5 +935,31 @@ mod tests {
              update s { var c = 2; pub def warm = s.c > 0; }",
         );
         assert_eq!(names, ["t", "c", "warm"]);
+    }
+
+    /// An `atomic` block is ordered by its final declarations: the first
+    /// update has `x` read a new `c`, the second reverses that, and `c` must
+    /// end up after `x` (a regression found in review of #266)
+    #[test]
+    fn test_apply_updates_orders_an_atomic_block_by_its_final_declarations() {
+        let names = names_after_update(
+            "service s { var a = 0; pub def x = a + 1; }
+             atomic {
+                 update s { var c = 5; pub def x = c + 1; }
+                 update s { pub def x = a + 2; pub def c = x + 1; }
+             }",
+        );
+        assert_eq!(names, ["a", "x", "c"]);
+    }
+
+    /// Existing members keep their order, so a changed member reading a later
+    /// existing one is left for the check to reject
+    #[test]
+    fn test_apply_updates_keeps_a_forward_reference_between_existing_members() {
+        let names = names_after_update(
+            "service s { var a = 1; var b = 2; }
+             update s { var a = b; }",
+        );
+        assert_eq!(names, ["a", "b"]);
     }
 }

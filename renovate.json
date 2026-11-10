@@ -4,6 +4,7 @@
     "config:best-practices",
     ":enablePreCommit"
   ],
+  "ignorePresets": [":pinDevDependencies"],
   "timezone": "America/New_York",
   "schedule": ["* 0 * * 0"],
   "minimumReleaseAge": "7 days",
@@ -40,10 +41,23 @@
       "addLabels": ["major"]
     },
     {
-      "description": "Group Rust minor and patch updates",
+      "description": "Group Rust patch updates",
       "matchManagers": ["cargo"],
-      "matchUpdateTypes": ["minor", "patch"],
+      "matchUpdateTypes": ["patch"],
       "groupName": "rust minor and patch dependencies"
+    },
+    {
+      "description": "Group Rust minor updates of crates at 1.0 or later. A minor update of a 0.x crate (0.56 to 0.57) can break the API, so each gets its own PR and one that needs code changes doesn't hold up the rest",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["minor"],
+      "matchCurrentVersion": ">=1.0.0",
+      "groupName": "rust minor and patch dependencies"
+    },
+    {
+      "description": "Keep the wasm-bindgen crates in a group of their own. They are released together and depend on each other's exact versions, so they must move together, and other crates can pin them too (libp2p-swarm 0.48 pins wasm-bindgen-futures exactly). On their own, an update that can't resolve yet doesn't hold up the rest. Placed after the Rust rules so it takes precedence",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["wasm-bindgen", "wasm-bindgen-futures", "js-sys", "web-sys"],
+      "groupName": "wasm-bindgen crates"
     },
     {
       "description": "Group pre-commit hook updates",

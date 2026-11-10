@@ -7,6 +7,7 @@ use meerkat_lib::runtime::ast::Stmt;
 use meerkat_lib::runtime::imports::Imports;
 use meerkat_lib::runtime::interner::Interner;
 use meerkat_lib::runtime::parser;
+use meerkat_lib::runtime::update::Transaction as CodeUpdate;
 
 /// Test that local imports resolve transitively and circular
 /// imports terminate cleanly without infinite recursion
@@ -51,7 +52,7 @@ fn test_imports_local_resolution_and_circular_prevention() {
     assert!(new_cmds.is_empty());
     assert!(imports.is_done());
 
-    let final_ast = imports.finalize();
+    let (final_ast, _) = imports.finalize().expect("finalize");
     let has_service_b = final_ast.iter().any(|stmt| {
         if let Stmt::Service { name, .. } = stmt {
             interner.get(*name) == "B"
@@ -139,7 +140,7 @@ fn test_imports_on_recv_source_merges_and_resolves() {
     assert!(new_cmds.is_empty());
     assert!(imports.is_done());
 
-    let imported_ast = imports.finalize();
+    let (imported_ast, _) = imports.finalize().expect("finalize");
     let mut all_stmts = base_ast;
     all_stmts.extend(imported_ast);
 
@@ -232,7 +233,9 @@ fn test_imports_pending_cleanup() {
     );
 
     // Assert that msg1 was pruned by registering msg2
-    let retry1 = imports.on_send_failure(msg1).expect("on_send_failure ok");
+    let retry1 = imports
+        .on_send_failure(msg1, "test failure")
+        .expect("on_send_failure ok");
     assert!(retry1.is_none());
 
     // Receive source for B; should remove pending entries for B
@@ -242,7 +245,9 @@ fn test_imports_pending_cleanup() {
         .expect("on_recv_source success");
 
     // Stale failure notifications for completed service yield None
-    let retry2 = imports.on_send_failure(msg2).expect("on_send_failure ok");
+    let retry2 = imports
+        .on_send_failure(msg2, "test failure")
+        .expect("on_send_failure ok");
     assert!(retry2.is_none());
 }
 
@@ -287,8 +292,15 @@ fn test_imports_max_imported_services_limit() {
     let mut interner = Interner::new();
     let base_ast = Vec::new();
 
+    // A network arrival is only recorded for a service fetched from a peer
+    let remote_map: HashMap<String, String> = (0..MAX_IMPORTED_SERVICES)
+        .map(|i| format!("S{}", i))
+        .chain(std::iter::once("Overflow".to_string()))
+        .map(|name| (name, "/ip4/127.0.0.1/tcp/9000".to_string()))
+        .collect();
+
     let (mut imports, _initial_cmds) =
-        Imports::new(&mut interner, HashMap::new(), &base_ast, Path::new(""), "")
+        Imports::new(&mut interner, remote_map, &base_ast, Path::new(""), "")
             .expect("Imports::new success");
 
     // Populate visited_services up to the limit
@@ -502,6 +514,8 @@ fn test_network_imports_are_dependency_ordered_regardless_of_arrival() {
 
     let order: Vec<String> = imports
         .finalize()
+        .expect("finalize")
+        .0
         .iter()
         .filter_map(|s| match s {
             Stmt::Service { name, .. } => Some(node.interner.get(*name).to_string()),
@@ -746,4 +760,208 @@ async fn test_local_only_resolution_clears_discovered_ownership() {
     );
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// #204: when retries run out, the error says why the last attempt failed,
+/// not just that it did
+#[test]
+fn test_import_retry_exhaustion_reports_the_cause() {
+    use meerkat_lib::net::MessageId;
+    use meerkat_lib::runtime::limits::MAX_IMPORT_RETRIES;
+
+    // Parsed rather than built, so the test doesn't depend on the shape of
+    // `Stmt::Import`
+    let mut interner = Interner::new();
+    let base_ast = parser::parse_string("import B\n", &mut interner).expect("parse import");
+    let mut remote_map = HashMap::new();
+    remote_map.insert("B".to_string(), "/ip4/127.0.0.1/tcp/9000".to_string());
+    let (mut imports, _initial_cmds) = Imports::new(
+        &mut interner,
+        remote_map,
+        &base_ast,
+        Path::new(""),
+        "/ip4/127.0.0.1/tcp/8000/p2p/peer_a",
+    )
+    .expect("Imports::new success");
+
+    let cause = "ProtocolError(\"Outgoing connection failed: WrongPeerId\")";
+    let mut retry = 0;
+    loop {
+        let msg_id = MessageId(1000 + u64::from(retry));
+        imports.register_sent_command(
+            msg_id,
+            "B".to_string(),
+            "/ip4/127.0.0.1/tcp/9000".to_string(),
+            retry,
+        );
+        match imports.on_send_failure(msg_id, cause) {
+            Ok(Some((_, _, _, next))) => retry = next,
+            Ok(None) => panic!("B is still pending, so a failure must be retried"),
+            Err(e) => {
+                assert_eq!(retry, MAX_IMPORT_RETRIES, "gave up early");
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("after") && msg.contains(cause),
+                    "the error must name the last cause, got: {msg}"
+                );
+                break;
+            }
+        }
+    }
+}
+
+/// The startup updates of a module fetched from a peer complete the peer's
+/// declarations here, so the static checks and a local update see what the
+/// peer serves; the peer's code itself is not run here, and a local module's
+/// startup updates stay as they are
+#[tokio::test]
+async fn test_imports_fold_a_peers_startup_updates_into_its_declarations() {
+    let dir = unique_temp_dir("peer_updates");
+    std::fs::write(
+        dir.join("helper.mkt"),
+        "service helper { var v = 1; }\nupdate helper { pub def w = 2; }\n",
+    )
+    .unwrap();
+    let mut node = meerkat_lib::runtime::Node::new();
+    let base_ast = parser::parse_string(
+        "import dep\nimport helper\nservice app { var x = 0; }\nupdate app { pub def z = dep.y; }",
+        &mut node.interner,
+    )
+    .expect("program parses");
+    let (dep, y, helper, w) = ["dep", "y", "helper", "w"]
+        .map(|n| node.interner.insert(n))
+        .into();
+    let mut remote_map = HashMap::new();
+    remote_map.insert("dep".to_string(), "/ip4/127.0.0.1/tcp/9000".to_string());
+    let (mut imports, _) = Imports::new(
+        &mut node.interner,
+        remote_map,
+        &base_ast,
+        &dir,
+        "/ip4/127.0.0.1/tcp/8000/p2p/peer_a",
+    )
+    .expect("Imports::new success");
+    imports
+        .on_recv_source(
+            "service dep { var x = 1; }\nupdate dep { pub def y = 2; }",
+            "dep",
+            &dir,
+        )
+        .expect("on_recv_source success");
+    let (imported, local_imports) = imports.finalize().expect("the peer's update completes dep");
+
+    let declares = |stmts: &[Stmt], service, member| {
+        stmts.iter().any(|s| {
+            matches!(s, Stmt::Service { name, decls } if *name == service && decls.iter().any(|d| d.name() == member))
+        })
+    };
+    assert!(
+        declares(&imported, dep, y),
+        "dep.y must be part of dep's declarations"
+    );
+    assert!(
+        !declares(&imported, helper, w),
+        "helper's own update is not folded: this node runs it"
+    );
+    assert!(
+        imported
+            .iter()
+            .any(|s| matches!(s, Stmt::Update { service_name, .. } if *service_name == helper)),
+        "the local module's startup update stays for validation"
+    );
+    assert!(
+        local_imports
+            .iter()
+            .any(|s| matches!(s, Stmt::Update { service_name, .. } if *service_name == helper)),
+        "and is run at startup"
+    );
+    let mut all = imported;
+    all.extend(base_ast.iter().cloned());
+    node.run_static_checks(&all)
+        .expect("static checks see dep.y");
+
+    // The runtime validates the local update against the installed declarations
+    let mut manager = meerkat_lib::runtime::Manager::new(node.interner);
+    manager.remote_services.insert(
+        dep,
+        meerkat_lib::net::Address::new("/ip4/127.0.0.1/tcp/9000"),
+    );
+    manager.install_unified_ast(all.clone());
+    for stmt in &all {
+        if let Stmt::Service { name, decls } = stmt {
+            if !manager.remote_services.contains_key(name) {
+                manager
+                    .create_service(*name, decls.clone())
+                    .await
+                    .expect("local services start");
+            }
+        }
+    }
+    let update = all
+        .iter()
+        .find(|s| matches!(s, Stmt::Update { service_name, .. } if *service_name != helper))
+        .cloned()
+        .expect("the program's update");
+    CodeUpdate::new(vec![update])
+        .apply(&mut manager)
+        .await
+        .expect("the update resolves dep.y, which the peer declares");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Resolve the imports of a program that imports `dep` from a peer and
+/// `helper` from disk, with `peer_source` as the code the peer sends for
+/// `dep`, and return what `finalize` reports
+fn finalize_with_peer_source(label: &str, peer_source: &str) -> Result<(), String> {
+    let dir = unique_temp_dir(label);
+    std::fs::write(dir.join("helper.mkt"), "service helper { var v = 1; }\n").unwrap();
+    let mut interner = Interner::new();
+    let base_ast = parser::parse_string(
+        "import dep\nimport helper\nservice app { var x = 0; }",
+        &mut interner,
+    )
+    .expect("program parses");
+    let mut remote_map = HashMap::new();
+    remote_map.insert("dep".to_string(), "/ip4/127.0.0.1/tcp/9000".to_string());
+    let (mut imports, _) = Imports::new(
+        &mut interner,
+        remote_map,
+        &base_ast,
+        &dir,
+        "/ip4/127.0.0.1/tcp/8000/p2p/peer_a",
+    )
+    .expect("Imports::new success");
+    imports
+        .on_recv_source(peer_source, "dep", &dir)
+        .expect("on_recv_source success");
+    let result = imports.finalize().map(|_| ()).map_err(|e| e.to_string());
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+/// A module fetched from a peer may only update the services that peer
+/// serves. One updating a service this node declares, in its own program or
+/// in a module read from disk, is refused rather than folded into local code
+#[test]
+fn test_imports_refuse_a_peers_update_to_a_local_service() {
+    for (label, target) in [
+        ("peer_updates_root", "app"),
+        ("peer_updates_disk", "helper"),
+    ] {
+        let source = format!("service dep {{ var x = 1; }}\nupdate {target} {{ pub def q = 2; }}");
+        let error = finalize_with_peer_source(label, &source)
+            .expect_err("a peer's update to a local service must be refused");
+        assert!(
+            error.contains(&format!(
+                "updates service '{target}', which that peer does not serve"
+            )),
+            "unexpected error for '{target}': {error}"
+        );
+    }
+    // The same update aimed at the peer's own service is folded as usual
+    finalize_with_peer_source(
+        "peer_updates_own",
+        "service dep { var x = 1; }\nupdate dep { pub def q = 2; }",
+    )
+    .expect("a peer's update to its own service is folded");
 }

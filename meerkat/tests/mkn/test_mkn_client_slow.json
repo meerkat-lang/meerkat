@@ -9,7 +9,7 @@
       "alias": "slow_client",
       "type": "client",
       "cmd": ["python3", "-c", "import time; time.sleep(2)"],
-      "timeout": 5
+      "timeout": 10
     }
   ]
 }

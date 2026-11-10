@@ -15,7 +15,6 @@ strum_macros = "0.28.0"
 lalrpop-util = { version = "0.23.0", features = ["lexer", "unicode"] }
 kameo = "0.22"
 tokio = { version = "1", features = ["sync", "macros", "io-util", "rt", "time"] }
-json = "0.12.4"
 futures = "0.3"
 inline_colorization = "0.1.5"
 log = "0.4"
@@ -25,16 +24,23 @@ thiserror = "2"
 async-recursion = "1.0"
 petgraph = "0.8.3"
 
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-libp2p = { version = "0.56", features = ["tokio", "tcp", "dns", "websocket", "noise", "yamux", "relay", "dcutr", "identify", "macros"] }
-libp2p-stream = "0.4.0-alpha"
+libp2p = { version = "0.57", features = ["tokio", "tcp", "dns", "websocket", "noise", "yamux", "relay", "dcutr", "identify", "macros"] }
+libp2p-stream = "0.5.0-alpha"
+socket2 = "0.6"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-libp2p = { version = "0.56", default-features = false, features = ["macros", "wasm-bindgen", "websocket-websys", "noise", "yamux", "relay", "identify"] }
-libp2p-stream = "0.4.0-alpha"
+libp2p = { version = "0.57", default-features = false, features = ["macros", "websocket-websys", "noise", "yamux", "relay", "identify"] }
+libp2p-stream = "0.5.0-alpha"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = ["console"] }
 getrandom = { version = "0.3", features = ["wasm_js"] }
-gloo-timers = { version = "0.4", features = ["futures"] }
+# 0.3, not 0.4: gloo-timers 0.4 needs js-sys >= 0.3.91, but libp2p-swarm 0.48.0
+# pins wasm-bindgen-futures =0.4.58, which pins js-sys 0.3.85. Go back to 0.4
+# once libp2p-swarm relaxes that pin.
+gloo-timers = { version = "0.3", features = ["futures"] }
 send_wrapper = { version = "0.6", features = ["futures"] }

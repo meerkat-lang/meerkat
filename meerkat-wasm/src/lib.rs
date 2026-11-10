@@ -267,7 +267,7 @@ pub async fn load_service(server_ws_addr: String, path: String) -> Result<String
                     gloo_timers::future::TimeoutFuture::new(20).await;
                     continue;
                 };
-                manager.dispatch_network_events().await;
+                manager.serve_network_events().await;
             }
             let now = current_html(&manager_loop.borrow(), html_sym);
             if now != last {

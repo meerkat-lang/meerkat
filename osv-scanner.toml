@@ -1,0 +1,13 @@
+# Exceptions for the OSV scan in .github/workflows/weekly-security.yml.
+# Each entry needs a reason and an ignoreUntil date. When the date passes,
+# the scan fails again, which is the reminder to re-check the entry.
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0436"
+ignoreUntil = 2027-05-07
+reason = """\
+`paste` is unmaintained, not vulnerable, and has no fixed release. It is a \
+build-time proc-macro that libp2p brings in (libp2p-tcp -> if-watch -> \
+netlink-packet-core), so we can't remove it ourselves. Re-check whether \
+libp2p has dropped it when this expires. See #220 and #242.\
+"""

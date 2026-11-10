@@ -2417,6 +2417,7 @@ dependencies = [
  "kameo",
  "lalrpop",
  "lalrpop-util",
+ "libc",
  "libp2p",
  "libp2p-stream",
  "log",

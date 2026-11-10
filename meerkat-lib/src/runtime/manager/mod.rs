@@ -3438,21 +3438,11 @@ impl Manager {
                 path,
                 reply_to,
             } if self.served_base_dir.is_some() => {
-                if let Some(base_dir) = self.served_base_dir.clone() {
-                    let destination = Address::new(&reply_to);
-                    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-                    let response = tokio::task::spawn_blocking(move || {
-                        codec::serve_service_code(request_id, path, &reply_to, &base_dir)
-                    })
-                    .await
-                    .unwrap_or_else(|error| MeerkatMessage::ServiceCodeError {
-                        request_id,
-                        error: format!("failed to serve requested file: {}", error),
-                    });
-                    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-                    let response =
-                        codec::serve_service_code(request_id, path, &reply_to, &base_dir);
-                    self.send_oneway(destination, response).await;
+                let response = self.served_base_dir.as_deref().map(|base_dir| {
+                    codec::serve_service_code(request_id, path, &reply_to, base_dir)
+                });
+                if let Some(response) = response {
+                    self.send_oneway(Address::new(&reply_to), response).await;
                 }
             }
             MeerkatMessage::LookupRequest {

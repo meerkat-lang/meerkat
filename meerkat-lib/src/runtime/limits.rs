@@ -78,7 +78,8 @@ pub const MAX_NET_CLOCK_COUNTER: u64 = u64::MAX / 2;
 /// Maximum number of services allowed to be imported
 pub const MAX_IMPORTED_SERVICES: usize = 256;
 
-/// Maximum number of code updates a node holds for one peer: applied, and
-/// waiting up to `FIRST_VALUE_TIMEOUT` for the first values of their new defs
-/// before the peer is answered. Another update from that peer is refused
+/// Maximum number of code updates a node holds for one peer: being applied,
+/// or applied and waiting up to `FIRST_VALUE_TIMEOUT` for the first values of
+/// their new defs before the peer is answered. Another update from that peer
+/// is refused
 pub const MAX_PENDING_UPDATES_PER_PEER: usize = 32;

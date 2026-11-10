@@ -342,6 +342,10 @@ pub struct Manager {
     deferred_deliveries: Vec<DeferredDelivery>,
     /// Shared by server dispatch and RPC waits; completing never starts an RPC.
     completing_updates: Vec<Completing>,
+    /// The peers whose code updates are being applied, innermost last: one
+    /// that waits on a remote call lets the node serve other requests, more
+    /// updates among them
+    applying_updates: Vec<String>,
     /// (Probabilistically) unique identifier of this node, used in transaction
     /// ids so ids minted on different nodes never collide.
     pub node_id: u64,
@@ -453,6 +457,7 @@ impl Manager {
             deferred_events: VecDeque::new(),
             deferred_deliveries: Vec::new(),
             completing_updates: Vec::new(),
+            applying_updates: Vec::new(),
             node_id: Self::random_node_id(),
             pending_txns: HashMap::new(),
             wait_queue: HashMap::new(),
@@ -1968,8 +1973,8 @@ impl Manager {
     /// Apply the code update `peer` asks for without waiting inside the request
     /// handler: the one place a node applies a peer's update. Its reply is sent
     /// by complete_code_updates after its new defs have values, and the update
-    /// is held until then; a peer with `MAX_PENDING_UPDATES_PER_PEER` held is
-    /// refused another
+    /// is held until then; a peer with `MAX_PENDING_UPDATES_PER_PEER` being
+    /// applied or held is refused another
     pub async fn apply_service_update(
         &mut self,
         peer: String,
@@ -1979,12 +1984,14 @@ impl Manager {
         source: &str,
         reply_to: String,
     ) {
-        let held = self
+        let pending = self
             .completing_updates
             .iter()
-            .filter(|(_, from, ..)| *from == peer)
+            .map(|(_, from, ..)| from)
+            .chain(&self.applying_updates)
+            .filter(|from| **from == peer)
             .count();
-        let stmts = if held >= MAX_PENDING_UPDATES_PER_PEER {
+        let stmts = if pending >= MAX_PENDING_UPDATES_PER_PEER {
             Err("Too many pending updates from this peer".to_string())
         } else {
             codec::decode_update_service_request(service_name, source, &mut self.interner)
@@ -1999,7 +2006,12 @@ impl Manager {
                     Some(tid) => crate::runtime::update::Transaction::new_with_id(tid, stmts),
                     None => crate::runtime::update::Transaction::new(stmts),
                 };
-                Box::pin(txn.apply(self)).await.map_err(|e| e.to_string())
+                // The update counts from here on: applying it may wait on a
+                // remote call, during which the peer can ask for another
+                self.applying_updates.push(peer.clone());
+                let result = Box::pin(txn.apply(self)).await;
+                self.applying_updates.pop();
+                result.map_err(|e| e.to_string())
             }
             Err(e) => Err(e),
         };

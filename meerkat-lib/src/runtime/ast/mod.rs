@@ -892,6 +892,18 @@ mod tests {
         assert_eq!(names, ["t", "warm", "hot"]);
     }
 
+    /// A new member nothing reads goes at the end even when the update lists
+    /// it before a changed member that reads no new member (#265's amended
+    /// decision)
+    #[test]
+    fn test_apply_updates_appends_a_new_member_listed_before_a_changed_one() {
+        let names = names_after_update(
+            "service s { var t = 1; pub def warm = t > 0; }
+             update s { var h = 3; pub def warm = t > 0; }",
+        );
+        assert_eq!(names, ["t", "warm", "h"]);
+    }
+
     /// A new member nothing reads goes at the end, even when the update lists
     /// it before a changed member: placing it earlier would put it ahead of a
     /// member it reads (a regression found in review of #266)

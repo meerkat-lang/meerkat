@@ -13,6 +13,7 @@ use meerkat_lib::net::{
 use meerkat_lib::runtime::{
     ast::{ActionStmt, Expr, Stmt, Value},
     interpreter::{eval, EvalContext},
+    limits::MAX_PENDING_UPDATES_PER_PEER,
     parser::parse_string,
     txn::{Transaction as LockTxn, TxnId, VarLock},
     update::Transaction,
@@ -1257,6 +1258,138 @@ async fn test_update_waits_for_missing_input_without_publishing() {
         clock
     );
     assert_update(&mut peer, 21, &[("remote", "input", 1)]).await;
+}
+
+/// Send `node` a code update that adds `def` to `local`. The def reads
+/// `remote.current`, so it has no first value, and the update no reply, until
+/// the owner of `remote` answers the def's subscription
+async fn request_update(
+    from: &mut NetworkActor,
+    reply_to: &Address,
+    node: &Address,
+    request_id: u64,
+    def: &str,
+) {
+    let sent = from
+        .handle_command(NetworkCommand::SendMessage {
+            addr: node.clone(),
+            msg: MeerkatMessage::UpdateServiceRequest {
+                request_id,
+                txn_id: None,
+                service_name: "local".to_string(),
+                source: format!("update local {{ pub def {def} = remote.current; }}"),
+                reply_to: reply_to.0.clone(),
+            },
+        })
+        .await;
+    assert!(matches!(sent, NetworkReply::MessageSent { .. }));
+}
+
+/// Serve what `manager` receives until `peer` gets its next message
+async fn serve_until_received(manager: &mut Manager, peer: &mut NetworkActor) -> MeerkatMessage {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            manager.dispatch_network_events().await;
+            match peer.event_rx.try_recv() {
+                Ok(NetworkEvent::MessageReceived { msg, .. }) => return msg,
+                Ok(NetworkEvent::SendFailed { error, .. }) => panic!("send failed: {error:?}"),
+                _ => tokio::task::yield_now().await,
+            }
+        }
+    })
+    .await
+    .expect("expected message must arrive")
+}
+
+/// Whether `msg` subscribes `def` to its input, as applying the update that
+/// adds the def does
+fn subscribes(msg: &MeerkatMessage, def: &str) -> bool {
+    matches!(msg, MeerkatMessage::RequestUpdates { listener_def, .. } if listener_def == def)
+}
+
+/// A node holds a code update until its new defs have first values, and only
+/// `MAX_PENDING_UPDATES_PER_PEER` of them for one peer: the peer's next update
+/// is refused, another peer's is not, and one answered makes room for another
+#[tokio::test]
+async fn test_update_requests_held_for_first_values_are_limited_per_peer() {
+    // `peer` owns `remote`: an applied update sends it the subscription of
+    // the def it adds, which stays unanswered
+    let (mut manager, mut peer, address) = setup_gate_test_manager().await;
+    let (mut other, other_address) = listening_node().await;
+    let node = Address::new(manager.local_reply_addr().await);
+
+    request_update(&mut peer, &address, &node, 0, "held0").await;
+    let MeerkatMessage::RequestUpdates {
+        listener_service,
+        listener_def,
+        reply_to,
+        ..
+    } = serve_until_received(&mut manager, &mut peer).await
+    else {
+        panic!("an applied update subscribes its new def");
+    };
+    for id in 1..MAX_PENDING_UPDATES_PER_PEER as u64 {
+        let def = format!("held{id}");
+        request_update(&mut peer, &address, &node, id, &def).await;
+        let applied = serve_until_received(&mut manager, &mut peer).await;
+        assert!(subscribes(&applied, &def), "{applied:?}");
+    }
+
+    request_update(&mut peer, &address, &node, 100, "refused").await;
+    let refused = serve_until_received(&mut manager, &mut peer).await;
+    assert!(
+        matches!(
+            &refused,
+            MeerkatMessage::UpdateServiceResponse { request_id: 100, error: Some(error) }
+                if error == "Too many pending updates from this peer"
+        ),
+        "the peer has as many updates held as a node holds for one: {refused:?}"
+    );
+
+    request_update(&mut other, &other_address, &node, 101, "others").await;
+    let applied = serve_until_received(&mut manager, &mut peer).await;
+    assert!(
+        subscribes(&applied, "others"),
+        "another peer's update is applied all the same: {applied:?}"
+    );
+
+    // The first def gets its input, so its update is answered
+    let sent = peer
+        .handle_command(NetworkCommand::SendMessage {
+            addr: Address::new(reply_to),
+            msg: MeerkatMessage::Update {
+                listener_service,
+                listener_def,
+                source_service: "remote".to_string(),
+                member: "current".to_string(),
+                value: NetValue::Int { val: 20 },
+                clock: vec![ClockEntry {
+                    service: "remote".to_string(),
+                    member: "input".to_string(),
+                    counter: 1,
+                }],
+                sources: Some(vec![("remote".into(), "input".into())]),
+            },
+        })
+        .await;
+    assert!(matches!(sent, NetworkReply::MessageSent { .. }));
+    let answered = serve_until_received(&mut manager, &mut peer).await;
+    assert!(
+        matches!(
+            answered,
+            MeerkatMessage::UpdateServiceResponse {
+                request_id: 0,
+                error: None
+            }
+        ),
+        "an update is answered once its def has a value: {answered:?}"
+    );
+    request_update(&mut peer, &address, &node, 102, "again").await;
+    let applied = serve_until_received(&mut manager, &mut peer).await;
+    assert!(
+        subscribes(&applied, "again"),
+        "with one answered, the peer's next update is applied: {applied:?}"
+    );
 }
 
 #[tokio::test]

@@ -12,7 +12,9 @@ use crate::net::{
     NetworkReply, ServiceNetId,
 };
 use crate::runtime::interner::{Interner, Symbol};
-use crate::runtime::limits::{FIRST_VALUE_TIMEOUT, KEEPALIVE_INTERVAL, REPLY_TIMEOUT};
+use crate::runtime::limits::{
+    FIRST_VALUE_TIMEOUT, KEEPALIVE_INTERVAL, MAX_PENDING_UPDATES_PER_PEER, REPLY_TIMEOUT,
+};
 use crate::runtime::txn::{
     ComposedCall, ReadEntry, Sources, Transaction, TxnId, VClock, VarState, WaitKey,
 };
@@ -312,8 +314,15 @@ impl ParkedRequest {
     }
 }
 
-/// An applied code update awaiting the first values of its new defs.
-type Completing = (u64, String, Vec<(Symbol, Symbol)>, web_time::Instant);
+/// An applied code update awaiting the first values of its new defs: its
+/// request, the peer that sent it, where to answer, the defs and their deadline
+type Completing = (
+    u64,
+    String,
+    String,
+    Vec<(Symbol, Symbol)>,
+    web_time::Instant,
+);
 
 pub struct Manager {
     pub services: HashMap<Symbol, Service>,
@@ -1956,16 +1965,35 @@ impl Manager {
         Ok(None)
     }
 
-    /// Apply an incoming code update without waiting inside the request handler.
-    /// Its reply is sent by complete_code_updates after its new defs have values.
+    /// Apply the code update `peer` asks for without waiting inside the request
+    /// handler: the one place a node applies a peer's update. Its reply is sent
+    /// by complete_code_updates after its new defs have values, and the update
+    /// is held until then; a peer with `MAX_PENDING_UPDATES_PER_PEER` held is
+    /// refused another
     pub async fn apply_service_update(
         &mut self,
+        peer: String,
         request_id: u64,
         txn_id: Option<TxnId>,
+        service_name: &str,
         source: &str,
         reply_to: String,
     ) {
-        let result = match crate::runtime::parser::parse_string(source, &mut self.interner) {
+        let held = self
+            .completing_updates
+            .iter()
+            .filter(|(_, from, ..)| *from == peer)
+            .count();
+        let stmts = if held >= MAX_PENDING_UPDATES_PER_PEER {
+            Err("Too many pending updates from this peer".to_string())
+        } else {
+            codec::decode_update_service_request(service_name, source, &mut self.interner)
+                .map_err(|e| e.to_string())
+                .and_then(|(_, source)| {
+                    crate::runtime::parser::parse_string(&source, &mut self.interner)
+                })
+        };
+        let result = match stmts {
             Ok(stmts) => {
                 let mut txn = match txn_id {
                     Some(tid) => crate::runtime::update::Transaction::new_with_id(tid, stmts),
@@ -1978,6 +2006,7 @@ impl Manager {
         match result {
             Ok(introduced) => self.completing_updates.push((
                 request_id,
+                peer,
                 reply_to,
                 introduced,
                 web_time::Instant::now() + FIRST_VALUE_TIMEOUT,
@@ -1992,12 +2021,14 @@ impl Manager {
     /// Advance applied updates using paired inputs already available locally.
     /// This does not wait for a first value or enter another network dispatcher.
     pub async fn complete_code_updates(&mut self) {
-        for (request_id, reply_to, defs, deadline) in std::mem::take(&mut self.completing_updates) {
+        for (request_id, peer, reply_to, defs, deadline) in
+            std::mem::take(&mut self.completing_updates)
+        {
             let error = match self.first_values(&defs).await {
                 Ok(None) => None,
                 Ok(Some(_)) if web_time::Instant::now() < deadline => {
                     self.completing_updates
-                        .push((request_id, reply_to, defs, deadline));
+                        .push((request_id, peer, reply_to, defs, deadline));
                     continue;
                 }
                 Ok(Some(waiting)) => Some(self.uninitialized(waiting).to_string()),
@@ -2009,7 +2040,7 @@ impl Manager {
     }
 
     /// Answer an `UpdateServiceRequest`, unless its sender gave no address
-    pub async fn reply_update_service(
+    async fn reply_update_service(
         &mut self,
         request_id: u64,
         reply_to: &str,
@@ -2030,7 +2061,7 @@ impl Manager {
         targets.extend(
             self.completing_updates
                 .iter()
-                .map(|(request_id, reply_to, _, _)| (*request_id, reply_to.clone())),
+                .map(|(request_id, _, reply_to, ..)| (*request_id, reply_to.clone())),
         );
         for (request_id, reply_to) in targets {
             self.send_oneway(
@@ -2498,25 +2529,15 @@ impl Manager {
                         source,
                         reply_to,
                     } => {
-                        let target_addr = if !peer.is_empty() { peer } else { reply_to };
-                        match codec::decode_update_service_request(
+                        self.apply_service_update(
+                            peer,
+                            request_id,
+                            txn_id,
                             &service_name,
                             &source,
-                            &mut self.interner,
-                        ) {
-                            Ok((_sym, source)) => {
-                                self.apply_service_update(request_id, txn_id, &source, target_addr)
-                                    .await;
-                            }
-                            Err(e) => {
-                                self.reply_update_service(
-                                    request_id,
-                                    &target_addr,
-                                    Some(e.to_string()),
-                                )
-                                .await
-                            }
-                        }
+                            reply_to,
+                        )
+                        .await;
                     }
                     msg @ MeerkatMessage::ServiceCodeRequest { .. } => {
                         Box::pin(self.serve_request(msg)).await;

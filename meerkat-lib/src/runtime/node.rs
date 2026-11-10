@@ -378,6 +378,8 @@ impl Node {
                             reply_to,
                         } => {
                             let base_dir = base_dir.to_path_buf();
+                            let destination = Address::new(&reply_to);
+                            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
                             let response = tokio::task::spawn_blocking(move || {
                                 codec::serve_service_code(request_id, path, &reply_to, &base_dir)
                             })
@@ -388,7 +390,10 @@ impl Node {
                                     error
                                 ))
                             })?;
-                            Self::send_message(net, Address::new(&reply_to), response).await?;
+                            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+                            let response =
+                                codec::serve_service_code(request_id, path, &reply_to, &base_dir);
+                            Self::send_message(net, destination, response).await?;
                         }
                         MeerkatMessage::ServiceCodeError {
                             request_id: _,

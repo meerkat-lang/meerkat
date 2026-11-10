@@ -3440,6 +3440,7 @@ impl Manager {
             } if self.served_base_dir.is_some() => {
                 if let Some(base_dir) = self.served_base_dir.clone() {
                     let destination = Address::new(&reply_to);
+                    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
                     let response = tokio::task::spawn_blocking(move || {
                         codec::serve_service_code(request_id, path, &reply_to, &base_dir)
                     })
@@ -3448,6 +3449,9 @@ impl Manager {
                         request_id,
                         error: format!("failed to serve requested file: {}", error),
                     });
+                    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+                    let response =
+                        codec::serve_service_code(request_id, path, &reply_to, &base_dir);
                     self.send_oneway(destination, response).await;
                 }
             }

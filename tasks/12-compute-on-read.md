@@ -141,11 +141,11 @@ Transitivity is required (`z` derives from `y` derives from `x`), as is
 following listeners into other services on this node.
 
 Staging a var in a code update (`Transaction::staged`) counts as a write here:
-run the same walk. Today an update's initializers can't read a def before
-staging its inputs, since they run in member order and a member reads only
-earlier members, so no Meerkat program can exercise this; the walk keeps the
-cache sound without relying on that order. If it needs a test, it is a unit
-test that drives the transaction directly.
+run the same walk. An update can read a def before staging its inputs, because
+its statements execute in program order and an updated service may read a
+service declared after it. Without the walk, the def's first value stays
+cached and a later read in the same update misses the staged input. Test 13
+checks this.
 
 #### 3b. Invalidate on composed action
 
@@ -397,6 +397,15 @@ naming will otherwise invite someone to restore the symmetry.
     another node and the update sent from a client that also reads `s.d` in a
     local var. It also needs #180 (the owner evaluating its part of the
     update as a participant), so land it ignored, naming #180.
+13. **New — a def read before its input is staged, then after.** With
+    `service a { var before = 0; }` and
+    `service b { var x = 1; pub def d = x; var after = 0; }`, the update
+    `atomic { update a { var before = b.d; } update b { var x = 2; var after = d; } }`
+    must give `before == 1` and `after == 2`. Update statements execute in
+    program order, so `a`'s initializer reads `d` before `x` is staged, and
+    `b`'s reads it after. This is the test for staging's invalidation walk
+    (§3a): without it, `after` gets the cached `d == 1`. Today (#266) this
+    gives `before == 1` and `after == 1`.
 
 ## Notes
 

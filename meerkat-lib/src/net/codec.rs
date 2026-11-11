@@ -2432,6 +2432,7 @@ mod service_code_tests {
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", &test, "--nocapture"])
             .env(FIFO_PATH_ENV, &fifo)
+            .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -2450,8 +2451,14 @@ mod service_code_tests {
             }
         };
 
+        let output = std::io::read_to_string(child.stdout.take().unwrap()).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(status.success(), "FIFO rejection failed: {status}");
+        // A filter that matches no test also exits successfully.
+        assert!(
+            output.contains("ok. 1 passed"),
+            "child ran no test:\n{output}"
+        );
     }
 
     /// Verify round-trip encoding and decoding for a ServiceType

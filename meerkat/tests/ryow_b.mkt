@@ -1,0 +1,5 @@
+service ryow_b {
+    var q = 1;
+    pub def y = q + 1;
+    pub def bump_b = action { q = q + 100; };
+}

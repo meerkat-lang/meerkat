@@ -12,7 +12,9 @@ use crate::net::{
     NetworkReply, ServiceNetId,
 };
 use crate::runtime::interner::{Interner, Symbol};
-use crate::runtime::limits::{FIRST_VALUE_TIMEOUT, KEEPALIVE_INTERVAL, REPLY_TIMEOUT};
+use crate::runtime::limits::{
+    FIRST_VALUE_TIMEOUT, KEEPALIVE_INTERVAL, MAX_PENDING_UPDATES_PER_PEER, REPLY_TIMEOUT,
+};
 use crate::runtime::txn::{
     ComposedCall, ReadEntry, Sources, Transaction, TxnId, VClock, VarState, WaitKey,
 };
@@ -312,8 +314,16 @@ impl ParkedRequest {
     }
 }
 
-/// An applied code update awaiting the first values of its new defs.
-type Completing = (u64, String, Vec<(Symbol, Symbol)>, web_time::Instant);
+/// An applied code update awaiting the first values of its new defs
+struct Completing {
+    request_id: u64,
+    /// The peer that sent the request
+    peer: String,
+    /// Where the request is answered
+    reply_to: String,
+    defs: Vec<(Symbol, Symbol)>,
+    deadline: web_time::Instant,
+}
 
 pub struct Manager {
     pub services: HashMap<Symbol, Service>,
@@ -333,6 +343,10 @@ pub struct Manager {
     deferred_deliveries: Vec<DeferredDelivery>,
     /// Shared by server dispatch and RPC waits; completing never starts an RPC.
     completing_updates: Vec<Completing>,
+    /// The peers whose code updates are being applied, innermost last: one
+    /// that waits on a remote call lets the node serve other requests, more
+    /// updates among them
+    applying_updates: Vec<String>,
     /// (Probabilistically) unique identifier of this node, used in transaction
     /// ids so ids minted on different nodes never collide.
     pub node_id: u64,
@@ -444,6 +458,7 @@ impl Manager {
             deferred_events: VecDeque::new(),
             deferred_deliveries: Vec::new(),
             completing_updates: Vec::new(),
+            applying_updates: Vec::new(),
             node_id: Self::random_node_id(),
             pending_txns: HashMap::new(),
             wait_queue: HashMap::new(),
@@ -1956,32 +1971,60 @@ impl Manager {
         Ok(None)
     }
 
-    /// Apply an incoming code update without waiting inside the request handler.
-    /// Its reply is sent by complete_code_updates after its new defs have values.
+    /// Apply the code update `peer` asks for, without waiting for the first
+    /// values of its new defs: the one place a node applies a peer's update.
+    /// A failure is answered here. An applied update is held, and answered
+    /// by complete_code_updates once those defs have values or their deadline
+    /// passes; a peer with `MAX_PENDING_UPDATES_PER_PEER` being applied or
+    /// held is refused another
     pub async fn apply_service_update(
         &mut self,
+        peer: String,
         request_id: u64,
         txn_id: Option<TxnId>,
+        service_name: &str,
         source: &str,
         reply_to: String,
     ) {
-        let result = match crate::runtime::parser::parse_string(source, &mut self.interner) {
+        let pending = self
+            .completing_updates
+            .iter()
+            .map(|held| &held.peer)
+            .chain(&self.applying_updates)
+            .filter(|from| **from == peer)
+            .count();
+        let stmts = if pending >= MAX_PENDING_UPDATES_PER_PEER {
+            Err("Too many pending updates from this peer".to_string())
+        } else {
+            codec::decode_update_service_request(service_name, source, &mut self.interner)
+                .map_err(|e| e.to_string())
+                .and_then(|(_, source)| {
+                    crate::runtime::parser::parse_string(&source, &mut self.interner)
+                })
+        };
+        let result = match stmts {
             Ok(stmts) => {
                 let mut txn = match txn_id {
                     Some(tid) => crate::runtime::update::Transaction::new_with_id(tid, stmts),
                     None => crate::runtime::update::Transaction::new(stmts),
                 };
-                Box::pin(txn.apply(self)).await.map_err(|e| e.to_string())
+                // The update counts from here on: applying it may wait on a
+                // remote call, during which the peer can ask for another
+                self.applying_updates.push(peer.clone());
+                let result = Box::pin(txn.apply(self)).await;
+                self.applying_updates.pop();
+                result.map_err(|e| e.to_string())
             }
             Err(e) => Err(e),
         };
         match result {
-            Ok(introduced) => self.completing_updates.push((
+            Ok(defs) => self.completing_updates.push(Completing {
                 request_id,
+                peer,
                 reply_to,
-                introduced,
-                web_time::Instant::now() + FIRST_VALUE_TIMEOUT,
-            )),
+                defs,
+                deadline: web_time::Instant::now() + FIRST_VALUE_TIMEOUT,
+            }),
             Err(error) => {
                 self.reply_update_service(request_id, &reply_to, Some(error))
                     .await
@@ -1992,24 +2035,23 @@ impl Manager {
     /// Advance applied updates using paired inputs already available locally.
     /// This does not wait for a first value or enter another network dispatcher.
     pub async fn complete_code_updates(&mut self) {
-        for (request_id, reply_to, defs, deadline) in std::mem::take(&mut self.completing_updates) {
-            let error = match self.first_values(&defs).await {
+        for held in std::mem::take(&mut self.completing_updates) {
+            let error = match self.first_values(&held.defs).await {
                 Ok(None) => None,
-                Ok(Some(_)) if web_time::Instant::now() < deadline => {
-                    self.completing_updates
-                        .push((request_id, reply_to, defs, deadline));
+                Ok(Some(_)) if web_time::Instant::now() < held.deadline => {
+                    self.completing_updates.push(held);
                     continue;
                 }
                 Ok(Some(waiting)) => Some(self.uninitialized(waiting).to_string()),
                 Err(e) => Some(e.to_string()),
             };
-            self.reply_update_service(request_id, &reply_to, error)
+            self.reply_update_service(held.request_id, &held.reply_to, error)
                 .await;
         }
     }
 
     /// Answer an `UpdateServiceRequest`, unless its sender gave no address
-    pub async fn reply_update_service(
+    async fn reply_update_service(
         &mut self,
         request_id: u64,
         reply_to: &str,
@@ -2030,7 +2072,7 @@ impl Manager {
         targets.extend(
             self.completing_updates
                 .iter()
-                .map(|(request_id, reply_to, _, _)| (*request_id, reply_to.clone())),
+                .map(|held| (held.request_id, held.reply_to.clone())),
         );
         for (request_id, reply_to) in targets {
             self.send_oneway(
@@ -2498,25 +2540,15 @@ impl Manager {
                         source,
                         reply_to,
                     } => {
-                        let target_addr = if !peer.is_empty() { peer } else { reply_to };
-                        match codec::decode_update_service_request(
+                        self.apply_service_update(
+                            peer,
+                            request_id,
+                            txn_id,
                             &service_name,
                             &source,
-                            &mut self.interner,
-                        ) {
-                            Ok((_sym, source)) => {
-                                self.apply_service_update(request_id, txn_id, &source, target_addr)
-                                    .await;
-                            }
-                            Err(e) => {
-                                self.reply_update_service(
-                                    request_id,
-                                    &target_addr,
-                                    Some(e.to_string()),
-                                )
-                                .await
-                            }
-                        }
+                            reply_to,
+                        )
+                        .await;
                     }
                     msg @ MeerkatMessage::ServiceCodeRequest { .. } => {
                         Box::pin(self.serve_request(msg)).await;

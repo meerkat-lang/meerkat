@@ -264,10 +264,19 @@ fn open_served_file(path: &std::path::Path) -> Result<std::fs::File> {
 }
 
 /// Read from the validated handle without resolving the pathname again.
-fn read_served_source(mut file: std::fs::File) -> Result<String> {
+/// Bound the read itself: source files supplied by other processes must not
+/// cause an unbounded allocation before the network size limit is enforced.
+fn read_served_source(file: std::fs::File) -> Result<String> {
     let mut source = String::new();
-    file.read_to_string(&mut source)
+    file.take((MAX_NET_REQUEST_SOURCE_LENGTH as u64) + 1)
+        .read_to_string(&mut source)
         .map_err(|e| Error::LimitExceeded(format!("failed to read requested file: {}", e)))?;
+    if source.len() > MAX_NET_REQUEST_SOURCE_LENGTH {
+        return Err(Error::LimitExceeded(format!(
+            "source size exceeds maximum length of {} bytes",
+            MAX_NET_REQUEST_SOURCE_LENGTH
+        )));
+    }
     Ok(source)
 }
 
@@ -2369,6 +2378,31 @@ mod service_code_tests {
         std::fs::write(&file, "service counter {}").unwrap();
 
         assert_eq!(read_served_file(&file).unwrap(), "service counter {}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_served_file_accepts_source_at_size_limit() {
+        let dir = unique_temp_dir("exactsize");
+        let file = dir.join("counter.mkt");
+        std::fs::write(&file, "a".repeat(MAX_NET_REQUEST_SOURCE_LENGTH)).unwrap();
+
+        assert_eq!(
+            read_served_file(&file).unwrap().len(),
+            MAX_NET_REQUEST_SOURCE_LENGTH
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_served_file_rejects_oversized_source() {
+        let dir = unique_temp_dir("oversize");
+        let file = dir.join("counter.mkt");
+        std::fs::write(&file, "a".repeat(MAX_NET_REQUEST_SOURCE_LENGTH + 1)).unwrap();
+
+        let err = read_served_file(&file).expect_err("oversized source must not be served");
+        assert!(matches!(&err, Error::LimitExceeded(_)), "{err}");
+        assert!(err.to_string().contains("source size exceeds"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

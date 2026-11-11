@@ -1328,6 +1328,15 @@ fn subscribes(msg: &MeerkatMessage, def: &str) -> bool {
     matches!(msg, MeerkatMessage::RequestUpdates { listener_def, .. } if listener_def == def)
 }
 
+/// Whether `msg` refuses the update request `id` because of its peer's limit
+fn refuses(msg: &MeerkatMessage, id: u64) -> bool {
+    matches!(
+        msg,
+        MeerkatMessage::UpdateServiceResponse { request_id, error: Some(error) }
+            if *request_id == id && error == "Too many pending updates from this peer"
+    )
+}
+
 /// A node holds a code update until its new defs have first values, and only
 /// `MAX_PENDING_UPDATES_PER_PEER` of them for one peer: the peer's next update
 /// is refused, another peer's is not, and one answered makes room for another
@@ -1359,11 +1368,7 @@ async fn test_update_requests_held_for_first_values_are_limited_per_peer() {
     request_update(&mut peer, &address, &node, 100, "refused").await;
     let refused = serve_until_received(&mut manager, &mut peer).await;
     assert!(
-        matches!(
-            &refused,
-            MeerkatMessage::UpdateServiceResponse { request_id: 100, error: Some(error) }
-                if error == "Too many pending updates from this peer"
-        ),
+        refuses(&refused, 100),
         "the peer has as many updates held as a node holds for one: {refused:?}"
     );
 
@@ -1476,7 +1481,13 @@ async fn test_update_being_applied_counts_toward_the_peer_limit() {
         send(&mut peer, &node, another).await;
         // Applied, it subscribes its def; refused, it is answered
         let outcome = received(&mut peer, |msg| {
-            let answered = matches!(msg, MeerkatMessage::UpdateServiceResponse { .. });
+            let answered = matches!(
+                msg,
+                MeerkatMessage::UpdateServiceResponse {
+                    request_id: 101,
+                    ..
+                }
+            );
             (answered || subscribes(&msg, "late")).then_some(msg)
         })
         .await;
@@ -1494,14 +1505,13 @@ async fn test_update_being_applied_counts_toward_the_peer_limit() {
             tokio::task::yield_now().await;
         }
     };
-    let (outcome, ()) = tokio::join!(participant, serve);
+    let exchange = async { tokio::join!(participant, serve) };
+    let (outcome, ()) = tokio::time::timeout(Duration::from_secs(10), exchange)
+        .await
+        .expect("the exchange must finish");
 
     assert!(
-        matches!(
-            &outcome,
-            MeerkatMessage::UpdateServiceResponse { error: Some(error), .. }
-                if error == "Too many pending updates from this peer"
-        ),
+        refuses(&outcome, 101),
         "with the update being applied, the peer is at the limit: {outcome:?}"
     );
     assert!(!manager.services[&spare].defs.contains_key(&late));

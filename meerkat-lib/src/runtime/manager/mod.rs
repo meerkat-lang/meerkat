@@ -314,15 +314,16 @@ impl ParkedRequest {
     }
 }
 
-/// An applied code update awaiting the first values of its new defs: its
-/// request, the peer that sent it, where to answer, the defs and their deadline
-type Completing = (
-    u64,
-    String,
-    String,
-    Vec<(Symbol, Symbol)>,
-    web_time::Instant,
-);
+/// An applied code update awaiting the first values of its new defs
+struct Completing {
+    request_id: u64,
+    /// The peer that sent the request
+    peer: String,
+    /// Where the request is answered
+    reply_to: String,
+    defs: Vec<(Symbol, Symbol)>,
+    deadline: web_time::Instant,
+}
 
 pub struct Manager {
     pub services: HashMap<Symbol, Service>,
@@ -1970,11 +1971,12 @@ impl Manager {
         Ok(None)
     }
 
-    /// Apply the code update `peer` asks for without waiting inside the request
-    /// handler: the one place a node applies a peer's update. Its reply is sent
-    /// by complete_code_updates after its new defs have values, and the update
-    /// is held until then; a peer with `MAX_PENDING_UPDATES_PER_PEER` being
-    /// applied or held is refused another
+    /// Apply the code update `peer` asks for, without waiting for the first
+    /// values of its new defs: the one place a node applies a peer's update.
+    /// A failure is answered here. An applied update is held, and answered
+    /// by complete_code_updates once those defs have values or their deadline
+    /// passes; a peer with `MAX_PENDING_UPDATES_PER_PEER` being applied or
+    /// held is refused another
     pub async fn apply_service_update(
         &mut self,
         peer: String,
@@ -1987,7 +1989,7 @@ impl Manager {
         let pending = self
             .completing_updates
             .iter()
-            .map(|(_, from, ..)| from)
+            .map(|held| &held.peer)
             .chain(&self.applying_updates)
             .filter(|from| **from == peer)
             .count();
@@ -2016,13 +2018,13 @@ impl Manager {
             Err(e) => Err(e),
         };
         match result {
-            Ok(introduced) => self.completing_updates.push((
+            Ok(defs) => self.completing_updates.push(Completing {
                 request_id,
                 peer,
                 reply_to,
-                introduced,
-                web_time::Instant::now() + FIRST_VALUE_TIMEOUT,
-            )),
+                defs,
+                deadline: web_time::Instant::now() + FIRST_VALUE_TIMEOUT,
+            }),
             Err(error) => {
                 self.reply_update_service(request_id, &reply_to, Some(error))
                     .await
@@ -2033,20 +2035,17 @@ impl Manager {
     /// Advance applied updates using paired inputs already available locally.
     /// This does not wait for a first value or enter another network dispatcher.
     pub async fn complete_code_updates(&mut self) {
-        for (request_id, peer, reply_to, defs, deadline) in
-            std::mem::take(&mut self.completing_updates)
-        {
-            let error = match self.first_values(&defs).await {
+        for held in std::mem::take(&mut self.completing_updates) {
+            let error = match self.first_values(&held.defs).await {
                 Ok(None) => None,
-                Ok(Some(_)) if web_time::Instant::now() < deadline => {
-                    self.completing_updates
-                        .push((request_id, peer, reply_to, defs, deadline));
+                Ok(Some(_)) if web_time::Instant::now() < held.deadline => {
+                    self.completing_updates.push(held);
                     continue;
                 }
                 Ok(Some(waiting)) => Some(self.uninitialized(waiting).to_string()),
                 Err(e) => Some(e.to_string()),
             };
-            self.reply_update_service(request_id, &reply_to, error)
+            self.reply_update_service(held.request_id, &held.reply_to, error)
                 .await;
         }
     }
@@ -2073,7 +2072,7 @@ impl Manager {
         targets.extend(
             self.completing_updates
                 .iter()
-                .map(|(request_id, _, reply_to, ..)| (*request_id, reply_to.clone())),
+                .map(|held| (held.request_id, held.reply_to.clone())),
         );
         for (request_id, reply_to) in targets {
             self.send_oneway(

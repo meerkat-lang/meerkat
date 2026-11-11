@@ -8,6 +8,7 @@ use meerkat_lib::runtime::Manager;
 use directories::ProjectDirs;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
+use std::env;
 use std::io::{self, IsTerminal};
 
 const PROMPT: &str = "meerkat> ";
@@ -52,6 +53,31 @@ async fn check_watches(watches: &mut [Watch], manager: &mut Manager, repl_env: &
     }
 }
 
+async fn init_net_layer(manager: &mut Manager) -> Result<(), Box<dyn std::error::Error>> {
+    let mut n = meerkat_lib::net::NetworkActor::new(meerkat_lib::net::types::NodeType::Server)
+        .await
+        .map_err(|e| format!("Network error: {}", e))?;
+    let listen_ip = if manager.local {
+        "127.0.0.1"
+    } else {
+        "0.0.0.0"
+    };
+    let listen_addr = meerkat_lib::net::Address::new(format!("/ip4/{}/tcp/0", listen_ip));
+    let reply = n
+        .handle_command(meerkat_lib::net::NetworkCommand::Listen { addr: listen_addr })
+        .await;
+    let addr = crate::listen_success_addr(reply)?;
+    let node_ip = manager.get_node_ip();
+    let peer_id = n.local_peer_id();
+    let addr_str = addr
+        .0
+        .replace("0.0.0.0", &node_ip)
+        .replace("127.0.0.1", &node_ip);
+    manager.network = Some(n);
+    manager.set_local_address(format!("{}/p2p/{}", addr_str, peer_id));
+    Ok(())
+}
+
 /// Run the `REPL` loop for interactive execution
 pub async fn run_repl(
     mut manager: Manager,
@@ -80,27 +106,7 @@ pub async fn run_repl(
     }
 
     if !remote_url_map.is_empty() {
-        let mut n = meerkat_lib::net::NetworkActor::new(meerkat_lib::net::types::NodeType::Server)
-            .await
-            .map_err(|e| format!("Network error: {}", e))?;
-        let listen_ip = if manager.local {
-            "127.0.0.1"
-        } else {
-            "0.0.0.0"
-        };
-        let listen_addr = meerkat_lib::net::Address::new(format!("/ip4/{}/tcp/0", listen_ip));
-        let reply = n
-            .handle_command(meerkat_lib::net::NetworkCommand::Listen { addr: listen_addr })
-            .await;
-        let addr = crate::listen_success_addr(reply)?;
-        let node_ip = manager.get_node_ip();
-        let peer_id = n.local_peer_id();
-        let addr_str = addr
-            .0
-            .replace("0.0.0.0", &node_ip)
-            .replace("127.0.0.1", &node_ip);
-        manager.network = Some(n);
-        manager.set_local_address(format!("{}/p2p/{}", addr_str, peer_id));
+        init_net_layer(&mut manager).await?;
     }
 
     let mut repl_env: Vec<(Symbol, Value)> = Vec::new();
@@ -218,28 +224,67 @@ async fn exec_stmt(
             )))
         }
         Stmt::Import { path, service_name } => {
-            let svc_name_str = manager.interner.get(service_name);
-            if let Some(url) = remote_url_map.get(svc_name_str) {
-                manager
-                    .remote_services
-                    .insert(service_name, meerkat_lib::net::Address::new(url.as_str()));
-                return Ok(Some(format!(
-                    "Remote service '{}' registered at {}.",
-                    svc_name_str, url
-                )));
-            }
-            let import_stmts = parse_file(&path, &mut manager.interner)
-                .map_err(|e| format!("Import '{}': {}", path, e))?;
-            let mut loaded = Vec::new();
-            for s in import_stmts {
-                if let Stmt::Service { name, decls } = s {
-                    manager.create_service(name, decls).await.map_err(|e| {
-                        format!("Imported service '{}': {}", manager.interner.get(name), e)
-                    })?;
-                    loaded.push(manager.interner.get(name).to_string());
+            let svc_name_str = manager.interner.get(service_name).to_string();
+            let base_dir = env::current_dir().unwrap();
+            if let Some(p) = path {
+                if p.starts_with("/ip4/") {
+                    if manager.network.is_none() {
+                        init_net_layer(manager).await?;
+                    }
+                    manager
+                        .remote_services
+                        .insert(service_name, meerkat_lib::net::Address::new(p.clone()));
+                    return Ok(Some(format!(
+                        "Remote service '{}' registered at {}.",
+                        svc_name_str, p
+                    )));
+                }
+                let import_stmts = parse_file(&p, &mut manager.interner)
+                    .map_err(|e| format!("Import '{}': {}", p, e))?;
+                let mut loaded = Vec::new();
+                let found = import_stmts.iter().any(|stmt| {
+                    matches!(stmt, Stmt::Service {name, ..} if *name == service_name)
+                });
+                if !found {
+                    return Err(format!("Import '{}': Service not found", p).into());
+                }
+                for s in import_stmts {
+                    if let Stmt::Service { name, decls } = s {
+                        manager.create_service(name, decls).await.map_err(|e| {
+                            format!("Imported service '{}': {}", manager.interner.get(name), e)
+                        })?;
+                        loaded.push(manager.interner.get(name).to_string());
+                    }
+                }
+                Ok(Some(format!("Imported service(s): {}.", loaded.join(", "))))
+            } else {
+                if let Some(url) = remote_url_map.get(&svc_name_str) {
+                    manager
+                        .remote_services
+                        .insert(service_name, meerkat_lib::net::Address::new(url.as_str()));
+                    Ok(Some(format!(
+                        "Remote service '{}' registered at {}.",
+                        svc_name_str, url
+                    )))
+                } else {
+                    let implicit_path = base_dir.join(format!("{}.mkt", svc_name_str));
+                    let import_stmts =
+                        parse_file(implicit_path.to_str().unwrap(), &mut manager.interner)
+                            .map_err(|e| {
+                                format!("Import '{}': {}", implicit_path.to_str().unwrap(), e)
+                            })?;
+                    let mut loaded = Vec::new();
+                    for s in import_stmts {
+                        if let Stmt::Service { name, decls } = s {
+                            manager.create_service(name, decls).await.map_err(|e| {
+                                format!("Imported service '{}': {}", manager.interner.get(name), e)
+                            })?;
+                            loaded.push(manager.interner.get(name).to_string());
+                        }
+                    }
+                    Ok(Some(format!("Imported service(s): {}.", loaded.join(", "))))
                 }
             }
-            Ok(Some(format!("Imported service(s): {}.", loaded.join(", "))))
         }
         Stmt::ActionStmt(action_stmt) => {
             let effect = execute(&action_stmt, repl_env, manager, Symbol::empty(), None)

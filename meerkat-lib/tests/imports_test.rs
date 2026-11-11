@@ -18,7 +18,7 @@ fn test_imports_local_resolution_and_circular_prevention() {
     let sym_a = interner.insert("A");
     let base_ast = vec![
         Stmt::Import {
-            path: "B.mkt".to_string(),
+            path: None,
             service_name: sym_b,
         },
         Stmt::Service {
@@ -71,7 +71,7 @@ fn test_imports_remote_queuing() {
     let mut interner = Interner::new();
     let sym_b = interner.insert("B");
     let base_ast = vec![Stmt::Import {
-        path: "B.mkt".to_string(),
+        path: None,
         service_name: sym_b,
     }];
 
@@ -116,7 +116,7 @@ fn test_imports_on_recv_source_merges_and_resolves() {
     let mut node = meerkat_lib::runtime::node::Node::new();
     let sym_b = node.interner.insert("B");
     let base_ast = vec![Stmt::Import {
-        path: "B.mkt".to_string(),
+        path: None,
         service_name: sym_b,
     }];
 
@@ -197,7 +197,7 @@ fn test_imports_pending_cleanup() {
     let mut interner = Interner::new();
     let sym_b = interner.insert("B");
     let base_ast = vec![Stmt::Import {
-        path: "B.mkt".to_string(),
+        path: None,
         service_name: sym_b,
     }];
 
@@ -469,7 +469,7 @@ fn test_network_imports_are_dependency_ordered_regardless_of_arrival() {
     let sym_a = node.interner.insert("a");
     let base_ast = vec![
         Stmt::Import {
-            path: "a.mkt".to_string(),
+            path: None,
             service_name: sym_a,
         },
         Stmt::Service {
@@ -544,7 +544,7 @@ fn test_network_module_owns_every_service_it_declares() {
     let sym_a = node.interner.insert("a");
     let base_ast = vec![
         Stmt::Import {
-            path: "a.mkt".to_string(),
+            path: None,
             service_name: sym_a,
         },
         Stmt::Service {
@@ -607,7 +607,7 @@ fn test_root_declarations_are_not_claimed_by_a_peer() {
     let sym_b = node.interner.insert("b");
     let base_ast = vec![
         Stmt::Import {
-            path: "a.mkt".to_string(),
+            path: None,
             service_name: sym_a,
         },
         // The root program declares `b` itself, and the peer's module below
@@ -668,7 +668,7 @@ fn test_local_disk_modules_are_not_claimed_as_remote() {
     let sym_dep = node.interner.insert("dep");
     let base_ast = vec![
         Stmt::Import {
-            path: "dep.mkt".to_string(),
+            path: None,
             service_name: sym_dep,
         },
         Stmt::Service {

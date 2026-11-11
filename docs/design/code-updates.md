@@ -95,6 +95,77 @@ The type checker is run after locks are acquired but before applying the code
 update, and if there are type errors, the locks are released, the update is
 canceled, and error messages are reported to the developer.
 
+## Evaluating an update
+
+**Member order.**  A member may only read members declared before it.  An
+update keeps a changed member where it was and adds new members at the end, in
+the order the update declares them; members are then reordered only as far as
+needed for each one to follow the members it reads, keeping the existing
+members' order and the update's order.  So an update can add a member and
+change an existing def to read it, while a forward reference among the
+update's own members is still an error (#265).
+
+**Staged reads.**  The initializers of the vars an update declares, new or
+changed, are evaluated in that member order, and each one sees the values the
+update has already given its own vars.  With `var a = 1` running,
+
+```meerkat
+update s {
+    var a = 10;
+    var b = a;
+}
+```
+
+gives `b == 10`.  This holds however a member is read: by its plain name, by a
+qualified name such as `s.a`, inside a function the initializer calls, or in a
+service on another node that the update changes.  An `atomic` block is
+evaluated as one update, using each var's final declaration in the block.  The
+staged values live in the update's transaction, not in the initializer's local
+scope, so a closure doesn't capture them; it reads the member when it runs.
+Vars the update doesn't declare keep their running values, read under the
+update's locks.
+
+**Defs: the intended semantics.**  A code update is a transaction, and its
+staged vars are its writes.  So any def read in the update's transaction, on
+any node (its remote participants included), should reflect them: a def the
+update adds or changes, and also an unchanged def whose inputs the update
+changes.  Other transactions never see the staged values: they read the state
+from before the update, or wait under its locks and read it after the commit.
+With `def d = w` running on `s`,
+
+```meerkat
+update s {
+    var w = 2;
+    var v = d;
+}
+```
+
+should give `v == 2`.  Defs that nobody reads during the update don't need to
+be recomputed then: they catch up after the commit, through ordinary
+propagation.
+
+**Defs today: a limitation.**  For now, defs aren't staged, and reading one
+during an update doesn't take the update's writes into account.  A var
+initializer that reads a def the same update adds fails, since the def's
+first value is computed only after the commit; one that reads any other def,
+including one the update changes or whose inputs it changes, sees the def's
+value from before the update (so the example above gives `v == 1`).  Closing
+this takes three pieces:
+
+- reads on the updating node: compute-on-read (task 12,
+  `tasks/12-compute-on-read.md`), treating the update's staged values as the
+  transaction's writes, so a def read during the update is recomputed from
+  them;
+- defs the update declares: evaluated in member order alongside its vars
+  (#267);
+- reads on other nodes: a remote owner answering a read during the update has
+  to see the update's staged values for its own service.  Today the updating
+  node evaluates everything and forwards the update only after its own commit,
+  so the owner can't.  The fix is for each owner to evaluate its service's
+  part of the update as a participant inside the transaction, buffering it
+  like a remote action's writes, and install it at commit: two-phase commit
+  for code updates (#180).
+
 ## Errors due to code update races
 
 A code update is transactional; if it succeeds, it will always preserve

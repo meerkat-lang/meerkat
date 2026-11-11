@@ -140,6 +140,13 @@ will, if there is one.
 Transitivity is required (`z` derives from `y` derives from `x`), as is
 following listeners into other services on this node.
 
+Staging a var in a code update (`Transaction::staged`) counts as a write here:
+run the same walk. An update can read a def before staging its inputs, because
+its statements execute in program order and an updated service may read a
+service declared after it. Without the walk, the def's first value stays
+cached and a later read in the same update misses the staged input. Test 13
+checks this.
+
 #### 3b. Invalidate on composed action
 
 That is exactly what `touched_services` reports, so bring that plumbing back —
@@ -350,6 +357,55 @@ naming will otherwise invite someone to restore the symmetry.
     `do` in an `@test` its own transaction, so it no longer exercises
     read-your-own-writes and is only a regression check. Tests 1 and 3 are
     the ones that show compute-on-read working.
+11. **New — a code update and its remote owner agree on a def they read** (see
+    the last note). Service `src` has `var w`; remote service `r` has
+    `def d = src.w`. A client's update to `r` adds `var v = d`, and the same
+    update has a local var read `r.v`. The update does not touch `src`.
+    Between the client's staged read of `d` and the owner's re-evaluation of
+    `v`, another transaction writes `src.w`. The local var and the owner's
+    `r.v` must hold the same value.
+    - **Keep `w` outside `r`.** Adding `v` takes a whole-service lock on `r`,
+      which already keeps any member of `r` from being written during the
+      update, so a `w` inside `r` would make the test pass without the fix
+      (or leave its concurrent writer blocked). Only an input in a service the
+      update doesn't lock exposes the gap.
+    - **Force the timing.** The concurrent write has to land in that window,
+      not merely during the update: use a deterministic hook, like the
+      stand-in peers in `participant_commit_order_test`, rather than a sleep.
+      Start the write in that window, but don't make the update wait for it:
+      with compute-on-read, the update's read lock on `src.w` makes the
+      writer wait or die (wait-die), and a harness that blocked forwarding
+      until the write committed would deadlock the correct implementation.
+      Assert that the values agree and that the write did not commit before
+      the owner's re-evaluation; don't require it to succeed.
+    - **Check the input lock is released.** After the update finishes,
+      require the concurrent writer to commit or abort within a bounded
+      time, then require a fresh transaction to write `src.w` within a
+      bounded time. Otherwise the assertions above pass with a leaked read
+      lock.
+    - Without the fix, the test must fail: the owner's `r.v` follows the new
+      `w` while the local var keeps the old one. An mkn scenario next to
+      `scripts/tests/integration/updates/remote_update/` (#266) is the
+      natural home.
+12. **New — a def read during a code update reflects the update's writes.**
+    With `service s { var w = 1; pub def d = w; pub def e = d + 1; }`, the
+    update `update s { var w = 2; var v = d; var u = e; }` must give `v == 2`
+    and `u == 3`: `d` and `e` are recomputed from the staged `w`, the second
+    transitively, though the update declares neither (see the last note). On
+    `main` this gives `v == 1` and `u == 2`, the documented limitation in
+    `docs/design/code-updates.md`. Write the cross-node form too, with `s` on
+    another node and the update sent from a client that also reads `s.d` in a
+    local var. It also needs #180 (the owner evaluating its part of the
+    update as a participant), so land it ignored, naming #180.
+13. **New — a def read before its input is staged, then after.** With
+    `service a { var before = 0; }` and
+    `service b { var x = 1; pub def d = x; var after = 0; }`, the update
+    `atomic { update a { var before = b.d; } update b { var x = 2; var after = d; } }`
+    must give `before == 1` and `after == 2`. Update statements execute in
+    program order, so `a`'s initializer reads `d` before `x` is staged, and
+    `b`'s reads it after. This is the test for staging's invalidation walk
+    (§3a): without it, `after` gets the cached `d == 1`. Today (#266) this
+    gives `before == 1` and `after == 1`.
 
 ## Notes
 
@@ -360,3 +416,37 @@ naming will otherwise invite someone to restore the symmetry.
   dependencies costs N round trips; subsequent reads in the same transaction
   cost nothing until a composed action touches one of those services. That is
   the price of fully transactional semantics and it was accepted deliberately.
+- **Code updates rely on this too (#266).** A code update evaluates the var
+  initializers of a remote service on the client, staging the values for its
+  other initializers, and the remote owner then re-evaluates them itself
+  under the same transaction id. The two agree only if every input they read
+  stays fixed in between. Remote vars do: the update's read locks are held
+  until after forwarding, and a service the update adds members to is
+  locked whole. A remote **def** whose inputs lie in a service the update
+  doesn't lock does not yet: today a transactional read of a def locks the
+  def but not its inputs, so a concurrent write to such an input recomputes
+  it. With compute-on-read, a participant's read of a def
+  (`remote_read_participant`, §3c) must lock the def's inputs under the shared
+  transaction id, so the owner's re-evaluation sees the same values. That is
+  the requirement test 11 checks. The alternative, forwarding the staged
+  values with `UpdateServiceRequest` instead of re-evaluating, is not needed
+  if this holds.
+
+  A code update is a transaction too, and its staged vars are its writes. The
+  intended semantics (`docs/design/code-updates.md`, "Evaluating an update")
+  are that any def read during the update reflects them, including an
+  unchanged def whose inputs the update changes. So compute-on-read inside a
+  code update must treat the update's staged values (`Transaction::staged`)
+  as the transaction's writes: a def read during the update is recomputed
+  from them, as a def read after a write is in an ordinary transaction. Do
+  not instead read the def's inputs' running values; that would make the
+  current limitation permanent. Test 12 checks this. Two further pieces are
+  outside task 12: defs the update declares (#267), and reads on other nodes,
+  where the owner needs the update's staged values for its own service, which
+  takes evaluating each owner's part of the update as a participant inside
+  the transaction (#180).
+- **Land #257 before or with this task.** An update that fails before commit
+  leaves its remote participants' locks held (#257). Compute-on-read widens
+  what those locks cover: a remote read of a def will also lock the def's
+  inputs, so a failed update would leak those too and block more writers
+  until the owner restarts.

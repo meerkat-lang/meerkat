@@ -1,0 +1,23 @@
+import counter
+
+// Two updates to the same remote service in one `atomic` block are one
+// update: the owner is sent the final declarations together, so `r` reads
+// the last value given to `c`, as it would if `counter` ran here.
+atomic {
+    update counter {
+        var c = 1;
+        var r = c;
+    }
+    update counter {
+        var c = 2;
+    }
+}
+
+service app {
+    var unused = 0;
+}
+
+@test(app) {
+    assert(counter.c == 2);
+    assert(counter.r == 2);
+}

@@ -1,0 +1,23 @@
+import counter
+
+// A code update to a service another node owns: it is forwarded to the owner
+// (UpdateServiceRequest), applied there, and confirmed once the new def has a
+// first value. `r` reads `c`, which the same update adds, so the update's
+// staged values must reach a service on another node.
+update counter {
+    var c = 4;
+    var r = c + 1;
+    pub def tripled = x * 3;
+}
+
+service app {
+    var unused = 0;
+}
+
+// Read from the owner, so these pass only if the owner applied the update and
+// kept what it already had.
+@test(app) {
+    assert(counter.tripled == 9);
+    assert(counter.doubled == 6);
+    assert(counter.r == 5);
+}

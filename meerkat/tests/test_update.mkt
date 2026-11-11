@@ -12,7 +12,11 @@ update weather_station {
     pub def is_warm = if is_celsius then temperature > 18 else temperature > 65;
 }
 
-// Test executing after live update applied to `weather_station`
+// Test executing after live update applied to `weather_station`. `is_warm` is
+// true before the update too, so the first two checks are what show the
+// update ran: `temperature` changed, and `is_celsius` exists only after it.
 @test(weather_station) {
+    assert(temperature == 22);
+    assert(is_celsius == true);
     assert(is_warm == true);
 }

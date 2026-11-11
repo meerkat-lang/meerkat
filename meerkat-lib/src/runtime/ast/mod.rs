@@ -2,6 +2,8 @@ use crate::net::ServiceNetId;
 use crate::runtime::html::{Html, HtmlTemplate};
 use crate::runtime::interner::Symbol;
 use crate::runtime::tt::{Param, Type};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt::Display;
 
 pub mod printer;
@@ -613,6 +615,10 @@ impl Display for Decl {
 /// in-place with new or modified declarations, and `Stmt::Update` and
 /// `Stmt::Atomic` nodes are removed from the top level
 ///
+/// Members keep their order unless one must follow a member it reads, which
+/// lets an update add a member and change an existing def to read it: see
+/// `order_members`
+///
 /// Args:
 ///     `base_ast` (`&[Stmt]`): The original AST statements
 ///     `updates` (`&[Stmt]`): The update statements to apply
@@ -628,7 +634,26 @@ pub fn apply_updates_to_ast(base_ast: &[Stmt], updates: &[Stmt]) -> Result<Vec<S
         .filter(|stmt| !matches!(stmt, Stmt::Update { .. } | Stmt::Atomic { .. }))
         .cloned()
         .collect();
+    // For each service changed, how many members it had before: members are
+    // ordered once, after every update (an `atomic` block's included) is in
+    let mut before: HashMap<usize, usize> = HashMap::new();
+    merge_updates(&mut patched_ast, updates, &mut before)?;
+    for (at, existing) in before {
+        if let Stmt::Service { name, decls } = &mut patched_ast[at] {
+            order_members(decls, *name, existing);
+        }
+    }
+    Ok(patched_ast)
+}
 
+/// `apply_updates_to_ast` before ordering: merge each update's declarations
+/// into its service, recording in `before` the service's member count before
+/// its first change
+fn merge_updates(
+    patched_ast: &mut [Stmt],
+    updates: &[Stmt],
+    before: &mut HashMap<usize, usize>,
+) -> Result<(), Symbol> {
     for stmt in updates {
         let (updated_svc_name, updated_decls) = match stmt {
             Stmt::Service { name, decls } => (name, decls),
@@ -639,7 +664,7 @@ pub fn apply_updates_to_ast(base_ast: &[Stmt], updates: &[Stmt]) -> Result<Vec<S
             Stmt::Atomic {
                 updates: inner_updates,
             } => {
-                patched_ast = apply_updates_to_ast(&patched_ast, inner_updates)?;
+                merge_updates(patched_ast, inner_updates, before)?;
                 continue;
             }
             Stmt::Connect { .. }
@@ -650,7 +675,7 @@ pub fn apply_updates_to_ast(base_ast: &[Stmt], updates: &[Stmt]) -> Result<Vec<S
         };
 
         let mut found_service = false;
-        for existing_stmt in &mut patched_ast {
+        for (at, existing_stmt) in patched_ast.iter_mut().enumerate() {
             if let Stmt::Service {
                 name: existing_svc_name,
                 decls: existing_decls,
@@ -658,31 +683,8 @@ pub fn apply_updates_to_ast(base_ast: &[Stmt], updates: &[Stmt]) -> Result<Vec<S
             {
                 if *existing_svc_name == *updated_svc_name {
                     found_service = true;
-                    for up_decl in updated_decls {
-                        let up_name = match up_decl {
-                            Decl::VarDecl { name: n, .. }
-                            | Decl::DefDecl { name: n, .. }
-                            | Decl::TableDecl { name: n, .. } => *n,
-                        };
-
-                        let mut matched_existing = false;
-                        for ex_decl in existing_decls.iter_mut() {
-                            let ex_name = match ex_decl {
-                                Decl::VarDecl { name: n, .. }
-                                | Decl::DefDecl { name: n, .. }
-                                | Decl::TableDecl { name: n, .. } => *n,
-                            };
-                            if ex_name == up_name {
-                                *ex_decl = up_decl.clone();
-                                matched_existing = true;
-                                break;
-                            }
-                        }
-
-                        if !matched_existing {
-                            existing_decls.push(up_decl.clone());
-                        }
-                    }
+                    before.entry(at).or_insert(existing_decls.len());
+                    merge_update_decls(existing_decls, updated_decls);
                 }
             }
         }
@@ -691,8 +693,130 @@ pub fn apply_updates_to_ast(base_ast: &[Stmt], updates: &[Stmt]) -> Result<Vec<S
             return Err(*updated_svc_name);
         }
     }
+    Ok(())
+}
 
-    Ok(patched_ast)
+/// Add to `reads` the members of `service` that evaluating `expr` certainly
+/// reads: plain names, and qualified names in `service` itself. Building a
+/// function or an action reads nothing (C-Abs, C-Action), so their bodies are
+/// skipped; what applying a function reads (C-App) is left out too. These
+/// reads are a subset of those the forward-reference check counts
+fn eager_reads(expr: &Expr, service: Symbol, reads: &mut HashSet<Symbol>) {
+    match expr {
+        Expr::Variable { name } => {
+            reads.insert(*name);
+        }
+        Expr::MemberAccess {
+            service_name,
+            member_name,
+        } => {
+            if *service_name == service {
+                reads.insert(*member_name);
+            }
+        }
+        Expr::Func { .. } | Expr::Action(_) => {}
+        // A table literal holds data; a query's condition is evaluated per row
+        Expr::Table { .. } => {}
+        Expr::Select { table_name, .. } => {
+            reads.insert(*table_name);
+        }
+        _ => {
+            for child in expr.children() {
+                eager_reads(child, service, reads);
+            }
+        }
+    }
+}
+
+/// Merge an update's declarations into a service's: a changed declaration
+/// replaces the old one in place, and a new one goes at the end, in the
+/// update's order
+fn merge_update_decls(decls: &mut Vec<Decl>, updated: &[Decl]) {
+    let mut index: HashMap<Symbol, usize> = decls
+        .iter()
+        .enumerate()
+        .map(|(i, d)| (d.name(), i))
+        .collect();
+    for up in updated {
+        match index.get(&up.name()) {
+            Some(&i) => decls[i] = up.clone(),
+            None => {
+                index.insert(up.name(), decls.len());
+                decls.push(up.clone());
+            }
+        }
+    }
+}
+
+/// Order the members of `service` after its updates are merged, the first
+/// `existing` of them being those it had before
+///
+/// A member may only read members declared before it, so the two sequences,
+/// existing members and new ones, are interleaved, each keeping its own order
+/// (the existing members theirs, the new members the updates'), so that each
+/// member follows the members it certainly reads (`eager_reads`), preferring
+/// the merged order: a stable topological sort. That lets an update add a
+/// member and change an existing def to read it, while a forward reference
+/// among the updates' own members, or among existing members, stays an error
+/// for the check to report. It runs once for all the updates merged together,
+/// so an `atomic` block is ordered by its final declarations.
+///
+/// The merged order already keeps both sequences in order, so if it also
+/// satisfies these reads it is left as it is; and they are a subset of the
+/// reads the forward-reference check counts, so any update the check accepted
+/// without ordering is merged exactly as before. Members only move when that
+/// order would certainly be rejected. If the constraints form a cycle, the
+/// order is left for the check to report.
+fn order_members(decls: &mut Vec<Decl>, service: Symbol, existing: usize) {
+    let index: HashMap<Symbol, usize> = decls
+        .iter()
+        .enumerate()
+        .map(|(i, d)| (d.name(), i))
+        .collect();
+
+    // `readers[j]`: the members that read member `j`; `waiting[i]`: how many
+    // members member `i` reads that are not placed yet
+    let mut readers: Vec<Vec<usize>> = vec![Vec::new(); decls.len()];
+    let mut waiting = vec![0usize; decls.len()];
+    // Each sequence keeps its order
+    for i in 1..decls.len() {
+        if i != existing {
+            readers[i - 1].push(i);
+            waiting[i] += 1;
+        }
+    }
+    for (i, decl) in decls.iter().enumerate() {
+        let mut reads = HashSet::new();
+        if let Decl::VarDecl { val, .. } | Decl::DefDecl { val, .. } = decl {
+            eager_reads(val, service, &mut reads);
+        }
+        for read in reads {
+            if let Some(&j) = index.get(&read).filter(|&&j| j != i) {
+                readers[j].push(i);
+                waiting[i] += 1;
+            }
+        }
+    }
+    let mut ready: BinaryHeap<Reverse<usize>> = (0..decls.len())
+        .filter(|&i| waiting[i] == 0)
+        .map(Reverse)
+        .collect();
+    let mut order = Vec::with_capacity(decls.len());
+    while let Some(Reverse(i)) = ready.pop() {
+        order.push(i);
+        for &reader in &readers[i] {
+            waiting[reader] -= 1;
+            if waiting[reader] == 0 {
+                ready.push(Reverse(reader));
+            }
+        }
+    }
+    let unchanged = order.iter().enumerate().all(|(at, &i)| at == i);
+    if order.len() < decls.len() || unchanged {
+        return;
+    }
+    let mut slots: Vec<Option<Decl>> = std::mem::take(decls).into_iter().map(Some).collect();
+    *decls = order.into_iter().filter_map(|i| slots[i].take()).collect();
 }
 
 #[cfg(test)]
@@ -715,5 +839,139 @@ mod tests {
 
         let result = apply_updates_to_ast(&base_ast, &updates);
         assert_eq!(result, Err(target_sym));
+    }
+
+    /// The member names of the one service in `program` after applying the
+    /// updates that follow it
+    fn names_after_update(program: &str) -> Vec<String> {
+        let mut interner = Interner::new();
+        let stmts = crate::runtime::parser::parse_string(program, &mut interner).unwrap();
+        let (base, updates): (Vec<Stmt>, Vec<Stmt>) = stmts
+            .into_iter()
+            .partition(|s| matches!(s, Stmt::Service { .. }));
+        let patched = apply_updates_to_ast(&base, &updates).unwrap();
+        let Some(Stmt::Service { decls, .. }) = patched.first() else {
+            panic!("expected the service");
+        };
+        decls
+            .iter()
+            .map(|d| interner.get(d.name()).to_string())
+            .collect()
+    }
+
+    /// A new member goes just before the first existing member that follows
+    /// it in the update, so a changed def can read it (as in
+    /// `meerkat/tests/test_update.mkt`)
+    #[test]
+    fn test_apply_updates_places_new_member_before_the_def_reading_it() {
+        let names = names_after_update(
+            "service s { var t = 1; pub def warm = t > 0; }
+             update s { var t = 2; var c = true; pub def warm = if c then t > 0 else t > 1; }",
+        );
+        assert_eq!(names, ["t", "c", "warm"]);
+    }
+
+    /// Several new members keep their order in the update
+    #[test]
+    fn test_apply_updates_keeps_the_order_of_new_members() {
+        let names = names_after_update(
+            "service s { var t = 1; pub def warm = t > 0; }
+             update s { var a = 1; var b = 2; pub def warm = a + b > t; }",
+        );
+        assert_eq!(names, ["t", "a", "b", "warm"]);
+    }
+
+    /// A new member that nothing reads goes at the end, and a changed member
+    /// keeps its position
+    #[test]
+    fn test_apply_updates_appends_trailing_new_members() {
+        let names = names_after_update(
+            "service s { var t = 1; pub def warm = t > 0; }
+             update s { var t = 5; pub def hot = t > 9; }",
+        );
+        assert_eq!(names, ["t", "warm", "hot"]);
+    }
+
+    /// A new member nothing reads goes at the end even when the update lists
+    /// it before a changed member that reads no new member (#265's amended
+    /// decision)
+    #[test]
+    fn test_apply_updates_appends_a_new_member_listed_before_a_changed_one() {
+        let names = names_after_update(
+            "service s { var t = 1; pub def warm = t > 0; }
+             update s { var h = 3; pub def warm = t > 0; }",
+        );
+        assert_eq!(names, ["t", "warm", "h"]);
+    }
+
+    /// A new member nothing reads goes at the end, even when the update lists
+    /// it before a changed member: placing it earlier would put it ahead of a
+    /// member it reads (a regression found in review of #266)
+    #[test]
+    fn test_apply_updates_keeps_an_unread_new_member_after_its_dependencies() {
+        let names = names_after_update(
+            "service s { var x = 1; pub def flag = x > 0; var tail = 10; }
+             update s { var added = tail + 1; pub def flag = x > 1; }",
+        );
+        assert_eq!(names, ["x", "flag", "tail", "added"]);
+    }
+
+    /// A chain of new members, the last read by a changed def, is placed
+    /// before that def in dependency order
+    #[test]
+    fn test_apply_updates_places_a_chain_of_new_members() {
+        let names = names_after_update(
+            "service s { var t = 1; pub def warm = t > 0; }
+             update s { var c = 2; pub def f = c + t; pub def warm = f > 0; }",
+        );
+        assert_eq!(names, ["t", "c", "f", "warm"]);
+    }
+
+    /// Building an action reads nothing, so a name inside an action body
+    /// doesn't move anything: the order appending gives, which the check
+    /// accepts, stays (a regression found in review of #266)
+    #[test]
+    fn test_apply_updates_ignores_names_inside_actions() {
+        let names = names_after_update(
+            "service s { pub def check = action {}; var tail = 10; }
+             update s { var c = tail; pub def d = c; pub def check = action { assert(d == 10); }; }",
+        );
+        assert_eq!(names, ["check", "tail", "c", "d"]);
+    }
+
+    /// A qualified read of the member's own service (`s.c`) counts as a read
+    #[test]
+    fn test_apply_updates_counts_qualified_reads_of_the_same_service() {
+        let names = names_after_update(
+            "service s { var t = 1; pub def warm = t > 0; }
+             update s { var c = 2; pub def warm = s.c > 0; }",
+        );
+        assert_eq!(names, ["t", "c", "warm"]);
+    }
+
+    /// An `atomic` block is ordered by its final declarations: the first
+    /// update has `x` read a new `c`, the second reverses that, and `c` must
+    /// end up after `x` (a regression found in review of #266)
+    #[test]
+    fn test_apply_updates_orders_an_atomic_block_by_its_final_declarations() {
+        let names = names_after_update(
+            "service s { var a = 0; pub def x = a + 1; }
+             atomic {
+                 update s { var c = 5; pub def x = c + 1; }
+                 update s { pub def x = a + 2; pub def c = x + 1; }
+             }",
+        );
+        assert_eq!(names, ["a", "x", "c"]);
+    }
+
+    /// Existing members keep their order, so a changed member reading a later
+    /// existing one is left for the check to reject
+    #[test]
+    fn test_apply_updates_keeps_a_forward_reference_between_existing_members() {
+        let names = names_after_update(
+            "service s { var a = 1; var b = 2; }
+             update s { var a = b; }",
+        );
+        assert_eq!(names, ["a", "b"]);
     }
 }

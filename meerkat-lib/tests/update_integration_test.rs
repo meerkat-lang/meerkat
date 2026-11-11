@@ -103,7 +103,7 @@ async fn test_step2_locking_conflict() {
     ";
     let update_ast = parse_string(update_code, &mut manager.interner).unwrap();
 
-    let mut txn = Transaction::new(update_ast);
+    let txn = Transaction::new(update_ast);
     let poll_res = txn.poll(&mut manager).await;
     assert!(poll_res.is_err());
 
@@ -131,7 +131,7 @@ async fn test_step3_nonexistent_service_rejection() {
     ";
     let update_ast = parse_string(invalid_update_code, &mut manager.interner).unwrap();
 
-    let mut txn = Transaction::new(update_ast);
+    let txn = Transaction::new(update_ast);
     let poll_res = txn.poll(&mut manager).await;
     assert!(poll_res.is_err());
 
@@ -163,7 +163,7 @@ async fn test_step4_and_5_static_validation_rejection() {
     ";
     let update_ast = parse_string(ill_typed_update_code, &mut manager.interner).unwrap();
 
-    let mut txn = Transaction::new(update_ast);
+    let txn = Transaction::new(update_ast);
     let poll_res = txn.poll(&mut manager).await;
     assert!(poll_res.is_err());
 
@@ -195,7 +195,7 @@ async fn test_step6_old_state_evaluation_failure() {
     ";
     let update_ast = parse_string(eval_fail_update_code, &mut manager.interner).unwrap();
 
-    let mut txn = Transaction::new(update_ast);
+    let txn = Transaction::new(update_ast);
     let poll_res = txn.poll(&mut manager).await;
     assert!(poll_res.is_err());
 
@@ -227,7 +227,7 @@ async fn test_step8_and_9_success_and_propagation() {
     ";
     let update_ast = parse_string(update_code, &mut manager.interner).unwrap();
 
-    let mut txn = Transaction::new(update_ast);
+    let txn = Transaction::new(update_ast);
     let poll_res = txn.poll(&mut manager).await;
     assert!(poll_res.is_ok());
 
@@ -273,7 +273,7 @@ async fn test_type_change_incompatible_rejection() {
     ";
     let update_ast = parse_string(incompatible_update_code, &mut manager.interner).unwrap();
 
-    let mut txn = Transaction::new(update_ast);
+    let txn = Transaction::new(update_ast);
     let poll_res = txn.poll(&mut manager).await;
     assert!(poll_res.is_err());
 
@@ -323,7 +323,7 @@ async fn test_type_change_valid_shift() {
     ";
     let update_ast = parse_string(update_code, &mut manager.interner).unwrap();
 
-    let mut txn = Transaction::new(update_ast);
+    let txn = Transaction::new(update_ast);
     let poll_res = txn.poll(&mut manager).await;
     assert!(poll_res.is_ok());
 
@@ -376,7 +376,7 @@ async fn test_update_supports_introducing_new_field() {
     ";
     let update_ast = parse_string(add_field_update_code, &mut manager.interner).unwrap();
 
-    let mut txn = Transaction::new(update_ast);
+    let txn = Transaction::new(update_ast);
     let poll_res = txn.poll(&mut manager).await;
     assert!(poll_res.is_ok(), "poll error: {:?}", poll_res);
 
@@ -425,7 +425,7 @@ async fn test_update_rejects_removing_existing_field() {
     ";
     let update_ast = parse_string(update_code, &mut manager.interner).unwrap();
 
-    let mut txn = Transaction::new(update_ast);
+    let txn = Transaction::new(update_ast);
     let poll_res = txn.poll(&mut manager).await;
     assert!(poll_res.is_ok());
 
@@ -467,7 +467,7 @@ async fn test_update_new_field_conflict_service_lock_rejection() {
     ";
     let update_ast = parse_string(update_code, &mut manager.interner).unwrap();
 
-    let mut txn = Transaction::new(update_ast);
+    let txn = Transaction::new(update_ast);
     let poll_res = txn.poll(&mut manager).await;
     assert!(poll_res.is_err());
 
@@ -497,7 +497,7 @@ async fn test_update_multiple_new_fields_and_reactive_defs_success() {
     ";
     let update_ast = parse_string(update_code, &mut manager.interner).unwrap();
 
-    let mut txn = Transaction::new(update_ast);
+    let txn = Transaction::new(update_ast);
     let poll_res = txn.poll(&mut manager).await;
     assert!(poll_res.is_ok(), "poll error: {:?}", poll_res);
 
@@ -559,7 +559,7 @@ async fn test_atomic_block_multiple_services_update() {
     assert_eq!(ast.len(), 1);
 
     if let meerkat_lib::runtime::ast::Stmt::Atomic { updates } = &ast[0] {
-        let mut txn = Transaction::new(updates.clone());
+        let txn = Transaction::new(updates.clone());
         let poll_res = txn.poll(&mut manager).await;
         assert!(poll_res.is_ok(), "poll error: {:?}", poll_res);
     } else {
@@ -616,7 +616,7 @@ async fn test_update_listener_rewiring_propagation() {
         }
     ";
     let update_ast = parse_string(update_code, &mut manager.interner).unwrap();
-    let mut txn = Transaction::new(update_ast);
+    let txn = Transaction::new(update_ast);
     let poll_res = txn.poll(&mut manager).await;
     assert!(poll_res.is_ok(), "poll error: {:?}", poll_res);
 
@@ -667,7 +667,7 @@ async fn test_update_cross_service_listener_rewiring() {
         }
     ";
     let update_ast = parse_string(update_code, &mut manager.interner).unwrap();
-    let mut txn = Transaction::new(update_ast);
+    let txn = Transaction::new(update_ast);
     let poll_res = txn.poll(&mut manager).await;
     assert!(poll_res.is_ok(), "poll error: {:?}", poll_res);
 
@@ -723,7 +723,7 @@ async fn test_update_adds_new_cross_service_listener_edge() {
         }
     ";
     let update_ast = parse_string(update_code, &mut manager.interner).unwrap();
-    let mut txn = Transaction::new(update_ast);
+    let txn = Transaction::new(update_ast);
     let poll_res = txn.poll(&mut manager).await;
     assert!(poll_res.is_ok(), "poll error: {:?}", poll_res);
 
@@ -761,7 +761,7 @@ async fn manager_after_update(
         .unwrap();
 
     let update_ast = parse_string(update_code, &mut manager.interner).unwrap();
-    let mut txn = Transaction::new(update_ast);
+    let txn = Transaction::new(update_ast);
     let poll_res = txn.poll(&mut manager).await;
     assert!(poll_res.is_ok(), "poll error: {:?}", poll_res);
     manager
@@ -930,7 +930,7 @@ async fn test_update_def_to_var_ignores_update_from_stale_subscription() {
 async fn test_update_empty_statements_no_panic() {
     let interner = Interner::new();
     let mut manager = meerkat_lib::runtime::Manager::new(interner);
-    let mut txn = Transaction::new(Vec::new());
+    let txn = Transaction::new(Vec::new());
     let poll_res = txn.poll(&mut manager).await;
     assert!(
         poll_res.is_ok(),
@@ -1333,4 +1333,194 @@ async fn test_update_unchanged_result_still_initializes_subscription() {
         "new subscriber must receive the unchanged current pair"
     );
     assert_update(&mut peer, 2, &[]).await;
+}
+
+/// Start a manager on `initial_code`, then apply `update_code`, unwrapping
+/// an `atomic` block into its updates as `Manager::run_update` does, and
+/// return the manager or the update's error
+async fn try_update(
+    initial_code: &str,
+    update_code: &str,
+) -> Result<meerkat_lib::runtime::Manager, String> {
+    let mut interner = Interner::new();
+    let initial_ast = parse_string(initial_code, &mut interner).unwrap();
+    let mut node = Node::new();
+    node.interner = interner;
+    node.unified_ast = initial_ast;
+    node.static_checks().unwrap();
+    let local_ast = node.unified_ast.clone();
+    let mut manager = node
+        .on_manager_startup(true, None, HashMap::new(), &local_ast)
+        .await
+        .unwrap();
+    let updates: Vec<Stmt> = parse_string(update_code, &mut manager.interner)
+        .unwrap()
+        .into_iter()
+        .flat_map(|stmt| match stmt {
+            Stmt::Atomic { updates } => updates,
+            other => vec![other],
+        })
+        .collect();
+    Transaction::new(updates)
+        .poll(&mut manager)
+        .await
+        .map(|()| manager)
+        .map_err(|e| e.to_string())
+}
+
+/// The value of `service.member` in `manager`
+async fn value_of(
+    manager: &mut meerkat_lib::runtime::Manager,
+    service: &str,
+    member: &str,
+) -> Value {
+    let service = manager.interner.insert(service);
+    let member = manager.interner.insert(member);
+    manager.lookup(member, service, None).await.unwrap()
+}
+
+/// An update's var initializers see the vars the same update adds: a new var
+/// reading another new var
+#[tokio::test]
+async fn test_update_var_reads_a_var_the_update_adds() {
+    let mut m = try_update(
+        "service s { var a = 0; }",
+        "update s { var c = 1; var d = c + 1; }",
+    )
+    .await
+    .expect("the update applies");
+    assert_eq!(value_of(&mut m, "s", "d").await, Value::Int { val: 2 });
+}
+
+/// A changed var can read a var the same update adds
+#[tokio::test]
+async fn test_update_changed_var_reads_a_var_the_update_adds() {
+    let mut m = try_update(
+        "service s { var result = 0; }",
+        "update s { var c = 2; var result = c + 1; }",
+    )
+    .await
+    .expect("the update applies");
+    assert_eq!(value_of(&mut m, "s", "c").await, Value::Int { val: 2 });
+    assert_eq!(value_of(&mut m, "s", "result").await, Value::Int { val: 3 });
+}
+
+/// An update's var initializers see the update's new value of a var it
+/// changes, not the running one (staged reads)
+#[tokio::test]
+async fn test_update_var_reads_the_updated_value_of_a_changed_var() {
+    let mut m = try_update(
+        "service s { var a = 1; var b = 0; }",
+        "update s { var a = 10; var b = a; }",
+    )
+    .await
+    .expect("the update applies");
+    assert_eq!(value_of(&mut m, "s", "b").await, Value::Int { val: 10 });
+}
+
+/// A qualified read of the service's own member (`s.c`) sees the staged value
+/// too
+#[tokio::test]
+async fn test_update_var_reads_a_staged_var_by_qualified_name() {
+    let mut m = try_update(
+        "service s { var r = 0; }",
+        "update s { var c = 4; var r = s.c + 1; }",
+    )
+    .await
+    .expect("the update applies");
+    assert_eq!(value_of(&mut m, "s", "r").await, Value::Int { val: 5 });
+}
+
+/// A function called from an initializer reads the staged value of the
+/// members it reads
+#[tokio::test]
+async fn test_update_var_sees_staged_values_through_a_called_function() {
+    let mut m = try_update(
+        "service s { var c = 0; pub def get = fn () => c; var r = 0; }",
+        "update s { var c = 7; var r = get() + 1; }",
+    )
+    .await
+    .expect("the update applies");
+    assert_eq!(value_of(&mut m, "s", "r").await, Value::Int { val: 8 });
+}
+
+/// In an `atomic` block, one service's var can read a var another update in
+/// the block adds to another service
+#[tokio::test]
+async fn test_update_atomic_block_reads_a_var_added_to_another_service() {
+    let mut m = try_update(
+        "service p { var a = 0; } service q { var b = 0; }",
+        "atomic { update p { var c = 5; } update q { var b = p.c * 2; } }",
+    )
+    .await
+    .expect("the update applies");
+    assert_eq!(value_of(&mut m, "q", "b").await, Value::Int { val: 10 });
+}
+
+/// Defs aren't staged: a var initializer reading a def the same update adds
+/// fails, since the def has no value until after the commit
+#[tokio::test]
+async fn test_update_var_cannot_read_a_def_the_update_adds() {
+    let err = try_update(
+        "service s { var a = 0; }",
+        "update s { pub def d = 5; var r = d; }",
+    )
+    .await
+    .err()
+    .expect("reading a new def from a var initializer fails");
+    assert!(err.contains("'d' not found"), "unexpected error: {err}");
+}
+
+/// An `atomic` block given to a transaction as it is, without unwrapping it
+/// first (as a peer's `UpdateServiceRequest` can carry it), still stages and
+/// installs its vars' values
+#[tokio::test]
+async fn test_update_atomic_block_given_directly_installs_its_values() {
+    let mut m = manager_after_update(
+        "service s { var a = 0; }",
+        "atomic { update s { var c = 5; var d = c + 1; } }",
+    )
+    .await;
+    assert_eq!(value_of(&mut m, "s", "c").await, Value::Int { val: 5 });
+    assert_eq!(value_of(&mut m, "s", "d").await, Value::Int { val: 6 });
+}
+
+/// A nested `atomic` block, which the parser rejects but code can build, is
+/// flattened like any other
+#[tokio::test]
+async fn test_update_nested_atomic_block_installs_its_values() {
+    let mut interner = Interner::new();
+    let initial_ast = parse_string("service s { var a = 0; }", &mut interner).unwrap();
+    let mut node = Node::new();
+    node.interner = interner;
+    node.unified_ast = initial_ast;
+    node.static_checks().unwrap();
+    let local_ast = node.unified_ast.clone();
+    let mut m = node
+        .on_manager_startup(true, None, HashMap::new(), &local_ast)
+        .await
+        .unwrap();
+    let inner = parse_string("update s { var c = 7; }", &mut m.interner).unwrap();
+    let nested = vec![Stmt::Atomic {
+        updates: vec![Stmt::Atomic { updates: inner }],
+    }];
+    Transaction::new(nested)
+        .poll(&mut m)
+        .await
+        .expect("the nested update applies");
+    assert_eq!(value_of(&mut m, "s", "c").await, Value::Int { val: 7 });
+}
+
+/// Updates in one `atomic` block that change the same var are evaluated in
+/// their final form: `b` reads the last value given to `a`
+#[tokio::test]
+async fn test_update_atomic_block_overlapping_updates_use_final_values() {
+    let mut m = try_update(
+        "service s { var a = 0; var b = 0; }",
+        "atomic { update s { var a = 1; var b = a; } update s { var a = 2; } }",
+    )
+    .await
+    .expect("the update applies");
+    assert_eq!(value_of(&mut m, "s", "a").await, Value::Int { val: 2 });
+    assert_eq!(value_of(&mut m, "s", "b").await, Value::Int { val: 2 });
 }

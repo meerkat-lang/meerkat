@@ -1,0 +1,6 @@
+// Served by the `owner` node. The file is named after the service because a
+// client importing `counter` asks its owner for `counter.mkt`.
+service counter {
+    var x = 3;
+    pub def doubled = x * 2;
+}

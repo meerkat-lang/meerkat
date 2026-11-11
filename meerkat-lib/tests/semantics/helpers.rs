@@ -24,6 +24,6 @@ pub async fn check_update(initial: &str, update: &str) -> Result<(), String> {
 
     let update_ast =
         parse_string(update, &mut manager.interner).map_err(|e| format!("Parse error: {}", e))?;
-    let mut txn = update::Transaction::new(update_ast);
+    let txn = update::Transaction::new(update_ast);
     txn.poll(&mut manager).await.map_err(|e| e.to_string())
 }

@@ -307,6 +307,12 @@ pub struct Transaction {
     /// takes. A park rewinds it, so a replayed dispatch lands on the position
     /// the first attempt recorded
     pub composed_seq: u64,
+    /// Values a code update has given the vars it declares, by (service,
+    /// member), while it evaluates their initializers. A read in the update
+    /// sees these before the member's running value, wherever the member
+    /// lives; they are kept apart from `read_cache`, which holds what reads
+    /// actually observed
+    pub(crate) staged: HashMap<(Symbol, Symbol), Value>,
 }
 
 /// A composed action that completed under a transaction: where it was sent,
@@ -332,6 +338,7 @@ impl Transaction {
             participant_writes: HashSet::new(),
             composed_done: HashMap::new(),
             composed_seq: 0,
+            staged: HashMap::new(),
         }
     }
 }

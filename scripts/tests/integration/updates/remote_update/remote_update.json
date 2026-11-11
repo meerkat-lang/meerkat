@@ -1,0 +1,22 @@
+{
+  "settings": {
+    "startup_timeout": 60.0,
+    "monitor_poll_interval": 0.25,
+    "terminate_timeout": 5.0
+  },
+  "nodes": [
+    {
+      "alias": "owner",
+      "type": "server",
+      "file": "scripts/tests/integration/updates/remote_update/counter.mkt",
+      "port": 9510
+    },
+    {
+      "alias": "remote_update_client",
+      "type": "client",
+      "file": "scripts/tests/integration/updates/remote_update/client.mkt",
+      "timeout": 45,
+      "imports": ["owner.counter"]
+    }
+  ]
+}

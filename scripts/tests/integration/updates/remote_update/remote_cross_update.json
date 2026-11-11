@@ -1,0 +1,29 @@
+{
+  "settings": {
+    "startup_timeout": 60.0,
+    "monitor_poll_interval": 0.25,
+    "terminate_timeout": 5.0
+  },
+  "nodes": [
+    {
+      "alias": "owner",
+      "type": "server",
+      "file": "scripts/tests/integration/updates/remote_update/counter.mkt",
+      "port": 9530
+    },
+    {
+      "alias": "other_owner",
+      "type": "server",
+      "file": "scripts/tests/integration/updates/remote_update/other.mkt",
+      "port": 9535,
+      "imports": ["owner.counter"]
+    },
+    {
+      "alias": "remote_cross_client",
+      "type": "client",
+      "file": "scripts/tests/integration/updates/remote_update/cross_client.mkt",
+      "timeout": 45,
+      "imports": ["owner.counter", "other_owner.other"]
+    }
+  ]
+}

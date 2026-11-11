@@ -32,7 +32,7 @@ impl Transaction {
     ///     `Self`: The initialized `Transaction` instance
     pub fn new(updates: Vec<Stmt>) -> Self {
         Self {
-            updates,
+            updates: flatten_atomic(updates),
             ast: Vec::new(),
             values: HashMap::new(),
             lock_txn: None,
@@ -49,7 +49,7 @@ impl Transaction {
     ///     `Self`: The initialized `Transaction` instance
     pub fn new_with_id(txn_id: TxnId, updates: Vec<Stmt>) -> Self {
         Self {
-            updates,
+            updates: flatten_atomic(updates),
             ast: Vec::new(),
             values: HashMap::new(),
             lock_txn: Some(LockTxn::new(txn_id)),
@@ -78,13 +78,23 @@ impl Transaction {
     /// Raises:
     ///     `EvalError`: If lock acquisition, validation, or eval fails, or a
     ///     committed new def gets no value (`Manager::await_first_values`)
-    pub async fn poll(&mut self, manager: &mut Manager) -> Result<(), EvalError> {
+    pub async fn poll(self, manager: &mut Manager) -> Result<(), EvalError> {
         let introduced = self.apply(manager).await?;
         manager.await_first_values(&introduced).await
     }
 
     /// Takes the locks, validates and installs the update, forwards it to the
     /// remote owners it changes, and releases the locks
+    ///
+    /// Consumes the update: an attempt's lock transaction, with its staged
+    /// values, read cache and locks, belongs to that attempt, so retrying
+    /// after a failure means building a new `Transaction`
+    ///
+    /// Not cancellation-safe: callers must drive it to completion. Its locks
+    /// are released on its normal paths only, so dropping the future part way
+    /// (in a `select!`, say) would leave them held. No caller does today; see
+    /// `docs/design/suspendable-execution.md` for what the event loop of #28
+    /// has to respect
     ///
     /// Args:
     ///     `manager` (`&mut Manager`): The active runtime manager
@@ -98,7 +108,7 @@ impl Transaction {
     /// Raises:
     ///     `EvalError`: If lock acquisition, validation, or eval fails
     pub async fn apply(
-        &mut self,
+        mut self,
         manager: &mut Manager,
     ) -> Result<Vec<(Symbol, Symbol)>, EvalError> {
         let result = self.try_apply(manager).await;
@@ -211,47 +221,62 @@ impl Transaction {
                 e.message(&manager.interner)
             )));
         }
-        for stmt in &self.updates {
-            let (svc_name, decls) = match stmt {
-                Stmt::Service { name, decls } => (name, decls),
-                Stmt::Update {
-                    service_name: name,
-                    decls,
-                } => (name, decls),
-                Stmt::ActionStmt(_)
-                | Stmt::Atomic { .. }
-                | Stmt::Connect { .. }
-                | Stmt::Import { .. }
-                | Stmt::Test { .. }
-                | Stmt::Watch { .. } => continue,
-            };
+        // The vars the update declares, each evaluated once, in its final form
+        let mut staged_vars: HashSet<(Symbol, Symbol)> = HashSet::new();
+        for (svc_name, decls) in declared(&self.updates) {
             for decl in decls {
-                let (var_name, expr) = match decl {
-                    Decl::VarDecl { name, val, .. } => (*name, val),
-                    Decl::DefDecl { .. } => continue,
-                    Decl::TableDecl { .. } => {
-                        return Err(EvalError::NotImplemented);
+                match decl {
+                    Decl::VarDecl { name, .. } => {
+                        staged_vars.insert((*svc_name, *name));
                     }
-                };
-
-                let env: Vec<(Symbol, Value)> = Vec::new();
-                let eval_res = {
-                    let mut ctx = EvalContext {
-                        manager,
-                        service_name: *svc_name,
-                        txn: self.lock_txn.as_mut(),
-                    };
-                    eval(expr, &env, &mut ctx).await
-                };
-
-                let val = match eval_res {
-                    Ok(v) => v,
-                    Err(e) => {
-                        return Err(e);
-                    }
-                };
-                self.values.insert((*svc_name, var_name), val);
+                    Decl::DefDecl { .. } => {}
+                    Decl::TableDecl { .. } => return Err(EvalError::NotImplemented),
+                }
             }
+        }
+        // Evaluate their initializers in the merged order, staging each value
+        // in the lock transaction as it is computed. Every member read in the
+        // update then sees the update's own vars, new or changed, whether by
+        // plain or qualified name, from inside a called function, or in a
+        // service on another node, and the running state for the rest. Staged
+        // values carry no clock: the update's stamp absorbs the clocks of the
+        // running state it read.
+        // Defs aren't staged yet, so a def read here doesn't reflect the
+        // update's writes: one the update adds fails, any other gives its value
+        // from before the update. That is a known limitation, not the intended
+        // semantics (docs/design/code-updates.md, "Evaluating an update"; task
+        // 12, #267, #180)
+        let initializers: Vec<(Symbol, Symbol, Expr)> = self
+            .ast
+            .iter()
+            .filter_map(|stmt| match stmt {
+                Stmt::Service { name, decls } => Some((name, decls)),
+                _ => None,
+            })
+            .flat_map(|(svc_name, decls)| {
+                decls.iter().filter_map(|decl| match decl {
+                    Decl::VarDecl { name, val, .. }
+                        if staged_vars.contains(&(*svc_name, *name)) =>
+                    {
+                        Some((*svc_name, *name, val.clone()))
+                    }
+                    _ => None,
+                })
+            })
+            .collect();
+        for (svc_name, var_name, expr) in initializers {
+            let val = {
+                let mut ctx = EvalContext {
+                    manager,
+                    service_name: svc_name,
+                    txn: self.lock_txn.as_mut(),
+                };
+                eval(&expr, &[], &mut ctx).await?
+            };
+            if let Some(txn) = self.lock_txn.as_mut() {
+                txn.staged.insert((svc_name, var_name), val.clone());
+            }
+            self.values.insert((svc_name, var_name), val);
         }
 
         let introduced = self.unvalued_defs(manager);
@@ -278,6 +303,11 @@ impl Transaction {
             .collect();
         let graphs = manager.graphs_of(&self.ast, services, &staged);
         manager.check_graphs(&graphs)?;
+        // Each service's final declarations, so a remote owner is sent one
+        // update and evaluates the same batch this node did, in the order the
+        // services were staged in. Taken before the commit, which installs
+        // the merged program in the manager and leaves `self.ast` empty
+        let finals = final_declarations(&self.updates, &self.ast);
         if let Err(e) = self.commit(manager) {
             if let Some(txn) = &self.lock_txn {
                 manager.abort_participants(txn).await;
@@ -285,7 +315,8 @@ impl Transaction {
             return Err(e);
         }
 
-        let updated_services: Vec<_> = declared(&self.updates).collect();
+        let updated_services: Vec<(&Symbol, &Vec<Decl>)> =
+            finals.iter().map(|(svc, decls)| (svc, decls)).collect();
         // The staged values and declarations were installed without
         // yielding; their checked graphs are still the ones to install
         manager.install_graphs(graphs).await;
@@ -682,6 +713,61 @@ pub fn format_update_source(service_name: Symbol, decls: &[Decl], interner: &Int
     format!("update {} {{\n  {}\n}}", svc_str, decl_strs.join("\n  "))
 }
 
+/// `updates` with every `atomic` block, nested ones included, replaced by
+/// the updates it contains, as `Manager::run_update` unwraps one. A
+/// transaction locks, stages and merges the same flat list, so an `atomic`
+/// block arriving here (from a peer's `UpdateServiceRequest`, say) can't
+/// install declarations without their values
+fn flatten_atomic(updates: Vec<Stmt>) -> Vec<Stmt> {
+    updates
+        .into_iter()
+        .flat_map(|stmt| match stmt {
+            Stmt::Atomic { updates } => flatten_atomic(updates),
+            other => vec![other],
+        })
+        .collect()
+}
+
+/// The final declarations `updates` gives each service: a later declaration
+/// of a member replaces an earlier one in place, and a new one goes after the
+/// rest, as merging them into the service does. Forwarding these as one
+/// update to a remote owner makes it evaluate the same batch as this node:
+/// two updates to the same service in an `atomic` block are one update there
+/// too.
+///
+/// The services come in the order `ast`, the merged program, declares them:
+/// the order their initializers were evaluated and staged in. Forwarded in
+/// that order, an owner reading another service's member sees the update
+/// this node's staged evaluation saw, whatever order the updates were
+/// written in
+fn final_declarations(updates: &[Stmt], ast: &[Stmt]) -> Vec<(Symbol, Vec<Decl>)> {
+    let mut finals: Vec<(Symbol, Vec<Decl>)> = Vec::new();
+    for (svc, decls) in declared(updates) {
+        let at = match finals.iter().position(|(s, _)| s == svc) {
+            Some(at) => at,
+            None => {
+                finals.push((*svc, Vec::new()));
+                finals.len() - 1
+            }
+        };
+        let merged = &mut finals[at].1;
+        for decl in decls {
+            match merged.iter().position(|d| d.name() == decl.name()) {
+                Some(i) => merged[i] = decl.clone(),
+                None => merged.push(decl.clone()),
+            }
+        }
+    }
+    let mut position: HashMap<Symbol, usize> = HashMap::new();
+    for (at, stmt) in ast.iter().enumerate() {
+        if let Stmt::Service { name, .. } = stmt {
+            position.entry(*name).or_insert(at);
+        }
+    }
+    finals.sort_by_key(|(svc, _)| position.get(svc).copied().unwrap_or(usize::MAX));
+    finals
+}
+
 /// The services `updates` declares, each with its declarations
 fn declared(updates: &[Stmt]) -> impl Iterator<Item = (&Symbol, &Vec<Decl>)> {
     updates.iter().filter_map(|stmt| match stmt {
@@ -745,7 +831,7 @@ mod tests {
         let update_ast =
             crate::runtime::parser::parse_string(update_code, &mut manager.interner).unwrap();
 
-        let mut txn = Transaction::new(update_ast);
+        let txn = Transaction::new(update_ast);
         let res = txn.poll(&mut manager).await;
         assert!(res.is_err());
 
@@ -780,7 +866,7 @@ mod tests {
         let update_ast =
             crate::runtime::parser::parse_string(update_code, &mut manager.interner).unwrap();
 
-        let mut txn = Transaction::new(update_ast);
+        let txn = Transaction::new(update_ast);
         let res = txn.poll(&mut manager).await;
         assert!(res.is_err());
 
@@ -789,5 +875,63 @@ mod tests {
         let service = manager.services.get(&s1_sym).unwrap();
         let var_state = service.vars.get(&x_sym).unwrap();
         assert!(matches!(var_state.lock, VarLock::Unlocked));
+    }
+    /// Two updates to the same service combine into its final declarations,
+    /// in the order a merge gives them: what a remote owner is sent
+    #[test]
+    fn test_final_declarations_combine_updates_to_the_same_service() {
+        let mut interner = Interner::new();
+        let updates = crate::runtime::parser::parse_string(
+            "atomic { update counter { var c = 1; var r = c; } update other { var o = 0; } update counter { var c = 2; } }",
+            &mut interner,
+        )
+        .unwrap();
+        let ast = crate::runtime::parser::parse_string(
+            "service counter { var x = 0; } service other { var a = 0; }",
+            &mut interner,
+        )
+        .unwrap();
+        let finals = final_declarations(&flatten_atomic(updates), &ast);
+        let shown: Vec<(String, Vec<String>)> = finals
+            .iter()
+            .map(|(svc, decls)| {
+                (
+                    interner.get(*svc).to_string(),
+                    decls.iter().map(|d| format_decl(d, &interner)).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                (
+                    "counter".to_string(),
+                    vec!["var c = 2;".to_string(), "var r = c;".to_string()]
+                ),
+                ("other".to_string(), vec!["var o = 0;".to_string()]),
+            ]
+        );
+    }
+    /// Batches follow the merged program's service order, not the order the
+    /// updates were written in, so they are forwarded in the order their
+    /// initializers were staged
+    #[test]
+    fn test_final_declarations_follow_the_program_service_order() {
+        let mut interner = Interner::new();
+        let ast = crate::runtime::parser::parse_string(
+            "service counter { var x = 3; } service other { var a = 0; }",
+            &mut interner,
+        )
+        .unwrap();
+        let updates = crate::runtime::parser::parse_string(
+            "atomic { update other { var b = 1; } update counter { var x = 5; } update other { var r = counter.x; } }",
+            &mut interner,
+        )
+        .unwrap();
+        let order: Vec<String> = final_declarations(&flatten_atomic(updates), &ast)
+            .iter()
+            .map(|(svc, _)| interner.get(*svc).to_string())
+            .collect();
+        assert_eq!(order, ["counter", "other"]);
     }
 }

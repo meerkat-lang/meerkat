@@ -267,9 +267,9 @@ fn open_served_file(path: &std::path::Path) -> Result<std::fs::File> {
 /// Bound the read itself: source files supplied by other processes must not
 /// cause an unbounded allocation before the network size limit is enforced.
 fn read_served_source(file: std::fs::File) -> Result<String> {
-    let mut source = String::new();
+    let mut source = Vec::new();
     file.take((MAX_NET_REQUEST_SOURCE_LENGTH as u64) + 1)
-        .read_to_string(&mut source)
+        .read_to_end(&mut source)
         .map_err(|e| Error::LimitExceeded(format!("failed to read requested file: {}", e)))?;
     if source.len() > MAX_NET_REQUEST_SOURCE_LENGTH {
         return Err(Error::LimitExceeded(format!(
@@ -277,7 +277,8 @@ fn read_served_source(file: std::fs::File) -> Result<String> {
             MAX_NET_REQUEST_SOURCE_LENGTH
         )));
     }
-    Ok(source)
+    String::from_utf8(source)
+        .map_err(|e| Error::LimitExceeded(format!("failed to read requested file: {}", e)))
 }
 
 /// True if the path's extension is `.mkt`, compared case-insensitively:
@@ -2395,12 +2396,38 @@ mod service_code_tests {
     }
 
     #[test]
+    fn test_read_served_file_accepts_multibyte_source_at_size_limit() {
+        let dir = unique_temp_dir("exactsize-utf8");
+        let file = dir.join("counter.mkt");
+        let mut source = "a".repeat(MAX_NET_REQUEST_SOURCE_LENGTH - 2);
+        source.push('é');
+        std::fs::write(&file, &source).unwrap();
+
+        assert_eq!(read_served_file(&file).unwrap(), source);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_read_served_file_rejects_oversized_source() {
         let dir = unique_temp_dir("oversize");
         let file = dir.join("counter.mkt");
         std::fs::write(&file, "a".repeat(MAX_NET_REQUEST_SOURCE_LENGTH + 1)).unwrap();
 
         let err = read_served_file(&file).expect_err("oversized source must not be served");
+        assert!(matches!(&err, Error::LimitExceeded(_)), "{err}");
+        assert!(err.to_string().contains("source size exceeds"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_served_file_rejects_oversized_multibyte_source() {
+        let dir = unique_temp_dir("oversize-utf8");
+        let file = dir.join("counter.mkt");
+        let mut source = vec![b'a'; MAX_NET_REQUEST_SOURCE_LENGTH];
+        source.extend_from_slice("é".as_bytes());
+        std::fs::write(&file, source).unwrap();
+
+        let err = read_served_file(&file).expect_err("oversized UTF-8 source must be rejected");
         assert!(matches!(&err, Error::LimitExceeded(_)), "{err}");
         assert!(err.to_string().contains("source size exceeds"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);

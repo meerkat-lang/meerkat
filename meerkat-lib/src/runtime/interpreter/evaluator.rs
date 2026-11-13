@@ -185,6 +185,9 @@ pub(crate) async fn eval_with_inputs(
                     (Value::List { vals: v1 }, Value::List { vals: v2 }) => {
                         return Ok(Value::Bool { val: v1 == v2 });
                     }
+                    (Value::Record { .. }, Value::Record { .. }) => {
+                        return Ok(Value::Bool { val: val1 == val2 });
+                    }
                     (Value::Range { start: s1, end: e1 }, Value::Range { start: s2, end: e2 }) => {
                         return Ok(Value::Bool {
                             val: s1 == s2 && e1 == e2,
@@ -827,6 +830,64 @@ mod tests {
         };
         let eq_val_2 = eval(&eq_expr_2, &[], &mut ctx).await.unwrap();
         assert_eq!(eq_val_2, Value::Bool { val: true });
+    }
+
+    /// Two records compare by the same equality lists already use for their
+    /// elements, so a record and a list of that record agree.
+    #[tokio::test]
+    async fn test_record_equality_matches_list_equality() {
+        let mut manager = Manager::new(Interner::new());
+        let id = manager.interner.insert("id");
+        let x = manager.interner.insert("x");
+        let mut ctx = EvalContext {
+            manager: &mut manager,
+            service_name: Symbol::empty(),
+            txn: None,
+        };
+
+        let record = |n: i32| Expr::Tuple {
+            val: vec![
+                Expr::KeyVal {
+                    name: id,
+                    value: Box::new(Expr::Literal {
+                        val: Value::Int { val: 1 },
+                    }),
+                },
+                Expr::KeyVal {
+                    name: x,
+                    value: Box::new(Expr::Literal {
+                        val: Value::Int { val: n },
+                    }),
+                },
+            ],
+        };
+        let eq = |left: Expr, right: Expr| Expr::Binop {
+            op: BinOp::Eq,
+            expr1: Box::new(left),
+            expr2: Box::new(right),
+        };
+
+        let same = eval(&eq(record(2), record(2)), &[], &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(same, Value::Bool { val: true });
+
+        let different = eval(&eq(record(2), record(3)), &[], &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(different, Value::Bool { val: false });
+
+        let nested = eval(
+            &eq(
+                Expr::List(vec![record(2)]),
+                Expr::List(vec![record(2)]),
+            ),
+            &[],
+            &mut ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(nested, Value::Bool { val: true });
     }
 
     /// #39: an html template evaluates to a Value::Html whose rendered markup

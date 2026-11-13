@@ -2383,6 +2383,46 @@ mod service_code_tests {
     }
 
     #[test]
+    fn test_serve_service_code_accepts_source_at_size_limit() {
+        let dir = unique_temp_dir("serve-exactsize");
+        let file = dir.join("counter.mkt");
+        let source = "a".repeat(MAX_NET_REQUEST_SOURCE_LENGTH);
+        std::fs::write(&file, &source).unwrap();
+
+        match serve_service_code(1, "counter.mkt".to_string(), "test-reply", &dir) {
+            MeerkatMessage::ServiceCodeResponse {
+                request_id,
+                path,
+                source: served,
+            } => {
+                assert_eq!(request_id, 1);
+                assert_eq!(path, "counter.mkt");
+                assert_eq!(served, source);
+            }
+            other => panic!("expected ServiceCodeResponse, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_serve_service_code_rejects_source_over_size_limit() {
+        let dir = unique_temp_dir("serve-oversize");
+        let file = dir.join("counter.mkt");
+        std::fs::write(&file, "a".repeat(MAX_NET_REQUEST_SOURCE_LENGTH + 1)).unwrap();
+
+        match serve_service_code(2, "counter.mkt".to_string(), "test-reply", &dir) {
+            MeerkatMessage::ServiceCodeError { request_id, error } => {
+                assert_eq!(request_id, 2);
+                assert!(error.contains("source size exceeds"), "{error}");
+            }
+            other => panic!("expected ServiceCodeError, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_read_served_file_accepts_source_at_size_limit() {
         let dir = unique_temp_dir("exactsize");
         let file = dir.join("counter.mkt");

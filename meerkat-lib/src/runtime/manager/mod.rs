@@ -4444,6 +4444,10 @@ impl Manager {
                 if visited.insert((svc_sym, mem_sym)) {
                     if let Some(service) = self.services.get(&svc_sym) {
                         for (owner, input) in service.graphs.inputs(svc_sym, mem_sym) {
+                            // `cross_deps` also records vars. Only defs are followed.
+                            if owner != svc_sym && !service.defs.contains_key(&mem_sym) {
+                                continue;
+                            }
                             if self.remote_services.contains_key(&owner) {
                                 // Track remote dependencies for a
                                 // remote service to request them

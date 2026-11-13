@@ -127,7 +127,7 @@ fn collect_free_vars_action_stmt(
 /// `MemberAccess` uses the same syntax for `s1.y` (a service member) and
 /// `row.done` (a record field). Only the former is a cross-service dependency;
 /// the latter is distinguished by whether the left ident is a known service.
-pub fn service_names(program: &[Stmt]) -> HashSet<Symbol> {
+pub(super) fn service_names(program: &[Stmt]) -> HashSet<Symbol> {
     program
         .iter()
         .filter_map(|stmt| match stmt {

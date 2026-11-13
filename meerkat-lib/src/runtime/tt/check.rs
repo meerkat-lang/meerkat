@@ -46,7 +46,7 @@
 
 use crate::runtime::ast::{ActionStmt, BinOp, Decl, Expr, Field, Stmt, TableType, UnOp, Value};
 use crate::runtime::interner::Symbol;
-use crate::runtime::tt::types::{Param, ServiceType, TupleType, Type};
+use crate::runtime::tt::types::{Param, RecordType, ServiceType, TupleType, Type};
 use crate::runtime::Env;
 use std::collections::HashSet;
 
@@ -73,6 +73,12 @@ fn check_type(ty: &Type, depth: usize) -> Result<(), Error> {
             }
             Ok(())
         }
+        Type::Record(fields) => {
+            for (_, t) in fields.fields() {
+                check_type(t, depth + 1)?;
+            }
+            Ok(())
+        }
         Type::Func(t1, t2) => {
             check_type(t1, depth + 1)?;
             check_type(t2, depth + 1)?;
@@ -91,12 +97,11 @@ fn table_field_type(ty: &TableType) -> Type {
 }
 
 fn table_list_type(fields: &[Field]) -> Type {
-    let col_tys: Vec<Type> = fields.iter().map(|f| table_field_type(&f.ty)).collect();
-    let row_ty = match col_tys.len() {
-        0 => Type::Unit,
-        1 => col_tys.into_iter().next().unwrap(),
-        _ => Type::Tuple(TupleType::new(col_tys).unwrap()),
-    };
+    let cols = fields
+        .iter()
+        .map(|f| (f.name, table_field_type(&f.ty)))
+        .collect();
+    let row_ty = Type::Record(RecordType::new(cols).expect("table columns are unique"));
     Type::List(Box::new(row_ty))
 }
 
@@ -726,7 +731,17 @@ impl<'a, 'b> Context<'a, 'b> {
                 }
             }
             Expr::Tuple { val } => {
-                if val.is_empty() {
+                if !val.is_empty() && val.iter().all(|e| matches!(e, Expr::KeyVal { .. })) {
+                    let mut fields = Vec::new();
+                    for e in val {
+                        let Expr::KeyVal { name, value } = e else {
+                            unreachable!()
+                        };
+                        fields.push((*name, self.infer(value, env, type_depth + 1)?));
+                    }
+                    let rec = RecordType::new(fields).map_err(|_| Error::CannotInferType)?;
+                    Ok(Type::Record(rec))
+                } else if val.is_empty() {
                     Ok(Type::Unit)
                 } else if val.len() < 2 {
                     Err(Error::InvalidTupleArity)
@@ -826,7 +841,26 @@ impl<'a, 'b> Context<'a, 'b> {
             Expr::MemberAccess {
                 service_name,
                 member_name,
-            } => self.type_of_member(*service_name, *member_name),
+            } => {
+                let recv = if let Some(ty) = env.find(*service_name) {
+                    Some(ty.clone())
+                } else if let Some(svc) = self.current_service {
+                    match self.type_of_member(svc, *service_name) {
+                        Ok(ty) => Some(ty),
+                        Err(Error::UnboundVariable(_)) => None,
+                        Err(e) => return Err(e),
+                    }
+                } else {
+                    None
+                };
+                if let Some(Type::Record(rec)) = recv {
+                    rec.field_type(*member_name)
+                        .cloned()
+                        .ok_or(Error::UnboundVariable(*member_name))
+                } else {
+                    self.type_of_member(*service_name, *member_name)
+                }
+            }
             Expr::Select { .. } => Ok(Type::List(Box::new(Type::Unit))),
             Expr::Table { .. } => Ok(Type::Unit),
             Expr::Fold {
@@ -944,7 +978,14 @@ impl<'a, 'b> Context<'a, 'b> {
                     Ok(Type::List(Box::new(inner)))
                 }
             }
-            Value::Record { .. } => Ok(Type::Unit),
+            Value::Record { fields } => {
+                let mut tys = Vec::new();
+                for (name, v) in fields {
+                    tys.push((*name, self.infer_value(v, type_depth + 1)?));
+                }
+                let rec = RecordType::new(tys).map_err(|_| Error::CannotInferType)?;
+                Ok(Type::Record(rec))
+            }
             Value::Range { .. } => Ok(Type::List(Box::new(Type::Int))),
             Value::ActionClosure { .. } => Ok(Type::Unit),
             Value::Closure {
@@ -984,6 +1025,7 @@ impl<'a, 'b> Context<'a, 'b> {
         }
     }
 }
+
 
 /// Perform static type checking on a program statement list
 ///

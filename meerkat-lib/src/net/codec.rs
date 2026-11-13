@@ -537,6 +537,7 @@ fn encode_type_internal(ty: &Type, depth: usize) -> Result<NetType> {
         Type::UnresolvedService(_) => Err(Error::Message(
             "Cannot serialize unresolved service type".to_string(),
         )),
+        Type::Record(_) => Err(Error::Message("Cannot serialize record type".to_string())),
     }
 }
 

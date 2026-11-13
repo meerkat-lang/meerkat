@@ -200,19 +200,13 @@ pub async fn execute(
                 .table_field_names(service_name, *table_name)
                 .unwrap_or_default();
             let record = row_to_record(row_val, &names)?;
-            let mut table = manager
-                .lookup(*table_name, service_name, txn.as_deref_mut())
-                .await?;
-            match &mut table {
-                Value::List { vals } => vals.push(Value::Record { fields: record }),
-                _ => {
-                    return Err(EvalError::TypeError(
-                        "insert target is not a table".to_string(),
-                    ))
-                }
-            }
             manager
-                .assign(service_name, *table_name, table, txn)
+                .append_table_row(
+                    service_name,
+                    *table_name,
+                    Value::Record { fields: record },
+                    txn,
+                )
                 .await?;
             Ok(ExecuteEffect::None)
         }

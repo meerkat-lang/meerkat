@@ -1621,6 +1621,149 @@ impl Manager {
         (v_base, write_set)
     }
 
+    /// Append one row to a table without copying the rows already stored.
+    ///
+    /// Outside a transaction the live list is extended in place. Inside a
+    /// transaction the buffered list is extended in place; the live table is
+    /// copied only when that buffer does not exist yet.
+    pub(crate) async fn append_table_row(
+        &mut self,
+        service_name: Symbol,
+        table_name: Symbol,
+        row: Value,
+        mut txn: Option<&mut Transaction>,
+    ) -> Result<(), EvalError> {
+        if txn.is_some() {
+            let key = (self.service_net_id_for_name(service_name), table_name);
+            enum LockAction {
+                Acquire,
+                Upgrade,
+            }
+            let (txn_id, kind, staged) = {
+                let t = txn.as_deref().unwrap();
+                // Reject a missing or non-list target before locking. The
+                // write lock would otherwise create the variable.
+                let staged = if let Some(existing) =
+                    t.written.get(&key).or_else(|| t.read_cache.get(&key))
+                {
+                    if !matches!(existing, Value::List { .. }) {
+                        return Err(EvalError::TypeError(
+                            "insert target is not a table".to_string(),
+                        ));
+                    }
+                    None
+                } else {
+                    let current = self.current_table(service_name, table_name)?;
+                    if !matches!(current, Value::List { .. }) {
+                        return Err(EvalError::TypeError(
+                            "insert target is not a table".to_string(),
+                        ));
+                    }
+                    Some(current)
+                };
+                let kind = if t.locked.contains(&key) {
+                    LockAction::Upgrade
+                } else {
+                    LockAction::Acquire
+                };
+                (t.id.clone(), kind, staged)
+            };
+            match kind {
+                LockAction::Upgrade => {
+                    self.upgrade_to_write_lock(service_name, table_name, &txn_id)?
+                }
+                LockAction::Acquire => {
+                    self.acquire_write_lock(service_name, table_name, &txn_id)?
+                }
+            }
+            let t = txn.as_deref_mut().unwrap();
+            t.locked.insert(key.clone());
+
+            if t.written.contains_key(&key) {
+                if !matches!(t.written.get(&key), Some(Value::List { .. })) {
+                    return Err(EvalError::TypeError(
+                        "insert target is not a table".to_string(),
+                    ));
+                }
+                if let Some(Value::List { vals }) = t.written.get_mut(&key) {
+                    vals.push(row.clone());
+                }
+                if let Some(Value::List { vals }) = t.read_cache.get_mut(&key) {
+                    vals.push(row);
+                } else {
+                    let updated = t.written.get(&key).unwrap().clone();
+                    t.read_cache.insert(key, updated);
+                }
+                return Ok(());
+            }
+
+            let taken_from_cache = t.read_cache.contains_key(&key);
+            let mut table = if taken_from_cache {
+                t.read_cache.remove(&key).unwrap()
+            } else {
+                staged.unwrap()
+            };
+            match &mut table {
+                Value::List { vals } => vals.push(row),
+                _ => {
+                    if taken_from_cache {
+                        t.read_cache.insert(key, table);
+                    }
+                    return Err(EvalError::TypeError(
+                        "insert target is not a table".to_string(),
+                    ));
+                }
+            }
+            t.read_cache.insert(key.clone(), table.clone());
+            t.written.insert(key, table);
+            return Ok(());
+        }
+
+        {
+            let service = self.services.get_mut(&service_name).ok_or_else(|| {
+                EvalError::ServiceNotFound(format!(
+                    "Service '{}' not found",
+                    self.interner.get(service_name)
+                ))
+            })?;
+            let var_state = service.vars.get_mut(&table_name).ok_or_else(|| {
+                EvalError::VarNotFound(format!(
+                    "Variable '{}' not found in service '{}'",
+                    self.interner.get(table_name),
+                    self.interner.get(service_name)
+                ))
+            })?;
+            match &mut var_state.value {
+                Value::List { vals } => vals.push(row),
+                _ => {
+                    return Err(EvalError::TypeError(
+                        "insert target is not a table".to_string(),
+                    ))
+                }
+            }
+        }
+        self.propagate(service_name, table_name).await;
+        Ok(())
+    }
+
+    /// Clone of a local variable, or the same not-found errors as `lookup`.
+    fn current_table(&self, service_name: Symbol, table_name: Symbol) -> Result<Value, EvalError> {
+        let service = self.services.get(&service_name).ok_or_else(|| {
+            EvalError::ServiceNotFound(format!(
+                "Service '{}' not found",
+                self.interner.get(service_name)
+            ))
+        })?;
+        let var_state = service.vars.get(&table_name).ok_or_else(|| {
+            EvalError::VarNotFound(format!(
+                "Variable '{}' not found in service '{}'",
+                self.interner.get(table_name),
+                self.interner.get(service_name)
+            ))
+        })?;
+        Ok(var_state.value.clone())
+    }
+
     pub(crate) async fn propagate(&mut self, service_name: Symbol, changed_var: Symbol) {
         // #24: event-driven reactivity over the listener graph. A change to a
         // member notifies its listeners: a local one advances through the

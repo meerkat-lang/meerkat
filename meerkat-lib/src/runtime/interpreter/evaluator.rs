@@ -438,36 +438,37 @@ async fn lookup_name(
 }
 
 async fn call_closure(
-    func: Value,
+    func: &Value,
     args: Vec<Value>,
     ctx: &mut EvalContext<'_>,
 ) -> Result<Value, EvalError> {
-    match func {
-        Value::Closure {
-            params,
-            body,
-            env: mut closure_env,
-            service_name: closure_svc,
-            ..
-        } => {
-            for (param, arg_val) in params.iter().zip(args) {
-                closure_env.push((param.name, arg_val));
-            }
-            eval(
-                &body,
-                &closure_env,
-                &mut EvalContext {
-                    manager: ctx.manager,
-                    service_name: closure_svc,
-                    txn: ctx.txn.as_deref_mut(),
-                },
-            )
-            .await
-        }
-        _ => Err(EvalError::TypeError(
+    let Value::Closure {
+        params,
+        body,
+        env: closure_env,
+        service_name: closure_svc,
+        ..
+    } = func
+    else {
+        return Err(EvalError::TypeError(
             "Attempting to call a non-function value".to_string(),
-        )),
+        ));
+    };
+    // Extend a copy of the captured environment. The body stays borrowed.
+    let mut call_env = closure_env.clone();
+    for (param, arg_val) in params.iter().zip(args) {
+        call_env.push((param.name, arg_val));
     }
+    eval(
+        body,
+        &call_env,
+        &mut EvalContext {
+            manager: ctx.manager,
+            service_name: *closure_svc,
+            txn: ctx.txn.as_deref_mut(),
+        },
+    )
+    .await
 }
 
 async fn eval_fold(
@@ -493,11 +494,11 @@ async fn eval_fold(
         let item = record_field(&row, column_name)?;
         acc = match &op {
             Value::Closure { params, .. } if params.len() == 2 => {
-                call_closure(op.clone(), vec![acc, item], ctx).await?
+                call_closure(&op, vec![acc, item], ctx).await?
             }
             Value::Closure { params, .. } if params.len() == 1 => {
-                let inner = call_closure(op.clone(), vec![acc], ctx).await?;
-                call_closure(inner, vec![item], ctx).await?
+                let inner = call_closure(&op, vec![acc], ctx).await?;
+                call_closure(&inner, vec![item], ctx).await?
             }
             _ => {
                 return Err(EvalError::TypeError(
@@ -878,16 +879,99 @@ mod tests {
         assert_eq!(different, Value::Bool { val: false });
 
         let nested = eval(
-            &eq(
-                Expr::List(vec![record(2)]),
-                Expr::List(vec![record(2)]),
-            ),
+            &eq(Expr::List(vec![record(2)]), Expr::List(vec![record(2)])),
             &[],
             &mut ctx,
         )
         .await
         .unwrap();
         assert_eq!(nested, Value::Bool { val: true });
+    }
+
+    /// Fold applies one borrowed closure to every row. A captured binding
+    /// is still visible, and a one-parameter function is applied twice.
+    #[tokio::test]
+    async fn test_fold_applies_closure_per_row() {
+        let mut manager = Manager::new(Interner::new());
+        let tasks = manager.interner.insert("tasks");
+        let minutes = manager.interner.insert("minutes");
+        let acc = manager.interner.insert("acc");
+        let item = manager.interner.insert("item");
+        let extra = manager.interner.insert("extra");
+        let mut ctx = EvalContext {
+            manager: &mut manager,
+            service_name: Symbol::empty(),
+            txn: None,
+        };
+        let row = |n: i32| Value::Record {
+            fields: vec![(minutes, Value::Int { val: n })],
+        };
+        let env = vec![
+            (
+                tasks,
+                Value::List {
+                    vals: vec![row(1), row(2)],
+                },
+            ),
+            (extra, Value::Int { val: 10 }),
+        ];
+        let add_all = Expr::Binop {
+            op: BinOp::Add,
+            expr1: Box::new(Expr::Binop {
+                op: BinOp::Add,
+                expr1: Box::new(Expr::Variable { name: acc }),
+                expr2: Box::new(Expr::Variable { name: item }),
+            }),
+            expr2: Box::new(Expr::Variable { name: extra }),
+        };
+        let two_param = Expr::Fold {
+            table_name: tasks,
+            column_name: minutes,
+            operation: Box::new(Expr::Func {
+                params: vec![
+                    Param {
+                        name: acc,
+                        ty: None,
+                    },
+                    Param {
+                        name: item,
+                        ty: None,
+                    },
+                ],
+                body: Box::new(add_all.clone()),
+                return_ty: None,
+            }),
+            identity: Box::new(Expr::Literal {
+                val: Value::Int { val: 0 },
+            }),
+        };
+        let result = eval(&two_param, &env, &mut ctx).await.unwrap();
+        assert_eq!(result, Value::Int { val: 23 });
+
+        let curried = Expr::Fold {
+            table_name: tasks,
+            column_name: minutes,
+            operation: Box::new(Expr::Func {
+                params: vec![Param {
+                    name: acc,
+                    ty: None,
+                }],
+                body: Box::new(Expr::Func {
+                    params: vec![Param {
+                        name: item,
+                        ty: None,
+                    }],
+                    body: Box::new(add_all),
+                    return_ty: None,
+                }),
+                return_ty: None,
+            }),
+            identity: Box::new(Expr::Literal {
+                val: Value::Int { val: 0 },
+            }),
+        };
+        let result = eval(&curried, &env, &mut ctx).await.unwrap();
+        assert_eq!(result, Value::Int { val: 23 });
     }
 
     /// #39: an html template evaluates to a Value::Html whose rendered markup

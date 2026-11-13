@@ -1321,6 +1321,25 @@ impl Manager {
         })
     }
 
+    /// The declaration of `member` in `service` as this node's program has it, or
+    /// `None` for an unknown service or member. A code update replaces a
+    /// declaration in place and appends new members, and a remote service
+    /// imported more than once can appear in several `Stmt::Service`
+    /// statements. The last match is taken so the answer does not depend on
+    /// which copy is found first. It scans the whole program, so it is meant
+    /// for remote services, where that costs nothing next to a round trip.
+    pub(crate) fn member_decl(&self, service: Symbol, member: Symbol) -> Option<&Decl> {
+        self.unified_ast
+            .iter()
+            .filter_map(|stmt| match stmt {
+                Stmt::Service { name, decls } if *name == service => Some(decls),
+                _ => None,
+            })
+            .flat_map(|decls| decls.iter())
+            .rev()
+            .find(|decl| decl.name() == member)
+    }
+
     /// Initialization is private to its transaction, including cache reads.
     /// Ordinary service locks alone cannot protect non-transactional readers.
     pub(crate) fn ensure_service_visible(
@@ -4611,6 +4630,64 @@ mod tests {
     use crate::ast::{Decl, Expr, Value};
     use crate::runtime::interpreter::execute;
     use crate::runtime::{parser::parse_string, update::Transaction as CodeUpdate, Node};
+
+    // A service that appears in several statements must be answered from the
+    // last one, whichever copy comes first.
+    #[test]
+    fn member_decl_takes_the_last_declaration() {
+        let mut interner = Interner::new();
+        let ast = parse_string(
+            "service s { pub def a = 1; var v = 0; }
+             service s { pub def a = action { v = 1; }; }",
+            &mut interner,
+        )
+        .expect("valid syntax");
+        let mut manager = Manager::new(interner);
+        manager.install_unified_ast(ast);
+        let s = manager.interner.insert("s");
+        let a = manager.interner.insert("a");
+        let v = manager.interner.insert("v");
+        let missing = manager.interner.insert("missing");
+        assert!(matches!(
+            manager.member_decl(s, a),
+            Some(Decl::DefDecl {
+                val: Expr::Action(_),
+                ..
+            })
+        ));
+        assert!(matches!(
+            manager.member_decl(s, v),
+            Some(Decl::VarDecl { .. })
+        ));
+        assert!(manager.member_decl(s, missing).is_none());
+        assert!(manager.member_decl(missing, a).is_none());
+    }
+
+    // The real update path: turning an action into a forward must stop
+    // `member_decl` answering with an action literal, or `do s.a` would still be
+    // sent by name.
+    #[tokio::test]
+    async fn member_decl_follows_a_code_update() {
+        let mut manager =
+            start_local_manager("service s { var v = 0; pub def a = action { v = 1; }; }").await;
+        let s = manager.interner.insert("s");
+        let a = manager.interner.insert("a");
+        assert!(matches!(
+            manager.member_decl(s, a),
+            Some(Decl::DefDecl {
+                val: Expr::Action(_),
+                ..
+            })
+        ));
+        update_service_code(&mut manager, "update s { pub def a = v; }").await;
+        assert!(!matches!(
+            manager.member_decl(s, a),
+            Some(Decl::DefDecl {
+                val: Expr::Action(_),
+                ..
+            })
+        ));
+    }
 
     // #24: a def in s2 that reads s1.y updates eagerly when s1.x changes,
     // driven by the listener cascade rather than a lazy re-lookup.

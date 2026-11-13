@@ -1,5 +1,6 @@
 use super::evaluator::{eval, EvalContext, EvalError};
-use crate::ast::{ActionStmt, Value};
+use crate::ast::{ActionStmt, Decl, Expr, Value};
+use crate::net::ServiceNetId;
 use crate::runtime::interner::Symbol;
 use crate::runtime::txn::Transaction;
 use crate::runtime::Manager;
@@ -79,6 +80,50 @@ pub async fn execute(
                     .execute_action_with_txn(service_name, std::slice::from_ref(stmt), env)
                     .await
                     .map(|()| ExecuteEffect::None);
+            }
+            // Issue #20, option B: `do s.a` on a remote service `s` is one operation at
+            // `s`. Ship the one statement `do a` to the owner instead of first fetching
+            // the action's body with a lookup. The owner reads `a` under this
+            // transaction, taking the read lock the lookup used to take, and runs it
+            // there, so the body never crosses the network. This holds only for an
+            // action written in place in `s`'s own declaration, which necessarily
+            // belongs to `s`. A member that holds another service's action, such as a
+            // forwarding `pub def act = s2.inc;`, would run `s2`'s action at `s`,
+            // which may be this very node, and a call back into a node that is
+            // waiting for a reply waits for the reply timeout (#213). It is fetched
+            // as before. So is any other spelling (`let f = s.a; do f;`,
+            // `do s.f(x);`). The answer comes from this node's copy of `s`, taken
+            // at import, so an update made at `s`'s node that turns `a` into a
+            // forward is not seen here and `do a` can still be sent by name.
+            if let Expr::MemberAccess {
+                service_name: target,
+                member_name,
+            } = expr
+            {
+                if let Some(url) = manager.remote_services.get(target).filter(|_| {
+                    matches!(
+                        manager.member_decl(*target, *member_name),
+                        Some(Decl::DefDecl {
+                            val: Expr::Action(_),
+                            ..
+                        })
+                    )
+                }) {
+                    // A service URL is the node's address plus the service's slug, and a
+                    // bare node address is accepted too, so build the identity from both
+                    let slug = manager.interner.get(*target).to_string();
+                    let owner =
+                        ServiceNetId::new(format!("{}/{}", url.node_address(&slug).0, slug));
+                    manager
+                        .remote_action(
+                            &owner,
+                            vec![ActionStmt::Do(Expr::Variable { name: *member_name })],
+                            Vec::new(),
+                            txn.as_deref_mut(),
+                        )
+                        .await?;
+                    return Ok(ExecuteEffect::None);
+                }
             }
             let val = eval(
                 expr,

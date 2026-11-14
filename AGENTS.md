@@ -29,6 +29,16 @@ Address already in use (is another node still running on this port?)". Find and
 stop it with `ps -C meerkat -o pid,args`. Stop any server you start by hand
 when you're done with it.
 
+## Rust Toolchain
+
+`rust-toolchain.toml` pins the Rust version for local builds, the pre-commit
+hooks and CI. Renovate opens version-bump PRs through its `rust-toolchain`
+manager. Keep compiler upgrades in their own PRs, run the full regression run
+above, and fix any new warnings in that PR. When you upgrade, also check
+whether the `#[expect(...)]` workarounds still apply: an unfulfilled expectation
+fails CI's warnings-as-errors checks, so remove an obsolete workaround rather
+than switching it to `allow`.
+
 ## Known Flaky Tests
 
 These fail intermittently for reasons unrelated to most changes. If one fails,

@@ -19,9 +19,12 @@ const IDLE_CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// The maximum duration to wait for a relay reservation response
 const RELAY_RESERVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-// Rust 1.100 warns about impossible event types in the generated implementation.
-// Keep the workaround scoped to the derive: https://github.com/libp2p/rust-libp2p/issues/6600.
-#[allow(unreachable_code)]
+// libp2p-stream's handler uses `Infallible` for `FromBehaviour` and `ToBehaviour`.
+// The derive generates event-routing calls that Rust 1.100 flags as unreachable.
+// Lint attributes on the struct don't cover the generated impls, so keep them
+// in this module. Remove the wrapper when the expectation becomes unfulfilled.
+// Related: https://github.com/libp2p/rust-libp2p/issues/6600.
+#[expect(unreachable_code)]
 mod behaviour {
     use super::stream;
 

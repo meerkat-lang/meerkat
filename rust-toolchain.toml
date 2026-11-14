@@ -1,0 +1,8 @@
+# The Rust version CI, the pre-commit hooks and local builds all use. rustup
+# installs it automatically. Bump it on purpose, in its own PR, and fix any new
+# warnings there; see "Rust toolchain" in AGENTS.md.
+[toolchain]
+channel = "1.100.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]

@@ -1,6 +1,6 @@
-use super::evaluator::{eval, EvalContext, EvalError};
-use crate::ast::{ActionStmt, Decl, Expr, Value};
-use crate::net::ServiceNetId;
+use super::evaluator::{call_target, eval, EvalContext, EvalError};
+use crate::ast::{ActionStmt, Decl, DefForm, Expr, Value};
+use crate::net::codec;
 use crate::runtime::interner::Symbol;
 use crate::runtime::txn::Transaction;
 use crate::runtime::Manager;
@@ -100,20 +100,16 @@ pub async fn execute(
                 member_name,
             } = expr
             {
-                if let Some(url) = manager.remote_services.get(target).filter(|_| {
-                    matches!(
+                if manager.remote_services.contains_key(target)
+                    && matches!(
                         manager.member_decl(*target, *member_name),
                         Some(Decl::DefDecl {
                             val: Expr::Action(_),
                             ..
                         })
                     )
-                }) {
-                    // A service URL is the node's address plus the service's slug, and a
-                    // bare node address is accepted too, so build the identity from both
-                    let slug = manager.interner.get(*target).to_string();
-                    let owner =
-                        ServiceNetId::new(format!("{}/{}", url.node_address(&slug).0, slug));
+                {
+                    let owner = manager.owner_net_id(*target);
                     manager
                         .remote_action(
                             &owner,
@@ -123,6 +119,69 @@ pub async fn execute(
                         )
                         .await?;
                     return Ok(ExecuteEffect::None);
+                }
+            }
+            // The same for `do s.a(e1, ..)` when this node's copy of `s` declares `a` as
+            // `action a(..)`: the action belongs to `s` by construction, so the caller
+            // evaluates the arguments and sends the one statement `do a(__arg0, ..)`
+            // with their values in its environment, one round trip instead of a lookup
+            // that returns the action followed by shipping its body back. A special
+            // def whose result is an action is not sent this way: which action it
+            // returns is the owner's decision, so the call goes through the evaluator
+            // and the `do` below runs the result at its owner. The environment is
+            // searched before members on the owner, so `__argN` cannot meet a member.
+            if let Expr::Call { func, args } = expr {
+                if let Some((target, member)) = call_target(func, env, service_name) {
+                    if manager.remote_services.contains_key(&target)
+                        && matches!(
+                            manager.member_decl(target, member),
+                            Some(Decl::DefDecl {
+                                form: DefForm::Action,
+                                ..
+                            })
+                        )
+                    {
+                        let mut arg_env = Vec::new();
+                        let mut arg_exprs = Vec::new();
+                        for (i, arg) in args.iter().enumerate() {
+                            let value = eval(
+                                arg,
+                                env,
+                                &mut EvalContext {
+                                    manager,
+                                    service_name,
+                                    txn: txn.as_deref_mut(),
+                                },
+                            )
+                            .await?;
+                            let name = manager.interner.insert(&format!("__arg{i}"));
+                            arg_env.push((name, value));
+                            arg_exprs.push(Expr::Variable { name });
+                        }
+                        // An argument with no wire form (html) cannot travel by name,
+                        // but the action may never read it: take the path below, which
+                        // fetches `a` and ships only what its body captures. Evaluating
+                        // the arguments again there only reads again under the same
+                        // transaction
+                        let sendable = arg_env.iter().all(|(_, value)| {
+                            codec::encode_value(value, &manager.interner).is_ok()
+                        });
+                        if sendable {
+                            let owner = manager.owner_net_id(target);
+                            manager
+                                .remote_action(
+                                    &owner,
+                                    vec![ActionStmt::Do(Expr::Call {
+                                        func: Box::new(Expr::Variable { name: member }),
+                                        args: arg_exprs,
+                                    })],
+                                    arg_env,
+                                    txn.as_deref_mut(),
+                                )
+                                .await?;
+                            return Ok(ExecuteEffect::None);
+                        }
+                    }
                 }
             }
             let val = eval(

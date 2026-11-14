@@ -107,7 +107,7 @@ async fn lookup_input(
 /// The member `(service, member)` a call names, if its function is a member
 /// access, or a variable no local binding shadows (a member of the service
 /// running the code)
-fn call_target(
+pub(super) fn call_target(
     func: &Expr,
     env: &[(Symbol, Value)],
     service_name: Symbol,

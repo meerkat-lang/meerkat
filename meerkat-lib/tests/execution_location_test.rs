@@ -1,14 +1,16 @@
-//! Issue #20, stage B: a call of a member of a remote service goes to its
+//! Issue #20, stages B and C: a call of a member of a remote service goes to its
 //! owner as a `LookupRequest` that carries the arguments, and the owner
 //! decides whether to run it (design note `docs/design/execution-location.md`,
 //! "Where a call runs" and "Protocol").
 //!
 //! The node under test (the caller) runs `app`, which calls `s1.f` on a
 //! stand-in peer that records every message and answers as the test chooses.
-//! The last test uses a real owner.
+//! Stage C adds `do s1.a(args)` of a special action, which is one
+//! `ActionRequest`. Some tests use a real owner.
 
 use meerkat_lib::net::ast::NetValue;
 use meerkat_lib::net::codec::{encode_value, validate_call_args};
+use meerkat_lib::net::ServiceNetId;
 use meerkat_lib::net::{
     Address, MeerkatMessage, NetworkActor, NetworkCommand, NetworkEvent, NetworkReply, NodeType,
 };
@@ -55,6 +57,12 @@ enum Seen {
         member: String,
         args: Option<Vec<i32>>,
         in_txn: bool,
+    },
+    /// An `ActionRequest`: its statements as the wire shows them (`Debug`) and
+    /// the integer values of its environment
+    Action {
+        stmts: String,
+        env: Vec<(String, i32)>,
     },
     Commit,
     Abort,
@@ -157,6 +165,29 @@ async fn stand_in_s1(
                     };
                     reply(net, &reply_to, msg).await;
                 }
+                MeerkatMessage::ActionRequest {
+                    request_id,
+                    reply_to,
+                    stmts,
+                    env,
+                    ..
+                } => {
+                    log.borrow_mut().push(Seen::Action {
+                        stmts: format!("{stmts:?}"),
+                        env: env
+                            .into_iter()
+                            .map(|(name, v)| (name, ints(Some(vec![v])).unwrap()[0]))
+                            .collect(),
+                    });
+                    let msg = MeerkatMessage::ActionResponse {
+                        request_id,
+                        success: true,
+                        error: None,
+                        history: Vec::new(),
+                        writes: Vec::new(),
+                    };
+                    reply(net, &reply_to, msg).await;
+                }
                 MeerkatMessage::Commit {
                     request_id,
                     reply_to,
@@ -247,14 +278,27 @@ async fn run_on_app(
     stmts: &[ActionStmt],
     as_test: bool,
 ) -> Result<(), meerkat_lib::runtime::interpreter::EvalError> {
-    let app = m.interner.insert("app");
+    run_on(m, "app", s1_net, log, answer, stmts, as_test).await
+}
+
+/// Run `stmts` on the service `service` of `m` while the stand-in serves
+async fn run_on(
+    m: &mut Manager,
+    service: &str,
+    s1_net: &mut NetworkActor,
+    log: &Log,
+    answer: &dyn Fn(&str, &Option<Vec<NetValue>>) -> Answer,
+    stmts: &[ActionStmt],
+    as_test: bool,
+) -> Result<(), meerkat_lib::runtime::interpreter::EvalError> {
+    let svc = m.interner.insert(service);
     tokio::select! {
         biased;
         r = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             if as_test {
-                m.execute_test_block(app, stmts).await
+                m.execute_test_block(svc, stmts).await
             } else {
-                m.execute_action(app, stmts).await
+                m.execute_action(svc, stmts).await
             }
         }) => r.expect("the run must not time out"),
         _ = stand_in_s1(s1_net, log, answer) => {
@@ -621,4 +665,454 @@ async fn a_call_against_a_real_owner_is_one_round_trip() {
         vec!["Lookup f args=1".to_string(), "Commit".to_string()],
         "one request, then the commit"
     );
+}
+
+// Stage C: `do s1.a(args)` of a special action is one `ActionRequest`.
+
+/// The caller's copy of `s1` with special forms, and the statements under test
+const SPECIAL: &str = "
+    service s1 {
+        var y = 5;
+        pub def f(x: int) = x + y;
+        pub action a(x: int) { y = y * x; }
+        pub action reset() { y = 0; }
+        pub def mk(x: int) = action { y = x; };
+    }
+    service app {
+        pub def run_a = action { do s1.a(3); };
+        pub def run_wiki = action { do s1.a(s1.f(3)); };
+        pub def run_reset = action { do s1.reset(); };
+        pub def run_mk = action { do s1.mk(3); };
+    }
+    @test(s1) {
+        do a(3);
+    }
+";
+
+/// The `fn` spelling of the same `s1`
+const FN_SPELLING: &str = "
+    service s1 {
+        var y = 5;
+        pub def f = fn (x: int) => x + y;
+        pub def a = fn (x: int) => action { y = y * x; };
+    }
+    service app {
+        pub def run_wiki = action { do s1.a(s1.f(3)); };
+    }
+";
+
+/// `do NAME;` on `app`
+fn do_member(m: &mut Manager, name: &str) -> Vec<ActionStmt> {
+    let name = m.interner.insert(name);
+    vec![ActionStmt::Do(Expr::Variable { name })]
+}
+
+fn lookups_of(log: &[Seen]) -> Vec<(String, Option<Vec<i32>>)> {
+    log.iter()
+        .filter_map(|e| match e {
+            Seen::Lookup { member, args, .. } => Some((member.clone(), args.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn action(stmts: &str, env: Vec<(&str, i32)>) -> Seen {
+    Seen::Action {
+        stmts: stmts.to_string(),
+        env: env.into_iter().map(|(n, v)| (n.to_string(), v)).collect(),
+    }
+}
+
+/// `do a(__arg0)` as the wire shows it
+const DO_A: &str =
+    r#"[Do(Call { func: Variable { name: "a" }, args: [Variable { name: "__arg0" }] })]"#;
+
+/// `do s1.a(3);` with `action a(x: int)` in the caller's copy is exactly one
+/// `ActionRequest` `[do a(__arg0)]` with `__arg0 = 3`, no lookup, then the
+/// commit.
+///
+/// Without the change the call goes through the evaluator gate: a
+/// `LookupRequest a` comes first, so the log differs.
+#[tokio::test(flavor = "multi_thread")]
+async fn do_of_a_special_action_is_one_action_request() {
+    let (app_net, _) = listening_node().await;
+    let (mut s1_net, s1_addr) = listening_node().await;
+    let (mut m, _) = caller_node(SPECIAL, app_net, &s1_addr).await;
+    let stmts = do_member(&mut m, "run_a");
+    let log = Log::default();
+    let answer = |_: &str, _: &Option<Vec<NetValue>>| (int(-1), true);
+
+    let result = run_on_app(&mut m, &mut s1_net, &log, &answer, &stmts, false).await;
+
+    assert!(result.is_ok(), "the action must succeed, got: {result:?}");
+    assert_eq!(
+        *log.borrow(),
+        vec![action(DO_A, vec![("__arg0", 3)]), Seen::Commit]
+    );
+}
+
+/// The wiki's example against special forms: the call of `f` goes to the
+/// owner and its result is the action's argument: two requests before the
+/// commit.
+///
+/// Without the change a lookup of `a` follows the one of `f`, and the body
+/// of `a` is sent instead of `do a(__arg0)`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_wiki_example_takes_two_requests() {
+    let (app_net, _) = listening_node().await;
+    let (mut s1_net, s1_addr) = listening_node().await;
+    let (mut m, _) = caller_node(SPECIAL, app_net, &s1_addr).await;
+    let stmts = do_member(&mut m, "run_wiki");
+    let log = Log::default();
+    let answer = |member: &str, args: &Option<Vec<NetValue>>| match (member, args) {
+        ("f", Some(_)) => (int(8), true),
+        _ => (int(-1), true),
+    };
+
+    let result = run_on_app(&mut m, &mut s1_net, &log, &answer, &stmts, false).await;
+
+    assert!(result.is_ok(), "the action must succeed, got: {result:?}");
+    assert_eq!(
+        *log.borrow(),
+        vec![
+            Seen::Lookup {
+                member: "f".to_string(),
+                args: Some(vec![3]),
+                in_txn: true,
+            },
+            action(DO_A, vec![("__arg0", 8)]),
+            Seen::Commit,
+        ]
+    );
+}
+
+/// `fn (x: int) => action { y = y * x; }` of `s1`, as a plain owner answers a
+/// lookup of `a`
+fn a_closure() -> NetValue {
+    let mut i = Interner::new();
+    let [x, y, s1] = ["x", "y", "s1"].map(|n| i.insert(n));
+    let closure = Value::Closure {
+        params: vec![Param {
+            name: x,
+            ty: Some(Type::Int),
+        }],
+        body: Box::new(Expr::Action(vec![ActionStmt::Assign {
+            name: y,
+            expr: Expr::Binop {
+                op: BinOp::Mul,
+                expr1: Box::new(Expr::Variable { name: y }),
+                expr2: Box::new(Expr::Variable { name: x }),
+            },
+        }])),
+        env: vec![],
+        service_name: s1,
+        return_ty: None,
+    };
+    encode_value(&closure, &i).expect("closure encodes")
+}
+
+/// The same statement against the `fn` spelling in the caller's copy: nothing
+/// is known to be special, so the owner answers with the members and the
+/// caller applies them: four requests before the commit, the last one
+/// carrying the action's body.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_fn_spelling_takes_four_requests() {
+    let (app_net, _) = listening_node().await;
+    let (mut s1_net, s1_addr) = listening_node().await;
+    let (mut m, _) = caller_node(FN_SPELLING, app_net, &s1_addr).await;
+    // A caller that imported `s1` holds no running copy of it: the action
+    // closure must resolve to the owner, not to a local service of that name
+    let s1 = m.interner.insert("s1");
+    m.services.remove(&s1);
+    let stmts = do_member(&mut m, "run_wiki");
+    let log = Log::default();
+    let answer = |member: &str, _: &Option<Vec<NetValue>>| match member {
+        "f" => (f_closure(), false),
+        "a" => (a_closure(), false),
+        _ => (int(5), false),
+    };
+
+    let result = run_on_app(&mut m, &mut s1_net, &log, &answer, &stmts, false).await;
+
+    assert!(result.is_ok(), "the action must succeed, got: {result:?}");
+    let log = log.borrow();
+    let mut lookups = lookups_of(&log);
+    assert_eq!(lookups.len(), 3, "log: {log:?}");
+    lookups.sort();
+    assert_eq!(
+        lookups,
+        vec![
+            ("a".to_string(), Some(vec![8])),
+            ("f".to_string(), Some(vec![3])),
+            ("y".to_string(), None),
+        ],
+        "log: {log:?}"
+    );
+    match &log[log.len() - 2] {
+        Seen::Action { stmts, env } => {
+            assert!(
+                stmts.contains(r#"Assign { name: "y""#),
+                "the action's body must be sent, got: {stmts}"
+            );
+            assert!(env.iter().any(|(n, v)| n == "x" && *v == 8), "env: {env:?}");
+        }
+        other => panic!("expected the action request, got {other:?}, log: {log:?}"),
+    }
+    assert_eq!(log.len(), 5, "four requests and the commit, log: {log:?}");
+    assert_eq!(log.last(), Some(&Seen::Commit));
+}
+
+/// A zero-parameter special action sends `do reset()` with an empty
+/// environment.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_zero_parameter_action_sends_an_empty_environment() {
+    let (app_net, _) = listening_node().await;
+    let (mut s1_net, s1_addr) = listening_node().await;
+    let (mut m, _) = caller_node(SPECIAL, app_net, &s1_addr).await;
+    let stmts = do_member(&mut m, "run_reset");
+    let log = Log::default();
+    let answer = |_: &str, _: &Option<Vec<NetValue>>| (int(-1), true);
+
+    let result = run_on_app(&mut m, &mut s1_net, &log, &answer, &stmts, false).await;
+
+    assert!(result.is_ok(), "the action must succeed, got: {result:?}");
+    assert_eq!(
+        *log.borrow(),
+        vec![
+            action(
+                r#"[Do(Call { func: Variable { name: "reset" }, args: [] })]"#,
+                vec![]
+            ),
+            Seen::Commit
+        ]
+    );
+}
+
+/// A special def that returns an action is not sent by name: the owner decides
+/// which action it returns, so the call is a lookup with the arguments and the
+/// returned action's body is then sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_special_def_returning_an_action_goes_through_the_owner() {
+    let (app_net, _) = listening_node().await;
+    let (mut s1_net, s1_addr) = listening_node().await;
+    let (mut m, _) = caller_node(SPECIAL, app_net, &s1_addr).await;
+    let stmts = do_member(&mut m, "run_mk");
+    let log = Log::default();
+    let owner_id = ServiceNetId::new(format!("{}/s1", s1_addr.0));
+    let answer = move |member: &str, args: &Option<Vec<NetValue>>| {
+        assert_eq!((member, args.is_some()), ("mk", true));
+        let mut i = Interner::new();
+        let y = i.insert("y");
+        let action = Value::ActionClosure {
+            stmts: vec![ActionStmt::Assign {
+                name: y,
+                expr: Expr::Literal {
+                    val: Value::Int { val: 3 },
+                },
+            }],
+            env: vec![],
+            service_net_id: owner_id.clone(),
+        };
+        (encode_value(&action, &i).expect("action encodes"), true)
+    };
+
+    let result = run_on_app(&mut m, &mut s1_net, &log, &answer, &stmts, false).await;
+
+    assert!(result.is_ok(), "the action must succeed, got: {result:?}");
+    let log = log.borrow();
+    assert_eq!(log.len(), 3, "log: {log:?}");
+    assert_eq!(
+        log[0],
+        Seen::Lookup {
+            member: "mk".to_string(),
+            args: Some(vec![3]),
+            in_txn: true,
+        }
+    );
+    assert!(
+        matches!(&log[1], Seen::Action { stmts, env }
+            if stmts.contains(r#"Assign { name: "y""#) && env.is_empty()),
+        "the returned action's body must be sent, log: {log:?}"
+    );
+    assert_eq!(log[2], Seen::Commit);
+}
+
+/// In a `@test(s1)` block of the caller with `s1` remote, the bare name `a`
+/// targets `s1`: `do a(3);` sends `do a(__arg0)`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_bare_name_in_a_test_block_is_sent_by_name() {
+    let (app_net, _) = listening_node().await;
+    let (mut s1_net, s1_addr) = listening_node().await;
+    let (mut m, tests) = caller_node(SPECIAL, app_net, &s1_addr).await;
+    let log = Log::default();
+    let answer = |_: &str, _: &Option<Vec<NetValue>>| (int(-1), true);
+
+    let result = run_on(&mut m, "s1", &mut s1_net, &log, &answer, &tests[0], true).await;
+
+    assert!(result.is_ok(), "the test must pass, got: {result:?}");
+    assert_eq!(
+        *log.borrow(),
+        vec![action(DO_A, vec![("__arg0", 3)]), Seen::Commit]
+    );
+}
+
+/// Run `do run_wiki;` of the caller built from `SPECIAL` against a real owner
+/// running `owner_code`, and return what the owner received and its `y`.
+async fn wiki_against_owner(owner_code: &str) -> (Vec<String>, Value) {
+    let (app_net, _) = listening_node().await;
+    let (owner_net, owner_addr) = listening_node().await;
+    let (mut m, _) = caller_node(SPECIAL, app_net, &owner_addr).await;
+
+    let mut interner = Interner::new();
+    let ast = parse_string(owner_code, &mut interner).expect("valid syntax");
+    let mut node = Node::new();
+    node.interner = interner;
+    node.unified_ast = ast.clone();
+    node.static_checks().expect("static checks must pass");
+    let mut owner = node
+        .on_manager_startup(true, Some(owner_net), HashMap::new(), &ast)
+        .await
+        .expect("owner startup");
+
+    let stmts = do_member(&mut m, "run_wiki");
+    let received = RefCell::new(Vec::new());
+    let serve = async {
+        loop {
+            while let Some(NetworkEvent::MessageReceived { msg, .. }) = owner.try_recv_event() {
+                received.borrow_mut().push(match &msg {
+                    MeerkatMessage::LookupRequest { member, args, .. } => {
+                        format!("Lookup {member} args={}", args.as_ref().map_or(0, Vec::len))
+                    }
+                    MeerkatMessage::ActionRequest { .. } => "Action".to_string(),
+                    MeerkatMessage::Commit { .. } => "Commit".to_string(),
+                    other => format!("{other:?}"),
+                });
+                owner.serve_request(msg).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    };
+    let app = m.interner.insert("app");
+    let result = tokio::select! {
+        biased;
+        r = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            m.execute_action(app, &stmts),
+        ) => r.expect("the action must not time out"),
+        _ = serve => unreachable!("the owner serves forever"),
+    };
+    assert!(result.is_ok(), "the action must succeed, got: {result:?}");
+    let y = var_of(&mut owner, "s1", "y");
+    (received.into_inner(), y)
+}
+
+/// Against a real owner declaring special forms, `do s1.a(s1.f(3));` leaves
+/// `y` at 5 * 8 = 40 with exactly two requests before the commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_wiki_example_against_a_real_owner_takes_two_requests() {
+    let (received, y) = wiki_against_owner(SPECIAL).await;
+
+    assert_eq!(y, Value::Int { val: 40 });
+    assert_eq!(
+        received,
+        vec![
+            "Lookup f args=1".to_string(),
+            "Action".to_string(),
+            "Commit".to_string()
+        ]
+    );
+}
+
+/// The caller's copy is out of date when the owner has the `fn` spelling: the
+/// caller still sends by name, and the result is the same, as the design
+/// requires.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_owner_with_the_fn_spelling_gives_the_same_result() {
+    const OWNER: &str = "
+        service s1 {
+            var y = 5;
+            pub def f = fn (x: int) => x + y;
+            pub def a = fn (x: int) => action { y = y * x; };
+        }
+    ";
+    let (received, y) = wiki_against_owner(OWNER).await;
+
+    assert_eq!(y, Value::Int { val: 40 }, "received: {received:?}");
+    // The owner answers the call of `f` with the member, which the caller
+    // applies, reading `y`; `a` is still sent by name, in one request
+    assert_eq!(
+        received,
+        vec![
+            "Lookup f args=1".to_string(),
+            "Lookup y args=0".to_string(),
+            "Action".to_string(),
+            "Commit".to_string()
+        ]
+    );
+}
+
+/// An argument with no wire form (html) cannot be sent by name, but the action
+/// may never read it: `do s1.show(html)` then fetches `show` and ships only
+/// what the action's body captures, as before calls ran on the owner.
+///
+/// Without the fallback the `do` fails, because the by-name request cannot
+/// encode `__arg0`.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_html_argument_takes_the_fetch_path() {
+    const CODE: &str = "
+        service s1 {
+            var y = 5;
+            pub action show(t: string) { y = 0; }
+        }
+        service app {
+            pub def run_show = action { do s1.show((<p>x</p>)); };
+        }
+    ";
+    let (app_net, _) = listening_node().await;
+    let (mut s1_net, s1_addr) = listening_node().await;
+    let (mut m, _) = caller_node(CODE, app_net, &s1_addr).await;
+    // A caller that imported `s1` holds no running copy of it: the fetched
+    // action must resolve to the owner, not to a local service of that name
+    let s1 = m.interner.insert("s1");
+    m.services.remove(&s1);
+    let stmts = do_member(&mut m, "run_show");
+    let log = Log::default();
+    let show_closure = {
+        let mut i = Interner::new();
+        let [t, y, s1] = ["t", "y", "s1"].map(|n| i.insert(n));
+        encode_value(
+            &Value::Closure {
+                params: vec![Param {
+                    name: t,
+                    ty: Some(Type::String),
+                }],
+                body: Box::new(Expr::Action(vec![ActionStmt::Assign {
+                    name: y,
+                    expr: Expr::Literal {
+                        val: Value::Int { val: 0 },
+                    },
+                }])),
+                env: vec![],
+                service_name: s1,
+                return_ty: None,
+            },
+            &i,
+        )
+        .expect("closure encodes")
+    };
+    let answer = move |_: &str, _: &Option<Vec<NetValue>>| (show_closure.clone(), false);
+
+    let result = run_on_app(&mut m, &mut s1_net, &log, &answer, &stmts, false).await;
+
+    assert!(result.is_ok(), "the action must succeed, got: {result:?}");
+    let seen = log.borrow();
+    assert!(
+        matches!(seen.first(), Some(Seen::Lookup { member, args: None, .. }) if member == "show"),
+        "a plain lookup of show comes first: {seen:?}"
+    );
+    assert!(
+        matches!(seen.get(1), Some(Seen::Action { stmts, env }) if stmts.contains("Assign") && env.is_empty()),
+        "then the action's body, with nothing captured: {seen:?}"
+    );
+    assert_eq!(seen.last(), Some(&Seen::Commit), "{seen:?}");
 }

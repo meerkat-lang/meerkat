@@ -291,7 +291,9 @@ the owner's served file is unchanged.  For calls of defs that copy does not
 matter, because the owner decides.  For `do`, an out-of-date copy is harmless
 by construction: a special form and its `fn` spelling compute the same value,
 so a caller that sends by name where it could fetch, or fetches where it
-could send by name, gets the same result.
+could send by name, gets the same result.  A changed parameter list is
+different: the owner checks the number of arguments of a def call, but not
+of a `do` sent by name (see "Limits").
 
 The text an update forwards to a remote owner (`update.rs`,
 `format_update_source`) prints a special form as it was declared:
@@ -331,6 +333,14 @@ with plain actions still loses `assert`'s parentheses and does not print
   A, times out.  This is #213.  It is why `do s.a` is sent by name only for
   actions that belong to the owner.
 - Computing a def and creating a service keep today's path (above).
+- A caller whose copy of the owner predates a change to a special action's
+  parameter list sends `do a(..)` with the old number of arguments.  The
+  owner applies it like any function value, without the check it makes for a
+  def call, so a missing argument fails as an unknown name and an extra one
+  is ignored.
+- An argument with no wire form (html) cannot be sent by name.  `do s1.a(..)`
+  then fetches `a` and ships what its action captures, as before, so it
+  still works when the action does not read that argument.
 - In the REPL and the browser, `do s1.a(3)` takes two round trips, because
   they hold no copy of the owner to tell that `a` is a special action.
 - **Browser handlers.**  The browser runs every handler as a remote action

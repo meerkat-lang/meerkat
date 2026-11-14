@@ -1361,6 +1361,16 @@ impl Manager {
             .find(|decl| decl.name() == member)
     }
 
+    /// The identity of the owner of the remote service `service`. A service URL
+    /// is the node's address plus the service's slug, and a bare node address is
+    /// accepted too, so it is built from both. `service` must be in
+    /// `remote_services`.
+    pub(crate) fn owner_net_id(&self, service: Symbol) -> ServiceNetId {
+        let slug = self.interner.get(service).to_string();
+        let url = &self.remote_services[&service];
+        ServiceNetId::new(format!("{}/{}", url.node_address(&slug).0, slug))
+    }
+
     /// Whether `txn` is the transaction creating a service here: some local
     /// service is initializing under it. It is recognised by the transaction,
     /// not by the service an evaluation is running in, because applying a

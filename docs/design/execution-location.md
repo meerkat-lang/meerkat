@@ -1,0 +1,355 @@
+# Design for controlling the location of execution
+
+Issue #20 asks to implement the execution-location proposal on the
+Requirements wiki page.  Rules 1 to 4 of that proposal describe what the
+runtime already does: execution starts where an action is triggered, stays in
+its service by default, moves to the defining service to run an action
+(rule 3), and reads a member of another service on its owner (rule 4).  This
+document designs rule 5, the part that is not built.
+
+## Motivation
+
+A call through another service downloads code.  Given
+
+```meerkat
+service s1 {
+    var y = 5;
+    def f = fn (x: int) => x + y;
+    def a = fn (x: int) => action { y = y * x; };
+}
+```
+
+a client running `do s1.a(s1.f(3));` sends four requests before it commits:
+a lookup of `a`, a lookup of `f`, a lookup of `y` (because `f`'s body runs on
+the client and reads `y`), and an action request that carries `a`'s body back
+to `s1`.  In general, a function of another service costs one round trip to
+fetch plus one per member its body reads.  Rule 5 lets the author of `s1` say
+that a member is called where it is declared:
+
+```meerkat
+service s1 {
+    var y = 5;
+    def f(x: int) = x + y;
+    action a(x: int) {
+        y = y * x;
+    }
+}
+```
+
+The same client line then takes two requests: `s1` runs `f(3)` and returns
+`8`, then `s1` runs `a(8)`.
+
+## What done means
+
+The wiki's text (Requirements, "Execution location", lines 123 to 150) makes
+seven claims.  Each is a test.
+
+| # | Claim | Test |
+|---|---|---|
+| 1 | `def f(..)` and `action a(..)` are declared at the top level of a service, with a parameter list that may be empty | parser tests, including `def g() = y;` and `action reset() { .. }` |
+| 2 | They can only be used with a call | static errors for every other use |
+| 3 | A call made by running code (an action, a `@test` or REPL statement, a code update's `var` initializer) runs at the owner instead of loading the code | a stand-in peer sees one request per call and no lookup of the member or of what it reads |
+| 4 | Execution returns to the caller, with the result of a def | the caller uses the value; statements after the call run on the caller |
+| 5 | They compute the same results as the `fn` spelling | one program against both spellings ends in the same state |
+| 6 | Client code may be the same for both | one unchanged client program against both servers |
+| 7 | `s1.a(s1.f(3))` takes two round trips instead of four | requests counted before the commit |
+
+Claim 3 is scoped: computing a def and creating a service keep today's path
+(see "Where a call runs").
+
+## Syntax
+
+```meerkat
+service s1 {
+    var y = 5;
+    def f(x: int) = x + y;              // a def with parameters
+    pub def g(x: int, z: int): int = x * z + y;
+    def now() = y;                      // an empty parameter list
+    action a(x: int) {                  // an action with parameters
+        y = y * x;
+    }
+    pub action reset() { y = 0; }
+}
+```
+
+- The forms are members, so they appear only directly inside `service` and
+  `update` blocks.  `pub` may precede either.
+- The parentheses are required, also when the list is empty.  A bare name
+  (`def f x = ..`) is not accepted: `fn` allows it, but here it would read as
+  an ordinary `def`.
+- Parameters need types.  The type checker cannot infer a parameter's type,
+  which is already the rule for `fn` (`tt/check.rs`, `infer_function_type`).
+  The wiki writes `def f(x)`; Meerkat spells it `def f(x: int)`.
+- A parameter may not have the name of a member of its service.  Inside an
+  action body such a name refers to the member at run time, because a closure
+  never captures a local named like a member of its service
+  (`interpreter/evaluator.rs`, the capture filters of `Expr::Func` and
+  `Expr::Action`), so the parameter would be silently ignored.
+- A def may state its result type after the parameters (`): int =`).  When it
+  does not, the type is inferred, as for `fn`.
+- The `;` after an action's block is optional, as on the wiki.
+
+A call is written as a call of any function member:
+
+- `s1.f(3)` anywhere an expression may appear, and `f(3)` inside `s1`;
+- `do s1.a(3);` runs an action, and `do a(3);` inside `s1`.  `do` stays
+  because the wiki says client code may be the same for both spellings
+  (line 144), and the `fn` spelling of that client line is
+  `do s1.a(s1.f(3));`.  Without `do`, `s1.a(3)` is the action as a value, as
+  it is for the `fn` spelling.
+
+## Meaning: the `fn` member, plus a mark
+
+The wiki defines the forms by equivalence (lines 127 to 142).  The parser
+desugars them into exactly those members and records which form was written:
+
+| Written | Parsed as |
+|---|---|
+| `def f(x: T) = e;` | `def f = fn (x: T) => e;` with `form: DefForm::Function` |
+| `def f(x: T): R = e;` | the same, with the lambda's `return_ty` set to `R` |
+| `action a(x: T) { S }` | `def a = fn (x: T) => action { S };` with `form: DefForm::Action` |
+| any other `def` | as today, with `form: DefForm::Plain` |
+
+`DefForm` is a new field of `Decl::DefDecl`.  Nothing else in the AST
+changes.  Because a special form is an ordinary function value:
+
+- typing is unchanged: `f` has type `int -> int`, `a` has type `int -> unit`;
+- the dependency analysis is unchanged: applying `f` reads what its body
+  reads, in `s1` (`docs/internals/statics.md`, "Reads and Edges");
+- reactive propagation, glitch freedom (#217) and live code updates are
+  unchanged: the member holds a closure, as before;
+- the owner still serves the member's value to a node that asks for it.
+
+## Only with a call
+
+Name resolution rejects any use of a special form other than as the function
+of a call: `let g = s1.f;`, `do s1.a;`, `onclick={s1.reset}`, passing `s1.f`
+as an argument, or `watch s1.f;`.  The error names the member and shows the
+call to write instead, for example
+``s1.a can only be called: write `do s1.a(...)` ``.
+
+How it is built: members are bound with a binding that carries their form
+(`Binding::Member(DefForm)`), while `let`s, parameters and loop variables keep
+`Binding::Value`, so a local that shadows a member wins as it does today.  The
+function of an `Expr::Call` is resolved on a call-position path that accepts
+special members; every other position rejects them.  The fallbacks for
+forward references and for `s.m` look up the form of the last matching
+declaration, because an `update` block appends declarations.
+
+The rule is checked wherever static checks run: at the CLI's startup
+(`Node::static_checks`) and on every code update, on the node that issues it
+and on the owner that applies it (`update::Transaction::try_apply`).  The REPL
+and the browser client run no static checks, so there it is not enforced, and
+the owner keeps answering lookups of the member as a value.
+
+## Where a call runs
+
+A call has a target `(service, member)`: for `s.m(..)` the service before the
+dot, for `m(..)` with `m` not bound locally the service of the code that is
+running, which may be the owner's service when the owner's own function runs
+on another node.  When the target's service is remote and the call is made by
+running code, the call goes to the owner.  The owner decides, from its own
+current declarations, whether it runs the call:
+
+| Call made by | Today | With a special form |
+|---|---|---|
+| running code (an action, a `@test` or REPL statement, a code update's `var` initializer): `s1.f(3)` | fetch `f`, run it here, fetch each member it reads | one request; `s1` runs `f(3)` and returns the value |
+| running code: `do s1.a(3)` | fetch `a`, apply it here, ship the action's body | one request; `s1` runs `a(3)` |
+| computing a def from pushed values | run `f` here | unchanged |
+| creating a service (all its initializers) | fetch | unchanged |
+| a service on the same node | run locally | unchanged |
+
+**The owner decides for calls of defs.**  The caller sends every call of a
+remote member from running code as a lookup that carries the arguments.  If
+the member is a special form, the owner runs the call and says so in the
+reply; otherwise it answers as for a plain lookup, with the member's value,
+and the caller applies it locally, exactly as today and at the same cost.  So
+the caller needs no copy of the owner's code (the REPL and the browser have
+none), a copy that is out of date does not matter, and an owner built before
+this change, which ignores the arguments, also gets the caller to apply the
+member itself.  Arguments are evaluated before the request is sent, so they
+are now evaluated before the function's member is read; the values are the
+same.
+
+**The caller decides for `do`.**  An action request runs whatever statements
+it carries, so the caller sends `do a(__arg0, ..)` only when its copy of the
+owner declares `a` as a special action, which guarantees that the action
+belongs to the owner.  Without such a copy (the REPL, the browser), `do
+s1.a(3)` evaluates the call as above, so the owner returns `a(3)`, and the
+`do` then runs that action at its owner: two round trips instead of one.  The
+same rule narrows the first commit of this work: `do s.a` without arguments is
+sent as `do a` only when the caller's copy declares `a` as a plain def whose
+initializer is an action written in place.  A member that holds another
+service's action, such as a forwarding `pub def act = s2.inc;`, is fetched as
+before; sending it by name could make the owner call back into a waiting node
+(see "Limits").
+
+**Why computing a def keeps today's path.**  Rule 5 exists to avoid round
+trips (end of line 123), and computing a def from pushed values makes none: a
+def's re-evaluation reads only values its owners pushed to it
+(`interpreter/evaluator.rs`, `lookup_input`), and the dependency analysis
+already subscribes it to the members `f` reads.  Re-evaluation is recognised
+by its pushed inputs and never sends a call.
+
+**Why creating a service keeps today's path.**  Creation reads remote
+function code through its own reads to compute the new service's graphs
+(`remote_functions_read`), and seeds each def's clock, its Sources and its
+cached inputs from what the creation transaction read
+(`manager/mod.rs`, `create_service`).  A call that ran on the owner would
+hide those reads.  The gate is therefore closed for the whole creation
+transaction, recognised as a transaction under which some local service is
+initializing: the predicate `remote_lookup_with_clock` already uses.  It must
+test the transaction, not the service in the evaluation context, because
+applying a closure switches that service to the closure's own.
+
+Running a def's calls on the owner would mean the owner keeps `f(3)` up to
+date and pushes it: the "To think about" note on the Requirements page
+(line 209), outside rules 1 to 5.  It needs a subscription per argument value
+and a way to unsubscribe, and is left as a follow-up.  Task 12
+(compute-on-read) will compute a def inside a transaction with no pushed
+inputs; its calls will then go to the owner, which is consistent with task 12
+reading every cross-service input from its owner under the transaction.
+
+## Protocol
+
+No new message type.
+
+**Defs.**  `LookupRequest` gains `args: Option<Vec<NetValue>>`, and
+`LookupResponse` gains `called: bool`; both default to absent and false, so
+peers built before this change still decode them.  With arguments, an owner
+whose declaration of the member is a special form evaluates
+`m(__arg0, ..)` in its own service and replies with the result and
+`called: true`:
+
+- inside a transaction, as a participant: it reads under the shared
+  transaction id, holds its read locks until `Commit` or `Abort`, and parks
+  under wait-die like any transactional read (`ParkedRequest::Lookup` carries
+  the arguments).  An expression cannot write or start a composed action, so
+  a parked call needs no rollback before it runs again;
+- outside a transaction, as a plain unlocked read.
+
+Inside a transaction the reply's clock is what `transaction_history` gives
+for the participant, the join of the clocks of everything the transaction has
+read there: a node that only serves reads reaches the originator's commit
+stamp only through this clock (`manager/mod.rs`, `remote_lookup_with_clock`).
+Outside a transaction the clock and Sources are absent.  The caller never
+stores a call's reply in the transaction's read cache, which is keyed by
+member: the value is a result of `f`, not `f`.  The owner checks the number of
+arguments against the function's parameters, accepting no arguments for a
+single `unit` parameter as the type checker does, and fails the call
+otherwise.
+
+**Actions.**  `do s1.a(e1, e2)` with `a` a special action sends the existing
+`ActionRequest` with the single statement `do a(__arg0, __arg1);` and the
+argument values in its environment (`net/types.rs`, `ActionRequest.env`).
+The owner runs it like any action request: evaluating `a` reads its own member
+under the transaction, which takes a read lock on `a`; applying it builds the
+action in `s1`; running it writes `s1`'s vars.  The names `__arg0, __arg1, ..`
+are valid identifiers, so the codec accepts them; the environment is searched
+before members, so a member with the same name cannot interfere, and the
+action's own body never sees them.
+
+## Transactions
+
+- **Participants.**  The caller registers the owner as a participant before
+  sending, as lookups and actions do, so an abort reaches it even if the reply
+  is lost.  Calls the owner makes on further services make those services its
+  own participants, and commit and abort follow the chain as they do today.
+- **Locks.**  The owner takes a read lock on the special form itself, because
+  evaluating the call reads the member, and on whatever the body reads; an
+  action also takes write locks on what it writes.  The lock on the member
+  keeps a concurrent code update from replacing it during the transaction,
+  the same reason task 12 locks a def it recomputes.
+- **Replay.**  A call of a special action is a composed action: it claims a
+  position and a fingerprint (statements and environment, so the arguments
+  count), and a replayed run neither repeats it nor sends a different one
+  (`remote_action`).  A call of a def is a read and is sent again on replay,
+  like a lookup.
+- **Errors.**  A failed call fails the caller's transaction like a failed read
+  or action.  Wait-die outcomes keep their meaning across the wire
+  (`remote_error`).
+
+## Arguments and results
+
+- Arguments are evaluated on the caller, left to right, before the request is
+  sent; results come back as values.
+- A closure passed as an argument carries its service only as a name
+  (`net/codec.rs`).  On the owner it may read its parameters and captured
+  values; a read of one of the caller's members fails there, or reads the
+  owner's own service if one has the same name.  This is shared with closures
+  shipped in an action's environment today, and needs closures that carry a
+  network identity to fix.
+
+## Code updates
+
+An update may add a special form, replace one, or turn a plain def into a
+special form and back: an update replaces a declaration whole.  The static
+checks run again on the patched program, so switching a member to a special
+form is rejected while any service on that node still uses it as a value.
+Other nodes keep the copy of the owner's code they imported for as long as
+the owner's served file is unchanged.  For calls of defs that copy does not
+matter, because the owner decides.  For `do`, an out-of-date copy is harmless
+by construction: a special form and its `fn` spelling compute the same value,
+so a caller that sends by name where it could fetch, or fetches where it
+could send by name, gets the same result.
+
+The text an update forwards to a remote owner (`update.rs`,
+`format_update_source`) prints a special form as it was declared:
+`[pub ]def NAME(P: T, ..)[: R] = BODY;` and
+`[pub ]action NAME(P: T, ..) { S; .. }`, with parameter names taken from the
+interner and every statement ended by `;`.  The statement printer it shares
+with plain actions still loses `assert`'s parentheses and does not print
+`for` and `insert` bodies so that they parse; that predates this work.
+
+## How this fits Meerkat
+
+- **Programmer control.**  The wiki prefers explicit control to an optimizer
+  in the short term (line 113).  The author of a service decides, per member,
+  where calls of it run, and the declaration shows it.
+- **Equivalence.**  A special form computes what its `fn` spelling computes;
+  only where the work happens differs.  Modelling the forms as that member
+  plus a mark is what keeps the change small: the type system, the dependency
+  analysis, propagation, glitch freedom and live updates need no change.
+- **The owner's code is the authority.**  For calls of defs the owner's
+  current declaration decides, so callers without the owner's source, or with
+  an old copy, behave correctly.
+- **Transactions.**  A call joins the caller's transaction with the same
+  locks, wait-die parking, replay protection and commit stamp as the reads
+  and actions it replaces.  Serializability is unchanged.
+- **Rule 3.**  Actions already run where they are defined; special actions
+  only skip the download of their body, and now take arguments.
+- **Protocol.**  Reusing `ActionRequest` and `LookupRequest` keeps the wire
+  format and its validation as they are, apart from two defaulted fields.
+- **Cost model.**  A call of a special def costs one round trip however many
+  members its body reads.
+
+## Limits
+
+- **A call back to a waiting node waits for the reply timeout.**  A node
+  waiting for a reply puts incoming requests aside until its own request
+  finishes (`manager/mod.rs`, `dispatch_events`), so A calling B, which calls
+  A, times out.  This is #213.  It is why `do s.a` is sent by name only for
+  actions that belong to the owner.
+- Computing a def and creating a service keep today's path (above).
+- In the REPL and the browser, `do s1.a(3)` takes two round trips, because
+  they hold no copy of the owner to tell that `a` is a special action.
+- **Browser handlers.**  The browser runs every handler as a remote action
+  and ignores a handler that is not an action (`meerkat-wasm`,
+  `attach_handlers`), so a special action cannot be a handler yet, neither as
+  `onclick={s1.reset}` nor through a wrapper action.  Handlers keep using
+  plain action members.
+- Until task 12 lands, a special form's body that reads a def inside a
+  transaction sees the def's value from before the transaction, as every def
+  read does today.
+- Not changed: `pub` is not enforced, and the owner still runs any statements
+  an `ActionRequest` carries.
+
+## Open questions
+
+- **Calls inside defs.**  Should the owner maintain a def's calls (above)?
+- **`pub`.**  Should only `pub` special forms be callable from another
+  service?  This would be the first enforcement of `pub`.
+- **Handlers.**  Should the browser run a zero-parameter special action as a
+  handler, which needs `attach_handlers` to apply it first?
+- **Source for the REPL and the browser.**  Should their `import` fetch and
+  keep the owner's source, so that `do` takes one round trip there too?

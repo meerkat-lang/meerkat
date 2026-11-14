@@ -3301,6 +3301,18 @@ impl Manager {
             },
         )
         .await?;
+        // A result with no wire form, such as a string longer than the wire
+        // limit or html, cannot be sent as a called reply. Serve the request as
+        // the plain lookup instead, as for the `fn` spelling: the caller applies
+        // the member and builds the value itself, which works for a long string.
+        // Html cannot be built there either yet (neither a value nor a template
+        // has a wire form), so for html this only moves where the call fails.
+        // The call's reads stay locked under the transaction, and the lookup
+        // takes the same lock again.
+        if codec::encode_value(&value, &self.interner).is_err() {
+            let entry = self.lookup_with_clock(member, service, txn).await?;
+            return Ok((entry, false));
+        }
         let clock = txn.map(|t| self.transaction_history(t).0);
         Ok(((value, clock, None), true))
     }
@@ -8278,6 +8290,29 @@ mod tests {
         let ((value, _, _), called) = m.lookup_or_call(s, a, int_args(&[4]), None).await.unwrap();
         assert!(called);
         assert!(matches!(value, Value::ActionClosure { .. }));
+    }
+
+    // A special def whose result has no wire form (html) cannot be sent as a
+    // called reply: it is answered as the plain lookup, with the member, and the
+    // caller builds the value itself
+    #[tokio::test]
+    async fn a_result_with_no_wire_form_is_answered_with_the_member() {
+        // The member itself has a wire form: its body names `page`, which holds
+        // the html, instead of containing it
+        let mut m = start_local_manager(
+            "service s { pub def page = (<p>hi</p>); pub def h(x: int) = page; }",
+        )
+        .await;
+        let [s, h] = ["s", "h"].map(|n| m.interner.insert(n));
+        let result = m.lookup_or_call(s, h, int_args(&[3]), None).await;
+        let ((value, _, _), called) = result.unwrap();
+        assert!(!called, "the reply must not claim to be a call's result");
+        assert!(matches!(value, Value::Closure { .. }));
+        let result = m.lookup_or_call(s, h, int_args(&[3]), None).await;
+        assert!(matches!(
+            m.lookup_reply(1, result),
+            MeerkatMessage::LookupResponse { called: false, .. }
+        ));
     }
 
     // A plain function member with arguments, under a transaction, is a

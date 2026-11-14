@@ -1,5 +1,6 @@
 //! Issue #20, stages B and C: a call of a member of a remote service goes to its
-//! owner as a `LookupRequest` that carries the arguments, and the owner
+//! owner as a `LookupRequest` that carries the arguments when the caller's copy
+//! declares a special form or it has no copy, and the owner
 //! decides whether to run it (design note `docs/design/execution-location.md`,
 //! "Where a call runs" and "Protocol").
 //!
@@ -391,14 +392,14 @@ async fn a_member_reply_is_applied_by_the_caller() {
     );
 }
 
-/// An argument with no wire form (html, typed `string`) to a plain function
-/// member is not an error: the call falls back to a plain lookup and the
-/// caller applies the member, as before calls ran on the owner.
+/// An argument with no wire form (html, typed `string`) to a special def is not
+/// an error: the call falls back to a plain lookup and the caller applies the
+/// member, as before calls ran on the owner.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_argument_with_no_wire_form_falls_back_to_a_lookup() {
     const CODE: &str = "
         service s1 {
-            pub def g = fn (t: string) => 7;
+            pub def g(t: string) = 7;
         }
         service app {
             var v = 0;
@@ -443,6 +444,75 @@ async fn an_argument_with_no_wire_form_falls_back_to_a_lookup() {
         )),
         "the member must be fetched with a plain lookup, log: {:?}",
         log.borrow()
+    );
+}
+
+/// A caller whose copy declares `f` plain (the `fn` spelling) sends a plain
+/// lookup for `s1.f(3)`, with no arguments on the wire, and applies the
+/// owner's answer itself.
+///
+/// Without the change the call is sent with `args: Some([3])`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_copy_that_declares_the_member_plain_sends_a_plain_lookup() {
+    const CODE: &str = "
+        service s1 {
+            var y = 5;
+            pub def f = fn (x: int) => x + y;
+        }
+        service app {
+            var v = 0;
+            pub def run = action { let r = s1.f(3); v = r; };
+        }
+    ";
+    let (app_net, _) = listening_node().await;
+    let (mut s1_net, s1_addr) = listening_node().await;
+    let (mut m, _) = caller_node(CODE, app_net, &s1_addr).await;
+    let stmts = do_run(&mut m);
+    let log = Log::default();
+    let answer = |member: &str, _: &Option<Vec<NetValue>>| match member {
+        "f" => (f_closure(), false),
+        _ => (int(5), false),
+    };
+
+    let result = run_on_app(&mut m, &mut s1_net, &log, &answer, &stmts, false).await;
+
+    assert!(result.is_ok(), "the action must succeed, got: {result:?}");
+    assert_eq!(var_of(&mut m, "app", "v"), Value::Int { val: 8 });
+    assert_eq!(
+        lookups_of(&log.borrow()),
+        vec![("f".to_string(), None), ("y".to_string(), None)]
+    );
+}
+
+/// A caller with no copy of `s1` (the REPL, the browser) cannot tell, so it
+/// sends the call with its arguments and lets the owner decide.
+///
+/// Without the change to the gate this passes too: it pins the case the gate
+/// must keep sending.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_caller_with_no_copy_sends_the_call_with_its_arguments() {
+    let (app_net, _) = listening_node().await;
+    let (mut s1_net, s1_addr) = listening_node().await;
+    let (mut m, _) = caller_node(CALLER, app_net, &s1_addr).await;
+    let s1 = m.interner.insert("s1");
+    let without_s1: Vec<Stmt> = m
+        .unified_ast()
+        .iter()
+        .filter(|stmt| !matches!(stmt, Stmt::Service { name, .. } if *name == s1))
+        .cloned()
+        .collect();
+    m.install_unified_ast(without_s1);
+    let stmts = do_run(&mut m);
+    let log = Log::default();
+    let answer = |_: &str, _: &Option<Vec<NetValue>>| (int(8), true);
+
+    let result = run_on_app(&mut m, &mut s1_net, &log, &answer, &stmts, false).await;
+
+    assert!(result.is_ok(), "the action must succeed, got: {result:?}");
+    assert_eq!(var_of(&mut m, "app", "v"), Value::Int { val: 8 });
+    assert_eq!(
+        lookups_of(&log.borrow()),
+        vec![("f".to_string(), Some(vec![3]))]
     );
 }
 
@@ -723,12 +793,11 @@ fn action(stmts: &str, env: Vec<(&str, i32)>) -> Seen {
     }
 }
 
-/// `do a(__arg0)` as the wire shows it
-const DO_A: &str =
-    r#"[Do(Call { func: Variable { name: "a" }, args: [Variable { name: "__arg0" }] })]"#;
+/// `do s1.a(__arg0)` as the wire shows it
+const DO_A: &str = r#"[Do(Call { func: MemberAccess { service_name: "s1", member_name: "a" }, args: [Variable { name: "__arg0" }] })]"#;
 
 /// `do s1.a(3);` with `action a(x: int)` in the caller's copy is exactly one
-/// `ActionRequest` `[do a(__arg0)]` with `__arg0 = 3`, no lookup, then the
+/// `ActionRequest` `[do s1.a(__arg0)]` with `__arg0 = 3`, no lookup, then the
 /// commit.
 ///
 /// Without the change the call goes through the evaluator gate: a
@@ -756,7 +825,7 @@ async fn do_of_a_special_action_is_one_action_request() {
 /// commit.
 ///
 /// Without the change a lookup of `a` follows the one of `f`, and the body
-/// of `a` is sent instead of `do a(__arg0)`.
+/// of `a` is sent instead of `do s1.a(__arg0)`.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_wiki_example_takes_two_requests() {
     let (app_net, _) = listening_node().await;
@@ -811,10 +880,10 @@ fn a_closure() -> NetValue {
     encode_value(&closure, &i).expect("closure encodes")
 }
 
-/// The same statement against the `fn` spelling in the caller's copy: nothing
-/// is known to be special, so the owner answers with the members and the
-/// caller applies them: four requests before the commit, the last one
-/// carrying the action's body.
+/// The same statement against the `fn` spelling in the caller's copy: the
+/// copy declares the members plain, so the caller sends plain lookups with no
+/// arguments, the owner answers with the members and the caller applies them:
+/// four requests before the commit, the last one carrying the action's body.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_fn_spelling_takes_four_requests() {
     let (app_net, _) = listening_node().await;
@@ -842,8 +911,8 @@ async fn the_fn_spelling_takes_four_requests() {
     assert_eq!(
         lookups,
         vec![
-            ("a".to_string(), Some(vec![8])),
-            ("f".to_string(), Some(vec![3])),
+            ("a".to_string(), None),
+            ("f".to_string(), None),
             ("y".to_string(), None),
         ],
         "log: {log:?}"
@@ -862,7 +931,7 @@ async fn the_fn_spelling_takes_four_requests() {
     assert_eq!(log.last(), Some(&Seen::Commit));
 }
 
-/// A zero-parameter special action sends `do reset()` with an empty
+/// A zero-parameter special action sends `do s1.reset()` with an empty
 /// environment.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_zero_parameter_action_sends_an_empty_environment() {
@@ -880,7 +949,7 @@ async fn a_zero_parameter_action_sends_an_empty_environment() {
         *log.borrow(),
         vec![
             action(
-                r#"[Do(Call { func: Variable { name: "reset" }, args: [] })]"#,
+                r#"[Do(Call { func: MemberAccess { service_name: "s1", member_name: "reset" }, args: [] })]"#,
                 vec![]
             ),
             Seen::Commit
@@ -938,7 +1007,7 @@ async fn a_special_def_returning_an_action_goes_through_the_owner() {
 }
 
 /// In a `@test(s1)` block of the caller with `s1` remote, the bare name `a`
-/// targets `s1`: `do a(3);` sends `do a(__arg0)`.
+/// targets `s1`: `do a(3);` sends `do s1.a(__arg0)`.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_bare_name_in_a_test_block_is_sent_by_name() {
     let (app_net, _) = listening_node().await;
@@ -956,12 +1025,60 @@ async fn the_bare_name_in_a_test_block_is_sent_by_name() {
     );
 }
 
+/// A special action named like an argument (`__arg0`) is reached by name: the
+/// callee is sent as a member access, which the environment cannot shadow.
+///
+/// Without the change the callee is `Variable { name: "__arg0" }`, which on the
+/// owner resolves to the argument value, not to the member.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_special_action_named_like_an_argument_reaches_the_member() {
+    const CODE: &str = "
+        service s1 {
+            var y = 5;
+            pub action __arg0(x: int) { y = x; }
+        }
+        service app {
+            pub def run = action { do s1.__arg0(3); };
+        }
+    ";
+    let (app_net, _) = listening_node().await;
+    let (mut s1_net, s1_addr) = listening_node().await;
+    let (mut m, _) = caller_node(CODE, app_net, &s1_addr).await;
+    let stmts = do_run(&mut m);
+    let log = Log::default();
+    let answer = |_: &str, _: &Option<Vec<NetValue>>| (int(-1), true);
+
+    let result = run_on_app(&mut m, &mut s1_net, &log, &answer, &stmts, false).await;
+
+    assert!(result.is_ok(), "the action must succeed, got: {result:?}");
+    assert_eq!(
+        *log.borrow(),
+        vec![
+            action(
+                r#"[Do(Call { func: MemberAccess { service_name: "s1", member_name: "__arg0" }, args: [Variable { name: "__arg0" }] })]"#,
+                vec![("__arg0", 3)]
+            ),
+            Seen::Commit
+        ]
+    );
+}
+
 /// Run `do run_wiki;` of the caller built from `SPECIAL` against a real owner
 /// running `owner_code`, and return what the owner received and its `y`.
 async fn wiki_against_owner(owner_code: &str) -> (Vec<String>, Value) {
+    run_against_owner(SPECIAL, owner_code, "run_wiki").await
+}
+
+/// Run `do member;` of the caller built from `caller_code` against a real
+/// owner running `owner_code`, and return what the owner received and its `y`.
+async fn run_against_owner(
+    caller_code: &str,
+    owner_code: &str,
+    member: &str,
+) -> (Vec<String>, Value) {
     let (app_net, _) = listening_node().await;
     let (owner_net, owner_addr) = listening_node().await;
-    let (mut m, _) = caller_node(SPECIAL, app_net, &owner_addr).await;
+    let (mut m, _) = caller_node(caller_code, app_net, &owner_addr).await;
 
     let mut interner = Interner::new();
     let ast = parse_string(owner_code, &mut interner).expect("valid syntax");
@@ -974,7 +1091,7 @@ async fn wiki_against_owner(owner_code: &str) -> (Vec<String>, Value) {
         .await
         .expect("owner startup");
 
-    let stmts = do_member(&mut m, "run_wiki");
+    let stmts = do_member(&mut m, member);
     let received = RefCell::new(Vec::new());
     let serve = async {
         loop {
@@ -1004,6 +1121,25 @@ async fn wiki_against_owner(owner_code: &str) -> (Vec<String>, Value) {
     assert!(result.is_ok(), "the action must succeed, got: {result:?}");
     let y = var_of(&mut owner, "s1", "y");
     (received.into_inner(), y)
+}
+
+/// The same call against a real owner: the member `__arg0` is reached, not the
+/// argument value, so the owner's `y` becomes 3.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_special_action_named_like_an_argument_runs_on_the_owner() {
+    const CODE: &str = "
+        service s1 {
+            var y = 5;
+            pub action __arg0(x: int) { y = x; }
+        }
+        service app {
+            pub def run = action { do s1.__arg0(3); };
+        }
+    ";
+    let (received, y) = run_against_owner(CODE, CODE, "run").await;
+
+    assert_eq!(y, Value::Int { val: 3 });
+    assert_eq!(received, vec!["Action".to_string(), "Commit".to_string()]);
 }
 
 /// Against a real owner declaring special forms, `do s1.a(s1.f(3));` leaves

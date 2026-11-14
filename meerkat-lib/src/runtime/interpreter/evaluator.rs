@@ -1,4 +1,4 @@
-use crate::ast::{BinOp, Expr, UnOp, Value};
+use crate::ast::{BinOp, Decl, DefForm, Expr, UnOp, Value};
 use crate::runtime::graphs::free_var::free_var;
 use crate::runtime::interner::Symbol;
 use crate::runtime::manager::CallReply;
@@ -194,7 +194,12 @@ pub(crate) async fn eval_with_inputs(
         Expr::Call { func, args } => {
             // A call of a member of a remote service goes to its owner, which
             // runs it if the member is a special form and otherwise answers
-            // with the member (rule 5 of the execution-location design). The
+            // with the member (rule 5 of the execution-location design). It is
+            // sent only when this node's copy of the owner does not declare the
+            // member as plain (a plain def, a var or a table): then the call
+            // is a plain lookup as before, with no arguments on the wire, so a
+            // program that uses no special form sends what it always sent. With
+            // no copy (the REPL, the browser) the owner has to decide. The
             // arguments are evaluated first, as below. Reevaluating a def
             // from pushed inputs never calls out, and nor does creating a
             // service, whose reads seed the new service's graphs: the
@@ -206,7 +211,18 @@ pub(crate) async fn eval_with_inputs(
                         .txn
                         .as_deref()
                         .is_some_and(|t| ctx.manager.is_creation_txn(&t.id));
-                    if ctx.manager.remote_services.contains_key(&svc) && !creating {
+                    // Checked last: the scan of the copy's declarations is not
+                    // paid by calls of local services.
+                    if ctx.manager.remote_services.contains_key(&svc)
+                        && !creating
+                        && matches!(
+                            ctx.manager.member_decl(svc, member),
+                            None | Some(Decl::DefDecl {
+                                form: DefForm::Function | DefForm::Action,
+                                ..
+                            })
+                        )
+                    {
                         let mut arg_vals = Vec::new();
                         for arg in args {
                             arg_vals.push(eval_with_inputs(arg, env, ctx, inputs).await?);

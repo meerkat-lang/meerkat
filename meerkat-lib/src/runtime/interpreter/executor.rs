@@ -122,14 +122,16 @@ pub async fn execute(
                 }
             }
             // The same for `do s.a(e1, ..)` when this node's copy of `s` declares `a` as
-            // `action a(..)`: the action belongs to `s` by construction, so the caller
-            // evaluates the arguments and sends the one statement `do a(__arg0, ..)`
-            // with their values in its environment, one round trip instead of a lookup
+            // `action a(..)`: the copy shows that `a`
+            // belonged to `s` when it was imported, so the caller evaluates the
+            // arguments and sends the one statement `do s.a(__arg0, ..)` with their
+            // values in its environment, one round trip instead of a lookup
             // that returns the action followed by shipping its body back. A special
             // def whose result is an action is not sent this way: which action it
             // returns is the owner's decision, so the call goes through the evaluator
-            // and the `do` below runs the result at its owner. The environment is
-            // searched before members on the owner, so `__argN` cannot meet a member.
+            // and the `do` below runs the result at its owner. The callee is sent as a
+            // member access, which never consults the environment, so a member named
+            // like an argument (`__argK`) cannot be shadowed on the owner.
             if let Expr::Call { func, args } = expr {
                 if let Some((target, member)) = call_target(func, env, service_name) {
                     if manager.remote_services.contains_key(&target)
@@ -172,7 +174,10 @@ pub async fn execute(
                                 .remote_action(
                                     &owner,
                                     vec![ActionStmt::Do(Expr::Call {
-                                        func: Box::new(Expr::Variable { name: member }),
+                                        func: Box::new(Expr::MemberAccess {
+                                            service_name: target,
+                                            member_name: member,
+                                        }),
                                         args: arg_exprs,
                                     })],
                                     arg_env,

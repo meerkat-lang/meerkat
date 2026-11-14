@@ -49,3 +49,10 @@ here.
   runs with "Timeout waiting for lock response from Node A". #244.
 
 List all known flaky tests with `gh issue list --label flaky`.
+
+## Drafting Reviews
+
+When drafting a PR review for a maintainer to edit and post, end it with this
+line:
+
+Disclosure: AI helped draft this review; I checked, directed, and edited it.

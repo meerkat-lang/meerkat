@@ -4,7 +4,7 @@
 //! name resolution pass using strings parsed into AST statements
 
 use meerkat_lib::runtime::{
-    ast::{Decl, Expr, Stmt, Value},
+    ast::{Decl, DefForm, Expr, Stmt, Value},
     nameres::{resolve, Error, ExpectedSort},
     parser::parse_string,
     tt::Param,
@@ -188,6 +188,7 @@ fn test_integration_update_stmt_resolves() {
                 val: Value::Int { val: 2 },
             },
             is_pub: false,
+            form: DefForm::Plain,
         }],
     };
 
@@ -212,6 +213,7 @@ fn test_integration_update_unbound_errors() {
                 val: Value::Int { val: 2 },
             },
             is_pub: false,
+            form: DefForm::Plain,
         }],
     };
 
@@ -708,6 +710,7 @@ fn test_integration_update_stmt_forward_reference_fails() {
                 ty: None,
                 val: Expr::Variable { name: x },
                 is_pub: false,
+                form: DefForm::Plain,
             },
             Decl::VarDecl {
                 name: x,
@@ -793,6 +796,7 @@ fn test_integration_update_inherits_service_env() {
             ty: None,
             val: Expr::Variable { name: a },
             is_pub: false,
+            form: DefForm::Plain,
         }],
     };
 
@@ -828,6 +832,7 @@ fn test_integration_update_sequential_scoping() {
                 ty: None,
                 val: Expr::Variable { name: a },
                 is_pub: false,
+                form: DefForm::Plain,
             },
         ],
     };
@@ -866,6 +871,7 @@ fn test_integration_update_accumulates_across_blocks() {
             ty: None,
             val: Expr::Variable { name: a },
             is_pub: false,
+            form: DefForm::Plain,
         }],
     };
 
@@ -900,6 +906,7 @@ fn test_integration_atomic_update_inherits_service_env() {
                 ty: None,
                 val: Expr::Variable { name: a },
                 is_pub: false,
+                form: DefForm::Plain,
             }],
         }],
     };

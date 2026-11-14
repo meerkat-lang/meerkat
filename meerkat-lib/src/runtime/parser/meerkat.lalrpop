@@ -3,7 +3,7 @@ grammar<'input>(
     interner: &mut Interner
 );
 
-use crate::ast::{Stmt, ActionStmt, Decl, Expr, UnOp, BinOp, TableType, Field, Value};
+use crate::ast::{Stmt, ActionStmt, Decl, DefForm, Expr, UnOp, BinOp, TableType, Field, Value};
 use crate::runtime::tt::{Type, Param, TupleType};
 use crate::runtime::interner::{Interner, Symbol};
 use lalrpop_util::ParseError;
@@ -149,10 +149,41 @@ Decl: Decl = {
         Decl::VarDecl { name: i, ty: t, val: e }
     },
     "pub" "def" <i:Ident> <t:(":" <Type>)?> "=" <e:Expr> ";" => {
-        Decl::DefDecl { name: i, ty: t, val: e, is_pub: true }
+        Decl::DefDecl { name: i, ty: t, val: e, is_pub: true, form: DefForm::Plain }
     },
     "def" <i:Ident> <t:(":" <Type>)?> "=" <e:Expr> ";" => {
-        Decl::DefDecl { name: i, ty: t, val: e, is_pub: false }
+        Decl::DefDecl { name: i, ty: t, val: e, is_pub: false, form: DefForm::Plain }
+    },
+    // The special forms are the `fn` member plus a mark (design note
+    // execution-location.md, "Meaning"), so everything after the parser
+    // treats them like the `fn` spelling.
+    "pub" "def" <i:Ident> <p:ParenParams> <t:(":" <Type>)?> "=" <e:Expr> ";" => {
+        Decl::DefDecl {
+            name: i, ty: None,
+            val: Expr::Func { params: p, body: Box::new(e), return_ty: t },
+            is_pub: true, form: DefForm::Function,
+        }
+    },
+    "def" <i:Ident> <p:ParenParams> <t:(":" <Type>)?> "=" <e:Expr> ";" => {
+        Decl::DefDecl {
+            name: i, ty: None,
+            val: Expr::Func { params: p, body: Box::new(e), return_ty: t },
+            is_pub: false, form: DefForm::Function,
+        }
+    },
+    "pub" "action" <i:Ident> <p:ParenParams> "{" <stmts: ActionStmts> "}" ";"? => {
+        Decl::DefDecl {
+            name: i, ty: None,
+            val: Expr::Func { params: p, body: Box::new(Expr::Action(stmts)), return_ty: None },
+            is_pub: true, form: DefForm::Action,
+        }
+    },
+    "action" <i:Ident> <p:ParenParams> "{" <stmts: ActionStmts> "}" ";"? => {
+        Decl::DefDecl {
+            name: i, ty: None,
+            val: Expr::Func { params: p, body: Box::new(Expr::Action(stmts)), return_ty: None },
+            is_pub: false, form: DefForm::Action,
+        }
     },
     "table" <i:Ident> "{" <f: TableFields> "}" ";" => {
         Decl::TableDecl {name: i, fields: f }
@@ -213,6 +244,22 @@ Param: Param = {
 Params: Vec<Param> = {
     "(" ")" => vec![],
     <i:Ident> => vec![Param { name: i, ty: None }],
+    "(" <mut v:(<Param> ",")+> <e:Param?> ")" => {
+        match e {
+            None => v,
+            Some(e) => {
+                v.push(e);
+                v
+            }
+        }
+    },
+    "(" <e:Param> ")" => vec![e],
+}
+
+// Only the parenthesized lists: a special form is never written with a bare
+// parameter name, which would read as an ordinary `def`.
+ParenParams: Vec<Param> = {
+    "(" ")" => vec![],
     "(" <mut v:(<Param> ",")+> <e:Param?> ")" => {
         match e {
             None => v,

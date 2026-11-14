@@ -4627,7 +4627,7 @@ impl Default for Manager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{Decl, Expr, Value};
+    use crate::ast::{Decl, DefForm, Expr, Value};
     use crate::runtime::interpreter::execute;
     use crate::runtime::{parser::parse_string, update::Transaction as CodeUpdate, Node};
 
@@ -4716,6 +4716,7 @@ mod tests {
                     }),
                 },
                 is_pub: true,
+                form: DefForm::Plain,
             },
         ];
         tc.manager.create_service(tc.s1, s1_decls).await.unwrap();
@@ -4735,6 +4736,7 @@ mod tests {
                 }),
             },
             is_pub: true,
+            form: DefForm::Plain,
         }];
         tc.manager.create_service(tc.s2, s2_decls).await.unwrap();
 
@@ -4812,6 +4814,7 @@ mod tests {
                     }),
                 },
                 is_pub: true,
+                form: DefForm::Plain,
             },
         ];
         tc.manager.create_service(tc.s1, s1_decls).await.unwrap();
@@ -4830,6 +4833,7 @@ mod tests {
                 }),
             },
             is_pub: true,
+            form: DefForm::Plain,
         }];
         tc.manager.create_service(tc.s2, s2_decls).await.unwrap();
 
@@ -4891,6 +4895,7 @@ mod tests {
                     }),
                 },
                 is_pub: true,
+                form: DefForm::Plain,
             },
         ];
         tc.manager.create_service(tc.s1, s1_decls).await.unwrap();
@@ -5003,6 +5008,7 @@ mod tests {
                     }),
                 },
                 is_pub: true,
+                form: DefForm::Plain,
             },
         ];
         tc.manager.create_service(tc.foo, decls).await.unwrap();
@@ -5038,6 +5044,7 @@ mod tests {
                     }),
                 },
                 is_pub: true,
+                form: DefForm::Plain,
             },
         ];
         tc.manager.create_service(tc.foo, decls).await.unwrap();
@@ -5258,6 +5265,7 @@ mod tests {
                     }),
                 },
                 is_pub: true,
+                form: DefForm::Plain,
             },
         ];
         tc.manager.create_service(tc.foo, decls).await.unwrap();
@@ -5319,18 +5327,21 @@ mod tests {
                 ty: None,
                 val: mk_add(Expr::Variable { name: tc.x }, lit_int(10)),
                 is_pub: true,
+                form: DefForm::Plain,
             },
             Decl::DefDecl {
                 name: b,
                 ty: None,
                 val: mk_add(Expr::Variable { name: tc.x }, lit_int(20)),
                 is_pub: true,
+                form: DefForm::Plain,
             },
             Decl::DefDecl {
                 name: q,
                 ty: None,
                 val: mk_add(Expr::Variable { name: a }, Expr::Variable { name: b }),
                 is_pub: true,
+                form: DefForm::Plain,
             },
         ];
         tc.manager.create_service(tc.foo, decls).await.unwrap();
@@ -5415,12 +5426,14 @@ mod tests {
                 ty: None,
                 val: mk_add(Expr::Variable { name: tc.x }, lit_int(10)),
                 is_pub: true,
+                form: DefForm::Plain,
             },
             Decl::DefDecl {
                 name: q,
                 ty: None,
                 val: mk_add(Expr::Variable { name: a }, Expr::Variable { name: tc.x }),
                 is_pub: true,
+                form: DefForm::Plain,
             },
         ];
         tc.manager.create_service(tc.foo, decls).await.unwrap();
@@ -5522,12 +5535,14 @@ mod tests {
                 ty: None,
                 val: mk_add(w(), lit_int(10)),
                 is_pub: true,
+                form: DefForm::Plain,
             },
             Decl::DefDecl {
                 name: b,
                 ty: None,
                 val: mk_add(w(), lit_int(20)),
                 is_pub: true,
+                form: DefForm::Plain,
             },
         ];
         tc.manager.create_service(tc.s1, s1_decls).await.unwrap();
@@ -5546,6 +5561,7 @@ mod tests {
                 },
             ),
             is_pub: true,
+            form: DefForm::Plain,
         }];
         tc.manager.create_service(tc.s2, s2_decls).await.unwrap();
         tc.manager.services.get(&tc.s2).unwrap().id.0.clone()
@@ -5885,6 +5901,7 @@ mod tests {
                         },
                     ),
                     is_pub: true,
+                    form: DefForm::Plain,
                 }],
             )
             .await
@@ -6383,6 +6400,7 @@ mod tests {
                         ty: None,
                         val: bump,
                         is_pub: true,
+                        form: DefForm::Plain,
                     },
                 ],
             )
@@ -7059,6 +7077,7 @@ mod tests {
                     expr2: Box::new(Expr::Variable { name: tc.y }),
                 },
                 is_pub: true,
+                form: DefForm::Plain,
             },
         ];
         tc.manager.create_service(tc.foo, decls).await.unwrap();
@@ -7172,6 +7191,7 @@ mod tests {
                         member_name: tc.x,
                     },
                     is_pub: true,
+                    form: DefForm::Plain,
                 }],
             )
             .await;

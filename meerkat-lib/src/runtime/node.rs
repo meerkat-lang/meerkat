@@ -70,6 +70,35 @@ impl StaticError {
                 "Invalid forward reference to uninitialized value '{}'",
                 interner.get(*name)
             ),
+            StaticError::Names(nameres::Error::NotCalled {
+                service,
+                member,
+                form,
+                bare,
+            }) => {
+                let name = if *bare {
+                    interner.get(*member).to_string()
+                } else {
+                    format!("{}.{}", interner.get(*service), interner.get(*member))
+                };
+                format!(
+                    "{} can only be called: write `{}{}(...)`",
+                    name,
+                    nameres::call_hint(*form),
+                    name
+                )
+            }
+            StaticError::Names(nameres::Error::ParamNamedLikeMember {
+                service,
+                decl,
+                member,
+            }) => format!(
+                "a parameter of {svc}.{decl} has the name of the member {svc}.{member}; \
+                 rename the parameter",
+                svc = interner.get(*service),
+                decl = interner.get(*decl),
+                member = interner.get(*member)
+            ),
             StaticError::Names(e @ nameres::Error::DepthLimit) => e.to_string(),
             StaticError::Types(tt::check::Error::RecursiveTypeInference { service, member }) => {
                 format!(
@@ -770,7 +799,7 @@ impl Default for Node {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{ActionStmt, BinOp, Decl, Expr, Value};
+    use crate::ast::{ActionStmt, BinOp, Decl, DefForm, Expr, Value};
     use crate::runtime::tt::Type;
 
     /// The third registration path must refuse a colliding `-i` flag too.
@@ -850,6 +879,7 @@ mod tests {
                     member_name: x,
                 },
                 is_pub: false,
+                form: DefForm::Plain,
             }],
         };
 
@@ -1085,6 +1115,7 @@ mod tests {
                 ty: None,
                 val: Expr::Variable { name: a },
                 is_pub: false,
+                form: DefForm::Plain,
             }],
         };
 
@@ -1114,6 +1145,7 @@ mod tests {
                     ty: None,
                     val: Expr::Variable { name: a },
                     is_pub: false,
+                    form: DefForm::Plain,
                 },
                 Decl::VarDecl {
                     name: a,
@@ -1159,6 +1191,7 @@ mod tests {
                 ty: None,
                 val: Expr::Variable { name: a },
                 is_pub: false,
+                form: DefForm::Plain,
             }],
         };
 
@@ -1228,6 +1261,7 @@ mod tests {
                     ty: None,
                     val: Expr::Variable { name: x },
                     is_pub: false,
+                    form: DefForm::Plain,
                 }],
             }],
         };
@@ -1267,6 +1301,7 @@ mod tests {
                         }),
                     },
                     is_pub: false,
+                    form: DefForm::Plain,
                 },
             ],
         };
@@ -1291,6 +1326,7 @@ mod tests {
                 ty: Some(Type::String),
                 val: Expr::Variable { name: x },
                 is_pub: false,
+                form: DefForm::Plain,
             }],
         };
 
@@ -1324,6 +1360,7 @@ mod tests {
                         }),
                     },
                     is_pub: false,
+                    form: DefForm::Plain,
                 },
             ],
         };
@@ -1348,6 +1385,7 @@ mod tests {
                 ty: Some(Type::String),
                 val: Expr::Variable { name: x_2 },
                 is_pub: false,
+                form: DefForm::Plain,
             }],
         };
 

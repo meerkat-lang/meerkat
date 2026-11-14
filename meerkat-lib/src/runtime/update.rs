@@ -6,7 +6,7 @@
 //! applies updates atomically once fully evaluated.
 
 use crate::net::LockGroup;
-use crate::runtime::ast::{apply_updates_to_ast, Decl, Expr, Stmt, Value};
+use crate::runtime::ast::{apply_updates_to_ast, Decl, DefForm, Expr, Stmt, Value};
 use crate::runtime::graphs::analysis::service_declarations;
 use crate::runtime::interner::{Interner, Symbol};
 use crate::runtime::interpreter::evaluator::{eval, EvalContext, EvalError};
@@ -646,11 +646,67 @@ pub fn format_decl(decl: &Decl, interner: &Interner) -> String {
                 format!("var {} = {};", name_str, val_str)
             }
         }
+        // A special form is forwarded as it was declared, so the owner
+        // parses the same mark back instead of an ordinary `fn` member
+        Decl::DefDecl {
+            name,
+            val:
+                Expr::Func {
+                    params,
+                    body,
+                    return_ty,
+                },
+            is_pub,
+            form: form @ (DefForm::Function | DefForm::Action),
+            ..
+        } => {
+            let prefix = if *is_pub { "pub " } else { "" };
+            let name_str = interner.get(*name);
+            // `Param`'s Display prints the symbol, not the name
+            let params_str: Vec<String> = params
+                .iter()
+                .map(|p| match &p.ty {
+                    Some(t) => format!("{}: {}", interner.get(p.name), t),
+                    None => interner.get(p.name).to_string(),
+                })
+                .collect();
+            let params_str = params_str.join(", ");
+            match (form, body.as_ref()) {
+                (DefForm::Action, Expr::Action(stmts)) => {
+                    let stmts_str: String = stmts
+                        .iter()
+                        .map(|s| format!(" {};", format_action_stmt(s, interner)))
+                        .collect();
+                    format!(
+                        "{}action {}({}) {{{} }}",
+                        prefix, name_str, params_str, stmts_str
+                    )
+                }
+                _ => match return_ty {
+                    Some(r) => format!(
+                        "{}def {}({}): {} = {};",
+                        prefix,
+                        name_str,
+                        params_str,
+                        r,
+                        format_expr(body, interner)
+                    ),
+                    None => format!(
+                        "{}def {}({}) = {};",
+                        prefix,
+                        name_str,
+                        params_str,
+                        format_expr(body, interner)
+                    ),
+                },
+            }
+        }
         Decl::DefDecl {
             name,
             ty,
             val,
             is_pub,
+            ..
         } => {
             let prefix = if *is_pub { "pub " } else { "" };
             let name_str = interner.get(*name);

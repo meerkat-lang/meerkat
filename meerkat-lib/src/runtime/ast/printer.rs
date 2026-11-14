@@ -150,14 +150,16 @@ impl<'a> AstPrinter<'a> {
                 ty,
                 val,
                 is_pub,
+                form,
             } => {
                 let name = *name;
                 let is_pub = *is_pub;
                 println!(
-                    "DefDecl: {{ name: {}, ty: {}, is_pub: {} }}",
+                    "DefDecl: {{ name: {}, ty: {}, is_pub: {}, form: {:?} }}",
                     self.format_symbol(name),
                     self.format_type_opt(ty),
-                    is_pub
+                    is_pub,
+                    form
                 );
                 self.print_expr(val, indent + 1);
             }

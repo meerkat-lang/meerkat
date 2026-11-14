@@ -11,7 +11,7 @@
 //! - `Select` expressions
 //! - `Fold` expressions
 
-use crate::runtime::ast::{ActionStmt, Decl, Expr, Stmt, Value};
+use crate::runtime::ast::{ActionStmt, Decl, DefForm, Expr, Stmt, Value};
 use crate::runtime::interner::Symbol;
 use crate::runtime::limits::MAX_SCOPE_DEPTH;
 use crate::runtime::Env;
@@ -52,6 +52,39 @@ pub enum Error {
     DepthLimit,
     /// A value was referenced eagerly before being declared
     ForwardReference(Symbol),
+    /// A special form of def was used other than as the function of a call
+    NotCalled {
+        /// The service that declares the member
+        service: Symbol,
+        /// The member that was used
+        member: Symbol,
+        /// The form the member was declared in
+        form: DefForm,
+        /// Whether the member was written without its service, which is how
+        /// code inside the service names it
+        bare: bool,
+    },
+    /// A parameter of a special form has the name of a member of the same
+    /// service. Inside an action body such a name refers to the member at run
+    /// time, because a closure never captures a local named like a member of
+    /// its service, so the parameter would be silently ignored
+    ParamNamedLikeMember {
+        /// The service that declares both
+        service: Symbol,
+        /// The special form that has the parameter
+        decl: Symbol,
+        /// The member whose name the parameter has
+        member: Symbol,
+    },
+}
+
+/// The shape of a use of a special form that name resolution accepts: the
+/// call to write instead, for the error message
+pub fn call_hint(form: DefForm) -> &'static str {
+    match form {
+        DefForm::Action => "do ",
+        DefForm::Function | DefForm::Plain => "",
+    }
 }
 
 impl fmt::Display for Error {
@@ -82,6 +115,35 @@ impl fmt::Display for Error {
                     name
                 )
             }
+            Error::NotCalled {
+                service,
+                member,
+                form,
+                bare,
+            } => {
+                let name = if *bare {
+                    format!("{:?}", member)
+                } else {
+                    format!("{:?}.{:?}", service, member)
+                };
+                write!(
+                    f,
+                    "{} can only be called: write `{}{}(...)`",
+                    name,
+                    call_hint(*form),
+                    name
+                )
+            }
+            Error::ParamNamedLikeMember {
+                service,
+                decl,
+                member,
+            } => write!(
+                f,
+                "a parameter of {:?}.{:?} has the name of the member {:?}.{:?}; \
+                 rename the parameter",
+                service, decl, service, member
+            ),
         }
     }
 }
@@ -93,6 +155,10 @@ impl std::error::Error for Error {}
 pub enum Binding<'a> {
     /// A standard, immediately evaluated value
     Value,
+    /// A member of a service, with the form it was declared in. Locals
+    /// (`let`, parameters, loop variables) stay `Value`, so the innermost
+    /// binding wins as it does for any name
+    Member(DefForm),
     #[doc(hidden)]
     _Marker(std::marker::PhantomData<&'a ()>),
 }
@@ -112,6 +178,51 @@ impl<'a> Default for Resolver<'a> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The form of the last declaration of `name` among `decls`, which is the one
+/// that counts because an `update` block appends declarations
+fn member_form<'d>(
+    decls: impl DoubleEndedIterator<Item = &'d Decl>,
+    name: Symbol,
+) -> Option<DefForm> {
+    decls.rev().find_map(|decl| match decl {
+        Decl::VarDecl { name: mem, .. } | Decl::TableDecl { name: mem, .. } if *mem == name => {
+            Some(DefForm::Plain)
+        }
+        Decl::DefDecl {
+            name: mem, form, ..
+        } if *mem == name => Some(*form),
+        _ => None,
+    })
+}
+
+/// Rejects a special form that has a parameter named like a member of
+/// `service`, `members` being the declarations that make up the service
+fn check_param_names<'d>(
+    service: Symbol,
+    decl: &Decl,
+    members: impl Iterator<Item = &'d Decl> + Clone,
+) -> Result<(), Error> {
+    let Decl::DefDecl {
+        name,
+        val: Expr::Func { params, .. },
+        form: DefForm::Function | DefForm::Action,
+        ..
+    } = decl
+    else {
+        return Ok(());
+    };
+    for param in params {
+        if members.clone().any(|m| m.name() == param.name) {
+            return Err(Error::ParamNamedLikeMember {
+                service,
+                decl: *name,
+                member: param.name,
+            });
+        }
+    }
+    Ok(())
 }
 
 impl<'a> Resolver<'a> {
@@ -205,6 +316,17 @@ impl<'a> Resolver<'a> {
                 let prev_context = self.current_context;
                 self.current_context = Some(*service_name);
                 for decl in decls {
+                    let members = self
+                        .local_services
+                        .get(service_name)
+                        .into_iter()
+                        .flatten()
+                        .copied()
+                        .chain(decls.iter());
+                    if let Err(e) = check_param_names(*service_name, decl, members) {
+                        self.current_context = prev_context;
+                        return Err(e);
+                    }
                     match decl {
                         Decl::VarDecl { val, .. } | Decl::DefDecl { val, .. } => {
                             if let Err(e) = self.resolve_expr(val, env, 0) {
@@ -264,13 +386,11 @@ impl<'a> Resolver<'a> {
                     }
                 };
                 for decl in decls {
-                    match decl {
-                        Decl::VarDecl { name: mem, .. }
-                        | Decl::DefDecl { name: mem, .. }
-                        | Decl::TableDecl { name: mem, .. } => {
-                            test_env.bind(*mem, Binding::Value);
-                        }
-                    }
+                    let form = match decl {
+                        Decl::DefDecl { form, .. } => *form,
+                        Decl::VarDecl { .. } | Decl::TableDecl { .. } => DefForm::Plain,
+                    };
+                    test_env.bind(decl.name(), Binding::Member(form));
                 }
                 let res = self.resolve_action_stmts(stmts, &mut test_env, 0);
                 self.current_context = prev_context;
@@ -296,26 +416,30 @@ impl<'a> Resolver<'a> {
         env: &mut Env<'b, Binding<'a>>,
     ) -> Result<(), Error> {
         for decl in decls {
+            if let Some(service) = self.current_context {
+                check_param_names(service, decl, decls.iter())?;
+            }
             match decl {
                 Decl::VarDecl { name, ty: _, val } => {
                     self.resolve_expr(val, env, 0)?;
-                    env.bind(*name, Binding::Value);
+                    env.bind(*name, Binding::Member(DefForm::Plain));
                 }
                 Decl::DefDecl {
                     name,
                     ty: _,
                     val,
                     is_pub: _,
+                    form,
                 } => {
                     self.resolve_expr(val, env, 0)?;
-                    env.bind(*name, Binding::Value);
+                    env.bind(*name, Binding::Member(*form));
                 }
                 Decl::TableDecl { name, fields: _ } => {
                     println!(
                         "warning: nameres: ignoring 'table' schema \
                          checks as not yet implemented"
                     );
-                    env.bind(*name, Binding::Value);
+                    env.bind(*name, Binding::Member(DefForm::Plain));
                 }
             }
         }
@@ -439,31 +563,7 @@ impl<'a> Resolver<'a> {
                 }
                 Ok(())
             }
-            Expr::Variable { name } => {
-                if env.find(*name).is_none() {
-                    let is_local_member = self
-                        .current_context
-                        .and_then(|ctx| self.local_services.get(&ctx))
-                        .is_some_and(|decls| {
-                            decls.iter().any(|decl| match decl {
-                                Decl::VarDecl { name: mem, .. }
-                                | Decl::DefDecl { name: mem, .. }
-                                | Decl::TableDecl { name: mem, .. } => mem == name,
-                            })
-                        });
-
-                    if is_local_member {
-                        return Ok(());
-                    }
-
-                    return Err(Error::UnknownIdentifier {
-                        name: *name,
-                        expected: ExpectedSort::Variable,
-                        context_name: self.current_context,
-                    });
-                }
-                Ok(())
-            }
+            Expr::Variable { name } => self.resolve_variable(*name, env, false),
             Expr::Tuple { val } => {
                 for e in val {
                     self.resolve_expr(e, env, depth + 1)?;
@@ -498,7 +598,16 @@ impl<'a> Resolver<'a> {
                 Ok(())
             }
             Expr::Call { func, args } => {
-                self.resolve_expr(func.as_ref(), env, depth + 1)?;
+                // The function of a call is the one place a special form of
+                // def may be named
+                match func.as_ref() {
+                    Expr::Variable { name } => self.resolve_variable(*name, env, true)?,
+                    Expr::MemberAccess {
+                        service_name,
+                        member_name,
+                    } => self.resolve_member_access(*service_name, *member_name, env, true)?,
+                    func => self.resolve_expr(func, env, depth + 1)?,
+                }
                 for arg in args {
                     self.resolve_expr(arg, env, depth + 1)?;
                 }
@@ -512,29 +621,7 @@ impl<'a> Resolver<'a> {
             Expr::MemberAccess {
                 service_name,
                 member_name,
-            } => {
-                if let Some(decls) = self.local_services.get(service_name) {
-                    let has_member = decls.iter().any(|decl| match decl {
-                        Decl::VarDecl { name: mem, .. }
-                        | Decl::DefDecl { name: mem, .. }
-                        | Decl::TableDecl { name: mem, .. } => mem == member_name,
-                    });
-                    if !has_member {
-                        return Err(Error::UnknownIdentifier {
-                            name: *member_name,
-                            expected: ExpectedSort::Variable,
-                            context_name: Some(*service_name),
-                        });
-                    }
-                } else if env.find(*service_name).is_none() {
-                    return Err(Error::UnknownIdentifier {
-                        name: *service_name,
-                        expected: ExpectedSort::Service,
-                        context_name: self.current_context,
-                    });
-                }
-                Ok(())
-            }
+            } => self.resolve_member_access(*service_name, *member_name, env, false),
             Expr::Select {
                 table_name: _,
                 column_names: _,
@@ -575,6 +662,95 @@ impl<'a> Resolver<'a> {
                 self.resolve_expr(end.as_ref(), env, depth + 1)
             }
         }
+    }
+
+    /// Resolves a bare name, which is a local or a member of the service
+    /// that is being resolved
+    ///
+    /// Args:
+    ///     `name` (`Symbol`): The name
+    ///     `env` (`&Env<'b, Binding<'a>>`): The environment
+    ///     `called` (`bool`): Whether the name is the function of a call
+    ///
+    /// Returns:
+    ///     `Result<(), Error>`: `Ok` if the name is bound and may be used so
+    fn resolve_variable<'b>(
+        &self,
+        name: Symbol,
+        env: &Env<'b, Binding<'a>>,
+        called: bool,
+    ) -> Result<(), Error> {
+        let form = match env.find(name) {
+            Some(Binding::Member(form)) => *form,
+            Some(_) => return Ok(()),
+            // A member declared further down the service
+            None => self
+                .current_context
+                .and_then(|ctx| self.local_services.get(&ctx))
+                .and_then(|decls| member_form(decls.iter().copied(), name))
+                .ok_or(Error::UnknownIdentifier {
+                    name,
+                    expected: ExpectedSort::Variable,
+                    context_name: self.current_context,
+                })?,
+        };
+        match (form, self.current_context) {
+            (DefForm::Function | DefForm::Action, Some(service)) if !called => {
+                Err(Error::NotCalled {
+                    service,
+                    member: name,
+                    form,
+                    bare: true,
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Resolves `service_name.member_name`
+    ///
+    /// Args:
+    ///     `service_name` (`Symbol`): The service
+    ///     `member_name` (`Symbol`): The member
+    ///     `env` (`&Env<'b, Binding<'a>>`): The environment
+    ///     `called` (`bool`): Whether the access is the function of a call
+    ///
+    /// Returns:
+    ///     `Result<(), Error>`: `Ok` if the member exists and may be used so
+    fn resolve_member_access<'b>(
+        &self,
+        service_name: Symbol,
+        member_name: Symbol,
+        env: &Env<'b, Binding<'a>>,
+        called: bool,
+    ) -> Result<(), Error> {
+        if let Some(decls) = self.local_services.get(&service_name) {
+            match member_form(decls.iter().copied(), member_name) {
+                None => {
+                    return Err(Error::UnknownIdentifier {
+                        name: member_name,
+                        expected: ExpectedSort::Variable,
+                        context_name: Some(service_name),
+                    })
+                }
+                Some(form @ (DefForm::Function | DefForm::Action)) if !called => {
+                    return Err(Error::NotCalled {
+                        service: service_name,
+                        member: member_name,
+                        form,
+                        bare: false,
+                    })
+                }
+                Some(_) => {}
+            }
+        } else if env.find(service_name).is_none() {
+            return Err(Error::UnknownIdentifier {
+                name: service_name,
+                expected: ExpectedSort::Service,
+                context_name: self.current_context,
+            });
+        }
+        Ok(())
     }
 
     /// Resolves variable names within a value
@@ -649,7 +825,7 @@ pub fn resolve(stmts: &[Stmt]) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::ast::{ActionStmt, Decl, Expr, Stmt, Value};
+    use crate::runtime::ast::{ActionStmt, Decl, DefForm, Expr, Stmt, Value};
     use crate::runtime::interner::Interner;
     use crate::runtime::tt::Param;
 
@@ -674,6 +850,7 @@ mod tests {
             ty: None,
             val: Expr::Variable { name: x },
             is_pub: false,
+            form: DefForm::Plain,
         };
 
         let stmt = Stmt::Service {
@@ -726,6 +903,7 @@ mod tests {
             ty: None,
             val: action_expr,
             is_pub: true,
+            form: DefForm::Plain,
         };
 
         let stmt = Stmt::Service {
@@ -757,6 +935,7 @@ mod tests {
             ty: None,
             val: bad_action,
             is_pub: true,
+            form: DefForm::Plain,
         };
 
         let bad_stmt = Stmt::Service {
@@ -805,6 +984,7 @@ mod tests {
             ty: None,
             val: Expr::Action(vec![block1, block2]),
             is_pub: true,
+            form: DefForm::Plain,
         };
 
         let s = interner.insert("s");
@@ -926,6 +1106,7 @@ mod tests {
                     ty: None,
                     val: Expr::Variable { name: x },
                     is_pub: false,
+                    form: DefForm::Plain,
                 },
             ],
         };
@@ -959,6 +1140,7 @@ mod tests {
                     ty: None,
                     val: Expr::Variable { name: x },
                     is_pub: false,
+                    form: DefForm::Plain,
                 },
                 Decl::VarDecl {
                     name: x,
@@ -1116,7 +1298,10 @@ mod tests {
                 assert_eq!(expected, ExpectedSort::Service);
                 assert_eq!(context_name, None);
             }
-            Error::DepthLimit | Error::ForwardReference(..) => {
+            Error::DepthLimit
+            | Error::ForwardReference(..)
+            | Error::NotCalled { .. }
+            | Error::ParamNamedLikeMember { .. } => {
                 panic!("Expected UnknownIdentifier error");
             }
         }

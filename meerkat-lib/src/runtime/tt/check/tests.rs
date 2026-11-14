@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::ast::DefForm;
 use crate::runtime::html::HtmlTemplateBuilder;
 use crate::runtime::interner::Interner;
 use crate::runtime::limits::{MAX_SCOPE_DEPTH, MAX_TYPE_DEPTH};
@@ -933,6 +934,7 @@ fn test_import_member_access_resolves_with_unified_ast() {
                 name: remote_member,
                 ty: None,
                 is_pub: true,
+                form: DefForm::Plain,
                 val: Expr::Literal {
                     val: Value::Int { val: 42 },
                 },
@@ -944,6 +946,7 @@ fn test_import_member_access_resolves_with_unified_ast() {
                 name: local_val,
                 ty: None,
                 is_pub: false,
+                form: DefForm::Plain,
                 val: Expr::MemberAccess {
                     service_name: remote_svc,
                     member_name: remote_member,
@@ -975,6 +978,7 @@ fn test_unknown_service_member_access_errors() {
             name: local_def,
             ty: None,
             is_pub: false,
+            form: DefForm::Plain,
             val: Expr::MemberAccess {
                 service_name: ghost_svc,
                 member_name: ghost_member,

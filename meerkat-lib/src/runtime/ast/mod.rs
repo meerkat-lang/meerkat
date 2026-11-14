@@ -288,6 +288,22 @@ impl ActionStmt {
     }
 }
 
+/// The form in which a `def` member was written.  The parser desugars every
+/// form into the same `fn` member, so typing, dependencies and evaluation do
+/// not depend on it; the mark only decides where a call may be written and
+/// how the declaration prints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DefForm {
+    /// `def x = e;`, a member that is used like a value
+    Plain,
+    /// `def f(params) = e;`, a special form of def (Requirements wiki,
+    /// execution location, rule 5) that can only be called
+    Function,
+    /// `action a(params) { .. }`, a special form that can only be run with
+    /// `do a(..)`
+    Action,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Decl {
     VarDecl {
@@ -300,6 +316,7 @@ pub enum Decl {
         ty: Option<Type>,
         val: Expr,
         is_pub: bool,
+        form: DefForm,
     },
     TableDecl {
         name: Symbol,
@@ -589,9 +606,41 @@ impl Display for Decl {
             }
             Decl::DefDecl {
                 name,
+                val:
+                    Expr::Func {
+                        params,
+                        body,
+                        return_ty,
+                    },
+                is_pub,
+                form: form @ (DefForm::Function | DefForm::Action),
+                ..
+            } => {
+                let prefix = if *is_pub { "pub " } else { "" };
+                let params: Vec<String> = params.iter().map(|p| p.to_string()).collect();
+                let params = params.join(", ");
+                match (form, &**body) {
+                    (DefForm::Action, Expr::Action(stmts)) => {
+                        write!(f, "{}action {:?}({}) {{", prefix, name, params)?;
+                        for stmt in stmts {
+                            write!(f, " {};", stmt)?;
+                        }
+                        write!(f, " }}")
+                    }
+                    _ => match return_ty {
+                        Some(r) => {
+                            write!(f, "{}def {:?}({}): {} = {}", prefix, name, params, r, body)
+                        }
+                        None => write!(f, "{}def {:?}({}) = {}", prefix, name, params, body),
+                    },
+                }
+            }
+            Decl::DefDecl {
+                name,
                 ty,
                 val,
                 is_pub,
+                ..
             } => {
                 let prefix = if *is_pub { "pub " } else { "" };
                 if let Some(t) = ty {

@@ -493,6 +493,13 @@ impl<'a> Imports<'a> {
                 let mut seen: HashSet<usize> = HashSet::new();
                 let mut pending: Vec<Symbol> = module.imports.clone();
                 while let Some(svc) = pending.pop() {
+                    // The root program owns every name it declares, even when
+                    // a disk module declares the same name and is recorded as
+                    // its owner above. Nothing was loaded for it, so an import
+                    // of that name must not reach the disk module.
+                    if self.root_declares.contains(&svc) {
+                        continue;
+                    }
                     let Some(&dep) = owner.get(&svc) else {
                         continue;
                     };
@@ -508,7 +515,15 @@ impl<'a> Imports<'a> {
             if module.remote_peer.is_some() {
                 continue;
             }
-            let mut allowed: HashSet<Symbol> = module.declares.iter().copied().collect();
+            // Only names `owner` attributes to this module: a module that
+            // declares a service another module declared first does not own
+            // that name, so its own declaration must not admit an update to it.
+            let mut allowed: HashSet<Symbol> = module
+                .declares
+                .iter()
+                .copied()
+                .filter(|svc| owner.get(svc) == Some(&idx))
+                .collect();
             for dep in &reach[idx] {
                 // Only declarations `owner` attributes to this dependency count:
                 // a peer module that re-declares a name the root program owns

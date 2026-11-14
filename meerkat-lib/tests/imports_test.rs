@@ -1084,6 +1084,63 @@ fn test_imports_refuse_a_modules_update_to_a_service_from_its_importer() {
     );
 }
 
+/// A disk module declaring a name the root program also declares is recorded
+/// in `owner`, but an import naming the root's service was resolved to no
+/// module. Following that mapping would lend the shadowing module's services
+/// to the importer and accept an unrelated update
+#[test]
+fn test_imports_do_not_follow_a_root_service_to_a_disk_shadow() {
+    let error = finalize_with_disk_module(
+        "disk_root_shadow_reachability",
+        "import helper\nimport other\nservice app { var x = 0; }",
+        &[
+            (
+                "helper.mkt",
+                "import app\nservice helper { var v = 1; }\nupdate target { pub def z = 1; }\n",
+            ),
+            (
+                "other.mkt",
+                "service other { var o = 1; }\nservice app { var y = 2; }\nservice target { var t = 3; }\n",
+            ),
+        ],
+    )
+    .expect_err("an import of the root's service must not reach a disk module");
+    assert!(
+        error.contains("module 'helper'")
+            && error.contains("service 'target'")
+            && error.contains("a module it does not import"),
+        "unexpected error: {error}"
+    );
+}
+
+/// A module may not update a name it declares when `owner` attributes that
+/// name to a module that declared it first: the first declaration is the
+/// service, so the later declaration must not admit the update
+#[test]
+fn test_imports_refuse_a_modules_update_to_a_name_another_module_declared_first() {
+    let error = finalize_with_disk_module(
+        "disk_module_update_shadowed_declaration",
+        "import a\nimport b\nservice root { var r = 0; }",
+        &[
+            (
+                "a.mkt",
+                "service a { var x = 0; }\nservice shared { var s = 1; }\n",
+            ),
+            (
+                "b.mkt",
+                "service b { var v = 1; }\nservice shared { var s = 2; }\nupdate shared { pub def q = 1; }\n",
+            ),
+        ],
+    )
+    .expect_err("a re-declared name is not this module's to update");
+    assert!(
+        error.contains("module 'b'")
+            && error.contains("service 'shared'")
+            && error.contains("a module it does not import"),
+        "unexpected error: {error}"
+    );
+}
+
 /// The dependency pointing the right way stays allowed: a module may update
 /// its own services and the services of the modules it imports, at startup and
 /// inside an atomic block

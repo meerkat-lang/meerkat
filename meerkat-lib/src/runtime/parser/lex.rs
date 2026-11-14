@@ -245,6 +245,8 @@ pub enum Token<'a> {
     #[token("..")]
     DotDot,
 
+    // Both patterns need the same callback; Clippy mistakes it for a duplicate.
+    #[allow(clippy::duplicated_attributes)]
     #[regex(r"\s*", logos::skip)]
     #[regex(r#"(//)[^\n]*"#, logos::skip)] // Regex for a single line comment
     // Yes there is regex for this no I could not get it to work

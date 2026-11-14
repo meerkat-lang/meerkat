@@ -1,0 +1,8 @@
+import s1
+
+service LocationClient {}
+
+@test(LocationClient) {
+    do s1.a(s1.f(3));
+    assert(s1.y == 40);
+}

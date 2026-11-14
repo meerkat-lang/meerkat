@@ -354,6 +354,31 @@ with plain actions still loses `assert`'s parentheses and does not print
 - Not changed: `pub` is not enforced, and the owner still runs any statements
   an `ActionRequest` carries.
 
+## Tests
+
+Each claim of "What done means" is checked by the tests below.  Names are
+those of the functions.  `sf` is `meerkat-lib/tests/special_forms_test.rs`,
+`el` is `meerkat-lib/tests/execution_location_test.rs`, `ibn` is
+`meerkat-lib/tests/invoke_by_name_test.rs`, `mgr` is the unit tests of
+`meerkat-lib/src/runtime/manager/mod.rs`, and `mkn` is a multi-node scenario
+of `scripts/test_mkn.py`, run on real processes.
+
+| # | Claim | Tests |
+|---|---|---|
+| 1 | Declared at the top level of a service, parameter list possibly empty | sf: `test_parse_def_forms` (including `def now() = y;`), `test_parse_action_forms` (including `action reset()`), `test_parse_rejects_bare_parameter_name`, `test_parse_desugars_to_the_fn_member`, `test_parameter_named_like_member_is_rejected`, `test_forwarded_update_text_round_trips` (special forms declared in an update keep their marks) |
+| 2 | Usable only with a call | sf: `test_special_form_without_call_is_rejected`, `test_bare_special_form_as_value_is_rejected`, `test_special_form_calls_are_accepted`, `test_local_shadows_special_form`, `test_update_to_special_form_is_rejected_while_used_as_value` |
+| 3 | A call by running code runs at the owner, with no lookup of the member or of what it reads | el: `a_call_in_an_action_is_one_request_with_the_arguments`, `a_call_in_a_test_statement_carries_no_transaction`, `do_of_a_special_action_is_one_action_request`, `a_zero_parameter_action_sends_an_empty_environment`, `the_bare_name_in_a_test_block_is_sent_by_name`, `a_special_def_returning_an_action_goes_through_the_owner`, `a_member_reply_is_applied_by_the_caller` and `an_argument_with_no_wire_form_falls_back_to_a_lookup` (the owner or the arguments do not allow a call), `an_html_argument_takes_the_fetch_path`; the scope, computing a def and creating a service: `recomputing_a_def_sends_no_request`, `creating_a_service_sends_plain_lookups`; ibn, the zero-argument precursor (`do s.a` of a plain action-literal member is sent by name): `do_on_a_remote_member_sends_no_lookup`, and where the old path is kept: `do_on_a_bound_remote_member_keeps_the_old_path`, `do_on_a_forwarding_member_keeps_the_old_path`; the owner's side, mgr: `a_call_of_a_special_def_under_a_transaction_is_called`, `a_call_outside_a_transaction_has_no_clock`, `anything_else_is_a_plain_lookup`, `the_owner_checks_the_number_of_arguments`, `the_owner_refuses_bad_arguments_only_for_a_call`, `a_parked_call_keeps_its_arguments`, `the_reply_of_a_call_outside_a_transaction_has_no_clock`, `a_call_of_a_special_action_is_called`, `a_plain_member_with_arguments_under_a_transaction_is_a_lookup`, `member_decl_takes_the_last_declaration`, `member_decl_follows_a_code_update` |
+| 4 | Execution returns to the caller, with the result of a def | el: `a_call_against_a_real_owner_is_one_round_trip` (the caller stores the result and commits), `the_wiki_example_against_a_real_owner_takes_two_requests`; mkn: `location_special_forms` (the caller passes the result of `f` on to `a`, on real processes) |
+| 5 | Same results as the `fn` spelling | sf: `test_special_forms_run_like_their_fn_spelling`, `test_special_forms_have_the_type_of_their_fn_spelling`, `test_special_forms_are_type_checked`; el: `an_owner_with_the_fn_spelling_gives_the_same_result`; mkn: `location_special_forms` and `location_fn_spelling`, which end in the same state (`s1.y == 40`) |
+| 6 | Client code may be the same for both | el: `an_owner_with_the_fn_spelling_gives_the_same_result` (one caller program, both owners); mkn: `location_special_forms` and `location_fn_spelling` use the one file `scripts/tests/integration/location/client.mkt` |
+| 7 | `s1.a(s1.f(3))` takes two round trips instead of four | el: `the_wiki_example_takes_two_requests`, `the_wiki_example_against_a_real_owner_takes_two_requests`, `the_fn_spelling_takes_four_requests` |
+
+Not covered by a test: a call made by a REPL statement or by a code
+update's `var` initializer (claim 3 lists both) has no test of its own,
+though both reach the same evaluator call gate as an action.  The
+multi-node scenarios check the end state, not the number of requests, which
+the in-process tests count.
+
 ## Open questions
 
 - **Calls inside defs.**  Should the owner maintain a def's calls (above)?

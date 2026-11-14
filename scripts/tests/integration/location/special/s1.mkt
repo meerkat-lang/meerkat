@@ -1,0 +1,7 @@
+service s1 {
+    var y = 5;
+    pub def f(x: int) = x + y;
+    pub action a(x: int) {
+        y = y * x;
+    }
+}

@@ -553,6 +553,8 @@ def integration_tests():
         ("diamond_topology",          make_mkn_test(f"{IDIR}/imports/diamond/diamond.json")),
         ("dense_mesh",                make_mkn_test(f"{IDIR}/imports/dense_mesh/dense_mesh.json")),
         ("action_cross_node",         make_mkn_test(f"{IDIR}/imports/action/action.json")),
+        ("location_special_forms",    make_mkn_test(f"{IDIR}/location/special.json")),
+        ("location_fn_spelling",      make_mkn_test(f"{IDIR}/location/fn.json")),
         ("file_imports",              make_mkn_test(f"{IDIR}/imports/file_imports/file_imports.json")),
         ("mixed_imports",             make_mkn_test(f"{IDIR}/imports/mixed_imports/mixed_imports.json")),
         ("server_file_imports",       make_mkn_test(f"{IDIR}/imports/server_file_imports/server_file_imports.json")),

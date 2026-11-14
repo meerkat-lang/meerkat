@@ -1,0 +1,22 @@
+{
+  "settings": {
+    "startup_timeout": 60.0,
+    "monitor_poll_interval": 0.25,
+    "terminate_timeout": 5.0
+  },
+  "nodes": [
+    {
+      "alias": "s1",
+      "type": "server",
+      "file": "scripts/tests/integration/location/fn/s1.mkt",
+      "port": 9520
+    },
+    {
+      "alias": "location_client",
+      "type": "client",
+      "file": "scripts/tests/integration/location/client.mkt",
+      "timeout": 45,
+      "imports": ["s1.s1"]
+    }
+  ]
+}

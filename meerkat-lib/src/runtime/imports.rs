@@ -469,9 +469,9 @@ impl<'a> Imports<'a> {
         // anything it imports, directly or transitively: startup creates those
         // first. It may not target a service declared by the root program or
         // by a module that imports it -- an imported module starts before its
-        // importer, so that service does not exist yet -- which today fails at
-        // startup with a message about a service not being found. Refuse the
-        // reversed update here, before anything runs.
+        // importer, so that service does not exist yet. Refuse that here, before
+        // anything runs, and name the module and service so the error points at
+        // the dependency that is the wrong way round.
         //
         // Only a disk module's updates need this: a peer module's updates are
         // folded into its declarations further down. Collect the targets first
@@ -510,8 +510,9 @@ impl<'a> Imports<'a> {
             }
             let mut allowed: HashSet<Symbol> = module.declares.iter().copied().collect();
             for dep in &reach[idx] {
-                // A declaration owned locally is not the peer's to lend: this
-                // node serves its own, and its startup order is what it is.
+                // Only declarations `owner` attributes to this dependency count:
+                // a peer module that re-declares a name the root program owns
+                // does not make that name the dependency's to lend.
                 for svc in &self.modules[*dep].declares {
                     if owner.get(svc) == Some(dep) {
                         allowed.insert(*svc);
@@ -519,16 +520,20 @@ impl<'a> Imports<'a> {
                 }
             }
             for target in &disk_targets[idx] {
-                if allowed.contains(target) {
-                    continue;
-                }
                 let target = *target;
                 let module_name = self.interner.get(module.name);
                 let service = self.interner.get(target);
+                // The root program's declaration wins over any module's, so a
+                // name it declares belongs to the root's service even when this
+                // module declares the same name itself: that declaration must
+                // not put the target in `allowed`.
                 if self.root_declares.contains(&target) {
                     return Err(Error::Message(format!(
                         "module '{module_name}' updates service '{service}', which is declared by the importing program"
                     )));
+                }
+                if allowed.contains(&target) {
+                    continue;
                 }
                 let Some(&declared_by) = owner.get(&target) else {
                     // Nobody here declares it: the static checks own that

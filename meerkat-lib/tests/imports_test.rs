@@ -966,8 +966,8 @@ fn test_imports_refuse_a_peers_update_to_a_local_service() {
     .expect("a peer's update to its own service is folded");
 }
 
-/// Resolve a program that imports `main_imports` from disk with the given
-/// files written in its directory, and return what `finalize` reports
+/// Resolve the given program with the given files written in its directory,
+/// and return what `finalize` reports
 fn finalize_with_disk_module(
     label: &str,
     program: &str,
@@ -992,24 +992,68 @@ fn finalize_with_disk_module(
 /// dependency. Refuse it at import resolution, naming the module and service
 #[test]
 fn test_imports_refuse_a_modules_update_to_its_importers_service() {
-    for (label, update) in [
-        ("disk_module_updates_root", "update app { pub def z = 1; }"),
+    for (label, helper) in [
+        (
+            "disk_module_updates_root",
+            "service helper { var v = 1; }\nupdate app { pub def z = 1; }\n",
+        ),
         (
             "disk_module_updates_root_atomically",
-            "atomic {\n    update app { pub def z = 1; }\n}",
+            "service helper { var v = 1; }\natomic {\n    update app { pub def z = 1; }\n}\n",
+        ),
+        // Declaring the root's service name does not make it this module's to
+        // update: the root's declaration wins, so the name is the root's
+        (
+            "disk_module_updates_root_it_also_declares",
+            "service helper { var v = 1; }\nservice app { var y = 1; }\nupdate app { pub def z = 1; }\n",
         ),
     ] {
-        let helper = format!("service helper {{ var v = 1; }}\n{update}\n");
         let error = finalize_with_disk_module(
             label,
             "import helper\nservice app { var x = 0; }",
-            &[("helper.mkt", helper.as_str())],
+            &[("helper.mkt", helper)],
         )
         .expect_err("a module's update to the importing program's service must be refused");
         assert!(
             error.contains("module 'helper'")
                 && error.contains("service 'app'")
                 && error.contains("importing program"),
+            "unexpected error for {label}: {error}"
+        );
+    }
+}
+
+/// A module may not update a service declared by a sibling it does not import
+/// either: nothing creates that service before the module's own startup. The
+/// answer must not depend on the order the programs imports the two modules in
+#[test]
+fn test_imports_refuse_a_modules_update_to_a_sibling_service() {
+    for (label, program) in [
+        (
+            "sibling_update_imports_a_then_b",
+            "import a\nimport b\nservice root { var r = 0; }",
+        ),
+        (
+            "sibling_update_imports_b_then_a",
+            "import b\nimport a\nservice root { var r = 0; }",
+        ),
+    ] {
+        let error = finalize_with_disk_module(
+            label,
+            program,
+            &[
+                ("a.mkt", "service a { var x = 0; }\n"),
+                (
+                    "b.mkt",
+                    "service b { var v = 1; }\nupdate a { pub def z = 1; }\n",
+                ),
+            ],
+        )
+        .expect_err("a module's update to a sibling it does not import must be refused");
+        assert!(
+            error.contains("module 'b'")
+                && error.contains("service 'a'")
+                && error.contains("a module it does not import"),
             "unexpected error for {label}: {error}"
         );
     }

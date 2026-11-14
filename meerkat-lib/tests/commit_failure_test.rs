@@ -110,6 +110,7 @@ async fn refuse_commits(net: &mut NetworkActor, reason: &str, got_commit: &Cell<
                         value,
                         clock: Some(Vec::new()),
                         sources: Some(vec![("rc".into(), "cv".into())]),
+                        called: false,
                     };
                     reply(net, &reply_to, msg).await;
                 }
@@ -318,6 +319,7 @@ async fn test_participant_reports_a_failed_commit_forward_and_still_propagates()
         reply_to: String::new(),
         service: mid,
         member: mv,
+        args: None,
         tid: TxnId::new(m.node_id),
     };
     m.park_request_key(key.clone(), waiter);

@@ -121,6 +121,13 @@ pub enum MeerkatMessage {
         /// until `commit`/`abort`
         /// When `None`, it is a plain unlocked read
         txn_id: Option<TxnId>,
+        /// The arguments of a call: when `Some` and the member is a special
+        /// form (`def f(..)`, `action a(..)`) in the owner's program, the
+        /// owner calls it with them and replies with the result. Any other
+        /// member is answered as a plain lookup, so a peer built before this
+        /// field existed (which ignores it) still gets a usable reply
+        #[serde(default)]
+        args: Option<Vec<NetValue>>,
     },
 
     /// Response to a `LookupRequest` with the serialized value
@@ -131,6 +138,11 @@ pub enum MeerkatMessage {
         /// or a reply from a peer that does not provide clocks.
         clock: Option<Vec<ClockEntry>>,
         sources: Option<Vec<(String, String)>>,
+        /// The owner ran the call the request carried arguments for, and
+        /// `value` is its result. When false `value` is the member itself,
+        /// which the caller applies locally
+        #[serde(default)]
+        called: bool,
     },
 
     /// Response indicating lookup failed

@@ -1366,6 +1366,7 @@ mod tests {
             reply_to: String::new(),
             service,
             member,
+            args: None,
             tid: TxnId::new(manager.node_id),
         }
     }
@@ -1462,6 +1463,7 @@ mod tests {
             reply_to: String::new(),
             service: foo,
             member: x,
+            args: None,
             tid: mine,
         };
         manager.run_and_reply_or_park(read).await;

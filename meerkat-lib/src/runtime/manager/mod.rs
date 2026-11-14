@@ -1,4 +1,4 @@
-use super::ast::{ActionStmt, Decl, Expr, Stmt, Value};
+use super::ast::{ActionStmt, Decl, DefForm, Expr, Stmt, Value};
 use super::graphs::{
     analysis::service_declarations,
     effects::{self, Effects},
@@ -290,6 +290,9 @@ pub enum ParkedRequest {
         reply_to: String,
         service: Symbol,
         member: Symbol,
+        /// The arguments of a call, kept so a parked call runs again with
+        /// them when the lock it waits on is released
+        args: Option<Vec<Value>>,
         tid: TxnId,
     },
     Lock {
@@ -314,6 +317,24 @@ impl ParkedRequest {
 
 /// An applied code update awaiting the first values of its new defs.
 type Completing = (u64, String, Vec<(Symbol, Symbol)>, web_time::Instant);
+
+/// One request id for every lookup and call: replies are routed by id alone,
+/// so a late reply to a timed-out lookup must not match a live call
+fn next_lookup_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    NEXT_ID.fetch_add(1, Ordering::SeqCst)
+}
+
+/// What a remote owner answered to a call of one of its members
+pub enum CallReply {
+    /// The owner ran the call (the member is a special form there): the
+    /// result
+    Called(Value),
+    /// The owner answered as for a plain lookup: the member itself, which the
+    /// caller applies to the arguments it sent
+    Member(Value),
+}
 
 pub struct Manager {
     pub services: HashMap<Symbol, Service>,
@@ -1338,6 +1359,16 @@ impl Manager {
             .flat_map(|decls| decls.iter())
             .rev()
             .find(|decl| decl.name() == member)
+    }
+
+    /// Whether `txn` is the transaction creating a service here: some local
+    /// service is initializing under it. It is recognised by the transaction,
+    /// not by the service an evaluation is running in, because applying a
+    /// closure switches that service to the closure's own.
+    pub(crate) fn is_creation_txn(&self, txn: &TxnId) -> bool {
+        self.services
+            .values()
+            .any(|s| s.initializing.as_ref() == Some(txn))
     }
 
     /// Initialization is private to its transaction, including cache reads.
@@ -2968,9 +2999,6 @@ impl Manager {
         member: Symbol,
         mut txn: Option<&mut Transaction>,
     ) -> Result<ReadEntry, EvalError> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-
         // Remote reads are always served by the owning node, which holds this
         // transaction's buffered writes and read locks. We deliberately do not
         // reuse a cached result on the requesting side: a def's value can change
@@ -2980,7 +3008,7 @@ impl Manager {
         // with the owner's buffered state. (Caching provably-immutable reads to
         // save round-trips could be a later optimization.)
         let addr = self.remote_addr(service)?;
-        let request_id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+        let request_id = next_lookup_id();
         let reply_to = self.local_reply_addr().await;
         let shared_tid = txn.as_ref().map(|t| t.id.clone());
 
@@ -2999,6 +3027,7 @@ impl Manager {
             member: self.interner.get(member).to_string(),
             reply_to,
             txn_id: shared_tid,
+            args: None,
         };
 
         let reply = self
@@ -3042,11 +3071,7 @@ impl Manager {
                     }
                     // Initialization keeps the pair: it stamps and seeds the
                     // def that read it
-                    if self
-                        .services
-                        .values()
-                        .any(|s| s.initializing.as_ref() == Some(&txn.id))
-                    {
+                    if self.is_creation_txn(&txn.id) {
                         let key = (self.service_net_id_for_name(service), member);
                         txn.read_cache.insert(key, entry.clone());
                     }
@@ -3081,22 +3106,248 @@ impl Manager {
         }
     }
 
+    /// Call a member of a remote service with `args`, and let its owner decide
+    /// whether to run the call. The request is a lookup that carries the
+    /// arguments: an owner whose declaration of the member is a special form
+    /// runs it and replies `Called(result)`; any other owner (or one built
+    /// before calls existed) replies with the member, which the caller applies
+    /// itself. Participants, timeout and errors are as for a lookup.
+    ///
+    /// The reply is never put in the transaction's read cache, which is keyed
+    /// by member: a result of `f(3)` is not `f`.
+    pub async fn remote_call(
+        &mut self,
+        service: Symbol,
+        member: Symbol,
+        args: Vec<Value>,
+        mut txn: Option<&mut Transaction>,
+    ) -> Result<CallReply, EvalError> {
+        // An argument with no wire form (html) cannot be sent, but the call
+        // can still be made: the member comes back and is applied here, as
+        // before calls ran on the owner. A special form and its `fn` spelling
+        // compute the same value.
+        let Ok(net_args) = args
+            .iter()
+            .map(|a| codec::encode_value(a, &self.interner))
+            .collect::<Result<Vec<_>, _>>()
+        else {
+            return self
+                .remote_lookup_with_clock(service, member, txn)
+                .await
+                .map(|(value, _, _)| CallReply::Member(value));
+        };
+
+        let addr = self.remote_addr(service)?;
+        let request_id = next_lookup_id();
+        let reply_to = self.local_reply_addr().await;
+        let shared_tid = txn.as_ref().map(|t| t.id.clone());
+
+        // As for a lookup: the owner may take locks under the shared id, so
+        // register it before sending, for an abort to reach it if the reply is
+        // lost
+        if shared_tid.is_some() {
+            if let Some(t) = txn.as_deref_mut() {
+                t.participants.insert(addr.clone());
+            }
+        }
+
+        let msg = MeerkatMessage::LookupRequest {
+            request_id,
+            service: self.interner.get(service).to_string(),
+            member: self.interner.get(member).to_string(),
+            reply_to,
+            txn_id: shared_tid,
+            args: Some(net_args),
+        };
+
+        let reply = self
+            .send_and_await_reply(
+                addr,
+                msg,
+                request_id,
+                format!(
+                    "Timeout waiting for remote call of '{}.{}'",
+                    self.interner.get(service),
+                    self.interner.get(member)
+                ),
+            )
+            .await?;
+
+        match reply {
+            MeerkatMessage::LookupResponse {
+                value,
+                clock,
+                called,
+                ..
+            } => {
+                let value = codec::decode_value(value, &mut self.interner)
+                    .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?;
+                let clock = clock
+                    .map(|clock| codec::clock_entry_to_vclock(clock, &mut self.interner))
+                    .transpose()
+                    .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?;
+                // What the owner read to compute the result reaches the commit
+                // stamp only through this clock, as for a lookup
+                if let (Some(txn), Some(clock)) = (txn, &clock) {
+                    txn.participant_history = join_clocks([&txn.participant_history, clock]);
+                }
+                Ok(if called {
+                    CallReply::Called(value)
+                } else {
+                    CallReply::Member(value)
+                })
+            }
+            MeerkatMessage::LookupError { error, .. } => Err(Self::remote_error(error)),
+            MeerkatMessage::Ping { .. }
+            | MeerkatMessage::Pong { .. }
+            | MeerkatMessage::Announce { .. }
+            | MeerkatMessage::Transaction { .. }
+            | MeerkatMessage::Propagation { .. }
+            | MeerkatMessage::LookupRequest { .. }
+            | MeerkatMessage::ActionRequest { .. }
+            | MeerkatMessage::ActionResponse { .. }
+            | MeerkatMessage::Commit { .. }
+            | MeerkatMessage::CommitResponse { .. }
+            | MeerkatMessage::Abort { .. }
+            | MeerkatMessage::AbortResponse { .. }
+            | MeerkatMessage::LockRequest { .. }
+            | MeerkatMessage::LockResponse { .. }
+            | MeerkatMessage::RequestUpdates { .. }
+            | MeerkatMessage::Update { .. }
+            | MeerkatMessage::ServiceCodeRequest { .. }
+            | MeerkatMessage::ServiceCodeResponse { .. }
+            | MeerkatMessage::ServiceCodeError { .. }
+            | MeerkatMessage::UpdateServiceRequest { .. }
+            | MeerkatMessage::UpdateServiceResponse { .. }
+            | MeerkatMessage::WaitParked { .. } => Err(EvalError::LocalDispatchFailed(
+                "Unexpected reply to call request".to_string(),
+            )),
+        }
+    }
+
+    /// Owner side: serve a request for `member` of the local `service`, which
+    /// is a call when `args` are given and the member is a special form in
+    /// this node's program, and a plain lookup otherwise. The flag is true
+    /// for a call, whose result is the value and, inside a transaction, whose
+    /// clock is the join of what the transaction has read here (what the body
+    /// read included). The owner's own declaration decides, so a caller with no
+    /// copy of it, or an old one, gets the right answer.
+    async fn lookup_or_call(
+        &mut self,
+        service: Symbol,
+        member: Symbol,
+        args: Option<Vec<Value>>,
+        mut txn: Option<&mut Transaction>,
+    ) -> Result<(ReadEntry, bool), EvalError> {
+        let Some(args) = args.filter(|_| self.is_special_form(service, member)) else {
+            let entry = self.lookup_with_clock(member, service, txn).await?;
+            return Ok((entry, false));
+        };
+        let params = match self.member_decl(service, member) {
+            Some(Decl::DefDecl {
+                val: Expr::Func { params, .. },
+                ..
+            }) => params.clone(),
+            _ => Vec::new(),
+        };
+        // No arguments also fit a single `unit` parameter, as in the type
+        // checker
+        let unit_param = matches!(
+            params.as_slice(),
+            [crate::runtime::tt::Param {
+                ty: Some(crate::runtime::tt::Type::Unit),
+                ..
+            }]
+        );
+        if args.len() != params.len() && !(args.is_empty() && unit_param) {
+            return Err(EvalError::RuntimeError(format!(
+                "'{}.{}' takes {} arguments, but the call has {}",
+                self.interner.get(service),
+                self.interner.get(member),
+                params.len(),
+                args.len()
+            )));
+        }
+        // The callee is a member access, which never consults the
+        // environment, so a member named like an argument cannot be shadowed
+        let names: Vec<Symbol> = (0..args.len())
+            .map(|i| self.interner.insert(&format!("__arg{i}")))
+            .collect();
+        let call = Expr::Call {
+            func: Box::new(Expr::MemberAccess {
+                service_name: service,
+                member_name: member,
+            }),
+            args: names.iter().map(|&name| Expr::Variable { name }).collect(),
+        };
+        let env: Vec<(Symbol, Value)> = names.into_iter().zip(args).collect();
+        let value = eval(
+            &call,
+            &env,
+            &mut EvalContext {
+                manager: self,
+                service_name: service,
+                txn: txn.as_deref_mut(),
+            },
+        )
+        .await?;
+        let clock = txn.map(|t| self.transaction_history(t).0);
+        Ok(((value, clock, None), true))
+    }
+
+    /// The arguments of a request, checked and decoded only for a call of a
+    /// special form. For any other member the request is a plain lookup,
+    /// which must not depend on them: a caller that sent arguments before
+    /// knowing the member's form is served as before.
+    fn call_args(
+        &mut self,
+        service: Symbol,
+        member: Symbol,
+        args: Option<Vec<NetValue>>,
+    ) -> Result<Option<Vec<Value>>, crate::error::Error> {
+        let Some(args) = args.filter(|_| self.is_special_form(service, member)) else {
+            return Ok(None);
+        };
+        codec::validate_call_args(args.len())?;
+        args.into_iter()
+            .map(|a| codec::decode_value(a, &mut self.interner))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some)
+    }
+
+    /// Whether `member` of the local `service` is declared as a special form
+    /// (`def f(..)` or `action a(..)`) in this node's program
+    fn is_special_form(&self, service: Symbol, member: Symbol) -> bool {
+        !self.remote_services.contains_key(&service)
+            && matches!(
+                self.member_decl(service, member),
+                Some(Decl::DefDecl {
+                    form: DefForm::Function | DefForm::Action,
+                    ..
+                })
+            )
+    }
+
     /// Participant side: serve a transactional remote read by acquiring and
     /// holding a read lock on the member under the shared transaction id (kept
     /// in pending_txns until commit/abort), accumulating into any state this
-    /// node already prepared for the same transaction.
+    /// node already prepared for the same transaction. With `args` it serves a
+    /// call of a special form instead (`lookup_or_call`), under the same
+    /// transaction: an expression cannot write, so a call parked by wait-die
+    /// needs no rollback before it runs again. The flag says it was a call.
     pub async fn remote_read_participant(
         &mut self,
         service: Symbol,
         member: Symbol,
+        args: Option<Vec<Value>>,
         tid: TxnId,
-    ) -> Result<ReadEntry, EvalError> {
+    ) -> Result<(ReadEntry, bool), EvalError> {
         let mut txn = self
             .pending_txns
             .remove(&tid)
             .unwrap_or_else(|| Transaction::new(tid.clone()));
         match self
-            .lookup_with_clock(member, service, Some(&mut txn))
+            .lookup_or_call(service, member, args, Some(&mut txn))
             .await
         {
             Ok(v) => {
@@ -3345,10 +3596,11 @@ impl Manager {
                 reply_to,
                 service,
                 member,
+                args,
                 tid,
             } => {
                 match self
-                    .remote_read_participant(service, member, tid.clone())
+                    .remote_read_participant(service, member, args.clone(), tid.clone())
                     .await
                 {
                     Err(EvalError::WaitOn(key)) => {
@@ -3359,6 +3611,7 @@ impl Manager {
                                 reply_to,
                                 service,
                                 member,
+                                args,
                                 tid,
                             },
                         );
@@ -3427,17 +3680,18 @@ impl Manager {
     fn lookup_reply(
         &self,
         request_id: u64,
-        result: Result<ReadEntry, EvalError>,
+        result: Result<(ReadEntry, bool), EvalError>,
     ) -> MeerkatMessage {
         result
             .map_err(|e| e.to_string())
-            .and_then(|(value, clock, sources)| {
+            .and_then(|((value, clock, sources), called)| {
                 Ok(MeerkatMessage::LookupResponse {
                     request_id,
                     value: codec::encode_value(&value, &self.interner)
                         .map_err(|e| e.to_string())?,
                     clock: clock.map(|clock| codec::encode_clock(&clock, &self.interner)),
                     sources: sources.map(|sources| codec::encode_sources(&sources, &self.interner)),
+                    called,
                 })
             })
             .unwrap_or_else(|error| MeerkatMessage::LookupError { request_id, error })
@@ -3470,6 +3724,7 @@ impl Manager {
                 member,
                 reply_to,
                 txn_id,
+                args,
             } => {
                 if let Err(e) = codec::validate_lookup_request(&service, &member) {
                     let response = MeerkatMessage::LookupError {
@@ -3481,6 +3736,18 @@ impl Manager {
                 }
                 let svc_sym = self.interner.insert(&service);
                 let mem_sym = self.interner.insert(&member);
+                let args = self.call_args(svc_sym, mem_sym, args);
+                let args = match args {
+                    Ok(args) => args,
+                    Err(e) => {
+                        let response = MeerkatMessage::LookupError {
+                            request_id,
+                            error: e.to_string(),
+                        };
+                        self.send_oneway(Address::new(&reply_to), response).await;
+                        return None;
+                    }
+                };
                 match txn_id {
                     // Transactional read: park if older than a holder
                     Some(tid) => {
@@ -3489,13 +3756,14 @@ impl Manager {
                             reply_to,
                             service: svc_sym,
                             member: mem_sym,
+                            args,
                             tid,
                         })
                         .await;
                     }
                     // Plain unlocked read: reply immediately
                     None => {
-                        let result = self.lookup_with_clock(mem_sym, svc_sym, None).await;
+                        let result = self.lookup_or_call(svc_sym, mem_sym, args, None).await;
                         let response = self.lookup_reply(request_id, result);
                         self.send_oneway(Address::new(&reply_to), response).await;
                     }
@@ -6705,7 +6973,7 @@ mod tests {
         let younger = TxnId::new(tc.manager.node_id);
         let err = tc
             .manager
-            .remote_read_participant(tc.foo, tc.x, younger)
+            .remote_read_participant(tc.foo, tc.x, None, younger)
             .await
             .expect_err("a younger transaction must die against an older holder");
         assert!(matches!(err, EvalError::WaitDieAbort(_)));
@@ -7419,6 +7687,7 @@ mod tests {
             reply_to: String::new(),
             service: tc.foo,
             member,
+            args: None,
             tid: TxnId::new(tc.manager.node_id),
         }
     }
@@ -7811,5 +8080,234 @@ mod tests {
         assert_eq!(manager.services[&s].vars[&a].vector_clock, clock);
         assert_eq!(manager.services[&s].vars[&b].value, Value::Int { val: 8 });
         assert_eq!(manager.services[&s].vars[&b].vector_clock, clock);
+    }
+
+    // Stage B of issue #20, the owner's side of a call: a lookup that carries
+    // arguments runs the member if it is a special form in this node's
+    // program, and is a plain lookup otherwise.
+
+    const CALL_OWNER: &str = "service s {
+        var y = 5;
+        var z = 7;
+        pub def f(x: int) = x + y;
+        pub def g = fn (x: int) => x + z;
+        pub def u(p: unit) = y;
+        pub def zero() = y;
+        pub action a(n: int) { y = n; }
+    }";
+
+    fn txn_at(timestamp: u128) -> TxnId {
+        TxnId {
+            timestamp,
+            node_id: 1,
+            iteration: 0,
+        }
+    }
+
+    fn int_args(vals: &[i32]) -> Option<Vec<Value>> {
+        Some(vals.iter().map(|&val| Value::Int { val }).collect())
+    }
+
+    // A call of a special def under a transaction returns the result with
+    // `called` set, and its reply clock covers the clock of what the body read
+    #[tokio::test]
+    async fn a_call_of_a_special_def_under_a_transaction_is_called() {
+        let mut m = start_local_manager(CALL_OWNER).await;
+        let [s, y, f] = ["s", "y", "f"].map(|n| m.interner.insert(n));
+        // Give `y` a clock to dominate
+        m.assign(s, y, Value::Int { val: 6 }, None).await.unwrap();
+        let y_clock = m.services[&s].vars[&y].vector_clock.clone();
+        assert!(!y_clock.is_empty());
+
+        let tid = txn_at(1);
+        let result = m
+            .remote_read_participant(s, f, int_args(&[3]), tid.clone())
+            .await;
+        let (entry, called) = result.unwrap();
+        let reply = m.lookup_reply(7, Ok((entry.clone(), called)));
+        let (value, clock, _) = entry;
+        assert!(called);
+        assert_eq!(value, Value::Int { val: 9 });
+        let clock = clock.expect("a call under a transaction replies with its clock");
+        for (dimension, counter) in &y_clock {
+            assert!(
+                clock.get(dimension).is_some_and(|c| c >= counter),
+                "the reply clock {clock:?} must dominate y's clock {y_clock:?}"
+            );
+        }
+        // What the body read is held under the transaction
+        assert!(matches!(
+            m.services[&s].vars[&y].lock,
+            crate::runtime::txn::VarLock::ReadLocked(_)
+        ));
+        assert!(matches!(
+            reply,
+            MeerkatMessage::LookupResponse {
+                called: true,
+                clock: Some(_),
+                ..
+            }
+        ));
+    }
+
+    // Outside a transaction the call is a plain unlocked read: no clock
+    #[tokio::test]
+    async fn a_call_outside_a_transaction_has_no_clock() {
+        let mut m = start_local_manager(CALL_OWNER).await;
+        let [s, f] = ["s", "f"].map(|n| m.interner.insert(n));
+        let (entry, called) = m.lookup_or_call(s, f, int_args(&[3]), None).await.unwrap();
+        assert!(called);
+        assert_eq!(entry, (Value::Int { val: 8 }, None, None));
+    }
+
+    // A plain def, or a request without arguments, is today's lookup
+    #[tokio::test]
+    async fn anything_else_is_a_plain_lookup() {
+        let mut m = start_local_manager(CALL_OWNER).await;
+        let [s, f, g] = ["s", "f", "g"].map(|n| m.interner.insert(n));
+        let ((value, _, _), called) = m.lookup_or_call(s, g, int_args(&[3]), None).await.unwrap();
+        assert!(!called, "a plain function member is answered as a lookup");
+        assert!(matches!(value, Value::Closure { .. }));
+        let ((value, _, _), called) = m.lookup_or_call(s, f, None, None).await.unwrap();
+        assert!(!called, "a request without arguments is a lookup");
+        assert!(matches!(value, Value::Closure { .. }));
+    }
+
+    // The number of arguments is checked against the parameters; none is
+    // accepted for a single `unit` parameter, and for an empty list
+    #[tokio::test]
+    async fn the_owner_checks_the_number_of_arguments() {
+        let mut m = start_local_manager(CALL_OWNER).await;
+        let [s, f, u, zero] = ["s", "f", "u", "zero"].map(|n| m.interner.insert(n));
+        for args in [int_args(&[]), int_args(&[1, 2])] {
+            let err = m
+                .lookup_or_call(s, f, args, None)
+                .await
+                .expect_err("a wrong number of arguments must fail");
+            let text = err.to_string();
+            assert!(
+                text.contains("s.f") && text.contains("takes 1") && text.contains("has "),
+                "the error must name the member and both counts, got: {text}"
+            );
+        }
+        let ((value, _, _), called) = m.lookup_or_call(s, u, int_args(&[]), None).await.unwrap();
+        assert!(called);
+        assert_eq!(value, Value::Int { val: 5 });
+        let ((value, _, _), called) = m
+            .lookup_or_call(s, zero, int_args(&[]), None)
+            .await
+            .unwrap();
+        assert!(called);
+        assert_eq!(value, Value::Int { val: 5 });
+        assert!(m
+            .lookup_or_call(s, zero, int_args(&[1]), None)
+            .await
+            .is_err());
+    }
+
+    // A call that waits on a lock held by a younger transaction is parked with
+    // its arguments, and runs again with them when the lock is released
+    #[tokio::test]
+    async fn a_parked_call_keeps_its_arguments() {
+        let mut m = start_local_manager(CALL_OWNER).await;
+        let [s, y, f] = ["s", "y", "f"].map(|n| m.interner.insert(n));
+        let (older, younger) = (txn_at(1), txn_at(5));
+        let mut holder = Transaction::new(younger);
+        m.assign(s, y, Value::Int { val: 6 }, Some(&mut holder))
+            .await
+            .unwrap();
+
+        m.run_and_reply_or_park(ParkedRequest::Lookup {
+            request_id: 1,
+            reply_to: String::new(),
+            service: s,
+            member: f,
+            args: int_args(&[3]),
+            tid: older.clone(),
+        })
+        .await;
+        let parked: Vec<_> = m.wait_queue.values().flatten().collect();
+        assert_eq!(parked.len(), 1, "the call must wait for the lock on y");
+        assert!(matches!(
+            parked[0],
+            ParkedRequest::Lookup { args, .. } if *args == int_args(&[3])
+        ));
+
+        m.discard_failed_participant_txn(holder).await;
+        m.wake_freed().await;
+        assert!(m.wait_queue.is_empty(), "the call must have run again");
+        assert!(
+            m.pending_txns[&older]
+                .read_cache
+                .contains_key(&(m.service_net_id_for_name(s), y)),
+            "the rerun call must hold its read of y"
+        );
+    }
+
+    // A call outside a transaction replies with `called` and no clock
+    #[tokio::test]
+    async fn the_reply_of_a_call_outside_a_transaction_has_no_clock() {
+        let mut m = start_local_manager(CALL_OWNER).await;
+        let [s, f] = ["s", "f"].map(|n| m.interner.insert(n));
+        let result = m.lookup_or_call(s, f, int_args(&[3]), None).await;
+        assert!(matches!(
+            m.lookup_reply(7, result),
+            MeerkatMessage::LookupResponse {
+                called: true,
+                clock: None,
+                ..
+            }
+        ));
+    }
+
+    // A call of a special action returns the action, run by the caller
+    #[tokio::test]
+    async fn a_call_of_a_special_action_is_called() {
+        let mut m = start_local_manager(CALL_OWNER).await;
+        let [s, a] = ["s", "a"].map(|n| m.interner.insert(n));
+        let ((value, _, _), called) = m.lookup_or_call(s, a, int_args(&[4]), None).await.unwrap();
+        assert!(called);
+        assert!(matches!(value, Value::ActionClosure { .. }));
+    }
+
+    // A plain function member with arguments, under a transaction, is a
+    // lookup that read-locks the member
+    #[tokio::test]
+    async fn a_plain_member_with_arguments_under_a_transaction_is_a_lookup() {
+        let mut m = start_local_manager(CALL_OWNER).await;
+        let [s, g] = ["s", "g"].map(|n| m.interner.insert(n));
+        let tid = txn_at(1);
+        let ((value, _, _), called) = m
+            .remote_read_participant(s, g, int_args(&[3]), tid.clone())
+            .await
+            .unwrap();
+        assert!(!called);
+        assert!(matches!(value, Value::Closure { .. }));
+        assert!(m.pending_txns[&tid]
+            .read_cache
+            .contains_key(&(m.service_net_id_for_name(s), g)));
+    }
+
+    // More than the maximum number of arguments, or one that cannot be
+    // decoded, fails a call; a plain member is served whatever they are
+    #[tokio::test]
+    async fn the_owner_refuses_bad_arguments_only_for_a_call() {
+        let mut m = start_local_manager(CALL_OWNER).await;
+        let [s, f, g] = ["s", "f", "g"].map(|n| m.interner.insert(n));
+        let many = || Some(vec![NetValue::Int { val: 1 }; 65]);
+        let bad = || {
+            Some(vec![NetValue::String {
+                val: "x".repeat(10_000),
+            }])
+        };
+        assert!(m.call_args(s, f, many()).is_err());
+        assert!(m.call_args(s, f, bad()).is_err());
+        assert!(m.call_args(s, g, many()).unwrap().is_none());
+        assert!(m.call_args(s, g, bad()).unwrap().is_none());
+        assert_eq!(
+            m.call_args(s, f, Some(vec![NetValue::Int { val: 3 }]))
+                .unwrap(),
+            int_args(&[3])
+        );
     }
 }

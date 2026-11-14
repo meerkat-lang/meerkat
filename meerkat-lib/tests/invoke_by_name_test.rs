@@ -72,6 +72,7 @@ async fn stand_in_rc(net: &mut NetworkActor, rc_addr: &Address, log: &RefCell<Ve
                         value,
                         clock: Some(Vec::new()),
                         sources: Some(Vec::new()),
+                        called: false,
                     };
                     reply(net, &reply_to, msg).await;
                 }

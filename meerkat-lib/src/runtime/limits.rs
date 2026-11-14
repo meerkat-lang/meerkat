@@ -75,6 +75,11 @@ pub const MAX_NET_CLOCK_ENTRIES: usize = 8192;
 /// maximum keeps every counter from ever overflowing
 pub const MAX_NET_CLOCK_COUNTER: u64 = u64::MAX / 2;
 
+/// Maximum number of arguments accepted in a call carried by a lookup request
+/// from the network. Each argument is decoded into a value, so the count is
+/// bounded before any of them is
+pub const MAX_NET_CALL_ARGS: usize = 64;
+
 /// Maximum number of services allowed to be imported
 pub const MAX_IMPORTED_SERVICES: usize = 256;
 

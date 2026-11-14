@@ -148,6 +148,7 @@ async fn serve_rc(rc_net: &mut NetworkActor) {
                         value,
                         clock: Some(clock),
                         sources: Some(vec![("rc".into(), "cv".into())]),
+                        called: false,
                     };
                     reply(rc_net, &reply_to, msg).await;
                 }

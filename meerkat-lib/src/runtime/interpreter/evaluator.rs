@@ -1,6 +1,7 @@
 use crate::ast::{BinOp, Expr, UnOp, Value};
 use crate::runtime::graphs::free_var::free_var;
 use crate::runtime::interner::Symbol;
+use crate::runtime::manager::CallReply;
 use crate::runtime::txn::{Transaction, WaitKey};
 use crate::runtime::Manager;
 use std::collections::{HashMap, HashSet};
@@ -103,6 +104,64 @@ async fn lookup_input(
         .await
 }
 
+/// The member `(service, member)` a call names, if its function is a member
+/// access, or a variable no local binding shadows (a member of the service
+/// running the code)
+fn call_target(
+    func: &Expr,
+    env: &[(Symbol, Value)],
+    service_name: Symbol,
+) -> Option<(Symbol, Symbol)> {
+    match *func {
+        Expr::MemberAccess {
+            service_name,
+            member_name,
+        } => Some((service_name, member_name)),
+        Expr::Variable { name } if !env.iter().any(|(bound, _)| *bound == name) => {
+            Some((service_name, name))
+        }
+        _ => None,
+    }
+}
+
+/// Apply a function value to already evaluated arguments, in the service the
+/// closure belongs to
+async fn apply_function(
+    func_val: Value,
+    arg_vals: Vec<Value>,
+    ctx: &mut EvalContext<'_>,
+    inputs: Option<&HashMap<(Symbol, Symbol), Value>>,
+) -> Result<Value, EvalError> {
+    match func_val {
+        Value::Closure {
+            params,
+            body,
+            env: closure_env,
+            service_name: closure_svc,
+            ..
+        } => {
+            let mut new_env = closure_env.clone();
+            for (param, arg_val) in params.iter().zip(arg_vals) {
+                new_env.push((param.name, arg_val));
+            }
+            eval_with_inputs(
+                &body,
+                &new_env,
+                &mut EvalContext {
+                    manager: ctx.manager,
+                    service_name: closure_svc,
+                    txn: ctx.txn.as_deref_mut(),
+                },
+                inputs,
+            )
+            .await
+        }
+        _ => Err(EvalError::TypeError(
+            "Attempting to call a non-function value".to_string(),
+        )),
+    }
+}
+
 // async_recursion adds a bare #[must_use] to a fn that returns a boxed Future.
 #[allow(clippy::double_must_use)]
 #[async_recursion::async_recursion]
@@ -133,39 +192,44 @@ pub(crate) async fn eval_with_inputs(
         }
 
         Expr::Call { func, args } => {
+            // A call of a member of a remote service goes to its owner, which
+            // runs it if the member is a special form and otherwise answers
+            // with the member (rule 5 of the execution-location design). The
+            // arguments are evaluated first, as below. Reevaluating a def
+            // from pushed inputs never calls out, and nor does creating a
+            // service, whose reads seed the new service's graphs: the
+            // transaction tells, not `ctx.service_name`, which applying a
+            // closure changes.
+            if inputs.is_none() {
+                if let Some((svc, member)) = call_target(func, env, ctx.service_name) {
+                    let creating = ctx
+                        .txn
+                        .as_deref()
+                        .is_some_and(|t| ctx.manager.is_creation_txn(&t.id));
+                    if ctx.manager.remote_services.contains_key(&svc) && !creating {
+                        let mut arg_vals = Vec::new();
+                        for arg in args {
+                            arg_vals.push(eval_with_inputs(arg, env, ctx, inputs).await?);
+                        }
+                        let reply = ctx
+                            .manager
+                            .remote_call(svc, member, arg_vals.clone(), ctx.txn.as_deref_mut())
+                            .await?;
+                        return match reply {
+                            CallReply::Called(value) => Ok(value),
+                            CallReply::Member(func_val) => {
+                                apply_function(func_val, arg_vals, ctx, inputs).await
+                            }
+                        };
+                    }
+                }
+            }
             let func_val = eval_with_inputs(func, env, ctx, inputs).await?;
             let mut arg_vals = Vec::new();
             for arg in args {
                 arg_vals.push(eval_with_inputs(arg, env, ctx, inputs).await?);
             }
-            match func_val {
-                Value::Closure {
-                    params,
-                    body,
-                    env: closure_env,
-                    service_name: closure_svc,
-                    ..
-                } => {
-                    let mut new_env = closure_env.clone();
-                    for (param, arg_val) in params.iter().zip(arg_vals) {
-                        new_env.push((param.name, arg_val));
-                    }
-                    eval_with_inputs(
-                        &body,
-                        &new_env,
-                        &mut EvalContext {
-                            manager: ctx.manager,
-                            service_name: closure_svc,
-                            txn: ctx.txn.as_deref_mut(),
-                        },
-                        inputs,
-                    )
-                    .await
-                }
-                _ => Err(EvalError::TypeError(
-                    "Attempting to call a non-function value".to_string(),
-                )),
-            }
+            apply_function(func_val, arg_vals, ctx, inputs).await
         }
 
         &Expr::Variable { name } => {

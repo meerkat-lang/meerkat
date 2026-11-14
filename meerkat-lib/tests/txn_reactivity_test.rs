@@ -273,11 +273,11 @@ async fn test_participant_transactional_read_sees_buffered_def() {
     // The derived member, read under the shared transaction id, reflects the
     // participant's own uncommitted write.
     let seen = m
-        .remote_read_participant(svc, y, tid.clone())
+        .remote_read_participant(svc, y, None, tid.clone())
         .await
         .unwrap();
     assert_eq!(
-        seen.0,
+        seen.0 .0,
         Value::Int { val: 2 },
         "a transactional remote read must see the participant's buffered write through a def"
     );

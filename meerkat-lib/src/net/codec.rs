@@ -13,7 +13,7 @@ use crate::net::ClockEntry;
 use crate::runtime::ast::{ActionStmt, BinOp, Expr, Field, TableType, UnOp, Value};
 use crate::runtime::interner::{Interner, Symbol};
 use crate::runtime::limits::{
-    MAX_IDENTIFIER_LENGTH, MAX_NET_CLOCK_COUNTER, MAX_NET_CLOCK_ENTRIES,
+    MAX_IDENTIFIER_LENGTH, MAX_NET_CALL_ARGS, MAX_NET_CLOCK_COUNTER, MAX_NET_CLOCK_ENTRIES,
     MAX_NET_REQUEST_SOURCE_LENGTH, MAX_NET_REQUEST_STRING_LENGTH, MAX_NET_SOURCE_PAIRS,
     MAX_STRING_LITERAL_LENGTH, MAX_TYPE_DEPTH,
 };
@@ -145,6 +145,29 @@ pub fn decode_update_service_request(
 pub fn validate_lookup_request(service: &str, member: &str) -> Result<()> {
     validate_identifier(service)?;
     validate_identifier(member)?;
+    Ok(())
+}
+
+/// Validate the arguments a `LookupRequest` arriving over the wire carries
+///
+/// Only their number is checked here, before any is decoded; each value is
+/// validated by `decode_value`.
+///
+/// Args:
+///     count (usize): Number of arguments in the request
+///
+/// Returns:
+///     Result<()>: Ok if valid, or an error if there are too many
+///
+/// Raises:
+///     Error::LimitExceeded: If the count exceeds `MAX_NET_CALL_ARGS`
+pub fn validate_call_args(count: usize) -> Result<()> {
+    if count > MAX_NET_CALL_ARGS {
+        return Err(Error::LimitExceeded(format!(
+            "call carries {} arguments, more than the maximum of {}",
+            count, MAX_NET_CALL_ARGS
+        )));
+    }
     Ok(())
 }
 

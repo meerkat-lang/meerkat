@@ -1377,8 +1377,12 @@ impl Manager {
     /// declaration in place and appends new members, and a remote service
     /// imported more than once can appear in several `Stmt::Service`
     /// statements. The last match is taken so the answer does not depend on
-    /// which copy is found first. It scans the whole program, so it is meant
-    /// for remote services, where that costs nothing next to a round trip.
+    /// which copy is found first.
+    /// It scans the whole program. A caller reads it once per call or `do` of
+    /// a member of a remote service, and the owner once when it decodes a
+    /// call's arguments and once each time it runs a call or a by-name `do`;
+    /// each of these is a round trip, next to which a scan costs nothing. A
+    /// plain lookup never reads it.
     pub(crate) fn member_decl(&self, service: Symbol, member: Symbol) -> Option<&Decl> {
         self.unified_ast
             .iter()
@@ -3141,20 +3145,21 @@ impl Manager {
             .map(|(value, _, _)| value)
     }
 
-    async fn remote_lookup_with_clock(
+    /// Send a `LookupRequest` for `member` of the remote `service`, with `args`
+    /// for a call, and wait for the reply: the value with its clock and
+    /// sources, and whether the owner ran the call. Inside a transaction the
+    /// owner is registered as a participant before the request goes out, and
+    /// the reply's clock joins the transaction's participant history. What else
+    /// is kept of the reply is up to the caller: a lookup made while creating a
+    /// service caches it, a call never does
+    async fn send_lookup_request(
         &mut self,
         service: Symbol,
         member: Symbol,
+        args: Option<Vec<NetValue>>,
         mut txn: Option<&mut Transaction>,
-    ) -> Result<ReadEntry, EvalError> {
-        // Remote reads are always served by the owning node, which holds this
-        // transaction's buffered writes and read locks. We deliberately do not
-        // reuse a cached result on the requesting side: a def's value can change
-        // later in the same transaction when a composed action writes one of
-        // its dependencies on the owner, so a cached copy would go stale and
-        // the def would "stop updating". Re-fetching keeps reads consistent
-        // with the owner's buffered state. (Caching provably-immutable reads to
-        // save round-trips could be a later optimization.)
+    ) -> Result<(ReadEntry, bool), EvalError> {
+        let kind = if args.is_some() { "call" } else { "lookup" };
         let addr = self.remote_addr(service)?;
         let request_id = next_lookup_id();
         let reply_to = self.local_reply_addr().await;
@@ -3175,7 +3180,7 @@ impl Manager {
             member: self.interner.get(member).to_string(),
             reply_to,
             txn_id: shared_tid,
-            args: None,
+            args,
         };
 
         let reply = self
@@ -3184,7 +3189,8 @@ impl Manager {
                 msg,
                 request_id,
                 format!(
-                    "Timeout waiting for remote lookup of '{}.{}'",
+                    "Timeout waiting for remote {} of '{}.{}'",
+                    kind,
                     self.interner.get(service),
                     self.interner.get(member)
                 ),
@@ -3196,6 +3202,7 @@ impl Manager {
                 value,
                 clock,
                 sources,
+                called,
                 ..
             } => {
                 let value = codec::decode_value(value, &mut self.interner)
@@ -3208,23 +3215,13 @@ impl Manager {
                     .map(|sources| codec::decode_sources(sources, &mut self.interner))
                     .transpose()
                     .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?;
-                let entry = (value, clock, sources);
-                if let Some(txn) = txn {
-                    // A node that only serves reads never answers an action,
-                    // so what it read reaches the commit stamp only through
-                    // here. Only the clock is kept: the value is fetched again
-                    // on every read
-                    if let Some(clock) = &entry.1 {
-                        txn.participant_history = join_clocks([&txn.participant_history, clock]);
-                    }
-                    // Initialization keeps the pair: it stamps and seeds the
-                    // def that read it
-                    if self.is_creation_txn(&txn.id) {
-                        let key = (self.service_net_id_for_name(service), member);
-                        txn.read_cache.insert(key, entry.clone());
-                    }
+                // A node that only serves reads never answers an action, so
+                // what it read (for a call, what the body read included)
+                // reaches the commit stamp only through this clock
+                if let (Some(txn), Some(clock)) = (txn, &clock) {
+                    txn.participant_history = join_clocks([&txn.participant_history, clock]);
                 }
-                Ok(entry)
+                Ok(((value, clock, sources), called))
             }
             MeerkatMessage::LookupError { error, .. } => Err(Self::remote_error(error)),
             MeerkatMessage::Ping { .. }
@@ -3248,10 +3245,39 @@ impl Manager {
             | MeerkatMessage::ServiceCodeError { .. }
             | MeerkatMessage::UpdateServiceRequest { .. }
             | MeerkatMessage::UpdateServiceResponse { .. }
-            | MeerkatMessage::WaitParked { .. } => Err(EvalError::LocalDispatchFailed(
-                "Unexpected reply to lookup request".to_string(),
-            )),
+            | MeerkatMessage::WaitParked { .. } => Err(EvalError::LocalDispatchFailed(format!(
+                "Unexpected reply to {kind} request"
+            ))),
         }
+    }
+
+    async fn remote_lookup_with_clock(
+        &mut self,
+        service: Symbol,
+        member: Symbol,
+        mut txn: Option<&mut Transaction>,
+    ) -> Result<ReadEntry, EvalError> {
+        // Remote reads are always served by the owning node, which holds this
+        // transaction's buffered writes and read locks. We deliberately do not
+        // reuse a cached result on the requesting side: a def's value can change
+        // later in the same transaction when a composed action writes one of
+        // its dependencies on the owner, so a cached copy would go stale and
+        // the def would "stop updating". Re-fetching keeps reads consistent
+        // with the owner's buffered state. (Caching provably-immutable reads to
+        // save round-trips could be a later optimization.)
+        let (entry, _) = self
+            .send_lookup_request(service, member, None, txn.as_deref_mut())
+            .await?;
+        // Initialization keeps the pair: it stamps and seeds the def that read
+        // it. Otherwise only the clock is kept, joined above: the value is
+        // fetched again on every read
+        if let Some(txn) = txn {
+            if self.is_creation_txn(&txn.id) {
+                let key = (self.service_net_id_for_name(service), member);
+                txn.read_cache.insert(key, entry.clone());
+            }
+        }
+        Ok(entry)
     }
 
     /// Call a member of a remote service with `args`, and let its owner decide
@@ -3268,7 +3294,7 @@ impl Manager {
         service: Symbol,
         member: Symbol,
         args: Vec<Value>,
-        mut txn: Option<&mut Transaction>,
+        txn: Option<&mut Transaction>,
     ) -> Result<CallReply, EvalError> {
         // An argument with no wire form (html) cannot be sent, and a function
         // value cannot be applied on the owner: a closure carries its service
@@ -3292,92 +3318,16 @@ impl Manager {
                 .map(|(value, _, _)| CallReply::Member(value));
         };
 
-        let addr = self.remote_addr(service)?;
-        let request_id = next_lookup_id();
-        let reply_to = self.local_reply_addr().await;
-        let shared_tid = txn.as_ref().map(|t| t.id.clone());
-
-        // As for a lookup: the owner may take locks under the shared id, so
-        // register it before sending, for an abort to reach it if the reply is
-        // lost
-        if shared_tid.is_some() {
-            if let Some(t) = txn.as_deref_mut() {
-                t.participants.insert(addr.clone());
-            }
-        }
-
-        let msg = MeerkatMessage::LookupRequest {
-            request_id,
-            service: self.interner.get(service).to_string(),
-            member: self.interner.get(member).to_string(),
-            reply_to,
-            txn_id: shared_tid,
-            args: Some(net_args),
-        };
-
-        let reply = self
-            .send_and_await_reply(
-                addr,
-                msg,
-                request_id,
-                format!(
-                    "Timeout waiting for remote call of '{}.{}'",
-                    self.interner.get(service),
-                    self.interner.get(member)
-                ),
-            )
+        // Participants, timeout and errors are as for a lookup. The reply is
+        // not put in the read cache (see above)
+        let ((value, _, _), called) = self
+            .send_lookup_request(service, member, Some(net_args), txn)
             .await?;
-
-        match reply {
-            MeerkatMessage::LookupResponse {
-                value,
-                clock,
-                called,
-                ..
-            } => {
-                let value = codec::decode_value(value, &mut self.interner)
-                    .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?;
-                let clock = clock
-                    .map(|clock| codec::clock_entry_to_vclock(clock, &mut self.interner))
-                    .transpose()
-                    .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?;
-                // What the owner read to compute the result reaches the commit
-                // stamp only through this clock, as for a lookup
-                if let (Some(txn), Some(clock)) = (txn, &clock) {
-                    txn.participant_history = join_clocks([&txn.participant_history, clock]);
-                }
-                Ok(if called {
-                    CallReply::Called(value)
-                } else {
-                    CallReply::Member(value)
-                })
-            }
-            MeerkatMessage::LookupError { error, .. } => Err(Self::remote_error(error)),
-            MeerkatMessage::Ping { .. }
-            | MeerkatMessage::Pong { .. }
-            | MeerkatMessage::Announce { .. }
-            | MeerkatMessage::Transaction { .. }
-            | MeerkatMessage::Propagation { .. }
-            | MeerkatMessage::LookupRequest { .. }
-            | MeerkatMessage::ActionRequest { .. }
-            | MeerkatMessage::ActionResponse { .. }
-            | MeerkatMessage::Commit { .. }
-            | MeerkatMessage::CommitResponse { .. }
-            | MeerkatMessage::Abort { .. }
-            | MeerkatMessage::AbortResponse { .. }
-            | MeerkatMessage::LockRequest { .. }
-            | MeerkatMessage::LockResponse { .. }
-            | MeerkatMessage::RequestUpdates { .. }
-            | MeerkatMessage::Update { .. }
-            | MeerkatMessage::ServiceCodeRequest { .. }
-            | MeerkatMessage::ServiceCodeResponse { .. }
-            | MeerkatMessage::ServiceCodeError { .. }
-            | MeerkatMessage::UpdateServiceRequest { .. }
-            | MeerkatMessage::UpdateServiceResponse { .. }
-            | MeerkatMessage::WaitParked { .. } => Err(EvalError::LocalDispatchFailed(
-                "Unexpected reply to call request".to_string(),
-            )),
-        }
+        Ok(if called {
+            CallReply::Called(value)
+        } else {
+            CallReply::Member(value)
+        })
     }
 
     /// Owner side: serve a request for `member` of the local `service`, which
@@ -3394,34 +3344,18 @@ impl Manager {
         args: Option<Vec<Value>>,
         mut txn: Option<&mut Transaction>,
     ) -> Result<(ReadEntry, bool), EvalError> {
-        let Some(args) = args.filter(|_| self.is_special_form(service, member)) else {
+        // Read here and not trusted from when the arguments were decoded: a
+        // parked call runs again after any code update
+        let params = args
+            .as_ref()
+            .and_then(|_| self.special_form_params(service, member))
+            .map(<[_]>::to_vec);
+        let (Some(args), Some(params)) = (args, params) else {
             let entry = self.lookup_with_clock(member, service, txn).await?;
             return Ok((entry, false));
         };
-        let params = match self.member_decl(service, member) {
-            Some(Decl::DefDecl {
-                val: Expr::Func { params, .. },
-                ..
-            }) => params.clone(),
-            _ => Vec::new(),
-        };
-        // No arguments also fit a single `unit` parameter, as in the type
-        // checker
-        let unit_param = matches!(
-            params.as_slice(),
-            [crate::runtime::tt::Param {
-                ty: Some(crate::runtime::tt::Type::Unit),
-                ..
-            }]
-        );
-        if args.len() != params.len() && !(args.is_empty() && unit_param) {
-            return Err(EvalError::RuntimeError(format!(
-                "'{}.{}' takes {} arguments, but the call has {}",
-                self.interner.get(service),
-                self.interner.get(member),
-                params.len(),
-                args.len()
-            )));
+        if !arity_fits(&params, args.len()) {
+            return Err(self.arity_error(service, member, params.len(), args.len()));
         }
         // The callee is a member access, which never consults the
         // environment, so a member named like an argument cannot be shadowed
@@ -3472,7 +3406,8 @@ impl Manager {
         member: Symbol,
         args: Option<Vec<NetValue>>,
     ) -> Result<Option<Vec<Value>>, crate::error::Error> {
-        let Some(args) = args.filter(|_| self.is_special_form(service, member)) else {
+        let Some(args) = args.filter(|_| self.special_form_params(service, member).is_some())
+        else {
             return Ok(None);
         };
         codec::validate_call_args(args.len())?;
@@ -3482,17 +3417,28 @@ impl Manager {
             .map(Some)
     }
 
-    /// Whether `member` of the local `service` is declared as a special form
-    /// (`def f(..)` or `action a(..)`) in this node's program
-    fn is_special_form(&self, service: Symbol, member: Symbol) -> bool {
-        !self.remote_services.contains_key(&service)
-            && matches!(
-                self.member_decl(service, member),
-                Some(Decl::DefDecl {
-                    form: DefForm::Function | DefForm::Action,
-                    ..
-                })
-            )
+    /// The parameters of `member` of the local `service` when this node's
+    /// program declares it as a special form (`def f(..)` or `action a(..)`),
+    /// or `None` for any other member, a remote service or an unknown member
+    fn special_form_params(
+        &self,
+        service: Symbol,
+        member: Symbol,
+    ) -> Option<&[crate::runtime::tt::Param]> {
+        if self.remote_services.contains_key(&service) {
+            return None;
+        }
+        match self.member_decl(service, member)? {
+            Decl::DefDecl {
+                form: DefForm::Function | DefForm::Action,
+                val,
+                ..
+            } => match val {
+                Expr::Func { params, .. } => Some(params),
+                _ => Some(&[]),
+            },
+            _ => None,
+        }
     }
 
     /// Participant side: serve a transactional remote read by acquiring and

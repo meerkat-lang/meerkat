@@ -3,86 +3,16 @@
 //! from, and the owner must compute what the sender's program computes.
 //!
 //! The round trip compares the ASTs (`Expr`, `Decl` and `ActionStmt` carry no
-//! source spans) after one normalisation: `ActionStmt::Assert` keeps the raw
-//! source text of its condition for error messages, and the printer writes the
-//! condition from the AST, so that text is cleared on both sides.
+//! source spans). `ActionStmt::Assert` keeps the source text of its condition,
+//! which the owner reports when the assertion fails; the printer forwards that
+//! text as written, so it is compared too.
 
-use meerkat_lib::runtime::ast::{ActionStmt, Decl, Expr, Stmt, Value};
+use meerkat_lib::runtime::ast::{Decl, Stmt, Value};
+use meerkat_lib::runtime::limits::MAX_STRING_LITERAL_LENGTH;
 use meerkat_lib::runtime::parser::parse_string;
 use meerkat_lib::runtime::update::format_update_source;
 use meerkat_lib::runtime::{Interner, Node};
 use std::collections::HashMap;
-
-fn norm_stmts(stmts: &mut [ActionStmt]) {
-    for s in stmts {
-        match s {
-            ActionStmt::Assert(e, text) => {
-                text.clear();
-                norm_expr(e);
-            }
-            ActionStmt::Let { expr, .. }
-            | ActionStmt::Expr(expr)
-            | ActionStmt::Do(expr)
-            | ActionStmt::Assign { expr, .. }
-            | ActionStmt::Insert { row: expr, .. } => norm_expr(expr),
-            ActionStmt::For { iterable, body, .. } => {
-                norm_expr(iterable);
-                norm_stmts(body);
-            }
-        }
-    }
-}
-
-fn norm_expr(e: &mut Expr) {
-    match e {
-        Expr::Action(stmts) => norm_stmts(stmts),
-        Expr::Literal { .. }
-        | Expr::Variable { .. }
-        | Expr::MemberAccess { .. }
-        | Expr::Html(_) => {}
-        Expr::KeyVal { value, .. } => norm_expr(value),
-        Expr::Unop { expr, .. } => norm_expr(expr),
-        Expr::Binop { expr1, expr2, .. } => {
-            norm_expr(expr1);
-            norm_expr(expr2);
-        }
-        Expr::Range { start, end } => {
-            norm_expr(start);
-            norm_expr(end);
-        }
-        Expr::If { cond, expr1, expr2 } => {
-            norm_expr(cond);
-            norm_expr(expr1);
-            norm_expr(expr2);
-        }
-        Expr::Func { body, .. } => norm_expr(body),
-        Expr::Call { func, args } => {
-            norm_expr(func);
-            args.iter_mut().for_each(norm_expr);
-        }
-        Expr::Tuple { val } | Expr::List(val) | Expr::Table { records: val, .. } => {
-            val.iter_mut().for_each(norm_expr)
-        }
-        Expr::Select { where_clause, .. } => norm_expr(where_clause),
-        Expr::Fold {
-            operation,
-            identity,
-            ..
-        } => {
-            norm_expr(operation);
-            norm_expr(identity);
-        }
-    }
-}
-
-fn norm_decls(decls: &mut [Decl]) {
-    for d in decls {
-        match d {
-            Decl::VarDecl { val, .. } | Decl::DefDecl { val, .. } => norm_expr(val),
-            Decl::TableDecl { .. } => {}
-        }
-    }
-}
 
 /// The declarations and name of the `update` or `service` in `src`
 fn parse_decls(
@@ -110,11 +40,8 @@ fn assert_round_trip(decls_src: &str) {
     let (name, decls) = parse_decls(&format!("update s1 {{ {} }}", decls_src), &mut interner);
     let text = format_update_source(name, &decls, &interner);
     let (_, back) = parse_decls(&text, &mut interner);
-    let (mut before, mut after) = (decls, back);
-    norm_decls(&mut before);
-    norm_decls(&mut after);
     assert_eq!(
-        before, after,
+        decls, back,
         "forwarded text parses to another program\nsource: {}\nprinted: {}",
         decls_src, text
     );
@@ -182,6 +109,20 @@ fn test_forwarded_text_round_trips() {
     }
 }
 
+/// An `assert` whose condition is as long as the parser allows is forwarded
+/// as written. Printed from the AST, with the parentheses the printer adds
+/// (`("a.." == "a..") && ((y + 1) == 1) && ..`), it would be longer than the
+/// limit, and the owner could not parse the update
+#[test]
+fn test_an_assert_at_the_length_limit_round_trips() {
+    let terms = 10;
+    let n = (MAX_STRING_LITERAL_LENGTH - 6 - 8 * terms) / 2;
+    let s = "a".repeat(n);
+    let cond = format!("\"{s}\"==\"{s}\"{}", "&&y+1==1".repeat(terms));
+    assert_eq!(cond.len(), MAX_STRING_LITERAL_LENGTH);
+    assert_round_trip(&format!("action chk() {{ assert({cond}); }}"));
+}
+
 /// The printed text of the three forms of the report, exactly
 #[test]
 fn test_printed_text_of_known_cases() {
@@ -192,6 +133,8 @@ fn test_printed_text_of_known_cases() {
     };
     let t = print("action a() { assert(true); }");
     assert!(t.contains("assert(true);"), "{}", t);
+    let t = print("action a(x: int) { assert(x+1 == 2); }");
+    assert!(t.contains("assert(x+1 == 2);"), "{}", t);
     let t = print("def make(x: int) = fn (z: int) => x + z;");
     assert!(t.contains("fn (z: int) => x + z"), "{}", t);
     let t = print("def f(x: int) = (x + 1) * 2;");

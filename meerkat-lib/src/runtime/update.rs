@@ -488,9 +488,19 @@ fn format_action_stmt(stmt: &crate::runtime::ast::ActionStmt, interner: &Interne
         }
         ActionStmt::Expr(expr) => format!("{};", format_expr(expr, interner)),
         ActionStmt::Do(expr) => format!("do {};", format_expr(expr, interner)),
-        // The raw source text kept in the statement is not reused: the owner
-        // reports the printed condition
-        ActionStmt::Assert(expr, _) => format!("assert({});", format_expr(expr, interner)),
+        // The condition is printed as the source text the statement keeps.
+        // The owner reports that text when the assertion fails, and it is
+        // within the parser's length limit for an assertion, since it parsed
+        // here. Printed from the AST, with the parentheses the printer adds, it
+        // could exceed that limit. A statement built without source text
+        // prints its condition from the AST
+        ActionStmt::Assert(expr, text) => {
+            if text.is_empty() {
+                format!("assert({});", format_expr(expr, interner))
+            } else {
+                format!("assert({});", text)
+            }
+        }
         ActionStmt::Assign { name, expr } => {
             format!("{} = {};", interner.get(*name), format_expr(expr, interner))
         }

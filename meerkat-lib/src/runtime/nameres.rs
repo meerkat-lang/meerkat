@@ -87,6 +87,48 @@ pub fn call_hint(form: DefForm) -> &'static str {
     }
 }
 
+impl Error {
+    /// The text of a special-form error, with each symbol written by `name`:
+    /// `Display` writes symbols with `{:?}`, the CLI with their names
+    /// (`node.rs`). `None` for the other errors
+    pub(crate) fn special_form_message(&self, name: &dyn Fn(Symbol) -> String) -> Option<String> {
+        match self {
+            Error::NotCalled {
+                service,
+                member,
+                form,
+                bare,
+            } => {
+                let full = if *bare {
+                    name(*member)
+                } else {
+                    format!("{}.{}", name(*service), name(*member))
+                };
+                Some(format!(
+                    "{} can only be called: write `{}{}(...)`",
+                    full,
+                    call_hint(*form),
+                    full
+                ))
+            }
+            Error::ParamNamedLikeMember {
+                service,
+                decl,
+                member,
+            } => Some(format!(
+                "a parameter of {svc}.{decl} has the name of the member {svc}.{member}; \
+                 rename the parameter",
+                svc = name(*service),
+                decl = name(*decl),
+                member = name(*member)
+            )),
+            Error::UnknownIdentifier { .. } | Error::DepthLimit | Error::ForwardReference(_) => {
+                None
+            }
+        }
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -115,35 +157,10 @@ impl fmt::Display for Error {
                     name
                 )
             }
-            Error::NotCalled {
-                service,
-                member,
-                form,
-                bare,
-            } => {
-                let name = if *bare {
-                    format!("{:?}", member)
-                } else {
-                    format!("{:?}.{:?}", service, member)
-                };
-                write!(
-                    f,
-                    "{} can only be called: write `{}{}(...)`",
-                    name,
-                    call_hint(*form),
-                    name
-                )
+            Error::NotCalled { .. } | Error::ParamNamedLikeMember { .. } => {
+                let debug = |s: Symbol| format!("{s:?}");
+                f.write_str(&self.special_form_message(&debug).unwrap_or_default())
             }
-            Error::ParamNamedLikeMember {
-                service,
-                decl,
-                member,
-            } => write!(
-                f,
-                "a parameter of {:?}.{:?} has the name of the member {:?}.{:?}; \
-                 rename the parameter",
-                service, decl, service, member
-            ),
         }
     }
 }

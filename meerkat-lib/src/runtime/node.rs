@@ -70,35 +70,12 @@ impl StaticError {
                 "Invalid forward reference to uninitialized value '{}'",
                 interner.get(*name)
             ),
-            StaticError::Names(nameres::Error::NotCalled {
-                service,
-                member,
-                form,
-                bare,
-            }) => {
-                let name = if *bare {
-                    interner.get(*member).to_string()
-                } else {
-                    format!("{}.{}", interner.get(*service), interner.get(*member))
-                };
-                format!(
-                    "{} can only be called: write `{}{}(...)`",
-                    name,
-                    nameres::call_hint(*form),
-                    name
-                )
-            }
-            StaticError::Names(nameres::Error::ParamNamedLikeMember {
-                service,
-                decl,
-                member,
-            }) => format!(
-                "a parameter of {svc}.{decl} has the name of the member {svc}.{member}; \
-                 rename the parameter",
-                svc = interner.get(*service),
-                decl = interner.get(*decl),
-                member = interner.get(*member)
-            ),
+            StaticError::Names(
+                e
+                @ (nameres::Error::NotCalled { .. } | nameres::Error::ParamNamedLikeMember { .. }),
+            ) => e
+                .special_form_message(&|s| interner.get(s).to_string())
+                .unwrap_or_default(),
             StaticError::Names(e @ nameres::Error::DepthLimit) => e.to_string(),
             StaticError::Types(tt::check::Error::RecursiveTypeInference { service, member }) => {
                 format!(

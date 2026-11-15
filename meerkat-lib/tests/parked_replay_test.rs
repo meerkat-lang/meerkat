@@ -254,6 +254,7 @@ async fn child_peer(net: &mut NetworkActor, child: &mut Manager, served: &mut Ve
                     error: outcome.err().map(|e| e.to_string()),
                     history,
                     writes,
+                    declined: false,
                 };
                 (reply_to, response)
             }

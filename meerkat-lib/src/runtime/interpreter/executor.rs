@@ -2,6 +2,7 @@ use super::evaluator::{call_target, eval, EvalContext, EvalError};
 use crate::ast::{ActionStmt, Decl, DefForm, Expr, Value};
 use crate::net::codec;
 use crate::runtime::interner::Symbol;
+use crate::runtime::manager::ActionOutcome;
 use crate::runtime::txn::Transaction;
 use crate::runtime::Manager;
 
@@ -92,9 +93,12 @@ pub async fn execute(
             // which may be this very node, and a call back into a node that is
             // waiting for a reply waits for the reply timeout (#213). It is fetched
             // as before. So is any other spelling (`let f = s.a; do f;`,
-            // `do s.f(x);`). The answer comes from this node's copy of `s`, taken
-            // at import, so an update made at `s`'s node that turns `a` into a
-            // forward is not seen here and `do a` can still be sent by name.
+            // `do s.f(x);`). The answer here comes from this node's copy of `s`,
+            // taken at import, which an update made at `s`'s node may have
+            // outdated, for instance by turning `a` into a forward. So the
+            // request is marked by name and the owner decides from its current
+            // declaration: it declines a member that is not an action written in
+            // place, and the call then falls through to the fetch below.
             if let Expr::MemberAccess {
                 service_name: target,
                 member_name,
@@ -110,15 +114,19 @@ pub async fn execute(
                     )
                 {
                     let owner = manager.owner_net_id(*target);
-                    manager
-                        .remote_action(
+                    let outcome = manager
+                        .remote_action_by_name(
                             &owner,
                             vec![ActionStmt::Do(Expr::Variable { name: *member_name })],
                             Vec::new(),
                             txn.as_deref_mut(),
                         )
                         .await?;
-                    return Ok(ExecuteEffect::None);
+                    if outcome == ActionOutcome::Ran {
+                        return Ok(ExecuteEffect::None);
+                    }
+                    // Declined: the owner's declaration is no longer an action
+                    // written in place. Fetch it below as for any other member
                 }
             }
             // The same for `do s.a(e1, ..)` when this node's copy of `s` declares `a` as
@@ -170,8 +178,8 @@ pub async fn execute(
                         });
                         if sendable {
                             let owner = manager.owner_net_id(target);
-                            manager
-                                .remote_action(
+                            let outcome = manager
+                                .remote_action_by_name(
                                     &owner,
                                     vec![ActionStmt::Do(Expr::Call {
                                         func: Box::new(Expr::MemberAccess {
@@ -184,7 +192,14 @@ pub async fn execute(
                                     txn.as_deref_mut(),
                                 )
                                 .await?;
-                            return Ok(ExecuteEffect::None);
+                            if outcome == ActionOutcome::Ran {
+                                return Ok(ExecuteEffect::None);
+                            }
+                            // Declined: the owner's `a` is no longer a special
+                            // action. Fall through to the path below, which
+                            // evaluates the arguments again: they are
+                            // expressions read under the same transaction, so
+                            // they give the same values
                         }
                     }
                 }

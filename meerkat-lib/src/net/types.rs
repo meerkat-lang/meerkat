@@ -160,6 +160,15 @@ pub enum MeerkatMessage {
         /// (do not commit) until a later `Commit`/`Abort`
         /// When `None`, execute standalone and commit immediately
         txn_id: Option<TxnId>,
+        /// The caller sent `do s.a` or `do s.a(__arg0, ..)`, naming a member of
+        /// the owner instead of shipping its body. The owner runs it only if its
+        /// current declaration of that member is an action written in place
+        /// (zero arguments) or a special action (with arguments), and otherwise
+        /// declines (`ActionResponse.declined`). A peer built before this field
+        /// existed ignores it and runs the request as before, and an older
+        /// caller never sets it
+        #[serde(default)]
+        by_name: bool,
     },
 
     /// Response to `ActionRequest`
@@ -173,6 +182,12 @@ pub enum MeerkatMessage {
         history: Vec<ClockEntry>,
         /// The vars they have written, as `(service, member)`
         writes: Vec<(String, String)>,
+        /// The owner did not run a by-name request: nothing ran, and nothing
+        /// was locked or recorded. The caller fetches the member instead. An
+        /// older owner never sets it (it runs the request), and an older caller
+        /// never sends a by-name request
+        #[serde(default)]
+        declined: bool,
     },
 
     /// Tell a participant node to commit a distributed transaction:

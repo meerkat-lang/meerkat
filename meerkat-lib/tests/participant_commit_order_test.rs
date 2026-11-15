@@ -185,6 +185,7 @@ async fn serve_rc(rc_net: &mut NetworkActor) {
                         error: None,
                         history: Vec::new(),
                         writes: vec![("rc".into(), "cv".into())],
+                        declined: false,
                     };
                     reply(rc_net, &reply_to, msg).await;
                 }

@@ -82,10 +82,11 @@ async fn stand_in_rc(net: &mut NetworkActor, rc_addr: &Address, log: &RefCell<Ve
                     service,
                     stmts,
                     env,
+                    by_name,
                     ..
                 } => {
                     log.borrow_mut().push(format!(
-                        "ActionRequest service={service} stmts={stmts:?} env_len={}",
+                        "ActionRequest service={service} stmts={stmts:?} by_name={by_name} env_len={}",
                         env.len()
                     ));
                     let msg = MeerkatMessage::ActionResponse {
@@ -94,6 +95,7 @@ async fn stand_in_rc(net: &mut NetworkActor, rc_addr: &Address, log: &RefCell<Ve
                         error: None,
                         history: Vec::new(),
                         writes: Vec::new(),
+                        declined: false,
                     };
                     reply(net, &reply_to, msg).await;
                 }

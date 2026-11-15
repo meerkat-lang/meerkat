@@ -143,6 +143,7 @@ async fn refuse_commits(net: &mut NetworkActor, reason: &str, got_commit: &Cell<
                         error: None,
                         history: Vec::new(),
                         writes: Vec::new(),
+                        declined: false,
                     };
                     reply(net, &reply_to, msg).await;
                 }

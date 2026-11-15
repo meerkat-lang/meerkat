@@ -274,6 +274,16 @@ pub struct Service {
     pub service_lock: Option<TxnId>,
 }
 
+/// What became of a by-name action request (`Manager::remote_action_by_name`)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionOutcome {
+    /// The owner ran the action
+    Ran,
+    /// The owner did not run it, because its current declaration of the member
+    /// is not one that runs by name. Nothing ran and nothing was recorded
+    Declined,
+}
+
 /// A remote request parked on a variable's wait queue because the requesting
 /// transaction is older than the current lock holder (wait-die wait). It holds
 /// everything needed to re-dispatch the request and send its deferred reply
@@ -1374,6 +1384,57 @@ impl Manager {
             .flat_map(|decls| decls.iter())
             .rev()
             .find(|decl| decl.name() == member)
+    }
+
+    /// Whether this node, as the owner of `service`, runs a by-name
+    /// `ActionRequest`: the one statement `do a` (zero arguments, sent as a
+    /// variable that names a member of `service`) needs this node's current
+    /// declaration of `a` to be an action written in place, and
+    /// `do s.a(__arg0, ..)` needs it to be a function whose body is an action
+    /// written in place: a special action, or its `fn` spelling. A forward,
+    /// another function, an unknown member or any other statement shape is not
+    /// run
+    fn by_name_request_is_runnable(&self, service: Symbol, stmts: &[ActionStmt]) -> bool {
+        let [ActionStmt::Do(expr)] = stmts else {
+            return false;
+        };
+        match expr {
+            Expr::Variable { name } => matches!(
+                self.member_decl(service, *name),
+                Some(Decl::DefDecl {
+                    val: Expr::Action(_),
+                    ..
+                })
+            ),
+            Expr::MemberAccess {
+                service_name,
+                member_name,
+            } => matches!(
+                self.member_decl(*service_name, *member_name),
+                Some(Decl::DefDecl {
+                    val: Expr::Action(_),
+                    ..
+                })
+            ),
+            // A special action is a function whose body is an action written
+            // in place; its `fn` spelling has the same shape and runs here just
+            // as safely. A function returning anything else, such as another
+            // service's action, is declined
+            Expr::Call { func, .. } => match &**func {
+                Expr::MemberAccess {
+                    service_name,
+                    member_name,
+                } => matches!(
+                    self.member_decl(*service_name, *member_name),
+                    Some(Decl::DefDecl {
+                        val: Expr::Func { body, .. },
+                        ..
+                    }) if matches!(**body, Expr::Action(_))
+                ),
+                _ => false,
+            },
+            _ => false,
+        }
     }
 
     /// The identity of the owner of the remote service `service`. A service URL
@@ -3435,8 +3496,46 @@ impl Manager {
         service_net_id: &ServiceNetId,
         stmts: Vec<ActionStmt>,
         env: Vec<(Symbol, Value)>,
-        mut txn: Option<&mut Transaction>,
+        txn: Option<&mut Transaction>,
     ) -> Result<(), EvalError> {
+        match self
+            .remote_action_inner(service_net_id, stmts, env, txn, false)
+            .await?
+        {
+            ActionOutcome::Ran => Ok(()),
+            // Only the owner of a by-name request declines
+            ActionOutcome::Declined => Err(EvalError::LocalDispatchFailed(
+                "remote action declined although it was not sent by name".to_string(),
+            )),
+        }
+    }
+
+    /// Send `do s.a` or `do s.a(__arg0, ..)` naming a member of the owner
+    /// instead of shipping its body (`ActionRequest.by_name`). The owner checks
+    /// its current declaration of the member and declines when it is not an
+    /// action written in place or a special action, for example a forward to
+    /// another service's action. Nothing ran then and nothing is recorded in
+    /// `txn`, so the caller fetches the member and runs it as before.
+    /// Parking, timeout and participant handling are those of `remote_action`
+    pub async fn remote_action_by_name(
+        &mut self,
+        service_net_id: &ServiceNetId,
+        stmts: Vec<ActionStmt>,
+        env: Vec<(Symbol, Value)>,
+        txn: Option<&mut Transaction>,
+    ) -> Result<ActionOutcome, EvalError> {
+        self.remote_action_inner(service_net_id, stmts, env, txn, true)
+            .await
+    }
+
+    async fn remote_action_inner(
+        &mut self,
+        service_net_id: &ServiceNetId,
+        stmts: Vec<ActionStmt>,
+        env: Vec<(Symbol, Value)>,
+        mut txn: Option<&mut Transaction>,
+        by_name: bool,
+    ) -> Result<ActionOutcome, EvalError> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT_ACTION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -3510,7 +3609,7 @@ impl Manager {
                         call.target.0
                     )));
                 }
-                return Ok(());
+                return Ok(ActionOutcome::Ran);
             }
             claim = Some((seq, call));
         }
@@ -3522,6 +3621,7 @@ impl Manager {
             env: net_env,
             reply_to,
             txn_id: shared_tid,
+            by_name,
         };
 
         let reply = self
@@ -3539,8 +3639,18 @@ impl Manager {
                 error,
                 history,
                 writes,
+                declined,
                 ..
             } => {
+                if declined {
+                    // The owner ran nothing: give back the dispatch position
+                    // claimed above so the fallback and a replay see the same
+                    // order as if this request had not been sent
+                    if let (Some(txn), Some((seq, _))) = (txn, claim) {
+                        txn.composed_seq = seq;
+                    }
+                    return Ok(ActionOutcome::Declined);
+                }
                 if success {
                     // Record completion before decoding metadata: the remote
                     // action has already run and must not run again on replay.
@@ -3555,7 +3665,7 @@ impl Manager {
                         txn.participant_history = join_clocks([&txn.participant_history, &history]);
                         txn.participant_writes.extend(writes);
                     }
-                    Ok(())
+                    Ok(ActionOutcome::Ran)
                 } else {
                     Err(Self::remote_error(
                         error.unwrap_or_else(|| "Remote action failed".to_string()),
@@ -3647,6 +3757,7 @@ impl Manager {
                             error: other.err().map(|e| e.to_string()),
                             history,
                             writes,
+                            declined: false,
                         };
                         self.send_oneway(Address::new(&reply_to), response).await;
                     }
@@ -3837,6 +3948,7 @@ impl Manager {
                 env: action_env,
                 reply_to,
                 txn_id,
+                by_name,
             } => {
                 if let Err(e) = codec::validate_action_request(&service) {
                     let response = MeerkatMessage::ActionResponse {
@@ -3845,6 +3957,7 @@ impl Manager {
                         error: Some(e.to_string()),
                         history: Vec::new(),
                         writes: Vec::new(),
+                        declined: false,
                     };
                     self.send_oneway(Address::new(&reply_to), response).await;
                     return None;
@@ -3883,6 +3996,24 @@ impl Manager {
                         error: error_msg,
                         history: Vec::new(),
                         writes: Vec::new(),
+                        declined: false,
+                    };
+                    self.send_oneway(Address::new(&reply_to), response).await;
+                    return None;
+                }
+                // A by-name request is checked against this node's CURRENT
+                // declaration, which may have changed since the caller took its
+                // copy. Decline here: after decoding, before the transaction is
+                // touched (no participant registration, lock, parking or
+                // replay record), so a decline leaves no trace
+                if by_name && !self.by_name_request_is_runnable(svc_sym, &local_stmts) {
+                    let response = MeerkatMessage::ActionResponse {
+                        request_id,
+                        success: false,
+                        error: None,
+                        history: Vec::new(),
+                        writes: Vec::new(),
+                        declined: true,
                     };
                     self.send_oneway(Address::new(&reply_to), response).await;
                     return None;
@@ -3912,6 +4043,7 @@ impl Manager {
                             error: result.err().map(|e| e.to_string()),
                             history: Vec::new(),
                             writes: Vec::new(),
+                            declined: false,
                         };
                         self.send_oneway(Address::new(&reply_to), response).await;
                     }
@@ -8225,6 +8357,112 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    const BY_NAME_OWNER: &str = "
+        service o {
+            var hits = 0;
+            pub def bump = action { hits = hits + 1; };
+        }
+        service s {
+            var y = 0;
+            pub def inc = action { y = y + 1; };
+            pub def fwd = o.bump;
+            pub def sp(x: int) = x;
+            pub action act(x: int) { y = x; }
+            pub def act_fn = fn (x: int) => action { y = x; };
+            pub def fwd_fn = fn (x: int) => o.bump;
+        }";
+
+    /// Send `do member;` to the owner `s` as an `ActionRequest` and let the owner
+    /// serve it. There is no network, so the reply is dropped: the tests look at
+    /// the owner's state.
+    async fn serve_do(m: &mut Manager, member: &str, by_name: bool, txn_id: Option<TxnId>) {
+        let name = m.interner.insert(member);
+        let stmt = crate::ast::ActionStmt::Do(Expr::Variable { name });
+        let stmts = vec![codec::encode_action_stmt(&stmt, &m.interner).unwrap()];
+        m.serve_request(MeerkatMessage::ActionRequest {
+            request_id: 1,
+            service: "s".to_string(),
+            stmts,
+            env: Vec::new(),
+            reply_to: String::new(),
+            txn_id,
+            by_name,
+        })
+        .await;
+    }
+
+    fn hits_of(m: &mut Manager) -> Value {
+        let [o, hits] = ["o", "hits"].map(|n| m.interner.insert(n));
+        m.services[&o].vars[&hits].value.clone()
+    }
+
+    // A by-name request for a member that is a forward is declined: nothing
+    // runs, no transaction is registered and no lock is taken, with or without
+    // a transaction
+    #[tokio::test]
+    async fn a_by_name_request_for_a_forward_is_declined_and_changes_nothing() {
+        let mut m = start_local_manager(BY_NAME_OWNER).await;
+        serve_do(&mut m, "fwd", true, None).await;
+        serve_do(&mut m, "fwd", true, Some(txn_at(1))).await;
+
+        assert_eq!(hits_of(&mut m), Value::Int { val: 0 });
+        assert!(m.pending_txns.is_empty(), "no transaction is registered");
+        let [o, hits] = ["o", "hits"].map(|n| m.interner.insert(n));
+        assert!(matches!(
+            m.services[&o].vars[&hits].lock,
+            crate::runtime::txn::VarLock::Unlocked
+        ));
+    }
+
+    // A by-name request for an action written in place runs as before
+    #[tokio::test]
+    async fn a_by_name_request_for_an_action_written_in_place_runs() {
+        let mut m = start_local_manager(BY_NAME_OWNER).await;
+        serve_do(&mut m, "inc", true, None).await;
+
+        let [s, y] = ["s", "y"].map(|n| m.interner.insert(n));
+        assert_eq!(m.services[&s].vars[&y].value, Value::Int { val: 1 });
+    }
+
+    // A request that is not by name is not checked: the same forward still
+    // runs, as it does for a caller built before `by_name` existed
+    #[tokio::test]
+    async fn a_request_not_by_name_for_a_forward_still_runs() {
+        let mut m = start_local_manager(BY_NAME_OWNER).await;
+        serve_do(&mut m, "fwd", false, None).await;
+
+        assert_eq!(hits_of(&mut m), Value::Int { val: 1 });
+    }
+
+    // The call form runs only for a function whose body is an action written
+    // in place, a special action or its `fn` spelling; a special def, a
+    // function returning another service's action, an unknown member and any
+    // other statement shape are declined
+    #[tokio::test]
+    async fn by_name_call_requests_run_only_for_actions_written_in_place() {
+        let mut m = start_local_manager(BY_NAME_OWNER).await;
+        let [s, act, sp, nope] = ["s", "act", "sp", "nope"].map(|n| m.interner.insert(n));
+        let [act_fn, fwd_fn] = ["act_fn", "fwd_fn"].map(|n| m.interner.insert(n));
+        let arg = m.interner.insert("__arg0");
+        let call = |member| {
+            vec![crate::ast::ActionStmt::Do(Expr::Call {
+                func: Box::new(Expr::MemberAccess {
+                    service_name: s,
+                    member_name: member,
+                }),
+                args: vec![Expr::Variable { name: arg }],
+            })]
+        };
+        assert!(m.by_name_request_is_runnable(s, &call(act)));
+        assert!(m.by_name_request_is_runnable(s, &call(act_fn)));
+        assert!(!m.by_name_request_is_runnable(s, &call(fwd_fn)));
+        assert!(!m.by_name_request_is_runnable(s, &call(sp)));
+        assert!(!m.by_name_request_is_runnable(s, &call(nope)));
+        assert!(!m.by_name_request_is_runnable(s, &[]));
+        let two = [call(act), call(act)].concat();
+        assert!(!m.by_name_request_is_runnable(s, &two));
     }
 
     // Outside a transaction the call is a plain unlocked read: no clock

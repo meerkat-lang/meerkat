@@ -186,6 +186,7 @@ async fn stand_in_s1(
                         error: None,
                         history: Vec::new(),
                         writes: Vec::new(),
+                        declined: false,
                     };
                     reply(net, &reply_to, msg).await;
                 }
@@ -1176,8 +1177,9 @@ async fn the_wiki_example_against_a_real_owner_takes_two_requests() {
 }
 
 /// The caller's copy is out of date when the owner has the `fn` spelling: the
-/// caller still sends by name, and the result is the same, as the design
-/// requires.
+/// caller still sends `a` by name, and the owner runs it, because its `a` is
+/// still a function whose body is an action written in place. The result is the
+/// same, as the design requires.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_owner_with_the_fn_spelling_gives_the_same_result() {
     const OWNER: &str = "
@@ -1343,4 +1345,163 @@ async fn an_html_argument_takes_the_fetch_path() {
         "then the action's body, with nothing captured: {seen:?}"
     );
     assert_eq!(seen.last(), Some(&Seen::Commit), "{seen:?}");
+}
+
+/// Run `do member;` of the caller built from `caller_code` against a real owner
+/// running `owner_code` that holds a forward to the CALLER's service `app`
+/// (`pub def a = app.hit;`). The owner sees `app` as a remote service at the
+/// caller's address, as `caller_node` does for `s1`: it keeps a copy of `app`'s
+/// declaration for its static checks, but not a running instance. Returns the
+/// result of the action, what the owner received and the caller's `app.hits`.
+async fn run_against_forwarding_owner(
+    caller_code: &str,
+    owner_code: &str,
+    member: &str,
+) -> (
+    Result<(), meerkat_lib::runtime::interpreter::EvalError>,
+    Vec<String>,
+    Value,
+) {
+    let (app_net, app_addr) = listening_node().await;
+    let (owner_net, owner_addr) = listening_node().await;
+    let (mut m, _) = caller_node(caller_code, app_net, &owner_addr).await;
+
+    let mut interner = Interner::new();
+    let ast = parse_string(owner_code, &mut interner).expect("valid syntax");
+    let mut node = Node::new();
+    node.interner = interner;
+    node.unified_ast = ast.clone();
+    node.static_checks().expect("static checks must pass");
+    let mut owner = node
+        .on_manager_startup(true, Some(owner_net), HashMap::new(), &ast)
+        .await
+        .expect("owner startup");
+    let app = owner.interner.insert("app");
+    owner.services.remove(&app);
+    owner
+        .remote_services
+        .insert(app, Address::new(format!("{}/app", app_addr.0)));
+
+    let stmts = do_member(&mut m, member);
+    let received = RefCell::new(Vec::new());
+    let serve = async {
+        loop {
+            while let Some(NetworkEvent::MessageReceived { msg, .. }) = owner.try_recv_event() {
+                received.borrow_mut().push(match &msg {
+                    MeerkatMessage::LookupRequest { member, args, .. } => {
+                        format!("Lookup {member} args={}", args.as_ref().map_or(0, Vec::len))
+                    }
+                    MeerkatMessage::ActionRequest { by_name, .. } => {
+                        format!("Action by_name={by_name}")
+                    }
+                    MeerkatMessage::Commit { .. } => "Commit".to_string(),
+                    other => format!("{other:?}"),
+                });
+                owner.serve_request(msg).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    };
+    let caller_app = m.interner.insert("app");
+    let result = tokio::select! {
+        biased;
+        r = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            m.execute_action(caller_app, &stmts),
+        ) => r.expect("the action must not time out"),
+        _ = serve => unreachable!("the owner serves forever"),
+    };
+    let hits = var_of(&mut m, "app", "hits");
+    (result, received.into_inner(), hits)
+}
+
+/// The owner changed `a` into a forward to an action of the caller's own service
+/// after the caller took its copy, which still shows `pub def a = action { .. }`.
+/// `do s1.a;` must run `app.hit` on the caller, once, as it does when the caller
+/// fetches `a`. The by-name request is declined by the owner, and the caller
+/// then looks `a` up and runs the action it gets.
+///
+/// Without the owner's decline the owner evaluates `a`, gets the caller's
+/// action and sends it back to the caller, which is waiting for the owner's
+/// reply: the call times out and `hits` stays 0.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_copy_of_an_action_that_became_a_forward_is_fetched() {
+    const CALLER: &str = "
+        service s1 {
+            var y = 0;
+            pub def a = action { y = 1; };
+        }
+        service app {
+            var hits = 0;
+            pub def hit = action { hits = hits + 1; };
+            pub def run = action { do s1.a; };
+        }
+    ";
+    const OWNER: &str = "
+        service app {
+            var hits = 0;
+            pub def hit = action { hits = hits + 1; };
+        }
+        service s1 {
+            var y = 0;
+            pub def a = app.hit;
+        }
+    ";
+    let (result, received, hits) = run_against_forwarding_owner(CALLER, OWNER, "run").await;
+
+    assert!(result.is_ok(), "the action must succeed, got: {result:?}");
+    assert_eq!(hits, Value::Int { val: 1 }, "received: {received:?}");
+    assert_eq!(
+        received,
+        vec![
+            "Action by_name=true".to_string(),
+            "Lookup a args=0".to_string(),
+            "Commit".to_string()
+        ]
+    );
+}
+
+/// The same with arguments: the caller's copy still declares `pub action
+/// a(x: int)`, the owner's `a` is now a plain def whose function returns the
+/// caller's action. The by-name call is declined, the call goes through the
+/// def-call path (a lookup that carries the argument; the owner's `a` is plain,
+/// so it answers with the member) and the caller applies it and runs the action
+/// it returns, once.
+///
+/// Without the owner's decline the call times out as in the zero-argument case.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_copy_of_a_special_action_that_became_a_forward_is_fetched() {
+    const CALLER: &str = "
+        service s1 {
+            var y = 0;
+            pub action a(x: int) { y = x; }
+        }
+        service app {
+            var hits = 0;
+            pub def hit = action { hits = hits + 1; };
+            pub def run = action { do s1.a(5); };
+        }
+    ";
+    const OWNER: &str = "
+        service app {
+            var hits = 0;
+            pub def hit = action { hits = hits + 1; };
+        }
+        service s1 {
+            var y = 0;
+            pub def a = fn (x: int) => app.hit;
+        }
+    ";
+    let (result, received, hits) = run_against_forwarding_owner(CALLER, OWNER, "run").await;
+
+    assert!(result.is_ok(), "the action must succeed, got: {result:?}");
+    assert_eq!(hits, Value::Int { val: 1 }, "received: {received:?}");
+    assert_eq!(
+        received,
+        vec![
+            "Action by_name=true".to_string(),
+            "Lookup a args=1".to_string(),
+            "Commit".to_string()
+        ]
+    );
 }

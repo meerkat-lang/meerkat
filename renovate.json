@@ -28,7 +28,8 @@
   "enabledManagers": [
     "cargo",
     "github-actions",
-    "pre-commit"
+    "pre-commit",
+    "rust-toolchain"
   ],
   "lockFileMaintenance": {
     "enabled": true,

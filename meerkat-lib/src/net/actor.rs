@@ -19,13 +19,24 @@ const IDLE_CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// The maximum duration to wait for a relay reservation response
 const RELAY_RESERVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-#[derive(libp2p::swarm::NetworkBehaviour)]
-struct MeerkatBehaviour {
-    stream: stream::Behaviour,
-    relay: libp2p::relay::Behaviour,
-    relay_client: libp2p::relay::client::Behaviour,
-    identify: libp2p::identify::Behaviour,
+// libp2p-stream's handler uses `Infallible` for `FromBehaviour` and `ToBehaviour`.
+// The derive generates event-routing calls that Rust 1.100 flags as unreachable.
+// Lint attributes on the struct don't cover the generated impls, so keep them
+// in this module. Remove the wrapper when the expectation becomes unfulfilled.
+// Related: https://github.com/libp2p/rust-libp2p/issues/6600.
+#[expect(unreachable_code)]
+mod behaviour {
+    use super::stream;
+
+    #[derive(libp2p::swarm::NetworkBehaviour)]
+    pub(super) struct MeerkatBehaviour {
+        pub(super) stream: stream::Behaviour,
+        pub(super) relay: libp2p::relay::Behaviour,
+        pub(super) relay_client: libp2p::relay::client::Behaviour,
+        pub(super) identify: libp2p::identify::Behaviour,
+    }
 }
+use behaviour::{MeerkatBehaviour, MeerkatBehaviourEvent};
 
 /// State of a pending relay reservation attempt
 enum PendingRelayState {

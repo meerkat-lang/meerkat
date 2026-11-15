@@ -476,14 +476,6 @@ async fn run_server(
 
     println!("Server running, press Ctrl+C to stop...");
 
-    let mut pending_updates: std::collections::VecDeque<(
-        u64,
-        Option<meerkat_lib::runtime::txn::TxnId>,
-        String,
-        String,
-        String,
-    )> = std::collections::VecDeque::new();
-
     let mut last_keepalive = tokio::time::Instant::now();
     loop {
         // Wake what is parked on locks released with no dispatcher to hand the
@@ -491,14 +483,6 @@ async fn run_server(
         // `send_and_await_reply` pumped events during the last iteration
         manager.wake_freed().await;
 
-        // Defer pending service updates so that network events can be processed
-        // without blocking the server loop during multi-step updates
-        if let Some((request_id, txn_id, source, reply_to, peer)) = pending_updates.pop_front() {
-            let target_addr = if !reply_to.is_empty() { reply_to } else { peer };
-            manager
-                .apply_service_update(request_id, txn_id, &source, target_addr)
-                .await;
-        }
         manager.complete_code_updates().await;
 
         // Periodically reassure parked waiters (wait-die wait) that they are
@@ -513,22 +497,20 @@ async fn run_server(
                 MeerkatMessage::UpdateServiceRequest {
                     request_id,
                     txn_id,
-                    service_name: _,
+                    service_name,
                     source,
                     reply_to,
                 } => {
-                    if exceeds_pending_update_limit(&pending_updates, &peer) {
-                        let target_addr = if !reply_to.is_empty() { reply_to } else { peer };
-                        manager
-                            .reply_update_service(
-                                request_id,
-                                &target_addr,
-                                Some("Too many pending updates from this peer".to_string()),
-                            )
-                            .await;
-                    } else {
-                        pending_updates.push_back((request_id, txn_id, source, reply_to, peer));
-                    }
+                    manager
+                        .apply_service_update(
+                            peer,
+                            request_id,
+                            txn_id,
+                            &service_name,
+                            &source,
+                            reply_to,
+                        )
+                        .await;
                 }
                 msg @ (MeerkatMessage::LookupRequest { .. }
                 | MeerkatMessage::ActionRequest { .. }
@@ -1068,21 +1050,6 @@ async fn run_lock_test_client(
     Ok(())
 }
 
-/// Check if the given peer has reached the maximum number of pending update requests.
-fn exceeds_pending_update_limit(
-    queue: &std::collections::VecDeque<(
-        u64,
-        Option<meerkat_lib::runtime::txn::TxnId>,
-        String,
-        String,
-        String,
-    )>,
-    peer: &str,
-) -> bool {
-    let active_for_peer = queue.iter().filter(|(_, _, _, _, p)| p == peer).count();
-    active_for_peer >= meerkat_lib::runtime::limits::MAX_PENDING_UPDATES_PER_PEER
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1121,35 +1088,6 @@ mod tests {
         })
         .expect_err("message-sent replies are not a Listen success");
         assert_eq!(message_sent_err.to_string(), "Unexpected reply");
-    }
-
-    #[test]
-    fn test_exceeds_pending_update_limit_rejects_spam() {
-        let mut queue = std::collections::VecDeque::new();
-        let peer = "peer1";
-
-        // Fill up to the limit
-        for i in 0..meerkat_lib::runtime::limits::MAX_PENDING_UPDATES_PER_PEER {
-            queue.push_back((
-                i as u64,
-                None,
-                String::new(),
-                String::new(),
-                peer.to_string(),
-            ));
-        }
-
-        // Negative test coverage: confirm limits correctly enforce bounds for spammers
-        assert!(
-            exceeds_pending_update_limit(&queue, peer),
-            "Should reject new updates from spamming peer"
-        );
-
-        // Confirm other peers are unaffected
-        assert!(
-            !exceeds_pending_update_limit(&queue, "peer2"),
-            "Should allow new updates from different peers"
-        );
     }
 
     /// `-i` slugs come from the URL's final path segment, and each slug maps

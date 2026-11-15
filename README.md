@@ -17,15 +17,16 @@ Core libraries for the Meerkat runtime:
 
 ## Building and Testing
 
+The Rust version is pinned in `rust-toolchain.toml`. With [rustup](https://rustup.rs),
+the first `cargo` command in the repository installs that version, along with the
+WASM target.
+
 ```bash
 # Build all packages
 cargo build
 
 # Run all tests
 cargo test
-
-# Install the WASM target (one-time setup)
-rustup target add wasm32-unknown-unknown
 
 # Test WASM compatibility
 cargo check --locked -p meerkat-lib --target wasm32-unknown-unknown --all-features

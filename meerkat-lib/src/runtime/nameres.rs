@@ -642,11 +642,16 @@ impl<'a> Resolver<'a> {
             Expr::Fold {
                 table_name: _,
                 column_name: _,
-                operation: _,
-                identity: _,
+                operation,
+                identity,
             } => {
+                // The operation and the identity are ordinary expressions, so a
+                // special form named there without a call is rejected as
+                // anywhere else. The table and the column are not checked yet
+                self.resolve_expr(operation, env, depth + 1)?;
+                self.resolve_expr(identity, env, depth + 1)?;
                 println!(
-                    "warning: nameres: ignoring 'fold' checks \
+                    "warning: nameres: ignoring 'fold' table checks \
                      as not yet implemented"
                 );
                 Ok(())

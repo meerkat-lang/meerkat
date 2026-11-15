@@ -303,6 +303,32 @@ fn test_special_form_without_call_is_rejected() {
     assert_rejected(&with_s1("watch s1.f;"), "s1.f can only be called");
 }
 
+/// The operation and the identity of a `fold` are checked like any other
+/// expression: a special form named there without a call is rejected, and a
+/// plain function member is still accepted
+#[test]
+fn test_special_form_in_fold_is_rejected() {
+    assert_rejected(
+        &with_s1("service s2 { table t { n: int, }; def total = fold(t.n, s1.f, 0); }"),
+        "s1.f can only be called",
+    );
+    assert_rejected(
+        &with_s1(
+            "service s2 { table t { n: int, };
+                def total = fold(t.n, fn a => fn b => (a + b), s1.f); }",
+        ),
+        "s1.f can only be called",
+    );
+    let plain = "service s2 { table t { n: int, };
+        def add = fn (a: int) => fn (b: int) => (a + b);
+        def total = fold(t.n, add, 0); }";
+    assert!(
+        check(plain).is_ok(),
+        "a plain function member as the operation must be accepted: {:?}",
+        check(plain).err()
+    );
+}
+
 /// Inside the service the bare name is rejected the same way, before and after
 /// the declaration, and the message keeps the bare name
 #[test]

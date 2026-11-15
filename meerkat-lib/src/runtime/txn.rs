@@ -309,13 +309,20 @@ pub struct Transaction {
     pub composed_seq: u64,
 }
 
-/// A composed action that completed under a transaction: where it was sent,
-/// and what was sent, so a diverging replay is detected rather than suppressed
+/// A composed action dispatched under a transaction: where it was sent, and
+/// what was sent, so a diverging replay is detected rather than suppressed
+///
+/// A by-name probe the owner declined is recorded too, with `declined` set.
+/// The fallback that follows takes the next position, so a replay finds the
+/// probe at its own position and the fallback at its own
 #[derive(Debug, Clone)]
 pub struct ComposedCall {
     pub target: ServiceNetId,
     /// Hash of the encoded statements and environment the dispatch shipped
     pub fingerprint: u64,
+    /// The owner declined to run it and ran nothing: a replay answers
+    /// `Declined` again without sending
+    pub declined: bool,
 }
 
 impl Transaction {

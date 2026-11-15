@@ -1353,6 +1353,7 @@ mod tests {
             stmts,
             env: Vec::new(),
             tid,
+            by_name: false,
         };
         manager.run_and_reply_or_park(action).await;
 

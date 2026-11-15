@@ -126,7 +126,7 @@ pub(super) fn call_target(
 
 /// Apply a function value to already evaluated arguments, in the service the
 /// closure belongs to
-async fn apply_function(
+pub(super) async fn apply_function(
     func_val: Value,
     arg_vals: Vec<Value>,
     ctx: &mut EvalContext<'_>,

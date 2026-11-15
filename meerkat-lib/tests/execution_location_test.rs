@@ -1347,24 +1347,12 @@ async fn an_html_argument_takes_the_fetch_path() {
     assert_eq!(seen.last(), Some(&Seen::Commit), "{seen:?}");
 }
 
-/// Run `do member;` of the caller built from `caller_code` against a real owner
-/// running `owner_code` that holds a forward to the CALLER's service `app`
-/// (`pub def a = app.hit;`). The owner sees `app` as a remote service at the
-/// caller's address, as `caller_node` does for `s1`: it keeps a copy of `app`'s
-/// declaration for its static checks, but not a running instance. Returns the
-/// result of the action, what the owner received and the caller's `app.hits`.
-async fn run_against_forwarding_owner(
-    caller_code: &str,
-    owner_code: &str,
-    member: &str,
-) -> (
-    Result<(), meerkat_lib::runtime::interpreter::EvalError>,
-    Vec<String>,
-    Value,
-) {
+/// The two nodes of `run_against_forwarding_owner`: the caller, and the owner
+/// with its forward to the caller's `app`. See there for what they hold.
+async fn forwarding_pair(caller_code: &str, owner_code: &str) -> (Manager, Manager) {
     let (app_net, app_addr) = listening_node().await;
     let (owner_net, owner_addr) = listening_node().await;
-    let (mut m, _) = caller_node(caller_code, app_net, &owner_addr).await;
+    let (m, _) = caller_node(caller_code, app_net, &owner_addr).await;
 
     let mut interner = Interner::new();
     let ast = parse_string(owner_code, &mut interner).expect("valid syntax");
@@ -1381,6 +1369,25 @@ async fn run_against_forwarding_owner(
     owner
         .remote_services
         .insert(app, Address::new(format!("{}/app", app_addr.0)));
+    (m, owner)
+}
+
+/// Run `do member;` of the caller built from `caller_code` against a real owner
+/// running `owner_code` that holds a forward to the CALLER's service `app`
+/// (`pub def a = app.hit;`). The owner sees `app` as a remote service at the
+/// caller's address, as `caller_node` does for `s1`: it keeps a copy of `app`'s
+/// declaration for its static checks, but not a running instance. Returns the
+/// result of the action, what the owner received and the caller's `app.hits`.
+async fn run_against_forwarding_owner(
+    caller_code: &str,
+    owner_code: &str,
+    member: &str,
+) -> (
+    Result<(), meerkat_lib::runtime::interpreter::EvalError>,
+    Vec<String>,
+    Value,
+) {
+    let (mut m, mut owner) = forwarding_pair(caller_code, owner_code).await;
 
     let stmts = do_member(&mut m, member);
     let received = RefCell::new(Vec::new());
@@ -1463,10 +1470,9 @@ async fn a_stale_copy_of_an_action_that_became_a_forward_is_fetched() {
 
 /// The same with arguments: the caller's copy still declares `pub action
 /// a(x: int)`, the owner's `a` is now a plain def whose function returns the
-/// caller's action. The by-name call is declined, the call goes through the
-/// def-call path (a lookup that carries the argument; the owner's `a` is plain,
-/// so it answers with the member) and the caller applies it and runs the action
-/// it returns, once.
+/// caller's action. The by-name call is declined, the caller fetches `a` with a
+/// plain lookup (no arguments on the wire), applies it to the argument values it
+/// already computed and runs the action it returns, once.
 ///
 /// Without the owner's decline the call times out as in the zero-argument case.
 #[tokio::test(flavor = "multi_thread")]
@@ -1500,8 +1506,155 @@ async fn a_stale_copy_of_a_special_action_that_became_a_forward_is_fetched() {
         received,
         vec![
             "Action by_name=true".to_string(),
-            "Lookup a args=1".to_string(),
+            "Lookup a args=0".to_string(),
             "Commit".to_string()
         ]
     );
+}
+
+/// The argument of a declined by-name call is itself a remote call. The caller
+/// evaluates it once, for the probe, and reuses the value when it falls back to
+/// fetching `a`: `f` is looked up once, not twice. Its effects are not repeated
+/// and a remote call costs a round trip each time.
+///
+/// Without the reuse the fallback evaluates `do s1.a(s1.f(3))` again and `f`
+/// is called a second time.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_declined_by_name_call_does_not_evaluate_its_arguments_twice() {
+    const CALLER: &str = "
+        service s1 {
+            pub def f(x: int) = x + 1;
+            pub action a(x: int) { }
+        }
+        service app {
+            var hits = 0;
+            pub def hit = action { hits = hits + 1; };
+            pub def run = action { do s1.a(s1.f(3)); };
+        }
+    ";
+    const OWNER: &str = "
+        service app {
+            var hits = 0;
+            pub def hit = action { hits = hits + 1; };
+        }
+        service s1 {
+            pub def f(x: int) = x + 1;
+            pub def a = fn (x: int) => app.hit;
+        }
+    ";
+    let (result, received, hits) = run_against_forwarding_owner(CALLER, OWNER, "run").await;
+
+    assert!(result.is_ok(), "the action must succeed, got: {result:?}");
+    assert_eq!(hits, Value::Int { val: 1 }, "received: {received:?}");
+    let f_calls = received.iter().filter(|m| *m == "Lookup f args=1").count();
+    assert_eq!(f_calls, 1, "received: {received:?}");
+}
+
+/// A participant action that makes a declined by-name call and then parks is
+/// re-run from its first statement. The replay must find the probe at the
+/// position it took, recorded as declined, and the fallback at the next, so the
+/// owner receives the probe once and the replay succeeds.
+///
+/// If the declined probe gave its position back to the fallback, the replay
+/// would send the probe again at that position and meet the fallback's record:
+/// "replayed transaction's composed action ... differs".
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parked_action_replays_a_declined_by_name_call() {
+    use meerkat_lib::runtime::interpreter::EvalError;
+    use meerkat_lib::runtime::txn::TxnId;
+
+    const CALLER: &str = "
+        service s1 {
+            var y = 0;
+            pub action a(x: int) { y = x; }
+        }
+        service app {
+            var hits = 0;
+            var z = 0;
+            pub def hit = action { hits = hits + 1; };
+        }
+    ";
+    const OWNER: &str = "
+        service app {
+            var hits = 0;
+            var z = 0;
+            pub def hit = action { hits = hits + 1; };
+        }
+        service s1 {
+            var y = 0;
+            pub def a = fn (x: int) => app.hit;
+        }
+    ";
+    let (mut m, mut owner) = forwarding_pair(CALLER, OWNER).await;
+    let [app, s1, a, z] = ["app", "s1", "a", "z"].map(|n| m.interner.insert(n));
+    let bump_z = ActionStmt::Assign {
+        name: z,
+        expr: Expr::Binop {
+            op: BinOp::Add,
+            expr1: Box::new(Expr::Variable { name: z }),
+            expr2: Box::new(Expr::Literal {
+                val: Value::Int { val: 1 },
+            }),
+        },
+    };
+    let stmts = vec![
+        ActionStmt::Do(Expr::Call {
+            func: Box::new(Expr::MemberAccess {
+                service_name: s1,
+                member_name: a,
+            }),
+            args: vec![Expr::Literal {
+                val: Value::Int { val: 5 },
+            }],
+        }),
+        bump_z.clone(),
+    ];
+    let older = TxnId::new(m.node_id);
+    let younger = TxnId::new(m.node_id);
+
+    let received = RefCell::new(Vec::new());
+    let serve = async {
+        loop {
+            while let Some(NetworkEvent::MessageReceived { msg, .. }) = owner.try_recv_event() {
+                received.borrow_mut().push(match &msg {
+                    MeerkatMessage::LookupRequest { member, .. } => format!("Lookup {member}"),
+                    MeerkatMessage::ActionRequest { by_name, .. } => {
+                        format!("Action by_name={by_name}")
+                    }
+                    other => format!("{other:?}"),
+                });
+                owner.serve_request(msg).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    };
+    let drive = async {
+        // A younger transaction holds `z`, so the older one waits for it
+        m.execute_action_participant(app, std::slice::from_ref(&bump_z), &[], younger.clone())
+            .await
+            .expect("the younger transaction takes `z`");
+        let first = m
+            .execute_action_participant(app, &stmts, &[], older.clone())
+            .await;
+        assert!(matches!(first, Err(EvalError::WaitOn(_))), "got: {first:?}");
+
+        m.abort_participant(&younger).await;
+        let replay = m
+            .execute_action_participant(app, &stmts, &[], older.clone())
+            .await;
+        assert!(replay.is_ok(), "the replay must succeed, got: {replay:?}");
+    };
+    tokio::select! {
+        biased;
+        r = tokio::time::timeout(std::time::Duration::from_secs(10), drive) => {
+            r.expect("the actions must not time out")
+        }
+        _ = serve => unreachable!("the owner serves forever"),
+    };
+    let probes = received
+        .borrow()
+        .iter()
+        .filter(|m| *m == "Action by_name=true")
+        .count();
+    assert_eq!(probes, 1, "received: {:?}", received.borrow());
 }

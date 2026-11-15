@@ -280,7 +280,8 @@ pub enum ActionOutcome {
     /// The owner ran the action
     Ran,
     /// The owner did not run it, because its current declaration of the member
-    /// is not one that runs by name. Nothing ran and nothing was recorded
+    /// is not one that runs by name. Nothing ran. Under a transaction the
+    /// probe is recorded as declined, so a replay does not send it again
     Declined,
 }
 
@@ -296,6 +297,10 @@ pub enum ParkedRequest {
         stmts: Vec<ActionStmt>,
         env: Vec<(Symbol, Value)>,
         tid: TxnId,
+        /// Sent by name (`ActionRequest.by_name`): checked against this
+        /// node's current declaration at every dispatch, because a park
+        /// can outlast a code update that changes what the member is
+        by_name: bool,
     },
     Lookup {
         request_id: u64,
@@ -3514,8 +3519,10 @@ impl Manager {
     /// instead of shipping its body (`ActionRequest.by_name`). The owner checks
     /// its current declaration of the member and declines when it is not an
     /// action written in place or a special action, for example a forward to
-    /// another service's action. Nothing ran then and nothing is recorded in
-    /// `txn`, so the caller fetches the member and runs it as before.
+    /// another service's action. Nothing ran then, so the caller fetches the
+    /// member and runs it as before. Under a transaction the probe keeps its
+    /// dispatch position, recorded as declined, so a replay answers it without
+    /// sending.
     /// Parking, timeout and participant handling are those of `remote_action`
     pub async fn remote_action_by_name(
         &mut self,
@@ -3589,6 +3596,7 @@ impl Manager {
             let call = ComposedCall {
                 target: service_net_id.clone(),
                 fingerprint: Self::fingerprint(&net_stmts, &net_env)?,
+                declined: false,
             };
             if let Some(done) = t.composed_done.get(&seq) {
                 // Target alone is not identity: a replay can branch into a
@@ -3609,7 +3617,11 @@ impl Manager {
                         call.target.0
                     )));
                 }
-                return Ok(ActionOutcome::Ran);
+                return Ok(if done.declined {
+                    ActionOutcome::Declined
+                } else {
+                    ActionOutcome::Ran
+                });
             }
             claim = Some((seq, call));
         }
@@ -3643,11 +3655,16 @@ impl Manager {
                 ..
             } => {
                 if declined {
-                    // The owner ran nothing: give back the dispatch position
-                    // claimed above so the fallback and a replay see the same
-                    // order as if this request had not been sent
-                    if let (Some(txn), Some((seq, _))) = (txn, claim) {
-                        txn.composed_seq = seq;
+                    // The owner ran nothing, but the probe keeps its position
+                    // and is recorded as declined: the fallback takes the next
+                    // one, and a replay answers the probe from the record
+                    // without sending it again. Handing the position back
+                    // instead would let the fallback's dispatch claim it, and
+                    // a replay would meet the fallback's record where it sends
+                    // the probe
+                    if let (Some(txn), Some((seq, mut call))) = (txn, claim) {
+                        call.declined = true;
+                        txn.composed_done.insert(seq, call);
                     }
                     return Ok(ActionOutcome::Declined);
                 }
@@ -3700,6 +3717,20 @@ impl Manager {
         }
     }
 
+    /// Reply to a by-name action request that this node declines to run: the
+    /// owner ran nothing, and the caller falls back to fetching the member
+    async fn send_declined(&mut self, request_id: u64, reply_to: &str) {
+        let response = MeerkatMessage::ActionResponse {
+            request_id,
+            success: false,
+            error: None,
+            history: Vec::new(),
+            writes: Vec::new(),
+            declined: true,
+        };
+        self.send_oneway(Address::new(reply_to), response).await;
+    }
+
     /// Run a participant request (initial dispatch or a woken waiter), then wake
     /// whatever is parked on locks it released
     pub async fn run_and_reply_or_park(&mut self, parked: ParkedRequest) {
@@ -3719,7 +3750,20 @@ impl Manager {
                 stmts,
                 env,
                 tid,
+                by_name,
             } => {
+                // A by-name request runs only against a declaration of the
+                // right shape, checked now and not when it arrived: a request
+                // that parked behind a code update re-dispatches against the
+                // declaration the update left. The check and the run have no
+                // await between them. A decline here can come on a
+                // re-dispatch, after the transaction already took locks in an
+                // earlier attempt; that is fine, the caller's fallback runs
+                // under the same transaction
+                if by_name && !self.by_name_request_is_runnable(service, &stmts) {
+                    self.send_declined(request_id, &reply_to).await;
+                    return;
+                }
                 match self
                     .execute_action_participant(service, &stmts, &env, tid.clone())
                     .await
@@ -3734,6 +3778,7 @@ impl Manager {
                                 stmts,
                                 env,
                                 tid,
+                                by_name,
                             },
                         );
                     }
@@ -4001,23 +4046,6 @@ impl Manager {
                     self.send_oneway(Address::new(&reply_to), response).await;
                     return None;
                 }
-                // A by-name request is checked against this node's CURRENT
-                // declaration, which may have changed since the caller took its
-                // copy. Decline here: after decoding, before the transaction is
-                // touched (no participant registration, lock, parking or
-                // replay record), so a decline leaves no trace
-                if by_name && !self.by_name_request_is_runnable(svc_sym, &local_stmts) {
-                    let response = MeerkatMessage::ActionResponse {
-                        request_id,
-                        success: false,
-                        error: None,
-                        history: Vec::new(),
-                        writes: Vec::new(),
-                        declined: true,
-                    };
-                    self.send_oneway(Address::new(&reply_to), response).await;
-                    return None;
-                }
                 match txn_id {
                     // Part of a distributed transaction: park if older
                     // than a holder, otherwise reply
@@ -4029,11 +4057,20 @@ impl Manager {
                             stmts: local_stmts,
                             env: local_env,
                             tid,
+                            by_name,
                         })
                         .await;
                     }
                     // Standalone: commit immediately and reply
                     None => {
+                        // Checked against this node's CURRENT declaration,
+                        // which may have changed since the caller took its
+                        // copy. A transaction's request is checked in
+                        // `dispatch_parked` instead, on every dispatch
+                        if by_name && !self.by_name_request_is_runnable(svc_sym, &local_stmts) {
+                            self.send_declined(request_id, &reply_to).await;
+                            return None;
+                        }
                         let result = self
                             .execute_action_with_env(svc_sym, &local_stmts, &local_env)
                             .await;
@@ -7372,6 +7409,7 @@ mod tests {
             stmts: vec![],
             env: vec![],
             tid,
+            by_name: false,
         };
         let old = crate::runtime::txn::TxnId {
             timestamp: 1,
@@ -7474,6 +7512,7 @@ mod tests {
                 stmts: stmts.clone(),
                 env: vec![],
                 tid: older.clone(),
+                by_name: false,
             },
         );
 
@@ -7978,6 +8017,7 @@ mod tests {
                 node_id: tc.manager.node_id,
                 iteration: 0,
             },
+            by_name: false,
         };
         let (first, second) = (parked_action(1), parked_action(2));
         let first_tid = first.tid().clone();
@@ -8434,6 +8474,109 @@ mod tests {
         serve_do(&mut m, "fwd", false, None).await;
 
         assert_eq!(hits_of(&mut m), Value::Int { val: 1 });
+    }
+
+    /// Dispatch `do member;` as a parked by-name (or not) participant request
+    /// to the owner `s` and let it run or decline. There is no network, so the
+    /// reply is dropped: the tests look at the owner's state.
+    async fn dispatch_parked_do(m: &mut Manager, member: &str, by_name: bool, tid: TxnId) {
+        let name = m.interner.insert(member);
+        let s = m.interner.insert("s");
+        m.run_and_reply_or_park(ParkedRequest::Action {
+            request_id: 1,
+            reply_to: String::new(),
+            service: s,
+            stmts: vec![crate::ast::ActionStmt::Do(Expr::Variable { name })],
+            env: Vec::new(),
+            tid,
+            by_name,
+        })
+        .await;
+    }
+
+    /// A by-name request is checked every time it is dispatched, not only when
+    /// it arrives: a parked request is re-dispatched later, against whatever
+    /// the owner declares by then (a code update can turn the member into a
+    /// forward while it waits). Dispatched against a forward it is declined and
+    /// changes nothing, however it got to `dispatch_parked`; the same request
+    /// not sent by name still runs (it takes the write lock on `o.hits`).
+    #[tokio::test]
+    async fn a_parked_by_name_request_is_checked_when_it_is_dispatched() {
+        let mut m = start_local_manager(BY_NAME_OWNER).await;
+        dispatch_parked_do(&mut m, "fwd", true, txn_at(1)).await;
+
+        assert_eq!(hits_of(&mut m), Value::Int { val: 0 });
+        assert!(m.pending_txns.is_empty(), "no transaction is registered");
+        let [o, hits] = ["o", "hits"].map(|n| m.interner.insert(n));
+        assert!(matches!(
+            m.services[&o].vars[&hits].lock,
+            crate::runtime::txn::VarLock::Unlocked
+        ));
+
+        // Not by name, the request runs: the transaction is held with its
+        // write buffered (a participant commits on `Commit`)
+        dispatch_parked_do(&mut m, "fwd", false, txn_at(2)).await;
+        assert!(m.pending_txns.contains_key(&txn_at(2)));
+        assert!(!matches!(
+            m.services[&o].vars[&hits].lock,
+            crate::runtime::txn::VarLock::Unlocked
+        ));
+    }
+
+    /// The by-name probe of a declined call keeps its position in the
+    /// transaction's dispatch order, recorded as declined, and the fallback's
+    /// dispatch takes the next one. A replay (a parked action re-run from its
+    /// first statement) then answers the probe `Declined` and the fallback
+    /// `Ran` from the records, sending neither; a probe that differs from the
+    /// recorded one is still an error. There is no network here, so a send
+    /// would fail instead of returning.
+    #[tokio::test]
+    async fn a_replayed_declined_probe_and_its_fallback_are_answered_from_the_records() {
+        use crate::ast::ActionStmt;
+        use crate::runtime::txn::ComposedCall;
+
+        let mut m = start_local_manager(BY_NAME_OWNER).await;
+        let [fwd, inc] = ["fwd", "inc"].map(|n| m.interner.insert(n));
+        let owner = ServiceNetId("/ip4/127.0.0.1/tcp/1/p2p/owner/s".to_string());
+        let probe = vec![ActionStmt::Do(Expr::Variable { name: fwd })];
+        let fallback = vec![ActionStmt::Do(Expr::Variable { name: inc })];
+        let record = |m: &Manager, stmts: &[ActionStmt], declined| ComposedCall {
+            target: owner.clone(),
+            fingerprint: {
+                let net: Vec<_> = stmts
+                    .iter()
+                    .map(|s| codec::encode_action_stmt(s, &m.interner).unwrap())
+                    .collect();
+                Manager::fingerprint(&net, &[]).unwrap()
+            },
+            declined,
+        };
+
+        let mut txn = Transaction::new(txn_at(1));
+        txn.composed_done.insert(3, record(&m, &probe, true));
+        txn.composed_done.insert(4, record(&m, &fallback, false));
+
+        // The replay starts again at the position the first run started at
+        txn.composed_seq = 3;
+        let probed = m
+            .remote_action_by_name(&owner, probe.clone(), Vec::new(), Some(&mut txn))
+            .await;
+        assert_eq!(probed.unwrap(), ActionOutcome::Declined);
+        let ran = m
+            .remote_action(&owner, fallback.clone(), Vec::new(), Some(&mut txn))
+            .await;
+        assert!(ran.is_ok(), "the fallback is answered from its record");
+        assert_eq!(txn.composed_seq, 5, "both positions were reached");
+
+        // A probe that is not the recorded one is a divergence
+        txn.composed_seq = 3;
+        let differs = m
+            .remote_action_by_name(&owner, fallback, Vec::new(), Some(&mut txn))
+            .await;
+        assert!(
+            matches!(&differs, Err(EvalError::LocalDispatchFailed(e)) if e.contains("differs")),
+            "got: {differs:?}"
+        );
     }
 
     // The call form runs only for a function whose body is an action written

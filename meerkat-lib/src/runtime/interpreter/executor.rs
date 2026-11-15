@@ -1,4 +1,4 @@
-use super::evaluator::{call_target, eval, EvalContext, EvalError};
+use super::evaluator::{apply_function, call_target, eval, EvalContext, EvalError};
 use crate::ast::{ActionStmt, Decl, DefForm, Expr, Value};
 use crate::net::codec;
 use crate::runtime::interner::Symbol;
@@ -41,6 +41,46 @@ pub async fn execute_seq(
         }
     }
     Ok(())
+}
+
+/// Run the action a `do` evaluated to: its statements in this node's service
+/// when the action belongs to a local service, shipped to its owner when not
+async fn run_action_value(
+    val: Value,
+    manager: &mut Manager,
+    mut txn: Option<&mut Transaction>,
+) -> Result<ExecuteEffect, EvalError> {
+    match val {
+        Value::ActionClosure {
+            stmts,
+            env: closure_env,
+            service_net_id,
+        } => {
+            // `service_name_for_net_id` tells us whether the action's
+            // service is local (`Some` => its in-scope name) or remote
+            // (`None`)
+            // For remote, we ship to the owning node using the address
+            // embedded in the `ServiceNetId`, so it runs even if not
+            // imported into this scope
+            match manager.service_name_for_net_id(&service_net_id) {
+                Some(svc_name) => {
+                    let mut exec_env = closure_env.clone();
+                    execute_seq(&stmts, &mut exec_env, manager, svc_name, txn.as_deref_mut())
+                        .await?;
+                }
+                None => {
+                    // Ship to its owning node under the shared
+                    // transaction; the remote node executes
+                    // and holds until our `commit` or `abort`
+                    manager
+                        .remote_action(&service_net_id, stmts, closure_env, txn)
+                        .await?;
+                }
+            }
+            Ok(ExecuteEffect::None)
+        }
+        _ => Err(EvalError::TypeError("do expects an action".to_string())),
+    }
 }
 
 // async_recursion adds a bare #[must_use] to a fn that returns a boxed Future.
@@ -169,10 +209,8 @@ pub async fn execute(
                             arg_exprs.push(Expr::Variable { name });
                         }
                         // An argument with no wire form (html) cannot travel by name,
-                        // but the action may never read it: take the path below, which
-                        // fetches `a` and ships only what its body captures. Evaluating
-                        // the arguments again there only reads again under the same
-                        // transaction
+                        // but the action may never read it: fetch `a` and apply it
+                        // here, so only what its body captures is shipped
                         let sendable = arg_env.iter().all(|(_, value)| {
                             codec::encode_value(value, &manager.interner).is_ok()
                         });
@@ -188,7 +226,7 @@ pub async fn execute(
                                         }),
                                         args: arg_exprs,
                                     })],
-                                    arg_env,
+                                    arg_env.clone(),
                                     txn.as_deref_mut(),
                                 )
                                 .await?;
@@ -196,11 +234,38 @@ pub async fn execute(
                                 return Ok(ExecuteEffect::None);
                             }
                             // Declined: the owner's `a` is no longer a special
-                            // action. Fall through to the path below, which
-                            // evaluates the arguments again: they are
-                            // expressions read under the same transaction, so
-                            // they give the same values
+                            // action. Fall through to the fetch below
                         }
+                        // Fetch the member and apply it to the argument values
+                        // already computed: evaluating the whole call again
+                        // would repeat the arguments' effects, including calls
+                        // they make on other nodes
+                        let func_val = eval(
+                            &Expr::MemberAccess {
+                                service_name: target,
+                                member_name: member,
+                            },
+                            env,
+                            &mut EvalContext {
+                                manager,
+                                service_name,
+                                txn: txn.as_deref_mut(),
+                            },
+                        )
+                        .await?;
+                        let arg_vals = arg_env.into_iter().map(|(_, value)| value).collect();
+                        let val = apply_function(
+                            func_val,
+                            arg_vals,
+                            &mut EvalContext {
+                                manager,
+                                service_name,
+                                txn: txn.as_deref_mut(),
+                            },
+                            None,
+                        )
+                        .await?;
+                        return run_action_value(val, manager, txn).await;
                     }
                 }
             }
@@ -214,48 +279,7 @@ pub async fn execute(
                 },
             )
             .await?;
-            match val {
-                Value::ActionClosure {
-                    stmts,
-                    env: closure_env,
-                    service_net_id,
-                } => {
-                    // `service_name_for_net_id` tells us whether the action's
-                    // service is local (`Some` => its in-scope name) or remote
-                    // (`None`)
-                    // For remote, we ship to the owning node using the address
-                    // embedded in the `ServiceNetId`, so it runs even if not
-                    // imported into this scope
-                    match manager.service_name_for_net_id(&service_net_id) {
-                        Some(svc_name) => {
-                            let mut exec_env = closure_env.clone();
-                            execute_seq(
-                                &stmts,
-                                &mut exec_env,
-                                manager,
-                                svc_name,
-                                txn.as_deref_mut(),
-                            )
-                            .await?;
-                        }
-                        None => {
-                            // Ship to its owning node under the shared
-                            // transaction; the remote node executes
-                            // and holds until our `commit` or `abort`
-                            manager
-                                .remote_action(
-                                    &service_net_id,
-                                    stmts,
-                                    closure_env,
-                                    txn.as_deref_mut(),
-                                )
-                                .await?;
-                        }
-                    }
-                    Ok(ExecuteEffect::None)
-                }
-                _ => Err(EvalError::TypeError("do expects an action".to_string())),
-            }
+            run_action_value(val, manager, txn).await
         }
         ActionStmt::Assert(expr, text) => {
             let val = eval(

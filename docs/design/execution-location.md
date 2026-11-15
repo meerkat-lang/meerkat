@@ -54,8 +54,28 @@ seven claims.  Each is a test.
 | 6 | Client code may be the same for both | one unchanged client program against both servers |
 | 7 | `s1.a(s1.f(3))` takes two round trips instead of four | requests counted before the commit |
 
-Claim 3 is scoped: computing a def and creating a service keep today's path
-(see "Where a call runs").
+Claims 3 and 5 are scoped, as follows.
+
+**Scope.**  Execution moves to the owner for a call of a special def made by
+running code, and for `do` of a special action from a node whose copy of the
+owner declares it, when the owner's current declaration agrees.  It stays on
+the caller, at today's cost, in these cases, each explained below:
+
+- computing a def from pushed values, and creating a service;
+- a def call with a function value among its arguments;
+- an argument or a result with no wire form (html);
+- a caller whose copy of the owner declares the member plain;
+- a by-name `do` that the owner declines, because its current declaration is
+  no longer an action written in place or a special action;
+- `do` of a special action in the REPL and the browser, which hold no copy of
+  the owner: the owner returns the action, which then runs at the owner, two
+  round trips instead of one.
+
+Results are the `fn` spelling's except where the call's location itself shows:
+a call back into the waiting caller, or a wait at a third node longer than the
+reply timeout, and a caller's copy that predates a change to a parameter list
+(see "Limits").  Whether this scope is what #20 asks for is for the
+maintainers to confirm.
 
 ## Syntax
 
@@ -134,7 +154,10 @@ How it is built: members are bound with a binding that carries their form
 function of an `Expr::Call` is resolved on a call-position path that accepts
 special members; every other position rejects them.  The fallbacks for
 forward references and for `s.m` look up the form of the last matching
-declaration, because an `update` block appends declarations.
+declaration, because an `update` block appends declarations.  The operation
+and the identity of a `fold` are resolved like any other expression.  The
+`where` clause of a `select` is not resolved yet, because it names the
+table's columns, so a special form named there without a call is not caught.
 
 The rule is checked wherever static checks run: at the CLI's startup
 (`Node::static_checks`) and on every code update, on the node that issues it
@@ -178,18 +201,26 @@ Arguments of a call that is sent are evaluated before the request is, so they
 are now evaluated before the function's member is read; the values are the
 same.
 
-**The caller decides for `do`.**  An action request runs whatever statements
-it carries, so the caller sends `do s1.a(__arg0, ..)` only when its copy of the
-owner declares `a` as a special action: the copy shows that the action
-belonged to the owner when the copy was imported.  Without such a copy (the REPL, the browser), `do
-s1.a(3)` evaluates the call as above, so the owner returns `a(3)`, and the
-`do` then runs that action at its owner: two round trips instead of one.  The
-same rule narrows the first commit of this work: `do s.a` without arguments is
-sent as `do a` only when the caller's copy declares `a` as a plain def whose
-initializer is an action written in place.  A member that holds another
-service's action, such as a forwarding `pub def act = s2.inc;`, is fetched as
-before; sending it by name could make the owner call back into a waiting node
-(see "Limits").
+**For `do`, the caller proposes and the owner confirms.**  An action request
+runs whatever statements it carries, so the caller sends `do s1.a(__arg0, ..)`
+only when its copy of the owner declares `a` as a special action, and `do a`
+without arguments only when the copy declares `a` as a plain def whose
+initializer is an action written in place.  Such a request is marked as sent
+by name.  The copy may be out of date: an update at the owner can have made
+`a` a forward, such as `pub def a = app.hit;` with `app` on the waiting
+caller, and running that by name would make the owner call back into the
+caller, which waits until the reply timeout (#213), where the fetch path runs
+`app.hit` on the caller and succeeds.  So the owner runs a by-name request only
+if its own current declaration of `a` still has the right shape: an action
+written in place without arguments, or a function whose body is an action
+written in place (a special action, or its `fn` spelling) with them.
+Otherwise it declines, before the request touches the transaction, and the
+caller takes the fetch path as before calls ran on the owner, at one extra
+round trip.  A member that the caller's copy shows holding another service's
+action is fetched as before, without asking.  Without a copy (the REPL, the
+browser), `do s1.a(3)` evaluates the call as above, so the owner returns
+`a(3)`, and the `do` then runs that action at its owner: two round trips
+instead of one.
 
 **Why computing a def keeps today's path.**  Rule 5 exists to avoid round
 trips (end of line 123), and computing a def from pushed values makes none: a
@@ -266,6 +297,19 @@ access, which never consults the environment, so a member named like an
 argument cannot be shadowed, and the action's own body never sees the
 arguments.
 
+**By-name requests.**  `ActionRequest` gains `by_name: bool` and
+`ActionResponse` gains `declined: bool`, both defaulting to false.  The caller
+sets `by_name` on `do a` and `do s1.a(__arg0, ..)` sent by name.  The owner
+checks such a request against its current declaration of `a` right after
+decoding it and before anything touches the transaction (no participant
+record, lock, park or replay record) and, if the shape is wrong, replies
+`declined: true` with nothing run (`manager/mod.rs`,
+`by_name_request_is_runnable`).  The caller then fetches `a` and runs it as
+for a plain copy; in the call form the arguments are evaluated again, under
+the same transaction, so their values are the same.  An owner built before
+this change ignores `by_name` and runs the request as before, and a caller
+built before it never sets it.
+
 ## Transactions
 
 - **Participants.**  The caller registers the owner as a participant before
@@ -318,19 +362,29 @@ own updates to a remote service patch its copy too), and the served file is not
 rewritten.  For a call of a def that is sent, the owner decides, so the copy
 does not matter; a copy that declares the member plain keeps the plain lookup
 even after the owner turns it into a special form, which is the same result at
-the old cost.  For `do`, an out-of-date copy gives the same result unless the
-owner has since turned `a` into a member that holds another service's action:
-the by-name request then runs that action from the owner, and can hit the
-call-back timeout of #213.  A changed parameter list is also different: the owner checks the number of arguments of a def call, but not
-of a `do` sent by name (see "Limits").
+the old cost.  For `do`, an out-of-date copy gives the same result too: if the
+owner has since turned `a` into a member that holds another service's action,
+the owner declines the by-name request and the caller fetches `a`, as before
+calls ran on the owner.  A changed parameter list is different: the owner
+checks the number of arguments of a def call, but not of a `do` sent by name
+(see "Limits").
 
 The text an update forwards to a remote owner (`update.rs`,
 `format_update_source`) prints a special form as it was declared:
 `[pub ]def NAME(P: T, ..)[: R] = BODY;` and
 `[pub ]action NAME(P: T, ..) { S; .. }`, with parameter names taken from the
-interner and every statement ended by `;`.  The statement printer it shares
-with plain actions still loses `assert`'s parentheses and does not print
-`for` and `insert` bodies so that they parse; that predates this work.
+interner.  The bodies go through the expression and statement printers that
+plain updates use (`format_expr`, `format_action_stmt`).  Those printers did
+not always produce text that parses back to the same program, which this
+work fixes because the new forms rely on them: `assert(e);` keeps its
+parentheses, a lambda prints as `fn (x: T) => e`, and every compound operand
+is parenthesised, so `(x + 1) * 2` no longer comes back as `x + 1 * 2`.
+Tuples, `select`, `fold`, action literals, `for` and `insert` statements and
+table declarations print in their grammar form too.  An html template still
+has no source form, so an update that contains one cannot be forwarded.
+`tests/format_update_test.rs` parses, prints and parses again a corpus of
+declarations and compares the trees, and runs printed programs to check that
+they compute the same values.
 
 ## How this fits Meerkat
 
@@ -345,7 +399,8 @@ with plain actions still loses `assert`'s parentheses and does not print
 - **The owner's code is the authority.**  For calls of defs that are sent, the
   owner's current declaration decides, so callers without the owner's source
   behave correctly; a copy that declares the member plain keeps today's plain
-  lookup.
+  lookup.  For a `do` sent by name the owner confirms or declines, so an
+  out-of-date copy cannot make it run a forward.
 - **Transactions.**  A call joins the caller's transaction with the same
   locks, wait-die parking, replay protection and commit stamp as the reads
   and actions it replaces.  Serializability is unchanged.
@@ -363,18 +418,22 @@ with plain actions still loses `assert`'s parentheses and does not print
 - **A call back to a waiting node waits for the reply timeout.**  A node
   waiting for a reply puts incoming requests aside until its own request
   finishes (`manager/mod.rs`, `dispatch_events`), so A calling B, which calls
-  A, times out.  This is #213.  It is why `do s.a` is sent by name only for
-  actions that belong to the owner.
+  A, times out.  This is #213.  It is why a `do` sent by name runs only for
+  actions written in place at the owner, and why the owner checks that
+  against its current declaration.  A special def whose body reads a member
+  of the waiting caller's node still meets it; its `fn` spelling reads that
+  member on the caller.
 - Computing a def and creating a service keep today's path (above).
 - A caller whose copy of the owner predates a change to a special action's
   parameter list sends `do s1.a(..)` with the old number of arguments.  The
   owner applies it like any function value, without the check it makes for a
   def call, so a missing argument fails as an unknown name and an extra one
   is ignored.
-- **A stale copy can forward.**  A caller keeps the copy it imported at
-  startup, apart from its own updates.  If the owner has since turned `a` into a member that holds another
-  service's action, a by-name `do s1.a(..)` runs that action from the owner and
-  can hit the call-back timeout of #213 (see "Code updates").
+- **A stale copy costs a round trip.**  A caller keeps the copy it imported
+  at startup, apart from its own updates.  If the owner has since turned `a`
+  into a member that holds another service's action, the owner declines a
+  by-name `do s1.a(..)` and the caller fetches `a`: the old path plus one
+  round trip (see "Protocol").
 - An argument with no wire form (html) cannot be sent.  For `do s1.a(..)`,
   the caller then fetches `a` and ships what its action captures, as before,
   so it still works when the action does not read that argument.  For a call
@@ -413,16 +472,17 @@ Each claim of "What done means" is checked by the tests below.  Names are
 those of the functions.  `sf` is `meerkat-lib/tests/special_forms_test.rs`,
 `el` is `meerkat-lib/tests/execution_location_test.rs`, `ibn` is
 `meerkat-lib/tests/invoke_by_name_test.rs`, `mgr` is the unit tests of
-`meerkat-lib/src/runtime/manager/mod.rs`, and `mkn` is a multi-node scenario
+`meerkat-lib/src/runtime/manager/mod.rs`, `fu` is
+`meerkat-lib/tests/format_update_test.rs`, and `mkn` is a multi-node scenario
 of `scripts/test_mkn.py`, run on real processes.
 
 | # | Claim | Tests |
 |---|---|---|
 | 1 | Declared at the top level of a service, parameter list possibly empty | sf: `test_parse_def_forms` (including `def now() = y;`), `test_parse_action_forms` (including `action reset()`), `test_parse_rejects_bare_parameter_name`, `test_parse_desugars_to_the_fn_member`, `test_parameter_named_like_member_is_rejected`, `test_forwarded_update_text_round_trips` (special forms declared in an update keep their marks) |
-| 2 | Usable only with a call | sf: `test_special_form_without_call_is_rejected`, `test_bare_special_form_as_value_is_rejected`, `test_special_form_calls_are_accepted`, `test_local_shadows_special_form`, `test_update_to_special_form_is_rejected_while_used_as_value` |
-| 3 | A call by running code runs at the owner, with no lookup of the member or of what it reads | el: `a_call_in_an_action_is_one_request_with_the_arguments`, `a_call_in_a_test_statement_carries_no_transaction`, `do_of_a_special_action_is_one_action_request`, `a_zero_parameter_action_sends_an_empty_environment`, `the_bare_name_in_a_test_block_is_sent_by_name`, `a_special_def_returning_an_action_goes_through_the_owner`, `a_member_reply_is_applied_by_the_caller` and `an_argument_with_no_wire_form_falls_back_to_a_lookup` (the owner or the arguments do not allow a call), `a_copy_that_declares_the_member_plain_sends_a_plain_lookup` (the gate keeps the plain path for a plain copy), `a_caller_with_no_copy_sends_the_call_with_its_arguments`, `a_special_action_named_like_an_argument_reaches_the_member` (the by-name callee is a member access), `an_html_argument_takes_the_fetch_path`; the scope, computing a def and creating a service: `recomputing_a_def_sends_no_request`, `creating_a_service_sends_plain_lookups`; ibn, the zero-argument precursor (`do s.a` of a plain action-literal member is sent by name): `do_on_a_remote_member_sends_no_lookup`, and where the old path is kept: `do_on_a_bound_remote_member_keeps_the_old_path`, `do_on_a_forwarding_member_keeps_the_old_path`; the owner's side, mgr: `a_call_of_a_special_def_under_a_transaction_is_called`, `a_call_outside_a_transaction_has_no_clock`, `anything_else_is_a_plain_lookup`, `the_owner_checks_the_number_of_arguments`, `the_owner_refuses_bad_arguments_only_for_a_call`, `a_parked_call_keeps_its_arguments`, `the_reply_of_a_call_outside_a_transaction_has_no_clock`, `a_call_of_a_special_action_is_called`, `a_result_with_no_wire_form_is_answered_with_the_member`, `a_plain_member_with_arguments_under_a_transaction_is_a_lookup`, `member_decl_takes_the_last_declaration`, `member_decl_follows_a_code_update` |
+| 2 | Usable only with a call | sf: `test_special_form_without_call_is_rejected`, `test_bare_special_form_as_value_is_rejected`, `test_special_form_calls_are_accepted`, `test_local_shadows_special_form`, `test_update_to_special_form_is_rejected_while_used_as_value`; the operation and identity of a `fold`: `test_special_form_in_fold_is_rejected` |
+| 3 | A call by running code runs at the owner, with no lookup of the member or of what it reads | el: `a_call_in_an_action_is_one_request_with_the_arguments`, `a_call_in_a_test_statement_carries_no_transaction`, `do_of_a_special_action_is_one_action_request`, `a_zero_parameter_action_sends_an_empty_environment`, `the_bare_name_in_a_test_block_is_sent_by_name`, `a_special_def_returning_an_action_goes_through_the_owner`, `a_member_reply_is_applied_by_the_caller` and `an_argument_with_no_wire_form_falls_back_to_a_lookup` (the owner or the arguments do not allow a call), `a_copy_that_declares_the_member_plain_sends_a_plain_lookup` (the gate keeps the plain path for a plain copy), `a_caller_with_no_copy_sends_the_call_with_its_arguments`, `a_special_action_named_like_an_argument_reaches_the_member` (the by-name callee is a member access), `an_html_argument_takes_the_fetch_path`; the scope, computing a def and creating a service: `recomputing_a_def_sends_no_request`, `creating_a_service_sends_plain_lookups`; ibn, the zero-argument precursor (`do s.a` of a plain action-literal member is sent by name): `do_on_a_remote_member_sends_no_lookup`, and where the old path is kept: `do_on_a_bound_remote_member_keeps_the_old_path`, `do_on_a_forwarding_member_keeps_the_old_path`; the owner's side, mgr: `a_call_of_a_special_def_under_a_transaction_is_called`, `a_call_outside_a_transaction_has_no_clock`, `anything_else_is_a_plain_lookup`, `the_owner_checks_the_number_of_arguments`, `the_owner_refuses_bad_arguments_only_for_a_call`, `a_parked_call_keeps_its_arguments`, `the_reply_of_a_call_outside_a_transaction_has_no_clock`, `a_call_of_a_special_action_is_called`, `a_result_with_no_wire_form_is_answered_with_the_member`, `a_plain_member_with_arguments_under_a_transaction_is_a_lookup`, `member_decl_takes_the_last_declaration`, `member_decl_follows_a_code_update`; a by-name `do` the owner declines because the caller's copy is out of date: el: `a_stale_copy_of_an_action_that_became_a_forward_is_fetched`, `a_stale_copy_of_a_special_action_that_became_a_forward_is_fetched`; mgr: `a_by_name_request_for_a_forward_is_declined_and_changes_nothing`, `a_by_name_request_for_an_action_written_in_place_runs`, `a_request_not_by_name_for_a_forward_still_runs`, `by_name_call_requests_run_only_for_actions_written_in_place` |
 | 4 | Execution returns to the caller, with the result of a def | el: `a_call_against_a_real_owner_is_one_round_trip` (the caller stores the result and commits), `the_wiki_example_against_a_real_owner_takes_two_requests`; mkn: `location_special_forms` (the caller passes the result of `f` on to `a`, on real processes) |
-| 5 | Same results as the `fn` spelling | sf: `test_special_forms_run_like_their_fn_spelling`, `test_special_forms_have_the_type_of_their_fn_spelling`, `test_special_forms_are_type_checked`; el: `an_owner_with_the_fn_spelling_gives_the_same_result`, and for a closure argument, which keeps the call on the caller, `a_closure_argument_is_applied_on_the_caller`, `a_closure_argument_does_not_read_a_service_of_the_same_name_on_the_owner` and `a_closure_argument_gives_the_fn_spelling_result`; mkn: `location_special_forms` and `location_fn_spelling`, which end in the same state (`s1.y == 40`) |
+| 5 | Same results as the `fn` spelling | sf: `test_special_forms_run_like_their_fn_spelling`, `test_special_forms_have_the_type_of_their_fn_spelling`, `test_special_forms_are_type_checked`; el: `an_owner_with_the_fn_spelling_gives_the_same_result`, and for a closure argument, which keeps the call on the caller, `a_closure_argument_is_applied_on_the_caller`, `a_closure_argument_does_not_read_a_service_of_the_same_name_on_the_owner` and `a_closure_argument_gives_the_fn_spelling_result`; mkn: `location_special_forms` and `location_fn_spelling`, which end in the same state (`s1.y == 40`); forwarded updates print text that parses back to the same declarations and computes the same values: fu: `test_forwarded_text_round_trips`, `test_printed_text_of_known_cases`, `test_forwarded_text_keeps_the_meaning`, `test_forwarded_action_runs` |
 | 6 | Client code may be the same for both | el: `an_owner_with_the_fn_spelling_gives_the_same_result` (one caller program, both owners); mkn: `location_special_forms` and `location_fn_spelling` use the one file `scripts/tests/integration/location/client.mkt` |
 | 7 | `s1.a(s1.f(3))` takes two round trips instead of four | el: `the_wiki_example_takes_two_requests`, `the_wiki_example_against_a_real_owner_takes_two_requests`, `the_fn_spelling_takes_four_requests` |
 

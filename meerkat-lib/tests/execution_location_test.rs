@@ -16,6 +16,8 @@ use meerkat_lib::net::{
     Address, MeerkatMessage, NetworkActor, NetworkCommand, NetworkEvent, NetworkReply, NodeType,
 };
 use meerkat_lib::runtime::ast::{ActionStmt, BinOp, Expr, Stmt, Value};
+use meerkat_lib::runtime::interner::Symbol;
+use meerkat_lib::runtime::interpreter::{execute, ExecuteEffect};
 use meerkat_lib::runtime::limits::MAX_NET_CALL_ARGS;
 use meerkat_lib::runtime::parser::parse_string;
 use meerkat_lib::runtime::tt::{Param, Type};
@@ -511,6 +513,44 @@ async fn a_caller_with_no_copy_sends_the_call_with_its_arguments() {
 
     assert!(result.is_ok(), "the action must succeed, got: {result:?}");
     assert_eq!(var_of(&mut m, "app", "v"), Value::Int { val: 8 });
+    assert_eq!(
+        lookups_of(&log.borrow()),
+        vec![("f".to_string(), Some(vec![3]))]
+    );
+}
+
+/// A `var` that a code update adds to a running service is initialized by
+/// running code, so its call of `s1.f` goes to the owner with the argument, as
+/// from an action. Creating a service keeps plain lookups
+/// (`creating_a_service_sends_plain_lookups`); an update of a running service
+/// is not a creation.
+///
+/// Fails if the update's initializer is treated as a creation: the stand-in
+/// then sees a plain lookup of `f`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_var_added_by_a_code_update_calls_the_owner() {
+    let (app_net, _) = listening_node().await;
+    let (mut s1_net, s1_addr) = listening_node().await;
+    let (mut m, _) = caller_node(CALLER, app_net, &s1_addr).await;
+    let update =
+        parse_string("update app { var w = s1.f(3); }", &mut m.interner).expect("valid syntax");
+    let mut code_update = meerkat_lib::runtime::update::Transaction::new(update);
+    let log = Log::default();
+    let answer = |_: &str, _: &Option<Vec<NetValue>>| (int(8), true);
+
+    let result = tokio::select! {
+        biased;
+        r = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            code_update.poll(&mut m),
+        ) => r.expect("the update must not time out"),
+        _ = stand_in_s1(&mut s1_net, &log, &answer) => {
+            unreachable!("the stand-in for s1 runs forever")
+        }
+    };
+
+    assert!(result.is_ok(), "the update must apply, got: {result:?}");
+    assert_eq!(var_of(&mut m, "app", "w"), Value::Int { val: 8 });
     assert_eq!(
         lookups_of(&log.borrow()),
         vec![("f".to_string(), Some(vec![3]))]
@@ -1171,6 +1211,133 @@ async fn the_wiki_example_against_a_real_owner_takes_two_requests() {
         vec![
             "Lookup f args=1".to_string(),
             "Action".to_string(),
+            "Commit".to_string()
+        ]
+    );
+}
+
+/// The owner of the REPL tests: a special def and a special action
+const REPL_OWNER: &str = "
+    service s1 {
+        var y = 5;
+        pub def f(x: int) = x + y;
+        pub action a(x: int) { y = y * x; }
+    }
+";
+
+/// Run `stmt_src`, one statement, as the REPL runs it: with `execute`, no
+/// service and no transaction, on a node that knows `s1` only by address and
+/// has no copy of its source. The owner is real and runs `REPL_OWNER`.
+/// Returns the result (the value of an expression statement, if it is one),
+/// what the owner received and its `y`.
+async fn run_repl_against_owner(
+    stmt_src: &str,
+) -> (
+    Result<Option<Value>, meerkat_lib::runtime::interpreter::EvalError>,
+    Vec<String>,
+    Value,
+) {
+    let (app_net, _) = listening_node().await;
+    let (owner_net, owner_addr) = listening_node().await;
+    let (mut m, _) = caller_node("", app_net, &owner_addr).await;
+
+    let mut interner = Interner::new();
+    let ast = parse_string(REPL_OWNER, &mut interner).expect("valid syntax");
+    let mut node = Node::new();
+    node.interner = interner;
+    node.unified_ast = ast.clone();
+    node.static_checks().expect("static checks must pass");
+    // As the command line does for a server (`main.rs`), give the owner its
+    // address before it creates its services, so their identities start with
+    // it and an action value the owner returns can be sent back to it.
+    // `on_manager_startup` alone leaves the bare service name as the identity,
+    // which no other node can dial
+    let mut owner = node
+        .on_manager_startup(true, Some(owner_net), HashMap::new(), &[])
+        .await
+        .expect("owner startup");
+    owner.set_local_address(owner_addr.0.clone());
+    for stmt in &ast {
+        owner
+            .run_declaration(stmt)
+            .await
+            .expect("owner service creation");
+    }
+
+    let stmt = match parse_string(stmt_src, &mut m.interner)
+        .expect("valid syntax")
+        .into_iter()
+        .next()
+    {
+        Some(Stmt::ActionStmt(stmt)) => stmt,
+        other => panic!("expected one statement, got {other:?}"),
+    };
+    let received = RefCell::new(Vec::new());
+    let serve = async {
+        loop {
+            while let Some(NetworkEvent::MessageReceived { msg, .. }) = owner.try_recv_event() {
+                received.borrow_mut().push(match &msg {
+                    MeerkatMessage::LookupRequest { member, args, .. } => {
+                        format!("Lookup {member} args={}", args.as_ref().map_or(0, Vec::len))
+                    }
+                    MeerkatMessage::ActionRequest { by_name, .. } => {
+                        format!("Action by_name={by_name}")
+                    }
+                    MeerkatMessage::Commit { .. } => "Commit".to_string(),
+                    other => format!("{other:?}"),
+                });
+                owner.serve_request(msg).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    };
+    let result = tokio::select! {
+        biased;
+        r = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            execute(&stmt, &[], &mut m, Symbol::empty(), None),
+        ) => r.expect("the statement must not time out").map(|effect| match effect {
+            ExecuteEffect::ExprValue(v) => Some(v),
+            _ => None,
+        }),
+        _ = serve => unreachable!("the owner serves forever"),
+    };
+    let y = var_of(&mut owner, "s1", "y");
+    (result, received.into_inner(), y)
+}
+
+/// A REPL statement that calls a special def sends one request with the
+/// argument, which the owner runs: no lookup of `f` or of the `y` it reads.
+///
+/// Fails if the evaluator gate sends calls only for a caller whose copy
+/// declares the member: with no copy the REPL would fetch `f` and then `y`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repl_statement_calls_a_special_def_on_the_owner() {
+    let (result, received, _) = run_repl_against_owner("s1.f(3);").await;
+
+    assert!(
+        matches!(result, Ok(Some(Value::Int { val: 8 }))),
+        "got: {result:?}"
+    );
+    assert_eq!(received, vec!["Lookup f args=1".to_string()]);
+}
+
+/// `do s1.a(3);` in the REPL, which has no copy of `s1`: the owner runs
+/// `a(3)` and returns the action, which the REPL then sends back to run. Two
+/// round trips, the first one with the argument; the owner's `y` becomes 15.
+/// A bare `do` at the REPL runs in a transaction of its own
+/// (`execute_action_with_txn`), so a commit follows.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repl_do_of_a_special_action_takes_two_round_trips() {
+    let (result, received, y) = run_repl_against_owner("do s1.a(3);").await;
+
+    assert!(result.is_ok(), "got: {result:?}");
+    assert_eq!(y, Value::Int { val: 15 });
+    assert_eq!(
+        received,
+        vec![
+            "Lookup a args=1".to_string(),
+            "Action by_name=false".to_string(),
             "Commit".to_string()
         ]
     );

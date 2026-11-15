@@ -3132,15 +3132,22 @@ impl Manager {
         args: Vec<Value>,
         mut txn: Option<&mut Transaction>,
     ) -> Result<CallReply, EvalError> {
-        // An argument with no wire form (html) cannot be sent, but the call
-        // can still be made: the member comes back and is applied here, as
-        // before calls ran on the owner. A special form and its `fn` spelling
-        // compute the same value.
-        let Ok(net_args) = args
-            .iter()
-            .map(|a| codec::encode_value(a, &self.interner))
-            .collect::<Result<Vec<_>, _>>()
-        else {
+        // An argument with no wire form (html) cannot be sent, and a function
+        // value cannot be applied on the owner: a closure carries its service
+        // only by name (`net/codec.rs`), so there a read of one of its
+        // service's members fails, or reads a service of the same name. The
+        // call can still be made: the member comes back and is applied here,
+        // as before calls ran on the owner, so the result is the `fn`
+        // spelling's.
+        let net_args = if args.iter().any(holds_function) {
+            None
+        } else {
+            args.iter()
+                .map(|a| codec::encode_value(a, &self.interner))
+                .collect::<Result<Vec<_>, _>>()
+                .ok()
+        };
+        let Some(net_args) = net_args else {
             return self
                 .remote_lookup_with_clock(service, member, txn)
                 .await
@@ -4905,6 +4912,22 @@ impl Manager {
     ) -> Result<(), EvalError> {
         let mut env: Vec<(Symbol, Value)> = Vec::new();
         execute_seq(stmts, &mut env, self, service_name, None).await
+    }
+}
+
+/// Whether `value` is or holds a function value, which cannot be applied on
+/// another node (see `Manager::remote_call`). An action value carries its
+/// owner's network identity and runs there, so it does not count.
+fn holds_function(value: &Value) -> bool {
+    match value {
+        Value::Closure { .. } => true,
+        Value::List { vals } => vals.iter().any(holds_function),
+        Value::Int { .. }
+        | Value::Bool { .. }
+        | Value::String { .. }
+        | Value::Html(_)
+        | Value::ActionClosure { .. }
+        | Value::Range { .. } => false,
     }
 }
 

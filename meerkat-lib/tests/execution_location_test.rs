@@ -1076,9 +1076,25 @@ async fn run_against_owner(
     owner_code: &str,
     member: &str,
 ) -> (Vec<String>, Value) {
+    run_against_owner_with(caller_code, owner_code, member, false).await
+}
+
+/// `run_against_owner`, optionally without the caller's running copy of `s1`,
+/// as for a caller that imported it: a fetched action must then resolve to the
+/// owner, not to a local service of that name.
+async fn run_against_owner_with(
+    caller_code: &str,
+    owner_code: &str,
+    member: &str,
+    remove_local_s1: bool,
+) -> (Vec<String>, Value) {
     let (app_net, _) = listening_node().await;
     let (owner_net, owner_addr) = listening_node().await;
     let (mut m, _) = caller_node(caller_code, app_net, &owner_addr).await;
+    if remove_local_s1 {
+        let s1 = m.interner.insert("s1");
+        m.services.remove(&s1);
+    }
 
     let mut interner = Interner::new();
     let ast = parse_string(owner_code, &mut interner).expect("valid syntax");
@@ -1181,6 +1197,82 @@ async fn an_owner_with_the_fn_spelling_gives_the_same_result() {
         vec![
             "Lookup f args=1".to_string(),
             "Lookup y args=0".to_string(),
+            "Action".to_string(),
+            "Commit".to_string()
+        ]
+    );
+}
+
+const CLOSURE_S1: &str = "
+    service s1 {
+        var y = 0;
+        pub def apply(g: int -> int) = g(1);
+        pub action set(x: int) { y = x; }
+    }
+";
+
+const CLOSURE_FN_S1: &str = "
+    service s1 {
+        var y = 0;
+        pub def apply = fn (g: int -> int) => g(1);
+        pub def set = fn (x: int) => action { y = x; };
+    }
+";
+
+const CLOSURE_APP: &str = "
+    service app {
+        var v = 7;
+        pub def run = action { do s1.set(s1.apply(fn (n: int) => v + n)); };
+    }
+";
+
+/// `do s1.set(s1.apply(fn (n: int) => v + n))` leaves `y` at 8. A closure
+/// argument carries its service only by name, so on the owner its read of `v`
+/// would fail: the call of `apply` is a plain lookup and the caller applies
+/// the member, reading its own `v`. `set` is still one by-name request.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_closure_argument_is_applied_on_the_caller() {
+    let caller = format!("{CLOSURE_S1}{CLOSURE_APP}");
+    let (received, y) = run_against_owner(&caller, CLOSURE_S1, "run").await;
+
+    assert_eq!(y, Value::Int { val: 8 }, "received: {received:?}");
+    assert_eq!(
+        received,
+        vec![
+            "Lookup apply args=0".to_string(),
+            "Action".to_string(),
+            "Commit".to_string()
+        ]
+    );
+}
+
+/// An owner that also runs a service named `app` with its own `v = 100` must
+/// not be read: the closure belongs to the caller's `app`, so `y` is 8, not
+/// 101.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_closure_argument_does_not_read_a_service_of_the_same_name_on_the_owner() {
+    let caller = format!("{CLOSURE_S1}{CLOSURE_APP}");
+    let owner = format!("{CLOSURE_S1} service app {{ var v = 100; }}");
+    let (received, y) = run_against_owner(&caller, &owner, "run").await;
+
+    assert_eq!(y, Value::Int { val: 8 }, "received: {received:?}");
+}
+
+/// The `fn` spelling on both sides gives the same `y`, 8. The fetched action
+/// runs on the owner, so the caller's own copy of `s1` is removed first. A
+/// call that is not sent reads its callee before its arguments
+/// (`evaluator.rs`), so `set` is fetched before `apply`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_closure_argument_gives_the_fn_spelling_result() {
+    let caller = format!("{CLOSURE_FN_S1}{CLOSURE_APP}");
+    let (received, y) = run_against_owner_with(&caller, CLOSURE_FN_S1, "run", true).await;
+
+    assert_eq!(y, Value::Int { val: 8 }, "received: {received:?}");
+    assert_eq!(
+        received,
+        vec![
+            "Lookup set args=0".to_string(),
+            "Lookup apply args=0".to_string(),
             "Action".to_string(),
             "Commit".to_string()
         ]

@@ -1512,6 +1512,91 @@ async fn a_stale_copy_of_a_special_action_that_became_a_forward_is_fetched() {
     );
 }
 
+/// The owner added a parameter to `a` after the caller took its copy, which
+/// still declares `pub action a(x: int)`. The by-name `do s1.a(5)` is refused
+/// with the error a call of a special def with the wrong number of arguments
+/// gets, and the caller does not fall back to fetching `a`. (`hits` is unused:
+/// the helper reads it.)
+///
+/// Without the owner's check the owner runs the body with `z` unbound, and the
+/// call fails on the unknown name instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_copy_missing_an_argument_gets_the_argument_count_error() {
+    const CALLER: &str = "
+        service s1 {
+            var y = 0;
+            pub action a(x: int) { y = x; }
+        }
+        service app {
+            var hits = 0;
+            pub def run = action { do s1.a(5); };
+        }
+    ";
+    const OWNER: &str = "
+        service s1 {
+            var y = 0;
+            pub action a(x: int, z: int) { y = x + z; }
+        }
+    ";
+    let (result, received, _) = run_against_forwarding_owner(CALLER, OWNER, "run").await;
+
+    let error = result.expect_err("the call must fail").to_string();
+    assert!(
+        error.contains("'s1.a' takes 2 arguments, but the call has 1"),
+        "got: {error}"
+    );
+    assert_eq!(
+        received.first().map(String::as_str),
+        Some("Action by_name=true"),
+        "{received:?}"
+    );
+    assert!(
+        !received.iter().any(|m| m.starts_with("Lookup a")),
+        "no fallback fetch: {received:?}"
+    );
+}
+
+/// The owner removed a parameter: the caller's copy still declares
+/// `pub action a(x: int, z: int)`. `do s1.a(5, 6)` is refused in the same way.
+///
+/// Without the owner's check the owner drops the second argument and the call
+/// succeeds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_copy_with_an_extra_argument_gets_the_argument_count_error() {
+    const CALLER: &str = "
+        service s1 {
+            var y = 0;
+            pub action a(x: int, z: int) { y = x + z; }
+        }
+        service app {
+            var hits = 0;
+            pub def run = action { do s1.a(5, 6); };
+        }
+    ";
+    const OWNER: &str = "
+        service s1 {
+            var y = 0;
+            pub action a(x: int) { y = x; }
+        }
+    ";
+    let (result, received, _) = run_against_forwarding_owner(CALLER, OWNER, "run").await;
+
+    let error = result.expect_err("the call must fail").to_string();
+    assert!(
+        error.contains("'s1.a' takes 1 arguments, but the call has 2"),
+        "got: {error}"
+    );
+    assert_eq!(
+        received.first().map(String::as_str),
+        Some("Action by_name=true"),
+        "{received:?}"
+    );
+    assert!(
+        !received.iter().any(|m| m.starts_with("Lookup a")),
+        "no fallback fetch: {received:?}"
+    );
+}
+
 /// The argument of a declined by-name call is itself a remote call. The caller
 /// evaluates it once, for the probe, and reuses the value when it falls back to
 /// fetching `a`: `f` is looked up once, not twice. Its effects are not repeated

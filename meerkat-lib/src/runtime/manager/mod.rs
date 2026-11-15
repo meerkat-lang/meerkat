@@ -1397,49 +1397,89 @@ impl Manager {
     /// declaration of `a` to be an action written in place, and
     /// `do s.a(__arg0, ..)` needs it to be a function whose body is an action
     /// written in place: a special action, or its `fn` spelling. A forward,
-    /// another function, an unknown member or any other statement shape is not
-    /// run
-    fn by_name_request_is_runnable(&self, service: Symbol, stmts: &[ActionStmt]) -> bool {
+    /// another function, an unknown member or any other statement shape is
+    /// declined (`Ok(false)`). A call of the right shape whose arguments do not
+    /// fit the parameters is an error, as a call of a special def is
+    /// (`lookup_or_call`): a caller whose copy predates a change of the
+    /// parameter list would otherwise run the body with a parameter unbound,
+    /// or with an argument dropped
+    fn by_name_request_is_runnable(
+        &self,
+        service: Symbol,
+        stmts: &[ActionStmt],
+    ) -> Result<bool, EvalError> {
         let [ActionStmt::Do(expr)] = stmts else {
-            return false;
+            return Ok(false);
         };
         match expr {
-            Expr::Variable { name } => matches!(
+            Expr::Variable { name } => Ok(matches!(
                 self.member_decl(service, *name),
                 Some(Decl::DefDecl {
                     val: Expr::Action(_),
                     ..
                 })
-            ),
+            )),
             Expr::MemberAccess {
                 service_name,
                 member_name,
-            } => matches!(
+            } => Ok(matches!(
                 self.member_decl(*service_name, *member_name),
                 Some(Decl::DefDecl {
                     val: Expr::Action(_),
                     ..
                 })
-            ),
+            )),
             // A special action is a function whose body is an action written
             // in place; its `fn` spelling has the same shape and runs here just
             // as safely. A function returning anything else, such as another
             // service's action, is declined
-            Expr::Call { func, .. } => match &**func {
-                Expr::MemberAccess {
+            Expr::Call { func, args } => {
+                let Expr::MemberAccess {
                     service_name,
                     member_name,
-                } => matches!(
-                    self.member_decl(*service_name, *member_name),
+                } = &**func
+                else {
+                    return Ok(false);
+                };
+                match self.member_decl(*service_name, *member_name) {
                     Some(Decl::DefDecl {
-                        val: Expr::Func { body, .. },
+                        val: Expr::Func { params, body, .. },
                         ..
-                    }) if matches!(**body, Expr::Action(_))
-                ),
-                _ => false,
-            },
-            _ => false,
+                    }) if matches!(**body, Expr::Action(_)) => {
+                        if arity_fits(params, args.len()) {
+                            Ok(true)
+                        } else {
+                            Err(self.arity_error(
+                                *service_name,
+                                *member_name,
+                                params.len(),
+                                args.len(),
+                            ))
+                        }
+                    }
+                    _ => Ok(false),
+                }
+            }
+            _ => Ok(false),
         }
+    }
+
+    /// The error of a call of `service.member` with `args` arguments whose
+    /// declaration has `params` parameters
+    fn arity_error(
+        &self,
+        service: Symbol,
+        member: Symbol,
+        params: usize,
+        args: usize,
+    ) -> EvalError {
+        EvalError::RuntimeError(format!(
+            "'{}.{}' takes {} arguments, but the call has {}",
+            self.interner.get(service),
+            self.interner.get(member),
+            params,
+            args
+        ))
     }
 
     /// The identity of the owner of the remote service `service`. A service URL
@@ -3731,6 +3771,20 @@ impl Manager {
         self.send_oneway(Address::new(reply_to), response).await;
     }
 
+    /// Reply to an action request that this node refuses before running
+    /// anything, such as a by-name call whose arguments do not fit
+    async fn send_action_error(&mut self, request_id: u64, reply_to: &str, error: String) {
+        let response = MeerkatMessage::ActionResponse {
+            request_id,
+            success: false,
+            error: Some(error),
+            history: Vec::new(),
+            writes: Vec::new(),
+            declined: false,
+        };
+        self.send_oneway(Address::new(reply_to), response).await;
+    }
+
     /// Run a participant request (initial dispatch or a woken waiter), then wake
     /// whatever is parked on locks it released
     pub async fn run_and_reply_or_park(&mut self, parked: ParkedRequest) {
@@ -3759,10 +3813,21 @@ impl Manager {
                 // await between them. A decline here can come on a
                 // re-dispatch, after the transaction already took locks in an
                 // earlier attempt; that is fine, the caller's fallback runs
-                // under the same transaction
-                if by_name && !self.by_name_request_is_runnable(service, &stmts) {
-                    self.send_declined(request_id, &reply_to).await;
-                    return;
+                // under the same transaction. A call whose arguments do not fit
+                // is refused with an error, as a def call is
+                if by_name {
+                    match self.by_name_request_is_runnable(service, &stmts) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            self.send_declined(request_id, &reply_to).await;
+                            return;
+                        }
+                        Err(e) => {
+                            self.send_action_error(request_id, &reply_to, e.to_string())
+                                .await;
+                            return;
+                        }
+                    }
                 }
                 match self
                     .execute_action_participant(service, &stmts, &env, tid.clone())
@@ -4067,9 +4132,19 @@ impl Manager {
                         // which may have changed since the caller took its
                         // copy. A transaction's request is checked in
                         // `dispatch_parked` instead, on every dispatch
-                        if by_name && !self.by_name_request_is_runnable(svc_sym, &local_stmts) {
-                            self.send_declined(request_id, &reply_to).await;
-                            return None;
+                        if by_name {
+                            match self.by_name_request_is_runnable(svc_sym, &local_stmts) {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    self.send_declined(request_id, &reply_to).await;
+                                    return None;
+                                }
+                                Err(e) => {
+                                    self.send_action_error(request_id, &reply_to, e.to_string())
+                                        .await;
+                                    return None;
+                                }
+                            }
                         }
                         let result = self
                             .execute_action_with_env(svc_sym, &local_stmts, &local_env)
@@ -5114,6 +5189,20 @@ impl Manager {
         let mut env: Vec<(Symbol, Value)> = Vec::new();
         execute_seq(stmts, &mut env, self, service_name, None).await
     }
+}
+
+/// Whether a call with `nargs` arguments fits `params`. No arguments also fit
+/// a single `unit` parameter, as in the type checker
+fn arity_fits(params: &[crate::runtime::tt::Param], nargs: usize) -> bool {
+    nargs == params.len()
+        || (nargs == 0
+            && matches!(
+                params,
+                [crate::runtime::tt::Param {
+                    ty: Some(crate::runtime::tt::Type::Unit),
+                    ..
+                }]
+            ))
 }
 
 /// Whether `value` is or holds a function value, which cannot be applied on
@@ -8598,14 +8687,69 @@ mod tests {
                 args: vec![Expr::Variable { name: arg }],
             })]
         };
-        assert!(m.by_name_request_is_runnable(s, &call(act)));
-        assert!(m.by_name_request_is_runnable(s, &call(act_fn)));
-        assert!(!m.by_name_request_is_runnable(s, &call(fwd_fn)));
-        assert!(!m.by_name_request_is_runnable(s, &call(sp)));
-        assert!(!m.by_name_request_is_runnable(s, &call(nope)));
-        assert!(!m.by_name_request_is_runnable(s, &[]));
+        assert!(matches!(
+            m.by_name_request_is_runnable(s, &call(act)),
+            Ok(true)
+        ));
+        assert!(matches!(
+            m.by_name_request_is_runnable(s, &call(act_fn)),
+            Ok(true)
+        ));
+        assert!(matches!(
+            m.by_name_request_is_runnable(s, &call(fwd_fn)),
+            Ok(false)
+        ));
+        assert!(matches!(
+            m.by_name_request_is_runnable(s, &call(sp)),
+            Ok(false)
+        ));
+        assert!(matches!(
+            m.by_name_request_is_runnable(s, &call(nope)),
+            Ok(false)
+        ));
+        assert!(matches!(m.by_name_request_is_runnable(s, &[]), Ok(false)));
         let two = [call(act), call(act)].concat();
-        assert!(!m.by_name_request_is_runnable(s, &two));
+        assert!(matches!(m.by_name_request_is_runnable(s, &two), Ok(false)));
+    }
+
+    // A call of the right shape whose arguments do not fit the owner's
+    // parameters is refused with the error a def call gets: it is not run
+    // with a parameter unbound or an argument dropped, and it is not declined,
+    // since the caller's fallback would apply the member to the same arguments
+    #[tokio::test]
+    async fn a_by_name_call_with_the_wrong_number_of_arguments_is_an_error() {
+        let mut m = start_local_manager(BY_NAME_OWNER).await;
+        let [s, act, act_fn] = ["s", "act", "act_fn"].map(|n| m.interner.insert(n));
+        let args: Vec<Expr> = (0..2)
+            .map(|i| Expr::Variable {
+                name: m.interner.insert(&format!("__arg{i}")),
+            })
+            .collect();
+        let call = |member, n: usize| {
+            vec![crate::ast::ActionStmt::Do(Expr::Call {
+                func: Box::new(Expr::MemberAccess {
+                    service_name: s,
+                    member_name: member,
+                }),
+                args: args[..n].to_vec(),
+            })]
+        };
+        for member in [act, act_fn] {
+            for (n, text) in [
+                (0, "takes 1 arguments, but the call has 0"),
+                (2, "takes 1 arguments, but the call has 2"),
+            ] {
+                let got = m.by_name_request_is_runnable(s, &call(member, n));
+                assert!(
+                    matches!(&got, Err(EvalError::RuntimeError(e)) if e.contains(text)),
+                    "got: {got:?}"
+                );
+            }
+            assert!(matches!(
+                m.by_name_request_is_runnable(s, &call(member, 1)),
+                Ok(true)
+            ));
+        }
     }
 
     // Outside a transaction the call is a plain unlocked read: no clock

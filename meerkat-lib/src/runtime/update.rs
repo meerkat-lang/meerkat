@@ -470,7 +470,10 @@ impl Transaction {
     }
 }
 
-/// Format an `ActionStmt` into a valid Meerkat string, resolving symbols with the interner.
+/// Format an `ActionStmt` into valid Meerkat source, terminator included
+///
+/// Every statement the grammar ends with `;` prints with it; `insert .. into t`
+/// and `for .. { .. }` have no terminator in the grammar and print without one.
 fn format_action_stmt(stmt: &crate::runtime::ast::ActionStmt, interner: &Interner) -> String {
     use crate::runtime::ast::ActionStmt;
     match stmt {
@@ -478,16 +481,18 @@ fn format_action_stmt(stmt: &crate::runtime::ast::ActionStmt, interner: &Interne
             let name_str = interner.get(*name);
             let expr_str = format_expr(expr, interner);
             if let Some(t) = ty {
-                format!("let {}: {} = {}", name_str, t, expr_str)
+                format!("let {}: {} = {};", name_str, t, expr_str)
             } else {
-                format!("let {} = {}", name_str, expr_str)
+                format!("let {} = {};", name_str, expr_str)
             }
         }
-        ActionStmt::Expr(expr) => format_expr(expr, interner),
-        ActionStmt::Do(expr) => format!("do {}", format_expr(expr, interner)),
-        ActionStmt::Assert(expr, _) => format!("assert {}", format_expr(expr, interner)),
+        ActionStmt::Expr(expr) => format!("{};", format_expr(expr, interner)),
+        ActionStmt::Do(expr) => format!("do {};", format_expr(expr, interner)),
+        // The raw source text kept in the statement is not reused: the owner
+        // reports the printed condition
+        ActionStmt::Assert(expr, _) => format!("assert({});", format_expr(expr, interner)),
         ActionStmt::Assign { name, expr } => {
-            format!("{} = {}", interner.get(*name), format_expr(expr, interner))
+            format!("{} = {};", interner.get(*name), format_expr(expr, interner))
         }
         ActionStmt::Insert { row, table_name } => {
             format!(
@@ -500,22 +505,71 @@ fn format_action_stmt(stmt: &crate::runtime::ast::ActionStmt, interner: &Interne
             var,
             iterable,
             body,
-        } => {
-            let body_strs: Vec<String> = body
-                .iter()
-                .map(|s| format_action_stmt(s, interner))
-                .collect();
-            format!(
-                "for {} in {} {{ {} }}",
-                interner.get(*var),
-                format_expr(iterable, interner),
-                body_strs.join("; ")
-            )
-        }
+        } => format!(
+            "for {} in {} {{{} }}",
+            interner.get(*var),
+            format_expr(iterable, interner),
+            format_action_stmts(body, interner)
+        ),
+    }
+}
+
+/// The statements of a block, each preceded by a space
+fn format_action_stmts(stmts: &[crate::runtime::ast::ActionStmt], interner: &Interner) -> String {
+    stmts
+        .iter()
+        .map(|s| format!(" {}", format_action_stmt(s, interner)))
+        .collect()
+}
+
+/// Format a sub-expression that is an operand of another expression
+///
+/// Only forms that are atoms of the grammar (`SubExpr`) print bare. Every
+/// other form is parenthesised, so the printed text never depends on operator
+/// precedence or on how far an `if`, `fn`, `select` or `fold` extends to the
+/// right.
+fn format_operand(expr: &Expr, interner: &Interner) -> String {
+    let atom = match expr {
+        Expr::Literal { val } => match val {
+            // `-5` is a unary minus in the grammar
+            Value::Int { val } => *val >= 0,
+            Value::Bool { .. } | Value::String { .. } | Value::List { .. } => true,
+            Value::Html(_)
+            | Value::Closure { .. }
+            | Value::ActionClosure { .. }
+            | Value::Range { .. } => false,
+        },
+        Expr::Variable { .. }
+        | Expr::Tuple { .. }
+        | Expr::List(_)
+        | Expr::Call { .. }
+        | Expr::MemberAccess { .. }
+        | Expr::Action(_) => true,
+        Expr::Html(_)
+        | Expr::KeyVal { .. }
+        | Expr::Unop { .. }
+        | Expr::Binop { .. }
+        | Expr::If { .. }
+        | Expr::Func { .. }
+        | Expr::Select { .. }
+        | Expr::Table { .. }
+        | Expr::Fold { .. }
+        | Expr::Range { .. } => false,
+    };
+    if atom {
+        format_expr(expr, interner)
+    } else {
+        format!("({})", format_expr(expr, interner))
     }
 }
 
 /// Format an `Expr` into a valid Meerkat source code string
+///
+/// The text parses back to the same expression. Compound operands are
+/// parenthesised (see `format_operand`). Two forms have no source spelling and
+/// print as placeholders: an HTML template, whose parts are private to
+/// `runtime::html`, and a string containing `"`, which the lexer cannot read
+/// (it has no escapes; the parser never produces one).
 ///
 /// Args:
 ///     `expr` (`&Expr`): The expression AST node
@@ -529,68 +583,65 @@ pub fn format_expr(expr: &Expr, interner: &Interner) -> String {
             Value::Int { val } => val.to_string(),
             Value::Bool { val } => val.to_string(),
             Value::String { val } => format!("\"{}\"", val),
+            Value::List { vals } => {
+                let elems: Vec<String> = vals
+                    .iter()
+                    .map(|v| format_expr(&Expr::Literal { val: v.clone() }, interner))
+                    .collect();
+                format!("[{}]", elems.join(", "))
+            }
+            Value::Range { start, end } => format!("{}..{}", start, end),
             Value::Html(h) => h.to_string(),
-            Value::Closure { .. }
-            | Value::ActionClosure { .. }
-            | Value::List { .. }
-            | Value::Range { .. } => val.to_string(),
+            Value::Closure { .. } | Value::ActionClosure { .. } => val.to_string(),
         },
         Expr::Html(_) => "<html>".to_string(),
         Expr::Tuple { val } => {
             let elems: Vec<String> = val.iter().map(|e| format_expr(e, interner)).collect();
-            format!("({})", elems.join(", "))
+            format!("{{{}}}", elems.join(", "))
         }
         Expr::KeyVal { name, value } => {
             format!("{}: {}", interner.get(*name), format_expr(value, interner))
         }
         Expr::Variable { name } => interner.get(*name).to_string(),
         Expr::Unop { op, expr } => {
-            format!("{}{}", op, format_expr(expr, interner))
+            format!("{}{}", op, format_operand(expr, interner))
         }
         Expr::Binop { op, expr1, expr2 } => format!(
             "{} {} {}",
-            format_expr(expr1, interner),
+            format_operand(expr1, interner),
             op,
-            format_expr(expr2, interner)
+            format_operand(expr2, interner)
         ),
         Expr::If { cond, expr1, expr2 } => format!(
             "if {} then {} else {}",
-            format_expr(cond, interner),
-            format_expr(expr1, interner),
-            format_expr(expr2, interner)
+            format_operand(cond, interner),
+            format_operand(expr1, interner),
+            format_operand(expr2, interner)
         ),
-        Expr::Func {
-            params,
-            body,
-            return_ty,
-        } => {
-            let params_str: Vec<String> = params.iter().map(|p| p.to_string()).collect();
-            if let Some(ref ty) = return_ty {
-                format!(
-                    "fn({}) -> {}[{}]",
-                    params_str.join(","),
-                    ty,
-                    format_expr(body, interner)
-                )
-            } else {
-                format!(
-                    "fn({})[{}]",
-                    params_str.join(","),
-                    format_expr(body, interner)
-                )
-            }
+        // A lambda has no return type syntax: the grammar sets it to `None`
+        Expr::Func { params, body, .. } => {
+            let params_str: Vec<String> = params
+                .iter()
+                .map(|p| match &p.ty {
+                    Some(t) => format!("{}: {}", interner.get(p.name), t),
+                    None => interner.get(p.name).to_string(),
+                })
+                .collect();
+            format!(
+                "fn ({}) => {}",
+                params_str.join(", "),
+                format_expr(body, interner)
+            )
         }
         Expr::Call { func, args } => {
             let arg_strs: Vec<String> = args.iter().map(|a| format_expr(a, interner)).collect();
-            format!("{}({})", format_expr(func, interner), arg_strs.join(", "))
+            format!(
+                "{}({})",
+                format_operand(func, interner),
+                arg_strs.join(", ")
+            )
         }
-        Expr::Action(stmts) => {
-            let stmts_str: Vec<String> = stmts
-                .iter()
-                .map(|s| format!("{:?}", format_action_stmt(s, interner)))
-                .collect();
-            format!("Action([{}])", stmts_str.join(", "))
-        }
+        Expr::Action(stmts) => format!("action {{{} }}", format_action_stmts(stmts, interner)),
         Expr::MemberAccess {
             service_name,
             member_name,
@@ -599,7 +650,20 @@ pub fn format_expr(expr: &Expr, interner: &Interner) -> String {
             interner.get(*service_name),
             interner.get(*member_name)
         ),
-        Expr::Select { where_clause, .. } => format_expr(where_clause, interner),
+        Expr::Select {
+            table_name,
+            column_names,
+            where_clause,
+        } => {
+            let cols: Vec<&str> = column_names.iter().map(|c| interner.get(*c)).collect();
+            format!(
+                "select {} from {} where {}",
+                cols.join(", "),
+                interner.get(*table_name),
+                format_expr(where_clause, interner)
+            )
+        }
+        // The parser has no table literal; kept as a list of tuples
         Expr::Table { records, .. } => {
             let records_str: Vec<String> = records
                 .iter()
@@ -614,15 +678,26 @@ pub fn format_expr(expr: &Expr, interner: &Interner) -> String {
                 .collect();
             format!("[{}]", records_str.join(", "))
         }
-        Expr::Fold { .. } => "fold".to_string(),
+        Expr::Fold {
+            table_name,
+            column_name,
+            operation,
+            identity,
+        } => format!(
+            "fold({}.{}, {}, {})",
+            interner.get(*table_name),
+            interner.get(*column_name),
+            format_expr(operation, interner),
+            format_expr(identity, interner)
+        ),
         Expr::List(exprs) => {
             let elems: Vec<String> = exprs.iter().map(|e| format_expr(e, interner)).collect();
             format!("[{}]", elems.join(", "))
         }
         Expr::Range { start, end } => format!(
-            "{}..{}",
-            format_expr(start, interner),
-            format_expr(end, interner)
+            "{} .. {}",
+            format_operand(start, interner),
+            format_operand(end, interner)
         ),
     }
 }
@@ -673,13 +748,12 @@ pub fn format_decl(decl: &Decl, interner: &Interner) -> String {
             let params_str = params_str.join(", ");
             match (form, body.as_ref()) {
                 (DefForm::Action, Expr::Action(stmts)) => {
-                    let stmts_str: String = stmts
-                        .iter()
-                        .map(|s| format!(" {};", format_action_stmt(s, interner)))
-                        .collect();
                     format!(
                         "{}action {}({}) {{{} }}",
-                        prefix, name_str, params_str, stmts_str
+                        prefix,
+                        name_str,
+                        params_str,
+                        format_action_stmts(stmts, interner)
                     )
                 }
                 _ => match return_ty {
@@ -717,8 +791,19 @@ pub fn format_decl(decl: &Decl, interner: &Interner) -> String {
                 format!("{}def {} = {};", prefix, name_str, val_str)
             }
         }
-        Decl::TableDecl { name, .. } => {
-            format!("table {};", interner.get(*name))
+        Decl::TableDecl { name, fields } => {
+            let fields_str: String = fields
+                .iter()
+                .map(|f| {
+                    let ty = match f.ty {
+                        crate::runtime::ast::TableType::Int => "int",
+                        crate::runtime::ast::TableType::String => "string",
+                        crate::runtime::ast::TableType::Bool => "bool",
+                    };
+                    format!(" {}: {},", interner.get(f.name), ty)
+                })
+                .collect();
+            format!("table {} {{{} }};", interner.get(*name), fields_str)
         }
     }
 }

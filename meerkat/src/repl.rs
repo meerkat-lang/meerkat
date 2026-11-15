@@ -105,9 +105,8 @@ pub async fn run_repl(
         println!();
     }
 
-    if !remote_url_map.is_empty() {
-        init_net_layer(&mut manager).await?;
-    }
+    //REPL imports may require the net layer even if no remote map was passed
+    init_net_layer(&mut manager).await?;
 
     let mut repl_env: Vec<(Symbol, Value)> = Vec::new();
     let mut watches: Vec<Watch> = Vec::new();
@@ -228,12 +227,14 @@ async fn exec_stmt(
             let base_dir = env::current_dir().unwrap();
             if let Some(p) = path {
                 if p.starts_with("/ip4/") {
-                    if manager.network.is_none() {
-                        init_net_layer(manager).await?;
-                    }
+                    let addr = if p.ends_with(&format!("/{}", svc_name_str)) {
+                        p.clone()
+                    } else {
+                        format!("{}/{}", p.trim_end_matches('/'), svc_name_str)
+                    };
                     manager
                         .remote_services
-                        .insert(service_name, meerkat_lib::net::Address::new(p.clone()));
+                        .insert(service_name, meerkat_lib::net::Address::new(addr));
                     return Ok(Some(format!(
                         "Remote service '{}' registered at {}.",
                         svc_name_str, p

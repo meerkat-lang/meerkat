@@ -242,9 +242,9 @@ async fn exec_stmt(
                 let import_stmts = parse_file(&p, &mut manager.interner)
                     .map_err(|e| format!("Import '{}': {}", p, e))?;
                 let mut loaded = Vec::new();
-                let found = import_stmts.iter().any(|stmt| {
-                    matches!(stmt, Stmt::Service {name, ..} if *name == service_name)
-                });
+                let found = import_stmts
+                    .iter()
+                    .any(|stmt| matches!(stmt, Stmt::Service {name, ..} if *name == service_name));
                 if !found {
                     return Err(format!("Import '{}': Service not found", p).into());
                 }

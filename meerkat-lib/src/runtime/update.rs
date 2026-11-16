@@ -610,7 +610,13 @@ pub fn format_expr(expr: &Expr, interner: &Interner) -> String {
             format!("{{{}}}", elems.join(", "))
         }
         Expr::KeyVal { name, value } => {
-            format!("{}: {}", interner.get(*name), format_expr(value, interner))
+            // The grammar reads a field's value at the level of a prefix
+            // operator, so `id: i + 1` would come back as `(id: i) + 1`
+            format!(
+                "{}: {}",
+                interner.get(*name),
+                format_operand(value, interner)
+            )
         }
         Expr::Variable { name } => interner.get(*name).to_string(),
         Expr::Unop { op, expr } => {
@@ -693,13 +699,18 @@ pub fn format_expr(expr: &Expr, interner: &Interner) -> String {
             column_name,
             operation,
             identity,
-        } => format!(
-            "fold({}.{}, {}, {})",
-            interner.get(*table_name),
-            interner.get(*column_name),
-            format_expr(operation, interner),
-            format_expr(identity, interner)
-        ),
+        } => {
+            // The grammar reads the identity one level below the top, so an
+            // `if`, `fn`, `select` or `fold` there needs its parentheses. The
+            // operation is read at the top level
+            format!(
+                "fold({}.{}, {}, {})",
+                interner.get(*table_name),
+                interner.get(*column_name),
+                format_expr(operation, interner),
+                format_operand(identity, interner)
+            )
+        }
         Expr::List(exprs) => {
             let elems: Vec<String> = exprs.iter().map(|e| format_expr(e, interner)).collect();
             format!("[{}]", elems.join(", "))

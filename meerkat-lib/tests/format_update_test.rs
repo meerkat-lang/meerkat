@@ -91,6 +91,10 @@ fn test_forwarded_text_round_trips() {
         "def q = select id from t where (id + 1) * 2 > 3;",
         "def q = (select id from t where id > 1) == (select id from t where id > 2);",
         "def total = fold(t.id, fn (p: int, q: int) => p + q, 0);",
+        "def total = fold(t.id, add, (fn (a: int) => a));",
+        "def total = fold(t.id, add, (if ok then 1 else 2));",
+        "action a(x: int) { insert {id: (x + 1), n: \"y\"} into t }",
+        "action a(x: int) { insert {id: (if x > 1 then 1 else 2), n: (-x)} into t }",
         // actions
         "action a() { assert(true); }",
         "action a(x: int) { assert(x+1 == 2); y = (x + 1) * 2; }",
@@ -141,6 +145,8 @@ fn test_printed_text_of_known_cases() {
     assert!(t.contains("(x + 1) * 2"), "{}", t);
     let t = print("def f(x: int) = -(x + 1);");
     assert!(t.contains("-(x + 1)"), "{}", t);
+    let t = print("action a(x: int) { insert {id: (x + 1), n: \"y\"} into t }");
+    assert!(t.contains("{id: (x + 1), n: \"y\"}"), "{}", t);
 }
 
 // ----- meaning -----

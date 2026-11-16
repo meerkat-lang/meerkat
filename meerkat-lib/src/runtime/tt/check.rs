@@ -87,6 +87,7 @@ fn check_type(ty: &Type, depth: usize) -> Result<(), Error> {
 pub enum Error {
     UnboundVariable(Symbol),
     UnknownUpdateTarget(Symbol),
+    DuplicateService(Symbol),
     DuplicateMember {
         service: Symbol,
         member: Symbol,
@@ -113,6 +114,9 @@ impl std::fmt::Display for Error {
             }
             Error::UnknownUpdateTarget(s) => {
                 write!(f, "target service '{:?}' for update not found.", s)
+            }
+            Error::DuplicateService(service) => {
+                write!(f, "service '{:?}' is declared more than once.", service)
             }
             Error::DuplicateMember { service, member } => {
                 write!(
@@ -145,6 +149,19 @@ impl std::fmt::Display for Error {
             }
         }
     }
+}
+
+/// Each service name identifies one declaration in a checked program.
+pub(crate) fn check_unique_services(program: &[Stmt]) -> Result<(), Error> {
+    let mut services = HashSet::new();
+    for stmt in program {
+        if let Stmt::Service { name, .. } = stmt {
+            if !services.insert(*name) {
+                return Err(Error::DuplicateService(*name));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Service members have one declaration, both for type queries and installation.
@@ -220,6 +237,7 @@ impl<'a, 'b> Context<'a, 'b> {
     /// Returns:
     ///     `Result<(), Error>`: Ok on success
     pub fn check_all(&mut self) -> Result<(), Error> {
+        check_unique_services(self.program)?;
         // First pass: register all service names (local and imported) so that
         // forward-reference lookups within `type_of_member` can find them.
         // Both local and imported Stmt::Service nodes are present in the

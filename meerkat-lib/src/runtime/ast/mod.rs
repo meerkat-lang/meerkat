@@ -213,6 +213,16 @@ pub enum Expr {
         service_name: Symbol,
         member_name: Symbol,
     },
+    /// Record field. Name resolution rewrites `x.f` into this when `x` is a local.
+    FieldAccess {
+        var: Symbol,
+        field: Symbol,
+    },
+    /// Service member. Name resolution rewrites `x.f` into this when `x` is a service.
+    ServiceAccess {
+        service: Symbol,
+        member: Symbol,
+    },
     Select {
         table_name: Symbol,
         column_names: Vec<Symbol>,
@@ -253,7 +263,11 @@ impl Expr {
     /// forms their own meaning recurses over these for all the others
     pub fn children(&self) -> Vec<&Expr> {
         match self {
-            Expr::Literal { .. } | Expr::Variable { .. } | Expr::MemberAccess { .. } => Vec::new(),
+            Expr::Literal { .. }
+            | Expr::Variable { .. }
+            | Expr::MemberAccess { .. }
+            | Expr::FieldAccess { .. }
+            | Expr::ServiceAccess { .. } => Vec::new(),
             Expr::KeyVal { value, .. } => vec![value],
             Expr::Unop { expr, .. } => vec![expr],
             Expr::Binop { expr1, expr2, .. }
@@ -534,6 +548,14 @@ impl Display for Expr {
             Expr::MemberAccess {
                 service_name,
                 member_name,
+            }
+            | Expr::FieldAccess {
+                var: service_name,
+                field: member_name,
+            }
+            | Expr::ServiceAccess {
+                service: service_name,
+                member: member_name,
             } => write!(f, "{:?}.{:?}", service_name, member_name),
             Expr::Select { where_clause, .. } => write!(f, "{}", where_clause),
             Expr::Table { records, .. } => {

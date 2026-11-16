@@ -327,6 +327,24 @@ impl<'a> AstPrinter<'a> {
                     self.format_symbol(member_name)
                 );
             }
+            Expr::FieldAccess { var, field } => {
+                let var = *var;
+                let field = *field;
+                println!(
+                    "FieldAccess: {{ var: {}, field: {} }}",
+                    self.format_symbol(var),
+                    self.format_symbol(field)
+                );
+            }
+            Expr::ServiceAccess { service, member } => {
+                let service = *service;
+                let member = *member;
+                println!(
+                    "ServiceAccess: {{ service: {}, member: {} }}",
+                    self.format_symbol(service),
+                    self.format_symbol(member)
+                );
+            }
             Expr::Select {
                 table_name,
                 column_names,

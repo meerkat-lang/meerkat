@@ -1034,6 +1034,26 @@ pub fn encode_expr(expr: &Expr, interner: &Interner) -> Result<NetExpr> {
                 member_name: member_str.to_string(),
             })
         }
+        Expr::FieldAccess { var, field } => {
+            let var_str = interner.get(*var);
+            let field_str = interner.get(*field);
+            validate_identifier(var_str)?;
+            validate_identifier(field_str)?;
+            Ok(NetExpr::FieldAccess {
+                var: var_str.to_string(),
+                field: field_str.to_string(),
+            })
+        }
+        Expr::ServiceAccess { service, member } => {
+            let service_str = interner.get(*service);
+            let member_str = interner.get(*member);
+            validate_identifier(service_str)?;
+            validate_identifier(member_str)?;
+            Ok(NetExpr::ServiceAccess {
+                service: service_str.to_string(),
+                member: member_str.to_string(),
+            })
+        }
         Expr::Select {
             table_name,
             column_names,
@@ -1282,6 +1302,22 @@ pub fn decode_expr(expr: NetExpr, interner: &mut Interner) -> Result<Expr> {
             start: Box::new(decode_expr(*start, interner)?),
             end: Box::new(decode_expr(*end, interner)?),
         }),
+        NetExpr::FieldAccess { var, field } => {
+            validate_identifier(&var)?;
+            validate_identifier(&field)?;
+            Ok(Expr::FieldAccess {
+                var: interner.insert(&var),
+                field: interner.insert(&field),
+            })
+        }
+        NetExpr::ServiceAccess { service, member } => {
+            validate_identifier(&service)?;
+            validate_identifier(&member)?;
+            Ok(Expr::ServiceAccess {
+                service: interner.insert(&service),
+                member: interner.insert(&member),
+            })
+        }
     }
 }
 

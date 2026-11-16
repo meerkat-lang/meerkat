@@ -21,6 +21,12 @@ pub fn free_var(expr: &Expr, var_binded: &HashSet<Symbol>) -> HashSet<Symbol> {
 /// Add the free variables of `expr` to `free`
 fn collect_free_vars(expr: &Expr, var_binded: &HashSet<Symbol>, free: &mut HashSet<Symbol>) {
     match expr {
+        Expr::FieldAccess { var, .. } => {
+            if !var_binded.contains(var) {
+                free.insert(*var);
+            }
+        }
+        Expr::ServiceAccess { .. } => {}
         Expr::Variable { name } => {
             if !var_binded.contains(name) {
                 free.insert(*name);
@@ -165,6 +171,8 @@ pub fn cross_service_deps(expr: &Expr, services: &HashSet<Symbol>) -> HashSet<(S
                 HashSet::new()
             }
         }
+        Expr::ServiceAccess { service, member } => HashSet::from([(*service, *member)]),
+        Expr::FieldAccess { .. } => HashSet::new(),
         Expr::KeyVal { value, .. } => cross_service_deps(value, services),
         Expr::Tuple { val } => {
             let mut deps = HashSet::new();

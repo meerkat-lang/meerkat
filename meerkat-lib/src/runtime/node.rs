@@ -29,7 +29,7 @@ use crate::runtime::{nameres, tt, Env, Manager};
 /// order: names resolve, types check, the dependency graph is complete and
 /// acyclic. The typing environment of the checked program is the result
 pub(crate) fn check_program(
-    ast: &[Stmt],
+    ast: &mut [Stmt],
 ) -> std::result::Result<Env<'static, ServiceType>, StaticError> {
     nameres::resolve(ast).map_err(StaticError::Names)?;
     let mut types = Env::new(None);
@@ -663,12 +663,12 @@ impl Node {
 
         if update_batches.is_empty() {
             self.local_services =
-                check_program(&self.unified_ast).map_err(|e| self.format_static_error(e))?;
+                check_program(&mut self.unified_ast).map_err(|e| self.format_static_error(e))?;
             return Ok(());
         }
 
         // Initial validation of base service declarations
-        check_program(&service_ast).map_err(|e| self.format_static_error(e))?;
+        check_program(&mut service_ast).map_err(|e| self.format_static_error(e))?;
 
         let last_batch = update_batches.pop().unwrap();
 
@@ -681,7 +681,7 @@ impl Node {
                 ))
             })?;
 
-            check_program(&service_ast).map_err(|e| self.format_static_error(e))?;
+            check_program(&mut service_ast).map_err(|e| self.format_static_error(e))?;
         }
 
         // Process final atomic transaction batch
@@ -695,7 +695,8 @@ impl Node {
         let mut final_ast = service_ast;
         final_ast.extend(top_level_stmts);
 
-        self.local_services = check_program(&final_ast).map_err(|e| self.format_static_error(e))?;
+        self.local_services =
+            check_program(&mut final_ast).map_err(|e| self.format_static_error(e))?;
         // Validate future updates without installing their declarations.
         // The runtime transaction installs each update only after evaluation.
 

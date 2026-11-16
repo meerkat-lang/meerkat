@@ -180,6 +180,14 @@ pub enum NetExpr {
         start: Box<NetExpr>,
         end: Box<NetExpr>,
     },
+    FieldAccess {
+        var: String,
+        field: String,
+    },
+    ServiceAccess {
+        service: String,
+        member: String,
+    },
 }
 
 /// Network representation of a unary operator

@@ -205,7 +205,7 @@ impl Transaction {
             }
         }
 
-        if let Err(e) = crate::runtime::node::check_program(&self.ast) {
+        if let Err(e) = crate::runtime::node::check_program(&mut self.ast) {
             return Err(EvalError::RuntimeError(format!(
                 "Static check failed on update: {}",
                 e.message(&manager.interner)
@@ -595,6 +595,14 @@ pub fn format_expr(expr: &Expr, interner: &Interner) -> String {
         Expr::MemberAccess {
             service_name,
             member_name,
+        }
+        | Expr::FieldAccess {
+            var: service_name,
+            field: member_name,
+        }
+        | Expr::ServiceAccess {
+            service: service_name,
+            member: member_name,
         } => format!(
             "{}.{}",
             interner.get(*service_name),

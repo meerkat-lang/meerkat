@@ -14,8 +14,8 @@ use meerkat_lib::runtime::{
 /// Verify that an empty program resolves successfully
 #[test]
 fn test_integration_resolve_empty() {
-    let stmts = vec![];
-    let res = resolve(&stmts);
+    let mut stmts = vec![];
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -31,8 +31,8 @@ fn test_integration_resolve_valid_service() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -49,8 +49,8 @@ fn test_integration_rejects_forward_reference() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -69,8 +69,8 @@ fn test_integration_shadowing_service_field() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -91,8 +91,8 @@ fn test_integration_nested_shadowing_let() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -107,8 +107,8 @@ fn test_integration_func_params() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -123,8 +123,8 @@ fn test_integration_nested_func_closures() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -140,8 +140,8 @@ fn test_integration_watch_expression() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -154,8 +154,8 @@ fn test_integration_watch_unbound() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     let z = interner.insert("z");
     assert_eq!(
         res,
@@ -191,8 +191,8 @@ fn test_integration_update_stmt_resolves() {
         }],
     };
 
-    let stmts = vec![s1_stmt, update_stmt];
-    let res = resolve(&stmts);
+    let mut stmts = vec![s1_stmt, update_stmt];
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -215,8 +215,8 @@ fn test_integration_update_unbound_errors() {
         }],
     };
 
-    let stmts = vec![update_stmt];
-    let res = resolve(&stmts);
+    let mut stmts = vec![update_stmt];
+    let res = resolve(&mut stmts);
     assert_eq!(
         res,
         Err(Error::UnknownIdentifier {
@@ -242,8 +242,8 @@ fn test_integration_select_expr() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -261,8 +261,8 @@ fn test_integration_fold_expr() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -278,8 +278,8 @@ fn test_integration_import_member_access() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -297,19 +297,19 @@ fn test_integration_assert_stmt() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
 /// Verify that connect statements resolve successfully
 #[test]
 fn test_integration_connect_stmt() {
-    let stmts = vec![Stmt::Connect {
+    let mut stmts = vec![Stmt::Connect {
         path: "some_path".to_string(),
         addr: "some_addr".to_string(),
     }];
-    let res = resolve(&stmts);
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -329,8 +329,8 @@ fn test_integration_insert_stmt() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -347,8 +347,8 @@ fn test_integration_insert_unbound() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     assert!(res.is_err());
 }
 
@@ -369,8 +369,8 @@ fn test_integration_insert_expr_resolve() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -388,8 +388,8 @@ fn test_integration_assign_stmt() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -406,8 +406,8 @@ fn test_integration_assign_unbound() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     let s1 = interner.insert("s1");
     let z = interner.insert("z");
     assert_eq!(
@@ -432,8 +432,8 @@ fn test_integration_if_expr() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -448,8 +448,8 @@ fn test_integration_if_expr_unbound() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     let s1 = interner.insert("s1");
     let unbound_val = interner.insert("unbound_val");
     assert_eq!(
@@ -474,8 +474,8 @@ fn test_integration_unop_expr() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -492,8 +492,8 @@ fn test_integration_binop_expr() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -509,8 +509,8 @@ fn test_integration_tuple_expr() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -527,8 +527,8 @@ fn test_integration_call_expr() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -544,8 +544,8 @@ fn test_integration_call_expr_unbound_arg() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     let s1 = interner.insert("s1");
     let z = interner.insert("z");
     assert_eq!(
@@ -569,8 +569,8 @@ fn test_integration_call_expr_unbound_func() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     let s1 = interner.insert("s1");
     let z = interner.insert("z");
     assert_eq!(
@@ -596,8 +596,8 @@ fn test_integration_value_closure_resolves() {
         return_ty: None,
     };
     let expr = Expr::Literal { val: closure };
-    let stmts = vec![Stmt::Watch { expr }];
-    let res = resolve(&stmts);
+    let mut stmts = vec![Stmt::Watch { expr }];
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -610,8 +610,8 @@ fn test_integration_value_action_closure_resolves() {
         service_net_id: meerkat_lib::net::ServiceNetId::new("s1"),
     };
     let expr = Expr::Literal { val: action };
-    let stmts = vec![Stmt::Watch { expr }];
-    let res = resolve(&stmts);
+    let mut stmts = vec![Stmt::Watch { expr }];
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -626,8 +626,8 @@ fn test_integration_member_access_unbound() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     let s1 = interner.insert("s1");
     let s2 = interner.insert("s2");
     assert_eq!(
@@ -652,8 +652,8 @@ fn test_integration_multiple_services() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -673,8 +673,8 @@ fn test_integration_nested_blocks_let_isolation() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     let s1 = interner.insert("s1");
     let x = interner.insert("x");
     assert_eq!(
@@ -719,8 +719,8 @@ fn test_integration_update_stmt_forward_reference_fails() {
         ],
     };
 
-    let stmts = vec![s1_stmt, update_stmt];
-    let res = resolve(&stmts);
+    let mut stmts = vec![s1_stmt, update_stmt];
+    let res = resolve(&mut stmts);
     assert_eq!(
         res,
         Err(Error::UnknownIdentifier {
@@ -756,8 +756,8 @@ fn test_integration_update_stmt_scoping() {
         expr: Expr::Variable { name: y },
     };
 
-    let stmts = vec![s1_stmt, update_stmt, watch_stmt];
-    let res = resolve(&stmts);
+    let mut stmts = vec![s1_stmt, update_stmt, watch_stmt];
+    let res = resolve(&mut stmts);
     assert_eq!(
         res,
         Err(Error::UnknownIdentifier {
@@ -796,8 +796,8 @@ fn test_integration_update_inherits_service_env() {
         }],
     };
 
-    let stmts = vec![s1_stmt, update_stmt];
-    let res = resolve(&stmts);
+    let mut stmts = vec![s1_stmt, update_stmt];
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -832,8 +832,8 @@ fn test_integration_update_sequential_scoping() {
         ],
     };
 
-    let stmts = vec![s1_stmt, update_stmt];
-    let res = resolve(&stmts);
+    let mut stmts = vec![s1_stmt, update_stmt];
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -869,8 +869,8 @@ fn test_integration_update_accumulates_across_blocks() {
         }],
     };
 
-    let stmts = vec![s1_stmt, update1, update2];
-    let res = resolve(&stmts);
+    let mut stmts = vec![s1_stmt, update1, update2];
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -904,8 +904,8 @@ fn test_integration_atomic_update_inherits_service_env() {
         }],
     };
 
-    let stmts = vec![s1_stmt, atomic_stmt];
-    let res = resolve(&stmts);
+    let mut stmts = vec![s1_stmt, atomic_stmt];
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -926,8 +926,8 @@ fn test_integration_test_block_member_resolution() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -948,8 +948,8 @@ fn test_integration_test_block_hoisting() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -970,8 +970,8 @@ fn test_integration_test_block_imported_resolves() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -1017,8 +1017,8 @@ fn test_integration_complex_arbitrary_order_resolution() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -1036,8 +1036,8 @@ fn test_integration_local_member_access_misspelled() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     let s1 = interner.insert("s1");
     let misspelled = interner.insert("misspelled");
     assert_eq!(
@@ -1064,8 +1064,8 @@ fn test_integration_local_member_access_valid() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -1085,8 +1085,8 @@ fn test_import_member_unknown_errors() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     assert!(res.is_err());
 }
 
@@ -1106,8 +1106,8 @@ fn test_import_test_block_member_unknown_errors() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     assert!(res.is_err());
 }
 
@@ -1131,8 +1131,8 @@ fn test_transitive_import_member_access() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -1150,8 +1150,8 @@ fn test_integration_delayed_fwd_ok() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -1168,8 +1168,8 @@ fn test_integration_closure_fwd_ref_lexical_ok() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }
 
@@ -1187,7 +1187,7 @@ fn test_integration_action_fwd_ok() {
     ";
     let parse_result = parse_string(input, &mut interner);
     assert!(parse_result.is_ok());
-    let stmts = parse_result.unwrap();
-    let res = resolve(&stmts);
+    let mut stmts = parse_result.unwrap();
+    let res = resolve(&mut stmts);
     assert!(res.is_ok());
 }

@@ -96,13 +96,13 @@ fn table_field_type(ty: &TableType) -> Type {
     }
 }
 
-fn table_list_type(fields: &[Field]) -> Type {
+fn table_list_type(fields: &[Field]) -> Result<Type, Error> {
     let cols = fields
         .iter()
         .map(|f| (f.name, table_field_type(&f.ty)))
         .collect();
-    let row_ty = Type::Record(RecordType::new(cols).expect("table columns are unique"));
-    Type::List(Box::new(row_ty))
+    let row_ty = Type::Record(RecordType::new(cols).map_err(|_| Error::CannotInferType)?);
+    Ok(Type::List(Box::new(row_ty)))
 }
 
 /// A `fold` operation is either `(acc, column) -> acc` or `acc -> column -> acc`.
@@ -416,7 +416,7 @@ impl<'a, 'b> Context<'a, 'b> {
                     self.infer(val, &mut env, 1)?
                 }
             }
-            Decl::TableDecl { fields, .. } => table_list_type(fields),
+            Decl::TableDecl { fields, .. } => table_list_type(fields)?,
         };
 
         if let Some(mut st) = self.local_services.remove(service_name) {

@@ -1323,7 +1323,7 @@ mod tests {
         env.bind(v, Binding::Value);
 
         let mut resolver = Resolver::new();
-        let res = resolver.resolve_action_stmt(&deep_stmt, &mut env, 0);
+        let res = resolver.resolve_action_stmt(&mut deep_stmt, &mut env, 0);
         assert_eq!(res, Err(Error::DepthLimit))
     }
 
@@ -1582,7 +1582,7 @@ mod tests {
                 .iter()
                 .map(|(col, ty)| crate::runtime::ast::Field {
                     name: interner.insert(col),
-                    ty: *ty,
+                    ty: ty.clone(),
                 })
                 .collect(),
         }

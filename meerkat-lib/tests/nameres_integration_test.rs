@@ -1198,3 +1198,35 @@ fn test_integration_action_fwd_ok() {
     let res = resolve(&stmts);
     assert!(res.is_ok());
 }
+
+/// The resolver's own `update` arm, which a node's static checks do not reach
+/// (they resolve the patched program): a special form declared in an update is
+/// checked against the members of the service and of the update itself
+#[test]
+fn test_update_statement_checks_special_form_parameters() {
+    let resolve_src = |src: &str| {
+        let mut interner = Interner::new();
+        let stmts = parse_string(src, &mut interner).expect("parses");
+        resolve(&stmts)
+    };
+
+    // a member of the service
+    let res = resolve_src("service s1 { var y = 5; } update s1 { def f(y: int) = y; }");
+    assert!(
+        matches!(res, Err(Error::ParamNamedLikeMember { .. })),
+        "{:?}",
+        res
+    );
+
+    // a member the update itself adds
+    let res = resolve_src("service s1 { var y = 5; } update s1 { var z = 1; def f(z: int) = z; }");
+    assert!(
+        matches!(res, Err(Error::ParamNamedLikeMember { .. })),
+        "{:?}",
+        res
+    );
+
+    // no clash
+    let res = resolve_src("service s1 { var y = 5; } update s1 { def f(x: int) = x + y; }");
+    assert!(res.is_ok(), "{:?}", res);
+}

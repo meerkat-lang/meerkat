@@ -1910,3 +1910,332 @@ async fn a_parked_action_replays_a_declined_by_name_call() {
         .count();
     assert_eq!(probes, 1, "received: {:?}", received.borrow());
 }
+
+/// `s1.f` reads `s2.z`, and `s2` is on a third node
+const CHAIN_S: &str = "
+    service s2 {
+        var z = 7;
+    }
+    service s1 {
+        var y = 5;
+        pub def f(x: int) = x + s2.z;
+    }
+";
+
+/// The service of the chain tests that calls `s1.f`; the caller's program is
+/// `CHAIN_S` followed by it
+const CHAIN_APP: &str = "
+    service app {
+        var v = 0;
+        pub def run = action { v = s1.f(3); };
+        pub def run_and_fail = action { v = s1.f(3); assert(v == 0); };
+    }
+";
+
+/// Serve what `owner` receives forever, recording a short text of each message
+async fn serve_recording(owner: &mut Manager, received: &RefCell<Vec<String>>) {
+    loop {
+        while let Some(NetworkEvent::MessageReceived { msg, .. }) = owner.try_recv_event() {
+            received.borrow_mut().push(match &msg {
+                MeerkatMessage::LookupRequest { member, args, .. } => {
+                    format!("Lookup {member} args={}", args.as_ref().map_or(0, Vec::len))
+                }
+                MeerkatMessage::ActionRequest { by_name, .. } => {
+                    format!("Action by_name={by_name}")
+                }
+                MeerkatMessage::Commit { .. } => "Commit".to_string(),
+                other => format!("{other:?}"),
+            });
+            owner.serve_request(msg).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+}
+
+/// Run `do member;` of `app` (`CHAIN_S` and `CHAIN_APP`) with `s1` on a real
+/// owner whose `s2` is on a third node, a stand-in that answers every lookup
+/// with 7.
+/// Returns the result of the action, what the owner received, what the third
+/// node saw and the caller's `app.v`. After the action returns, the nodes keep
+/// serving for up to 2 s, until the third node has seen a commit or an abort.
+async fn run_chain(
+    member: &str,
+) -> (
+    Result<(), meerkat_lib::runtime::interpreter::EvalError>,
+    Vec<String>,
+    Vec<Seen>,
+    Value,
+) {
+    let (app_net, _) = listening_node().await;
+    let (owner_net, owner_addr) = listening_node().await;
+    let (mut third_net, third_addr) = listening_node().await;
+    let (mut m, _) = caller_node(&format!("{CHAIN_S}{CHAIN_APP}"), app_net, &owner_addr).await;
+
+    let mut interner = Interner::new();
+    let ast = parse_string(CHAIN_S, &mut interner).expect("valid syntax");
+    let mut node = Node::new();
+    node.interner = interner;
+    node.unified_ast = ast.clone();
+    node.static_checks().expect("static checks must pass");
+    let mut owner = node
+        .on_manager_startup(true, Some(owner_net), HashMap::new(), &ast)
+        .await
+        .expect("owner startup");
+    let s2 = owner.interner.insert("s2");
+    owner.services.remove(&s2);
+    owner
+        .remote_services
+        .insert(s2, Address::new(format!("{}/s2", third_addr.0)));
+
+    let stmts = do_member(&mut m, member);
+    let received = RefCell::new(Vec::new());
+    let log: Log = RefCell::new(Vec::new());
+    let answer = |_: &str, _: &Option<Vec<NetValue>>| (int(7), false);
+    let app = m.interner.insert("app");
+    let result = {
+        let serve_owner = serve_recording(&mut owner, &received);
+        let serve_third = stand_in_s1(&mut third_net, &log, &answer);
+        tokio::select! {
+            biased;
+            r = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                m.execute_action(app, &stmts),
+            ) => r.expect("the action must not time out"),
+            _ = serve_owner => unreachable!("the owner serves forever"),
+            _ = serve_third => unreachable!("the stand-in serves forever"),
+        }
+    };
+    {
+        let serve_owner = serve_recording(&mut owner, &received);
+        let serve_third = stand_in_s1(&mut third_net, &log, &answer);
+        let wait = async {
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_secs(2)
+                && !log
+                    .borrow()
+                    .iter()
+                    .any(|s| matches!(s, Seen::Commit | Seen::Abort))
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = wait => {}
+            _ = serve_owner => unreachable!("the owner serves forever"),
+            _ = serve_third => unreachable!("the stand-in serves forever"),
+        }
+    }
+    let v = var_of(&mut m, "app", "v");
+    (result, received.into_inner(), log.into_inner(), v)
+}
+
+/// A special def whose body reads a third node, called inside a transaction:
+/// the owner reads that node under the caller's transaction, and the commit
+/// reaches it through the owner
+#[tokio::test(flavor = "multi_thread")]
+async fn a_special_def_that_reads_a_third_node_commits_through_the_owner() {
+    let (result, received, third, v) = run_chain("run").await;
+
+    assert!(result.is_ok(), "got: {result:?}");
+    assert_eq!(v, Value::Int { val: 10 });
+    assert_eq!(
+        received,
+        vec!["Lookup f args=1".to_string(), "Commit".to_string()]
+    );
+    assert_eq!(
+        third,
+        vec![
+            Seen::Lookup {
+                member: "z".to_string(),
+                args: None,
+                in_txn: true
+            },
+            Seen::Commit
+        ]
+    );
+}
+
+/// The same call in a transaction that fails afterwards: the abort reaches the
+/// third node through the owner
+#[tokio::test(flavor = "multi_thread")]
+async fn a_special_def_that_reads_a_third_node_aborts_through_the_owner() {
+    let (result, received, third, v) = run_chain("run_and_fail").await;
+
+    assert!(result.is_err(), "got: {result:?}");
+    assert_eq!(v, Value::Int { val: 0 });
+    assert_eq!(
+        third,
+        vec![
+            Seen::Lookup {
+                member: "z".to_string(),
+                args: None,
+                in_txn: true
+            },
+            Seen::Abort
+        ],
+        "owner received: {received:?}"
+    );
+    assert_eq!(
+        received.first().map(String::as_str),
+        Some("Lookup f args=1"),
+        "owner received: {received:?}"
+    );
+}
+
+/// Send `msg` from `from` to the node at `to`
+async fn send(from: &mut NetworkActor, to: &Address, msg: MeerkatMessage) {
+    let sent = from
+        .handle_command(NetworkCommand::SendMessage {
+            addr: to.clone(),
+            msg,
+        })
+        .await;
+    assert!(matches!(sent, NetworkReply::MessageSent { .. }));
+}
+
+/// Serve what `manager` receives until `peer` gets its next message
+async fn serve_until_received(manager: &mut Manager, peer: &mut NetworkActor) -> MeerkatMessage {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            manager.serve_network_events().await;
+            match peer.event_rx.try_recv() {
+                Ok(NetworkEvent::MessageReceived { msg, .. }) => return msg,
+                Ok(NetworkEvent::SendFailed { error, .. }) => panic!("send failed: {error:?}"),
+                _ => tokio::task::yield_now().await,
+            }
+        }
+    })
+    .await
+    .expect("expected message must arrive")
+}
+
+/// The text an issuer forwards for an update with special forms is applied by
+/// a real owner, which then runs calls of them: the printer, the owner's parser
+/// and the owner's declarations agree
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forwarded_update_with_special_forms_is_applied_and_called_on_the_owner() {
+    // The owner starts as `run_repl_against_owner` starts its own, with its
+    // address set before its services are created
+    let (owner_net, owner_addr) = listening_node().await;
+    let mut interner = Interner::new();
+    let src = "service s1 { var y = 5; pub def f = fn (x: int) => x + y; }";
+    let ast = parse_string(src, &mut interner).expect("valid syntax");
+    let mut node = Node::new();
+    node.interner = interner;
+    node.unified_ast = ast.clone();
+    node.static_checks().expect("static checks must pass");
+    let mut owner = node
+        .on_manager_startup(true, Some(owner_net), HashMap::new(), &[])
+        .await
+        .expect("owner startup");
+    owner.set_local_address(owner_addr.0.clone());
+    for stmt in &ast {
+        owner
+            .run_declaration(stmt)
+            .await
+            .expect("owner service creation");
+    }
+
+    // The text an issuer forwards
+    let mut issuer = Interner::new();
+    let update = parse_string(
+        "update s1 { pub def f(x: int) = x + y + 1; pub action a(x: int) { y = y * x; } }",
+        &mut issuer,
+    )
+    .expect("valid syntax");
+    let text = match update.into_iter().next() {
+        Some(Stmt::Update {
+            service_name,
+            decls,
+        }) => meerkat_lib::runtime::update::format_update_source(service_name, &decls, &issuer),
+        other => panic!("expected an update, got {other:?}"),
+    };
+    assert!(text.contains("def f(x: int) = "), "{text}");
+    assert!(text.contains("action a(x: int) {"), "{text}");
+
+    // A peer sends it to the owner
+    let (mut peer, peer_addr) = listening_node().await;
+    send(
+        &mut peer,
+        &owner_addr,
+        MeerkatMessage::UpdateServiceRequest {
+            request_id: 1,
+            txn_id: None,
+            service_name: "s1".to_string(),
+            source: text,
+            reply_to: peer_addr.0.clone(),
+        },
+    )
+    .await;
+    match serve_until_received(&mut owner, &mut peer).await {
+        MeerkatMessage::UpdateServiceResponse {
+            request_id: 1,
+            error: None,
+        } => {}
+        other => panic!("expected the update to be applied, got {other:?}"),
+    }
+
+    // A call of the new special def
+    send(
+        &mut peer,
+        &owner_addr,
+        MeerkatMessage::LookupRequest {
+            request_id: 2,
+            service: "s1".to_string(),
+            member: "f".to_string(),
+            reply_to: peer_addr.0.clone(),
+            txn_id: None,
+            args: Some(vec![int(3)]),
+        },
+    )
+    .await;
+    match serve_until_received(&mut owner, &mut peer).await {
+        MeerkatMessage::LookupResponse {
+            request_id: 2,
+            value: NetValue::Int { val: 9 },
+            called: true,
+            ..
+        } => {}
+        other => panic!("expected the call's result 9, got {other:?}"),
+    }
+
+    // A by-name call of the new special action, as `do s1.a(3);` sends it
+    let arg = owner.interner.insert("__arg0");
+    let (s1, a) = (owner.interner.insert("s1"), owner.interner.insert("a"));
+    let stmt = ActionStmt::Do(Expr::Call {
+        func: Box::new(Expr::MemberAccess {
+            service_name: s1,
+            member_name: a,
+        }),
+        args: vec![Expr::Variable { name: arg }],
+    });
+    let stmts = vec![
+        meerkat_lib::net::codec::encode_action_stmt(&stmt, &owner.interner)
+            .expect("the statement encodes"),
+    ];
+    send(
+        &mut peer,
+        &owner_addr,
+        MeerkatMessage::ActionRequest {
+            request_id: 3,
+            service: "s1".to_string(),
+            stmts,
+            env: vec![("__arg0".to_string(), int(3))],
+            reply_to: peer_addr.0.clone(),
+            txn_id: None,
+            by_name: true,
+        },
+    )
+    .await;
+    match serve_until_received(&mut owner, &mut peer).await {
+        MeerkatMessage::ActionResponse {
+            request_id: 3,
+            success: true,
+            declined: false,
+            ..
+        } => {}
+        other => panic!("expected the action to run, got {other:?}"),
+    }
+    assert_eq!(var_of(&mut owner, "s1", "y"), Value::Int { val: 15 });
+}

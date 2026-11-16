@@ -155,7 +155,6 @@ fn test_parse_rejects_bare_parameter_name() {
     for src in [
         "service s1 { def f x = 1; }",
         "service s1 { action a x { } }",
-        "service s1 { def f = 1 }",
     ] {
         assert!(
             parse_string(src, &mut interner).is_err(),
@@ -255,7 +254,7 @@ fn test_forwarded_update_text_round_trips() {
     // The text shows the declared form, not the `fn` spelling
     assert!(text.contains("def f(x: int) = "), "{}", text);
     assert!(text.contains("pub action reset() {"), "{}", text);
-    assert!(!text.contains("fn("), "{}", text);
+    assert!(!text.contains("fn ("), "{}", text);
 }
 
 // ----- name resolution -----
@@ -477,6 +476,36 @@ async fn test_update_to_special_form_is_rejected_while_used_as_value() {
     )
     .await
     .expect("every use of f is a call");
+}
+
+/// An update replaces a declaration whole, so a special form can be replaced
+/// by another one and can go back to a plain def, after which it is a value
+/// again
+#[tokio::test]
+async fn test_update_replaces_a_special_form_and_turns_it_back_into_a_plain_def() {
+    let initial = "service s1 { var y = 5; def f(x: int) = x + y; def d = f(1); }";
+
+    // replaced by a special form with another parameter list
+    update_result(
+        initial,
+        "update s1 { def f(x: int, z: int) = x + z + y; def d = f(1, 2); }",
+    )
+    .await
+    .expect("a special form is replaced whole");
+
+    // back to a plain def, which the same update may use as a value
+    update_result(
+        initial,
+        "update s1 { def f = fn (x: int) => x + y; def g = f; }",
+    )
+    .await
+    .expect("f is a plain def again");
+
+    // still a special form: the same use is rejected
+    let err = update_result(initial, "update s1 { def g = f; }")
+        .await
+        .expect_err("f is still a special form");
+    assert!(err.contains("can only be called"), "{}", err);
 }
 
 // ----- type checking -----

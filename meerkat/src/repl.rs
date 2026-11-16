@@ -24,7 +24,12 @@ struct Watch {
 }
 
 /// Re-evaluate all watches and print any that have changed
-async fn check_watches(watches: &mut [Watch], manager: &mut Manager, repl_env: &[(Symbol, Value)]) {
+async fn check_watches(
+    watches: &mut [Watch],
+    manager: &mut Manager,
+    repl_env: &[(Symbol, Value)],
+    mut print: impl FnMut(String),
+) {
     for w in watches.iter_mut() {
         let result = eval(
             &w.expr,
@@ -41,8 +46,8 @@ async fn check_watches(watches: &mut [Watch], manager: &mut Manager, repl_env: &
                 let changed = w.last.as_ref() != Some(&new_val);
                 if changed {
                     match &w.last {
-                        None => println!("[watch] {} = {}", w.label, new_val),
-                        Some(old) => println!("[watch] {}: {} => {}", w.label, old, new_val),
+                        None => print(format!("[watch] {} = {}", w.label, new_val)),
+                        Some(old) => print(format!("[watch] {}: {} => {}", w.label, old, new_val)),
                     }
                     w.last = Some(new_val);
                 }
@@ -180,7 +185,7 @@ pub async fn run_repl(
                 if buffer.trim().is_empty() {
                     buffer.clear();
                     continuation = false;
-                    check_watches(&mut watches, &mut manager, &repl_env).await;
+                    check_watches(&mut watches, &mut manager, &repl_env, |line| println!("{}", line)).await;
                     read_fut = spawn_next_readline(reader, continuation);
                     continue;
                 }
@@ -217,7 +222,7 @@ pub async fn run_repl(
                             }
                         }
                         // Check watches after every complete input
-                        check_watches(&mut watches, &mut manager, &repl_env).await;
+                        check_watches(&mut watches, &mut manager, &repl_env, |line| println!("{}", line)).await;
                         buffer.clear();
                         continuation = false;
                     }
@@ -226,13 +231,15 @@ pub async fn run_repl(
                 read_fut = spawn_next_readline(reader, continuation);
             }
             _ = watch_tick.tick(), if watch => {
-                crate::poll_and_print_update(&mut manager, |line| match printer.as_mut() {
+                let mut print = |line| match printer.as_mut() {
                     Some(p) => {
                         let _ = p.print(line);
                     }
                     None => println!("{}", line),
-                })
-                .await;
+                };
+                if crate::poll_and_print_update(&mut manager, &mut print).await {
+                    check_watches(&mut watches, &mut manager, &repl_env, &mut print).await;
+                }
             }
         }
     }

@@ -1214,7 +1214,8 @@ async fn run_client(
 /// `-> listener_def = value` line if the update's target service/def still
 /// exist locally. Factored out of the `--watch` loop so interactive mode
 /// (`repl::run_repl`) can drive the same logic alongside reading stdin.
-async fn poll_and_print_update(manager: &mut Manager, mut print: impl FnMut(String)) {
+/// Returns whether an update was decoded and passed to the manager.
+async fn poll_and_print_update(manager: &mut Manager, mut print: impl FnMut(String)) -> bool {
     let msg = manager
         .network
         .as_mut()
@@ -1246,7 +1247,7 @@ async fn poll_and_print_update(manager: &mut Manager, mut print: impl FnMut(Stri
             &mut manager.interner,
         ) {
             Ok(syms) => syms,
-            Err(_) => return,
+            Err(_) => return false,
         };
         manager
             .handle_update(lid.clone(), def_sym, source_sym, member_sym, value)
@@ -1256,7 +1257,9 @@ async fn poll_and_print_update(manager: &mut Manager, mut print: impl FnMut(Stri
                 print(format!("          -> {} = {:?}", listener_def, vs.value));
             }
         }
+        return true;
     }
+    false
 }
 
 /// Lock group cascade integration test client (debug builds only).

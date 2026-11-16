@@ -47,8 +47,9 @@ fn test_transaction_maps_indexing() {
     assert!(txn.locked.contains(&key));
 
     let read_value = meerkat_lib::runtime::ast::Value::Int { val: 42 };
-    txn.read_cache.insert(key.clone(), read_value.clone());
-    assert_eq!(txn.read_cache.get(&key), Some(&read_value));
+    let read_entry = (read_value, Some(HashMap::new()), None);
+    txn.read_cache.insert(key.clone(), read_entry.clone());
+    assert_eq!(txn.read_cache.get(&key), Some(&read_entry));
 
     let write_value = meerkat_lib::runtime::ast::Value::Int { val: 100 };
     txn.written.insert(key.clone(), write_value.clone());
@@ -198,7 +199,6 @@ fn test_ast_printer_type_display() {
             TupleType::new(vec![Type::Int, Type::String]).unwrap(),
         )),
         Box::new(Type::Bool),
-        std::collections::HashSet::new(),
     );
 
     let formatted_some = printer.format_type_opt(&Some(test_type));

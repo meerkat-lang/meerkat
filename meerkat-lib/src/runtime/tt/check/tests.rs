@@ -18,12 +18,7 @@ fn test_type_depth_calculation() {
     assert!(check_type(&Type::Int, 1).is_ok());
     let func = Type::Func(
         Box::new(Type::Int),
-        Box::new(Type::Func(
-            Box::new(Type::Bool),
-            Box::new(Type::String),
-            std::collections::HashSet::new(),
-        )),
-        std::collections::HashSet::new(),
+        Box::new(Type::Func(Box::new(Type::Bool), Box::new(Type::String))),
     );
     assert!(check_type(&func, 1).is_ok());
 }
@@ -137,11 +132,7 @@ fn test_function_calls() {
     let decls = vec![
         Decl::VarDecl {
             name: var_f,
-            ty: Some(Type::Func(
-                Box::new(Type::Int),
-                Box::new(Type::Int),
-                std::collections::HashSet::new(),
-            )),
+            ty: Some(Type::Func(Box::new(Type::Int), Box::new(Type::Int))),
             val: Expr::Func {
                 params: vec![Param {
                     name: interner.insert("a"),
@@ -629,11 +620,7 @@ fn test_function_parameter_mismatches() {
         name: name_s,
         decls: vec![Decl::VarDecl {
             name: interner.insert("f"),
-            ty: Some(Type::Func(
-                Box::new(Type::Int),
-                Box::new(Type::Int),
-                std::collections::HashSet::new(),
-            )),
+            ty: Some(Type::Func(Box::new(Type::Int), Box::new(Type::Int))),
             val: Expr::Func {
                 params: vec![],
                 body: Box::new(Expr::Literal {
@@ -649,11 +636,7 @@ fn test_function_parameter_mismatches() {
         name: name_s,
         decls: vec![Decl::VarDecl {
             name: interner.insert("f"),
-            ty: Some(Type::Func(
-                Box::new(Type::Int),
-                Box::new(Type::Int),
-                std::collections::HashSet::new(),
-            )),
+            ty: Some(Type::Func(Box::new(Type::Int), Box::new(Type::Int))),
             val: Expr::Func {
                 params: vec![
                     Param {
@@ -702,11 +685,7 @@ fn test_call_mismatches() {
         decls: vec![
             Decl::VarDecl {
                 name: interner.insert("f"),
-                ty: Some(Type::Func(
-                    Box::new(Type::Unit),
-                    Box::new(Type::Int),
-                    std::collections::HashSet::new(),
-                )),
+                ty: Some(Type::Func(Box::new(Type::Unit), Box::new(Type::Int))),
                 val: Expr::Func {
                     params: vec![],
                     body: Box::new(Expr::Literal {
@@ -840,11 +819,7 @@ fn test_lambda_annotations_in_checking_mode() {
         name: name_s,
         decls: vec![Decl::VarDecl {
             name: interner.insert("f"),
-            ty: Some(Type::Func(
-                Box::new(Type::Int),
-                Box::new(Type::Int),
-                std::collections::HashSet::new(),
-            )),
+            ty: Some(Type::Func(Box::new(Type::Int), Box::new(Type::Int))),
             val: Expr::Func {
                 params: vec![Param {
                     name: interner.insert("x"),
@@ -871,11 +846,7 @@ fn test_lambda_annotations_in_checking_mode() {
         name: name_s,
         decls: vec![Decl::VarDecl {
             name: interner.insert("g"),
-            ty: Some(Type::Func(
-                Box::new(Type::Int),
-                Box::new(Type::Int),
-                std::collections::HashSet::new(),
-            )),
+            ty: Some(Type::Func(Box::new(Type::Int), Box::new(Type::Int))),
             val: Expr::Func {
                 params: vec![Param {
                     name: interner.insert("x"),
@@ -907,7 +878,6 @@ fn test_lambda_annotations_in_checking_mode() {
                     TupleType::new(vec![Type::Int, Type::Int]).unwrap(),
                 )),
                 Box::new(Type::Int),
-                std::collections::HashSet::new(),
             )),
             val: Expr::Func {
                 params: vec![

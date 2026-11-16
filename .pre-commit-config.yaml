@@ -41,21 +41,21 @@ repos:
         name: cargo fmt
         entry: cargo fmt --all --
         language: system
-        types: [rust]
+        files: (^rust-toolchain\.toml$|\.rs$)
         pass_filenames: false
 
       - id: cargo-clippy
         name: cargo clippy
         entry: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
         language: system
-        types: [rust]
+        files: (^rust-toolchain\.toml$|\.rs$)
         pass_filenames: false
 
       - id: cargo-check-wasm
         name: cargo check wasm
         entry: cargo check --locked -p meerkat-lib --target wasm32-unknown-unknown --all-features
         language: system
-        files: ^(Cargo\.toml|Cargo\.lock|meerkat-lib/Cargo\.toml|meerkat-lib/.*\.(rs|lalrpop))$
+        files: ^(rust-toolchain\.toml|Cargo\.toml|Cargo\.lock|meerkat-lib/Cargo\.toml|meerkat-lib/.*\.(rs|lalrpop))$
         pass_filenames: false
 
       # TODO: Re-enable `multiple_message` test after Issue 73 resolved
@@ -63,5 +63,5 @@ repos:
         name: cargo test
         entry: cargo test --locked --workspace --all-features -- --skip multiple_message
         language: system
-        files: ^(Cargo\.toml|Cargo\.lock|meerkat(|-lib)/Cargo\.toml|.*\.(rs|lalrpop))$
+        files: ^(rust-toolchain\.toml|Cargo\.toml|Cargo\.lock|meerkat(|-lib)/Cargo\.toml|.*\.(rs|lalrpop))$
         pass_filenames: false

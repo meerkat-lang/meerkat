@@ -38,6 +38,8 @@ impl Message<NetworkCommand> for super::NetworkActor {
 
 /// Messages FROM Network Actor TO Manager Actor
 #[derive(Debug, Clone)]
+// Same as NetworkCommand above
+#[allow(clippy::large_enum_variant)]
 pub enum NetworkEvent {
     MessageReceived { peer: String, msg: MeerkatMessage },
     SendFailed { msg_id: MessageId, error: SendError },

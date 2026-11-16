@@ -154,6 +154,7 @@ pub async fn run_repl(
     } else {
         None
     };
+    let mut last_keepalive = tokio::time::Instant::now();
     let mut watch_tick = tokio::time::interval(std::time::Duration::from_millis(10));
     let mut read_fut = spawn_next_readline(reader, continuation);
 
@@ -237,7 +238,7 @@ pub async fn run_repl(
                     }
                     None => println!("{}", line),
                 };
-                if crate::poll_and_print_update(&mut manager, &mut print).await {
+                if crate::poll_and_print_update(&mut manager, &mut last_keepalive, &mut print).await {
                     check_watches(&mut watches, &mut manager, &repl_env, &mut print).await;
                 }
             }

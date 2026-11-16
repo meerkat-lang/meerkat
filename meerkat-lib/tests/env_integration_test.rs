@@ -211,11 +211,7 @@ fn test_env_int_complex_types() {
     let mut env = Env::new(None);
     let mut interner = Interner::new();
     let x = interner.insert("x");
-    let fun_ty = Type::Func(
-        Box::new(Type::Int),
-        Box::new(Type::Bool),
-        std::collections::HashSet::new(),
-    );
+    let fun_ty = Type::Func(Box::new(Type::Int), Box::new(Type::Bool));
 
     env.bind(x, fun_ty.clone());
     assert_eq!(env.find(x), Some(&fun_ty));

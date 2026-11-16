@@ -134,6 +134,11 @@ pub enum Value {
 }
 
 impl Value {
+    /// Whether the value is a function: applying it reads what its body reads
+    pub fn is_function(&self) -> bool {
+        matches!(self, Value::Closure { .. })
+    }
+
     pub fn to_list_elements(&self) -> Option<Vec<Value>> {
         match self {
             Value::List { vals } => Some(vals.clone()),
@@ -234,6 +239,55 @@ pub enum Expr {
     },
 }
 
+impl Expr {
+    /// The immediate subexpressions, in source order. A pass that gives some
+    /// forms their own meaning recurses over these for all the others
+    pub fn children(&self) -> Vec<&Expr> {
+        match self {
+            Expr::Literal { .. } | Expr::Variable { .. } | Expr::MemberAccess { .. } => Vec::new(),
+            Expr::KeyVal { value, .. } => vec![value],
+            Expr::Unop { expr, .. } => vec![expr],
+            Expr::Binop { expr1, expr2, .. }
+            | Expr::Range {
+                start: expr1,
+                end: expr2,
+            }
+            | Expr::Fold {
+                operation: expr1,
+                identity: expr2,
+                ..
+            } => vec![expr1, expr2],
+            Expr::If { cond, expr1, expr2 } => vec![cond, expr1, expr2],
+            Expr::Func { body, .. } => vec![body],
+            Expr::Call { func, args } => std::iter::once(func.as_ref()).chain(args).collect(),
+            Expr::Tuple { val } | Expr::List(val) | Expr::Table { records: val, .. } => {
+                val.iter().collect()
+            }
+            Expr::Html(template) => template.embedded_exprs().collect(),
+            Expr::Action(stmts) => stmts.iter().flat_map(ActionStmt::exprs).collect(),
+            Expr::Select { where_clause, .. } => vec![where_clause],
+        }
+    }
+}
+
+impl ActionStmt {
+    /// The expressions the statement evaluates, in source order, including
+    /// those of the statements in a loop body
+    pub fn exprs(&self) -> Vec<&Expr> {
+        match self {
+            ActionStmt::Let { expr, .. }
+            | ActionStmt::Expr(expr)
+            | ActionStmt::Do(expr)
+            | ActionStmt::Assert(expr, _)
+            | ActionStmt::Assign { expr, .. }
+            | ActionStmt::Insert { row: expr, .. } => vec![expr],
+            ActionStmt::For { iterable, body, .. } => std::iter::once(iterable)
+                .chain(body.iter().flat_map(ActionStmt::exprs))
+                .collect(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Decl {
     VarDecl {
@@ -251,6 +305,17 @@ pub enum Decl {
         name: Symbol,
         fields: Vec<Field>,
     },
+}
+
+impl Decl {
+    /// The member the declaration declares
+    pub fn name(&self) -> Symbol {
+        match self {
+            Decl::VarDecl { name, .. }
+            | Decl::DefDecl { name, .. }
+            | Decl::TableDecl { name, .. } => *name,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

@@ -41,6 +41,8 @@ pub async fn execute_seq(
     Ok(())
 }
 
+// async_recursion adds a bare #[must_use] to a fn that returns a boxed Future.
+#[allow(clippy::double_must_use)]
 #[async_recursion::async_recursion]
 pub async fn execute(
     stmt: &ActionStmt,
@@ -266,7 +268,8 @@ mod tests {
                 | EvalError::NotImplemented
                 | EvalError::WaitDieAbort(_)
                 | EvalError::WaitOn(_)
-                | EvalError::RuntimeError(_) => {
+                | EvalError::RuntimeError(_)
+                | EvalError::InputNotReady(_) => {
                     panic!("Expected EvalError::AssertionError")
                 }
             },

@@ -5,15 +5,22 @@
 //! analysis validation, and commit fidelity across all high-level
 //! algorithm steps
 
+use meerkat_lib::net::ast::NetValue;
+use meerkat_lib::net::{
+    Address, ClockEntry, MeerkatMessage, NetworkActor, NetworkCommand, NetworkEvent, NetworkReply,
+    NodeType, ServiceNetId,
+};
 use meerkat_lib::runtime::{
-    ast::Value,
+    ast::{ActionStmt, Expr, Stmt, Value},
     interpreter::{eval, EvalContext},
+    limits::MAX_PENDING_UPDATES_PER_PEER,
     parser::parse_string,
     txn::{Transaction as LockTxn, TxnId, VarLock},
     update::Transaction,
-    Interner, Node,
+    Interner, Manager, Node,
 };
 use std::collections::HashMap;
+use std::time::Duration;
 
 /// Helper function to create an initialized test `Manager` instance
 ///
@@ -736,6 +743,189 @@ async fn test_update_adds_new_cross_service_listener_edge() {
     assert_eq!(y_val, Value::Int { val: 200 });
 }
 
+/// Start a manager on `initial_code`, then apply `update_code` to it
+async fn manager_after_update(
+    initial_code: &str,
+    update_code: &str,
+) -> meerkat_lib::runtime::Manager {
+    let mut interner = Interner::new();
+    let initial_ast = parse_string(initial_code, &mut interner).unwrap();
+    let mut node = Node::new();
+    node.interner = interner;
+    node.unified_ast = initial_ast;
+    node.static_checks().unwrap();
+
+    let local_ast = node.unified_ast.clone();
+    let mut manager = node
+        .on_manager_startup(true, None, HashMap::new(), &local_ast)
+        .await
+        .unwrap();
+
+    let update_ast = parse_string(update_code, &mut manager.interner).unwrap();
+    let mut txn = Transaction::new(update_ast);
+    let poll_res = txn.poll(&mut manager).await;
+    assert!(poll_res.is_ok(), "poll error: {:?}", poll_res);
+    manager
+}
+
+/// Verify an update that turns a def into a var stops it listening to the
+/// member the def read in the same service
+///
+/// This went wrong when the old def stayed in `service.defs` after the update
+/// and the listener wiring consulted it (#210): the var stayed wired, and the
+/// next change to `x` re-ran the old expression `x + 1` over the var's own
+/// value
+#[tokio::test]
+async fn test_update_def_to_var_unwires_same_service_listener() {
+    let mut manager = manager_after_update(
+        "
+        service s1 {
+            var x = 1;
+            pub def d = x + 1;
+        }
+        ",
+        "
+        update s1 {
+            var d: int = x;
+        }
+        ",
+    )
+    .await;
+
+    let s1_sym = manager.interner.insert("s1");
+    let x_sym = manager.interner.insert("x");
+    let d_sym = manager.interner.insert("d");
+
+    manager
+        .assign(s1_sym, d_sym, Value::Int { val: 50 }, None)
+        .await
+        .unwrap();
+    manager
+        .assign(s1_sym, x_sym, Value::Int { val: 11 }, None)
+        .await
+        .unwrap();
+
+    let d_val = manager.lookup(d_sym, s1_sym, None).await.unwrap();
+    assert_eq!(
+        d_val,
+        Value::Int { val: 50 },
+        "12 means the var was recomputed from the old def expression"
+    );
+}
+
+/// Verify an update that turns a def into a var stops it listening to the
+/// member the def read in another service
+#[tokio::test]
+async fn test_update_def_to_var_unwires_cross_service_listener() {
+    let mut manager = manager_after_update(
+        "
+        service b {
+            var m = 1;
+            pub def mm = m;
+        }
+        service a {
+            pub def d = b.mm + 1;
+        }
+        ",
+        "
+        update a {
+            var d: int = b.mm;
+        }
+        ",
+    )
+    .await;
+
+    let a_sym = manager.interner.insert("a");
+    let b_sym = manager.interner.insert("b");
+    let m_sym = manager.interner.insert("m");
+    let d_sym = manager.interner.insert("d");
+
+    manager
+        .assign(a_sym, d_sym, Value::Int { val: 50 }, None)
+        .await
+        .unwrap();
+    manager
+        .assign(b_sym, m_sym, Value::Int { val: 11 }, None)
+        .await
+        .unwrap();
+
+    let d_val = manager.lookup(d_sym, a_sym, None).await.unwrap();
+    assert_eq!(
+        d_val,
+        Value::Int { val: 50 },
+        "12 means the var was recomputed from the old def expression"
+    );
+}
+
+/// Verify an update that turns a def into a var is not undone by an `Update`
+/// from a subscription the def made before
+///
+/// An owner on another node keeps the def's subscription after the update,
+/// since nothing cancels it, and keeps sending `Update`s for it. Calling
+/// `handle_update` directly delivers one the way the network dispatcher would.
+/// Two things each keep the var safe: the update's commit rebuilds
+/// `service.defs` without the old def, and a delivery is dropped unless the
+/// def's current graph reads that member (`Manager::accept_delivery`)
+#[tokio::test]
+async fn test_update_def_to_var_ignores_update_from_stale_subscription() {
+    let mut manager = manager_after_update(
+        "
+        service b {
+            var m = 1;
+            pub def mm = m;
+        }
+        service a {
+            pub def d = b.mm + 1;
+        }
+        ",
+        "
+        update a {
+            var d: int = b.mm;
+        }
+        ",
+    )
+    .await;
+
+    let a_sym = manager.interner.insert("a");
+    let b_sym = manager.interner.insert("b");
+    let mm_sym = manager.interner.insert("mm");
+    let d_sym = manager.interner.insert("d");
+
+    assert!(
+        !manager.services[&a_sym].defs.contains_key(&d_sym),
+        "the update must drop the old def expression for `d`"
+    );
+
+    manager
+        .assign(a_sym, d_sym, Value::Int { val: 50 }, None)
+        .await
+        .unwrap();
+    let a_id = manager.services[&a_sym].id.clone();
+    let value =
+        meerkat_lib::net::codec::encode_value(&Value::Int { val: 11 }, &manager.interner).unwrap();
+    manager
+        .handle_update(
+            a_id,
+            d_sym,
+            (b_sym, mm_sym),
+            value,
+            Default::default(),
+            None,
+        )
+        .await;
+
+    assert!(
+        !manager.services[&a_sym].dep_cache.contains_key(&d_sym),
+        "an `Update` for a listener that is no longer a def must be ignored"
+    );
+    let d_val = manager.lookup(d_sym, a_sym, None).await.unwrap();
+    assert_eq!(
+        d_val,
+        Value::Int { val: 50 },
+        "12 means the var was recomputed from the old def expression"
+    );
+}
+
 /// Verify empty statement lists do not panic and complete cleanly
 #[tokio::test]
 async fn test_update_empty_statements_no_panic() {
@@ -780,7 +970,7 @@ async fn test_integration_create_service_rollback_cleans_ast() {
     assert!(create_result.is_err(), "Service creation should fail");
 
     assert!(
-        !manager.unified_ast.iter().any(|s| {
+        !manager.unified_ast().iter().any(|s| {
             if let meerkat_lib::runtime::ast::Stmt::Service { name, .. } = s {
                 *name == bad_s_sym
             } else {
@@ -789,4 +979,616 @@ async fn test_integration_create_service_rollback_cleans_ast() {
         }),
         "Phantom service must not remain in unified_ast after integration rollback"
     );
+}
+
+// Hot updates publish after successful recomputation when the value/clock pair
+// changes or a source-change notification is pending.
+async fn listening_node() -> (NetworkActor, Address) {
+    let mut network = NetworkActor::new(NodeType::Server).await.unwrap();
+    let NetworkReply::ListenSuccess { addr } = network
+        .handle_command(NetworkCommand::Listen {
+            addr: Address::new("/ip4/127.0.0.1/tcp/0"),
+        })
+        .await
+    else {
+        panic!("network must listen");
+    };
+    let address = Address::new(format!("{}/p2p/{}", addr.0, network.local_peer_id()));
+    (network, address)
+}
+
+async fn setup_gate_test_manager() -> (Manager, NetworkActor, Address) {
+    let (network, _) = listening_node().await;
+    let (peer, address) = listening_node().await;
+    let mut interner = Interner::new();
+    let ast = parse_string(
+        "service remote {
+            var input = 20;
+            pub def current = input;
+        }
+        service local {
+            var x = 1;
+            var y = 1;
+            pub def result = x + 1;
+            pub def downstream = result * 2;
+        }",
+        &mut interner,
+    )
+    .unwrap();
+    let local = interner.insert("local");
+    let local_ast: Vec<_> = ast
+        .iter()
+        .filter(|stmt| matches!(stmt, Stmt::Service { name, .. } if *name == local))
+        .cloned()
+        .collect();
+    let mut node = Node::new();
+    node.interner = interner;
+    node.unified_ast = ast;
+    node.static_checks().unwrap();
+    let manager = node
+        .on_manager_startup(
+            true,
+            Some(network),
+            HashMap::from([("remote".to_string(), format!("{}/remote", address.0))]),
+            &local_ast,
+        )
+        .await
+        .unwrap();
+    (manager, peer, address)
+}
+
+async fn update_service_code(manager: &mut Manager, code: &str) {
+    let ast = parse_string(code, &mut manager.interner).unwrap();
+    Transaction::new(ast).poll(manager).await.unwrap();
+}
+
+async fn subscribe(manager: &mut Manager, address: &Address) {
+    let local = manager.interner.insert("local");
+    let result = manager.interner.insert("result");
+    let sink = manager.interner.insert("sink");
+    manager
+        .handle_request_updates(
+            local,
+            result,
+            ServiceNetId("observer".to_string()),
+            sink,
+            address.0.clone(),
+        )
+        .await;
+}
+
+async fn next_message(peer: &mut NetworkActor) -> MeerkatMessage {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match peer.event_rx.recv().await.expect("network remains open") {
+                NetworkEvent::MessageReceived { msg, .. } => return msg,
+                NetworkEvent::SendFailed { error, .. } => panic!("send failed: {error:?}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("expected message must arrive")
+}
+
+async fn assert_update(
+    peer: &mut NetworkActor,
+    expected_value: i32,
+    expected_clock: &[(&str, &str, u64)],
+) {
+    loop {
+        match next_message(peer).await {
+            MeerkatMessage::Ping { .. } => continue,
+            MeerkatMessage::Update {
+                listener_service,
+                listener_def,
+                source_service,
+                member,
+                value,
+                clock,
+                ..
+            } => {
+                assert_eq!(listener_service, "observer");
+                assert_eq!(listener_def, "sink");
+                assert_eq!(source_service, "local");
+                assert_eq!(member, "result");
+                assert!(matches!(value, NetValue::Int { val } if val == expected_value));
+                let actual: HashMap<_, _> = clock
+                    .into_iter()
+                    .map(|entry| ((entry.service, entry.member), entry.counter))
+                    .collect();
+                let expected = expected_clock
+                    .iter()
+                    .map(|&(service, member, counter)| {
+                        ((service.to_string(), member.to_string()), counter)
+                    })
+                    .collect();
+                assert_eq!(actual, expected);
+                return;
+            }
+            other => panic!("expected result Update, got {other:?}"),
+        }
+    }
+}
+
+// Message IDs are assigned synchronously when a send is submitted. Markers
+// count sends without depending on packet order or a no-message timeout.
+async fn send_marker(manager: &mut Manager, address: &Address) -> u64 {
+    match manager
+        .network
+        .as_mut()
+        .unwrap()
+        .handle_command(NetworkCommand::SendMessage {
+            addr: address.clone(),
+            msg: MeerkatMessage::Ping {
+                content: "send marker".to_string(),
+            },
+        })
+        .await
+    {
+        NetworkReply::MessageSent { msg_id } => msg_id.0,
+        other => panic!("marker send failed: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_update_waits_for_missing_input_without_publishing() {
+    let (mut manager, mut peer, address) = setup_gate_test_manager().await;
+    subscribe(&mut manager, &address).await;
+    assert_update(&mut peer, 2, &[]).await;
+    let [local, result, downstream, remote, current, input] = [
+        "local",
+        "result",
+        "downstream",
+        "remote",
+        "current",
+        "input",
+    ]
+    .map(|name| manager.interner.insert(name));
+    let before = send_marker(&mut manager, &address).await;
+
+    update_service_code(
+        &mut manager,
+        "update local { pub def result = remote.current + 1; }",
+    )
+    .await;
+
+    let after = send_marker(&mut manager, &address).await;
+    // The only operation send is the subscription to the new remote input.
+    // The second marker itself consumes one additional ID.
+    assert_eq!(
+        after - before,
+        2,
+        "blocked hot update must not publish its old result"
+    );
+    assert_eq!(
+        manager.services[&local].vars[&result].value,
+        Value::Int { val: 2 }
+    );
+    assert!(manager.services[&local].vars[&result]
+        .vector_clock
+        .is_empty());
+    assert_eq!(
+        manager.services[&local].vars[&downstream].value,
+        Value::Int { val: 4 }
+    );
+    assert!(manager.services[&local].vars[&downstream]
+        .vector_clock
+        .is_empty());
+    assert!(!manager.services[&local]
+        .dep_cache
+        .get(&result)
+        .and_then(|cache| cache.get(&(remote, current))?.newest())
+        .is_some_and(|entry| entry.1.is_some()));
+
+    let (listener_service, listener_def, reply_to) = loop {
+        match next_message(&mut peer).await {
+            MeerkatMessage::Ping { .. } => continue,
+            MeerkatMessage::RequestUpdates {
+                service,
+                member,
+                listener_service,
+                listener_def,
+                reply_to,
+                ..
+            } => {
+                assert_eq!(service, "remote");
+                assert_eq!(member, "current");
+                break (listener_service, listener_def, reply_to);
+            }
+            other => panic!("expected subscription, got {other:?}"),
+        }
+    };
+    let reply = peer
+        .handle_command(NetworkCommand::SendMessage {
+            addr: Address::new(reply_to),
+            msg: MeerkatMessage::Update {
+                listener_service,
+                listener_def,
+                source_service: "remote".to_string(),
+                member: "current".to_string(),
+                value: NetValue::Int { val: 20 },
+                clock: vec![ClockEntry {
+                    service: "remote".to_string(),
+                    member: "input".to_string(),
+                    counter: 1,
+                }],
+                sources: Some(vec![("remote".into(), "input".into())]),
+            },
+        })
+        .await;
+    assert!(matches!(reply, NetworkReply::MessageSent { .. }));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !manager.services[&local]
+            .dep_cache
+            .get(&result)
+            .and_then(|cache| cache.get(&(remote, current))?.newest())
+            .is_some_and(|entry| entry.1.is_some())
+        {
+            manager.dispatch_network_events().await;
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("initial input must resume recomputation");
+
+    let clock = HashMap::from([((remote, input), 1)]);
+    assert_eq!(
+        manager.services[&local].dep_cache[&result][&(remote, current)]
+            .retained
+            .clone()
+            .unwrap(),
+        (
+            Value::Int { val: 20 },
+            Some(clock.clone()),
+            Some(std::collections::HashSet::from([(remote, input)]))
+        )
+    );
+    assert_eq!(
+        manager.services[&local].vars[&result].value,
+        Value::Int { val: 21 }
+    );
+    assert_eq!(manager.services[&local].vars[&result].vector_clock, clock);
+    assert_eq!(
+        manager.services[&local].vars[&downstream].value,
+        Value::Int { val: 42 }
+    );
+    assert_eq!(
+        manager.services[&local].vars[&downstream].vector_clock,
+        clock
+    );
+    assert_update(&mut peer, 21, &[("remote", "input", 1)]).await;
+}
+
+/// Send `msg` from `from` to the node at `to`
+async fn send(from: &mut NetworkActor, to: &Address, msg: MeerkatMessage) {
+    let sent = from
+        .handle_command(NetworkCommand::SendMessage {
+            addr: to.clone(),
+            msg,
+        })
+        .await;
+    assert!(matches!(sent, NetworkReply::MessageSent { .. }));
+}
+
+/// A request for the code update `decls` of `service`, answered at `reply_to`
+fn update_request(
+    request_id: u64,
+    service: &str,
+    decls: &str,
+    reply_to: &Address,
+) -> MeerkatMessage {
+    MeerkatMessage::UpdateServiceRequest {
+        request_id,
+        txn_id: None,
+        service_name: service.to_string(),
+        source: format!("update {service} {{ {decls} }}"),
+        reply_to: reply_to.0.clone(),
+    }
+}
+
+/// Send `node` a code update that adds `def` to `local`. The def reads
+/// `remote.current`, so it has no first value, and the update no reply, until
+/// the owner of `remote` answers the def's subscription
+async fn request_update(
+    from: &mut NetworkActor,
+    reply_to: &Address,
+    node: &Address,
+    request_id: u64,
+    def: &str,
+) {
+    let decls = format!("pub def {def} = remote.current;");
+    send(
+        from,
+        node,
+        update_request(request_id, "local", &decls, reply_to),
+    )
+    .await;
+}
+
+/// Serve what `manager` receives until `peer` gets its next message
+async fn serve_until_received(manager: &mut Manager, peer: &mut NetworkActor) -> MeerkatMessage {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            manager.dispatch_network_events().await;
+            match peer.event_rx.try_recv() {
+                Ok(NetworkEvent::MessageReceived { msg, .. }) => return msg,
+                Ok(NetworkEvent::SendFailed { error, .. }) => panic!("send failed: {error:?}"),
+                _ => tokio::task::yield_now().await,
+            }
+        }
+    })
+    .await
+    .expect("expected message must arrive")
+}
+
+/// Whether `msg` subscribes `def` to its input, as applying the update that
+/// adds the def does
+fn subscribes(msg: &MeerkatMessage, def: &str) -> bool {
+    matches!(msg, MeerkatMessage::RequestUpdates { listener_def, .. } if listener_def == def)
+}
+
+/// Whether `msg` refuses the update request `id` because of its peer's limit
+fn refuses(msg: &MeerkatMessage, id: u64) -> bool {
+    matches!(
+        msg,
+        MeerkatMessage::UpdateServiceResponse { request_id, error: Some(error) }
+            if *request_id == id && error == "Too many pending updates from this peer"
+    )
+}
+
+/// A node holds a code update until its new defs have first values, and only
+/// `MAX_PENDING_UPDATES_PER_PEER` of them for one peer: the peer's next update
+/// is refused, another peer's is not, and one answered makes room for another
+#[tokio::test]
+async fn test_update_requests_held_for_first_values_are_limited_per_peer() {
+    // `peer` owns `remote`: an applied update sends it the subscription of
+    // the def it adds, which stays unanswered
+    let (mut manager, mut peer, address) = setup_gate_test_manager().await;
+    let (mut other, other_address) = listening_node().await;
+    let node = Address::new(manager.local_reply_addr().await);
+
+    request_update(&mut peer, &address, &node, 0, "held0").await;
+    let MeerkatMessage::RequestUpdates {
+        listener_service,
+        listener_def,
+        reply_to,
+        ..
+    } = serve_until_received(&mut manager, &mut peer).await
+    else {
+        panic!("an applied update subscribes its new def");
+    };
+    for id in 1..MAX_PENDING_UPDATES_PER_PEER as u64 {
+        let def = format!("held{id}");
+        request_update(&mut peer, &address, &node, id, &def).await;
+        let applied = serve_until_received(&mut manager, &mut peer).await;
+        assert!(subscribes(&applied, &def), "{applied:?}");
+    }
+
+    request_update(&mut peer, &address, &node, 100, "refused").await;
+    let refused = serve_until_received(&mut manager, &mut peer).await;
+    assert!(
+        refuses(&refused, 100),
+        "the peer has as many updates held as a node holds for one: {refused:?}"
+    );
+
+    request_update(&mut other, &other_address, &node, 101, "others").await;
+    let applied = serve_until_received(&mut manager, &mut peer).await;
+    assert!(
+        subscribes(&applied, "others"),
+        "another peer's update is applied all the same: {applied:?}"
+    );
+
+    // The first def gets its input, so its update is answered
+    let input = MeerkatMessage::Update {
+        listener_service,
+        listener_def,
+        source_service: "remote".to_string(),
+        member: "current".to_string(),
+        value: NetValue::Int { val: 20 },
+        clock: vec![ClockEntry {
+            service: "remote".to_string(),
+            member: "input".to_string(),
+            counter: 1,
+        }],
+        sources: Some(vec![("remote".into(), "input".into())]),
+    };
+    send(&mut peer, &Address::new(reply_to), input).await;
+    let answered = serve_until_received(&mut manager, &mut peer).await;
+    assert!(
+        matches!(
+            answered,
+            MeerkatMessage::UpdateServiceResponse {
+                request_id: 0,
+                error: None
+            }
+        ),
+        "an update is answered once its def has a value: {answered:?}"
+    );
+    request_update(&mut peer, &address, &node, 102, "again").await;
+    let applied = serve_until_received(&mut manager, &mut peer).await;
+    assert!(
+        subscribes(&applied, "again"),
+        "with one answered, the peer's next update is applied: {applied:?}"
+    );
+}
+
+/// What `select` makes of the first message `peer` gets that it takes
+async fn received<T>(peer: &mut NetworkActor, select: impl Fn(MeerkatMessage) -> Option<T>) -> T {
+    loop {
+        if let Some(selected) = select(next_message(peer).await) {
+            return selected;
+        }
+    }
+}
+
+/// An update a node is still applying counts toward its peer's limit. While
+/// the node waits for the update's remote participant to commit it serves
+/// other requests, and the peer's next update is refused before it has any
+/// effect
+#[tokio::test]
+async fn test_update_being_applied_counts_toward_the_peer_limit() {
+    let (mut manager, mut peer, address) = setup_gate_test_manager().await;
+    let node = Address::new(manager.local_reply_addr().await);
+    // A second service, which the locks of an update to `local` do not cover
+    let spare = parse_string("service spare { var z = 0; }", &mut manager.interner).unwrap();
+    manager.run_declaration(&spare[0]).await.unwrap();
+    let [local, spare, held, late] =
+        ["local", "spare", "held", "late"].map(|name| manager.interner.insert(name));
+
+    // The peer is one update short of the limit
+    for id in 1..MAX_PENDING_UPDATES_PER_PEER as u64 {
+        let def = format!("held{id}");
+        request_update(&mut peer, &address, &node, id, &def).await;
+        let applied = serve_until_received(&mut manager, &mut peer).await;
+        assert!(subscribes(&applied, &def), "{applied:?}");
+    }
+
+    // One more reads `remote.current` in an initializer, under the update's
+    // transaction. That makes `peer` a participant: once the update is
+    // installed the node asks it to commit, and serves other requests until
+    // it answers. The peer uses that wait to ask for another update
+    let decls = "var seed = remote.current; pub def held = remote.current;";
+    let update = update_request(100, "local", decls, &address);
+    send(&mut peer, &node, update).await;
+    let participant = async {
+        let (request_id, reply_to) = received(&mut peer, |msg| match msg {
+            MeerkatMessage::LookupRequest {
+                request_id,
+                reply_to,
+                ..
+            } => Some((request_id, reply_to)),
+            _ => None,
+        })
+        .await;
+        let value = MeerkatMessage::LookupResponse {
+            request_id,
+            value: NetValue::Int { val: 20 },
+            clock: Some(Vec::new()),
+            sources: Some(vec![("remote".into(), "input".into())]),
+        };
+        send(&mut peer, &Address::new(reply_to), value).await;
+        let (request_id, reply_to) = received(&mut peer, |msg| match msg {
+            MeerkatMessage::Commit {
+                request_id,
+                reply_to,
+                ..
+            } => Some((request_id, reply_to)),
+            _ => None,
+        })
+        .await;
+        let another = update_request(101, "spare", "pub def late = remote.current;", &address);
+        send(&mut peer, &node, another).await;
+        // Applied, it subscribes its def; refused, it is answered
+        let outcome = received(&mut peer, |msg| {
+            let answered = matches!(
+                msg,
+                MeerkatMessage::UpdateServiceResponse {
+                    request_id: 101,
+                    ..
+                }
+            );
+            (answered || subscribes(&msg, "late")).then_some(msg)
+        })
+        .await;
+        let committed = MeerkatMessage::CommitResponse {
+            request_id,
+            success: true,
+            error: None,
+        };
+        send(&mut peer, &Address::new(reply_to), committed).await;
+        outcome
+    };
+    let serve = async {
+        while !manager.services[&local].defs.contains_key(&held) {
+            manager.dispatch_network_events().await;
+            tokio::task::yield_now().await;
+        }
+    };
+    let exchange = async { tokio::join!(participant, serve) };
+    let (outcome, ()) = tokio::time::timeout(Duration::from_secs(10), exchange)
+        .await
+        .expect("the exchange must finish");
+
+    assert!(
+        refuses(&outcome, 101),
+        "with the update being applied, the peer is at the limit: {outcome:?}"
+    );
+    assert!(!manager.services[&spare].defs.contains_key(&late));
+}
+
+#[tokio::test]
+async fn test_update_propagates_unchanged_value_with_new_clock() {
+    let (mut manager, mut peer, address) = setup_gate_test_manager().await;
+    subscribe(&mut manager, &address).await;
+    assert_update(&mut peer, 2, &[]).await;
+    let [local, result, downstream, y] =
+        ["local", "result", "downstream", "y"].map(|name| manager.interner.insert(name));
+    manager
+        .execute_action(
+            local,
+            &[ActionStmt::Assign {
+                name: y,
+                expr: Expr::Literal {
+                    val: Value::Int { val: 1 },
+                },
+            }],
+        )
+        .await
+        .unwrap();
+    let clock = HashMap::from([((local, y), 1)]);
+    assert_eq!(manager.services[&local].vars[&y].vector_clock, clock);
+    assert!(manager.services[&local].vars[&result]
+        .vector_clock
+        .is_empty());
+    let before = send_marker(&mut manager, &address).await;
+
+    update_service_code(&mut manager, "update local { pub def result = y + 1; }").await;
+
+    let after = send_marker(&mut manager, &address).await;
+    assert_eq!(
+        after - before,
+        2,
+        "clock-only change must publish one result Update"
+    );
+    assert_eq!(
+        manager.services[&local].vars[&result].value,
+        Value::Int { val: 2 }
+    );
+    assert_eq!(manager.services[&local].vars[&result].vector_clock, clock);
+    assert_eq!(
+        manager.services[&local].vars[&downstream].value,
+        Value::Int { val: 4 }
+    );
+    assert_eq!(
+        manager.services[&local].vars[&downstream].vector_clock,
+        clock
+    );
+    assert_update(&mut peer, 2, &[("local", "y", 1)]).await;
+}
+
+#[tokio::test]
+async fn test_update_unchanged_result_still_initializes_subscription() {
+    let (mut manager, mut peer, address) = setup_gate_test_manager().await;
+    let local = manager.interner.insert("local");
+    let result = manager.interner.insert("result");
+
+    update_service_code(&mut manager, "update local { pub def result = x + 1; }").await;
+
+    assert_eq!(
+        manager.services[&local].vars[&result].value,
+        Value::Int { val: 2 }
+    );
+    assert!(manager.services[&local].vars[&result]
+        .vector_clock
+        .is_empty());
+    let before = send_marker(&mut manager, &address).await;
+    subscribe(&mut manager, &address).await;
+    let after = send_marker(&mut manager, &address).await;
+    assert_eq!(
+        after - before,
+        2,
+        "new subscriber must receive the unchanged current pair"
+    );
+    assert_update(&mut peer, 2, &[]).await;
 }

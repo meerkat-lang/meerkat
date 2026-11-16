@@ -245,9 +245,10 @@ pub enum Token<'a> {
     #[token("..")]
     DotDot,
 
-    #[regex(r"\s*", logos::skip)]
-    #[regex(r#"(//)[^\n]*"#, logos::skip)] // Regex for a single line comment
-    // Yes there is regex for this no I could not get it to work
+    // Whitespace and single-line comments, in one regex: Clippy reports two
+    // attributes with the same `logos::skip` callback as duplicates.
+    #[regex(r#"\s*|//[^\n]*"#, logos::skip)]
+    // Nested block comments need a callback to track their depth.
     #[token("/*", skip_multi_line_comments)] // Match start of multiline
     Comment,
 
@@ -340,6 +341,21 @@ mod html_lex_tests {
             !toks.iter().any(|t| matches!(t, Token::HtmlLit(_))),
             "no HtmlLit expected in a plain parenthesized expression: {:?}",
             toks
+        );
+    }
+
+    // Whitespace and `//` comments share one skip regex; check both are still
+    // skipped and that a lone `/` is still division.
+    #[test]
+    fn test_whitespace_and_line_comments_skipped() {
+        assert_eq!(
+            lex_all("a / b // note\n\t c // trailing"),
+            vec![
+                Token::Ident("a"),
+                Token::Div,
+                Token::Ident("b"),
+                Token::Ident("c"),
+            ]
         );
     }
 }

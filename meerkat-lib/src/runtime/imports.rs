@@ -9,7 +9,7 @@ use std::time::Instant;
 use crate::error::{Error, Result};
 use crate::net::types::MeerkatMessage;
 use crate::net::{Address, MessageId, NetworkCommand};
-use crate::runtime::ast::Stmt;
+use crate::runtime::ast::{apply_updates_to_ast, Stmt};
 use crate::runtime::interner::{Interner, Symbol};
 use crate::runtime::limits::{
     INDIVIDUAL_IMPORT_TIMEOUT_SECS, MAX_IMPORTED_SERVICES, MAX_IMPORT_RETRIES,
@@ -36,6 +36,9 @@ pub type ImportCommand = (NetworkCommand, String, String, u8);
 /// One imported file, kept whole so the resolved AST can be emitted in
 /// dependency order rather than in the order replies happened to arrive.
 struct ImportedModule {
+    /// The name the module was requested under, used to name it when
+    /// refusing an update that points the wrong way.
+    name: Symbol,
     /// Services this file declares.
     declares: Vec<Symbol>,
     /// Services this file imports.
@@ -45,7 +48,8 @@ struct ImportedModule {
     /// Address of the peer this file was fetched from, if it came over the
     /// network. That peer runs the file as its own program, so it serves
     /// every service the file declares -- not only the one that was asked
-    /// for. `None` for a file read from local disk, which this node serves.
+    /// for. `None` for a file read from local disk, which this node serves
+    /// and runs.
     remote_peer: Option<Address>,
 }
 
@@ -57,9 +61,12 @@ pub struct Imports<'a> {
     pending_services: HashSet<String>,
     remote_url_map: HashMap<String, String>,
     modules: Vec<ImportedModule>,
-    /// Services the root program declares itself. This node serves them, so a
-    /// peer that happens to declare the same name does not own them here.
+    /// Services declared by the root program or local disk modules. This node
+    /// serves them, so a peer declaring the same name does not own them here.
     local_declares: HashSet<Symbol>,
+    /// Services declared by the root program itself. Disk modules start before
+    /// it, so a module may not update these.
+    root_declares: HashSet<Symbol>,
     request_counter: u64,
     my_addr: String,
 }
@@ -99,6 +106,7 @@ impl<'a> Imports<'a> {
         let mut imports = Imports {
             interner,
             local_declares: visited_services.clone(),
+            root_declares: visited_services.clone(),
             visited_services,
             pending_network: HashMap::new(),
             pending_services: HashSet::new(),
@@ -191,6 +199,20 @@ impl<'a> Imports<'a> {
         service_name: &str,
         base_dir: &Path,
     ) -> Result<Vec<ImportCommand>> {
+        // The peer that served this file owns everything the file declares.
+        // Only a service with a remote URL is ever fetched, so a file for any
+        // other name has no owner to record it under: it would pass for one
+        // read from local disk, which this node runs. Ignore it, before any
+        // state changes, as nothing this resolution asked for.
+        let Some(url) = self.remote_url_map.get(service_name) else {
+            println!(
+                "Ignoring response for service '{}', which is not imported from any peer",
+                service_name
+            );
+            return Ok(Vec::new());
+        };
+        let remote_peer = Address::new(url.as_str()).node_address(service_name);
+
         if !self.pending_services.contains(service_name) {
             // Log unsolicited response rather than failing, which aids testing
             // and speculative pushes
@@ -204,13 +226,8 @@ impl<'a> Imports<'a> {
         self.pending_network
             .retain(|_, req| req.service_name != service_name);
 
-        // The peer that served this file owns everything the file declares.
-        let remote_peer = self
-            .remote_url_map
-            .get(service_name)
-            .map(|url| Address::new(url.as_str()).node_address(service_name));
-
-        self.record_source(source, base_dir, remote_peer)
+        let name = self.interner.insert(service_name);
+        self.record_source(source, base_dir, Some(remote_peer), name)
     }
 
     /// Record a resolved import's source and resolve its own imports in turn
@@ -225,6 +242,8 @@ impl<'a> Imports<'a> {
     /// Args:
     ///   `source` (`&str`): Raw source text of the imported file
     ///   `base_dir` (`&Path`): Directory for local imports
+    ///   `remote_peer` (`Option<Address>`): Peer serving the file, if any
+    ///   `name` (`Symbol`): The name the module was requested under
     ///
     /// Returns:
     ///   `Result<Vec<ImportCommand>>`: Fetch commands for its own imports
@@ -236,6 +255,7 @@ impl<'a> Imports<'a> {
         source: &str,
         base_dir: &Path,
         remote_peer: Option<Address>,
+        name: Symbol,
     ) -> Result<Vec<ImportCommand>> {
         if self.visited_services.len() >= MAX_IMPORTED_SERVICES {
             return Err(Error::LimitExceeded(format!(
@@ -251,6 +271,9 @@ impl<'a> Imports<'a> {
         for stmt in &parsed_stmts {
             if let Stmt::Service { name, .. } = stmt {
                 self.visited_services.insert(*name);
+                if remote_peer.is_none() {
+                    self.local_declares.insert(*name);
+                }
             }
         }
 
@@ -259,6 +282,7 @@ impl<'a> Imports<'a> {
         // it is recorded, so a dependency always lands *after* its dependent.
         // `finalize` sorts this out.
         self.modules.push(ImportedModule {
+            name,
             declares: parsed_stmts
                 .iter()
                 .filter_map(|s| match s {
@@ -303,13 +327,18 @@ impl<'a> Imports<'a> {
     ///
     /// Args:
     ///   `failed_msg_id` (`MessageId`): Message ID that failed
+    ///   `cause` (`&str`): Why it failed, reported if retries run out
     ///
     /// Returns:
     ///   `Result<Option<ImportCommand>>`: Retry command
     ///
     /// Errors:
     ///   `Error`: If retry limit has been exceeded
-    pub fn on_send_failure(&mut self, failed_msg_id: MessageId) -> Result<Option<ImportCommand>> {
+    pub fn on_send_failure(
+        &mut self,
+        failed_msg_id: MessageId,
+        cause: &str,
+    ) -> Result<Option<ImportCommand>> {
         let pending = match self.pending_network.remove(&failed_msg_id) {
             Some(p) => p,
             None => return Ok(None),
@@ -323,8 +352,8 @@ impl<'a> Imports<'a> {
         let new_retry_count = pending.retry_count + 1;
         if new_retry_count > MAX_IMPORT_RETRIES {
             return Err(Error::Message(format!(
-                "Import fetch failed for service '{}' after {} retries",
-                pending.service_name, MAX_IMPORT_RETRIES
+                "Import fetch failed for service '{}' after {} retries: {}",
+                pending.service_name, MAX_IMPORT_RETRIES, cause
             )));
         }
 
@@ -372,16 +401,17 @@ impl<'a> Imports<'a> {
             }
         }
 
+        let cause = format!("no reply within {}s", INDIVIDUAL_IMPORT_TIMEOUT_SECS);
         if let Some((svc, max_retries)) = failed_service {
             return Err(Error::Message(format!(
-                "Import fetch failed for service '{}' after {} retries",
-                svc, max_retries
+                "Import fetch failed for service '{}' after {} retries: {}",
+                svc, max_retries, cause
             )));
         }
 
         let mut retry_cmds = Vec::new();
         for msg_id in to_retry {
-            if let Some(cmd) = self.on_send_failure(msg_id)? {
+            if let Some(cmd) = self.on_send_failure(msg_id, &cause)? {
                 retry_cmds.push(cmd);
             }
         }
@@ -411,26 +441,142 @@ impl<'a> Imports<'a> {
     /// (`main -> a -> b` records `[a, b]`, but `a` reads `b`), so emit them in
     /// post-order over the import graph instead.
     ///
+    /// The statements of the modules read from local disk are also returned
+    /// on their own, in the same order: they are the imports this node runs
+    /// at startup. A module fetched from a peer is that peer's own program, so
+    /// only the peer runs it: its startup updates are folded into the
+    /// declarations they complete, which is how the peer serves them, and
+    /// one updating a service the peer does not serve is refused
+    ///
     /// Returns:
-    ///   `Vec<Stmt>`: Dependency-ordered AST of all imported services
-    pub fn finalize(self) -> Vec<Stmt> {
+    ///   `(Vec<Stmt>, Vec<Stmt>)`: Dependency-ordered AST of all imported
+    ///   services, and the statements of the local disk modules among them
+    pub fn finalize(self) -> Result<(Vec<Stmt>, Vec<Stmt>)> {
         // Which module declares each service, so an import edge can be
         // followed to the module that satisfies it. First declaration wins.
         let mut owner: HashMap<Symbol, usize> = HashMap::new();
         for (idx, module) in self.modules.iter().enumerate() {
             for svc in &module.declares {
+                if module.remote_peer.is_some() && self.local_declares.contains(svc) {
+                    continue;
+                }
                 owner.entry(*svc).or_insert(idx);
+            }
+        }
+
+        // Which modules each module imports, followed to the end of the chain.
+        // A module's startup updates may target its own services and those of
+        // anything it imports, directly or transitively: startup creates those
+        // first. It may not target a service declared by the root program or
+        // by a module that imports it -- an imported module starts before its
+        // importer, so that service does not exist yet. Refuse that here, before
+        // anything runs, and name the module and service so the error points at
+        // the dependency that is the wrong way round.
+        //
+        // Only a disk module's updates need this: a peer module's updates are
+        // folded into its declarations further down. Collect the targets first
+        // so a program with none pays nothing for the walk below.
+        let mut disk_targets: Vec<Vec<Symbol>> = Vec::with_capacity(self.modules.len());
+        let mut any_updates = false;
+        for module in &self.modules {
+            let mut targets = Vec::new();
+            if module.remote_peer.is_none() {
+                collect_update_targets(&module.stmts, &mut targets);
+            }
+            any_updates |= !targets.is_empty();
+            disk_targets.push(targets);
+        }
+
+        let mut reach: Vec<HashSet<usize>> = vec![HashSet::new(); self.modules.len()];
+        if any_updates {
+            for (idx, module) in self.modules.iter().enumerate() {
+                let mut seen: HashSet<usize> = HashSet::new();
+                let mut pending: Vec<Symbol> = module.imports.clone();
+                while let Some(svc) = pending.pop() {
+                    // The root program owns every name it declares, even when
+                    // a disk module declares the same name and is recorded as
+                    // its owner above. Nothing was loaded for it, so an import
+                    // of that name must not reach the disk module.
+                    if self.root_declares.contains(&svc) {
+                        continue;
+                    }
+                    let Some(&dep) = owner.get(&svc) else {
+                        continue;
+                    };
+                    if dep != idx && seen.insert(dep) {
+                        pending.extend(self.modules[dep].imports.iter().copied());
+                    }
+                }
+                reach[idx] = seen;
+            }
+        }
+
+        for (idx, module) in self.modules.iter().enumerate() {
+            if module.remote_peer.is_some() {
+                continue;
+            }
+            // Only names `owner` attributes to this module: a module that
+            // declares a service another module declared first does not own
+            // that name, so its own declaration must not admit an update to it.
+            let mut allowed: HashSet<Symbol> = module
+                .declares
+                .iter()
+                .copied()
+                .filter(|svc| owner.get(svc) == Some(&idx))
+                .collect();
+            for dep in &reach[idx] {
+                // Only declarations `owner` attributes to this dependency count:
+                // a peer module that re-declares a name the root program owns
+                // does not make that name the dependency's to lend.
+                for svc in &self.modules[*dep].declares {
+                    if owner.get(svc) == Some(dep) {
+                        allowed.insert(*svc);
+                    }
+                }
+            }
+            for target in &disk_targets[idx] {
+                let target = *target;
+                let module_name = self.interner.get(module.name);
+                let service = self.interner.get(target);
+                // The root program's declaration wins over any module's, so a
+                // name it declares belongs to the root's service even when this
+                // module declares the same name itself: that declaration must
+                // not put the target in `allowed`.
+                if self.root_declares.contains(&target) {
+                    return Err(Error::Message(format!(
+                        "module '{module_name}' updates service '{service}', which is declared by the importing program"
+                    )));
+                }
+                if allowed.contains(&target) {
+                    continue;
+                }
+                let Some(&declared_by) = owner.get(&target) else {
+                    // Nobody here declares it: the static checks own that
+                    // diagnostic, not import resolution.
+                    continue;
+                };
+                let whose = if reach[declared_by].contains(&idx) {
+                    "a module that imports it"
+                } else {
+                    "a module it does not import"
+                };
+                return Err(Error::Message(format!(
+                    "module '{module_name}' updates service '{service}', which is declared by {whose}"
+                )));
             }
         }
 
         // Split the modules apart so the walk can hand out each one's
         // statements without cloning them while still reading its import edges.
+        // Only a local module's statements are copied, once, for startup.
         let count = self.modules.len();
         let mut imports: Vec<Vec<Symbol>> = Vec::with_capacity(count);
         let mut stmts: Vec<Option<Vec<Stmt>>> = Vec::with_capacity(count);
+        let mut local: Vec<bool> = Vec::with_capacity(count);
         for module in self.modules {
             imports.push(module.imports);
             stmts.push(Some(module.stmts));
+            local.push(module.remote_peer.is_none());
         }
 
         // Iterative DFS post-order -- import chains are user-controlled depth,
@@ -438,6 +584,8 @@ impl<'a> Imports<'a> {
         // breaks import cycles, which the type checker reports properly once it
         // can see the services (a better diagnostic than looping here).
         let mut ordered: Vec<Stmt> = Vec::new();
+        let mut local_ordered: Vec<Stmt> = Vec::new();
+        let mut peer_updates: Vec<Stmt> = Vec::new();
         let mut done = vec![false; count];
         let mut on_stack = vec![false; count];
 
@@ -455,7 +603,21 @@ impl<'a> Imports<'a> {
                     done[idx] = true;
                     on_stack[idx] = false;
                     if let Some(module_stmts) = stmts[idx].take() {
-                        ordered.extend(module_stmts);
+                        if local[idx] {
+                            local_ordered.extend_from_slice(&module_stmts);
+                            ordered.extend(module_stmts);
+                        } else {
+                            for stmt in module_stmts {
+                                match stmt {
+                                    Stmt::Update { .. } | Stmt::Atomic { .. } => {
+                                        peer_updates.push(stmt)
+                                    }
+                                    Stmt::Service { name, .. }
+                                        if self.local_declares.contains(&name) => {}
+                                    _ => ordered.push(stmt),
+                                }
+                            }
+                        }
                     }
                     continue;
                 }
@@ -473,7 +635,27 @@ impl<'a> Imports<'a> {
             }
         }
 
-        ordered
+        let is_peer_service = |stmt: &Stmt| matches!(stmt, Stmt::Service { name, .. } if !self.local_declares.contains(name));
+        let peer_services: Vec<Stmt> = ordered
+            .iter()
+            .filter(|stmt| is_peer_service(stmt))
+            .cloned()
+            .collect();
+        let folded = apply_updates_to_ast(&peer_services, &peer_updates).map_err(|name| {
+            Error::Message(format!(
+                "a module fetched from a peer updates service '{}', which that peer does not serve",
+                self.interner.get(name)
+            ))
+        })?;
+        // Folding preserves the declarations' order, including repeated names.
+        for (stmt, service) in ordered
+            .iter_mut()
+            .filter(|stmt| is_peer_service(stmt))
+            .zip(folded)
+        {
+            *stmt = service;
+        }
+        Ok((ordered, local_ordered))
     }
 
     /// Services owned by a peer because a network-fetched module declares them
@@ -488,11 +670,9 @@ impl<'a> Imports<'a> {
     /// merges directly into the `-i` map. Empty unless imports were fetched
     /// over the network: a module read from local disk is served by this node.
     ///
-    /// A name the root program declares itself is never reported, even when a
-    /// peer's module happens to declare it too: this node serves its own
-    /// declaration. Reporting it would put an entry the user never asked for
-    /// into the `-i` map, where `Manager::register_remote_services` would
-    /// discard it and blame a `-i` flag that was never typed.
+    /// A name declared by the root program or a disk module is never reported,
+    /// even when a peer's module declares it too: this node serves its own
+    /// declaration.
     ///
     /// Returns:
     ///   `HashMap<String, String>`: Service name to serving URL
@@ -558,6 +738,19 @@ impl<'a> Imports<'a> {
         // disk, so there is no outstanding network request to clear. Going
         // through the network entry point would report it as an unsolicited
         // response on every startup that resolves a local import.
-        self.record_source(&source, base_dir, None)
+        self.record_source(&source, base_dir, None, service_sym)
+    }
+}
+
+/// Collect the services `stmts` update, including the ones inside `atomic`
+/// blocks: an atomic block commits as one transaction but each `update` in it
+/// names a service just the same.
+fn collect_update_targets(stmts: &[Stmt], targets: &mut Vec<Symbol>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Update { service_name, .. } => targets.push(*service_name),
+            Stmt::Atomic { updates } => collect_update_targets(updates, targets),
+            _ => {}
+        }
     }
 }

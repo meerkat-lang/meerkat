@@ -10,7 +10,9 @@
   "minimumReleaseAge": "7 days",
   "abandonmentThreshold": "2 years",
   "osvVulnerabilityAlerts": true,
-  "dependencyDashboardOSVVulnerabilitySummary": "all",
+  "dependencyDashboard": {
+    "osvVulnerabilitySummary": "all"
+  },
   "vulnerabilityAlerts": {
     "labels": ["security"],
     "minimumReleaseAge": null

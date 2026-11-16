@@ -9,7 +9,7 @@
 //! - `TableDecl` declarations
 //! - `Insert` statements
 //! - `Select` expressions
-//! - `Fold` expressions
+//! - the table and the column of `Fold` expressions
 
 use crate::runtime::ast::{ActionStmt, Decl, DefForm, Expr, Stmt, Value};
 use crate::runtime::interner::Symbol;

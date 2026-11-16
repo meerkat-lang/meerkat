@@ -207,14 +207,15 @@ pub(crate) async fn eval_with_inputs(
             // closure changes.
             if inputs.is_none() {
                 if let Some((svc, member)) = call_target(func, env, ctx.service_name) {
-                    let creating = ctx
-                        .txn
-                        .as_deref()
-                        .is_some_and(|t| ctx.manager.is_creation_txn(&t.id));
-                    // Checked last: the scan of the copy's declarations is not
-                    // paid by calls of local services.
+                    // The map test comes first, so a call of a local service
+                    // pays neither the scan of the local services
+                    // (`is_creation_txn`) nor the scan of the copy's
+                    // declarations
                     if ctx.manager.remote_services.contains_key(&svc)
-                        && !creating
+                        && !ctx
+                            .txn
+                            .as_deref()
+                            .is_some_and(|t| ctx.manager.is_creation_txn(&t.id))
                         && matches!(
                             ctx.manager.member_decl(svc, member),
                             None | Some(Decl::DefDecl {

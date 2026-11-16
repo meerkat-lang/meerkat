@@ -3731,6 +3731,30 @@ impl Manager {
         self.send_oneway(Address::new(reply_to), response).await;
     }
 
+    /// Whether a by-name request may run now (`by_name_request_is_runnable`).
+    /// When it may not, the request has been answered, declined or refused,
+    /// by the time this returns false. When it may, nothing has awaited
+    async fn admit_by_name(
+        &mut self,
+        service: Symbol,
+        stmts: &[ActionStmt],
+        request_id: u64,
+        reply_to: &str,
+    ) -> bool {
+        match self.by_name_request_is_runnable(service, stmts) {
+            Ok(true) => true,
+            Ok(false) => {
+                self.send_declined(request_id, reply_to).await;
+                false
+            }
+            Err(e) => {
+                self.send_action_error(request_id, reply_to, e.to_string())
+                    .await;
+                false
+            }
+        }
+    }
+
     /// Run a participant request (initial dispatch or a woken waiter), then wake
     /// whatever is parked on locks it released
     pub async fn run_and_reply_or_park(&mut self, parked: ParkedRequest) {
@@ -3755,25 +3779,19 @@ impl Manager {
                 // A by-name request runs only against a declaration of the
                 // right shape, checked now and not when it arrived: a request
                 // that parked behind a code update re-dispatches against the
-                // declaration the update left. The check and the run have no
-                // await between them. A decline here can come on a
-                // re-dispatch, after the transaction already took locks in an
-                // earlier attempt; that is fine, the caller's fallback runs
-                // under the same transaction. A call whose arguments do not fit
-                // is refused with an error, as a def call is
-                if by_name {
-                    match self.by_name_request_is_runnable(service, &stmts) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            self.send_declined(request_id, &reply_to).await;
-                            return;
-                        }
-                        Err(e) => {
-                            self.send_action_error(request_id, &reply_to, e.to_string())
-                                .await;
-                            return;
-                        }
-                    }
+                // declaration the update left. When the request is admitted,
+                // nothing awaits between the check and the run. A decline here
+                // can come on a re-dispatch, after the transaction already
+                // took locks in an earlier attempt; that is fine, the caller's
+                // fallback runs under the same transaction. A call whose
+                // arguments do not fit is refused with an error, as a def call
+                // is
+                if by_name
+                    && !self
+                        .admit_by_name(service, &stmts, request_id, &reply_to)
+                        .await
+                {
+                    return;
                 }
                 match self
                     .execute_action_participant(service, &stmts, &env, tid.clone())
@@ -4077,20 +4095,15 @@ impl Manager {
                         // Checked against this node's CURRENT declaration,
                         // which may have changed since the caller took its
                         // copy. A transaction's request is checked in
-                        // `dispatch_parked` instead, on every dispatch
-                        if by_name {
-                            match self.by_name_request_is_runnable(svc_sym, &local_stmts) {
-                                Ok(true) => {}
-                                Ok(false) => {
-                                    self.send_declined(request_id, &reply_to).await;
-                                    return None;
-                                }
-                                Err(e) => {
-                                    self.send_action_error(request_id, &reply_to, e.to_string())
-                                        .await;
-                                    return None;
-                                }
-                            }
+                        // `dispatch_parked` instead, on every dispatch. This
+                        // node's own callers always send a by-name request
+                        // under a transaction, so this arm serves other clients
+                        if by_name
+                            && !self
+                                .admit_by_name(svc_sym, &local_stmts, request_id, &reply_to)
+                                .await
+                        {
+                            return None;
                         }
                         let result = self
                             .execute_action_with_env(svc_sym, &local_stmts, &local_env)

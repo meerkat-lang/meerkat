@@ -242,18 +242,8 @@ Param: Param = {
 }
 
 Params: Vec<Param> = {
-    "(" ")" => vec![],
     <i:Ident> => vec![Param { name: i, ty: None }],
-    "(" <mut v:(<Param> ",")+> <e:Param?> ")" => {
-        match e {
-            None => v,
-            Some(e) => {
-                v.push(e);
-                v
-            }
-        }
-    },
-    "(" <e:Param> ")" => vec![e],
+    ParenParams => <>,
 }
 
 // Only the parenthesized lists: a special form is never written with a bare

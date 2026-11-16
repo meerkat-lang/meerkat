@@ -636,16 +636,9 @@ pub fn format_expr(expr: &Expr, interner: &Interner) -> String {
         ),
         // A lambda has no return type syntax: the grammar sets it to `None`
         Expr::Func { params, body, .. } => {
-            let params_str: Vec<String> = params
-                .iter()
-                .map(|p| match &p.ty {
-                    Some(t) => format!("{}: {}", interner.get(p.name), t),
-                    None => interner.get(p.name).to_string(),
-                })
-                .collect();
             format!(
                 "fn ({}) => {}",
-                params_str.join(", "),
+                format_params(params, interner),
                 format_expr(body, interner)
             )
         }
@@ -723,6 +716,19 @@ pub fn format_expr(expr: &Expr, interner: &Interner) -> String {
     }
 }
 
+/// A parameter list as source text, without its parentheses. `Param`'s Display
+/// prints the symbol, not the name
+fn format_params(params: &[crate::runtime::tt::Param], interner: &Interner) -> String {
+    params
+        .iter()
+        .map(|p| match &p.ty {
+            Some(t) => format!("{}: {}", interner.get(p.name), t),
+            None => interner.get(p.name).to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Format a `Decl` into a valid Meerkat declaration source code string
 ///
 /// Args:
@@ -758,15 +764,7 @@ pub fn format_decl(decl: &Decl, interner: &Interner) -> String {
         } => {
             let prefix = if *is_pub { "pub " } else { "" };
             let name_str = interner.get(*name);
-            // `Param`'s Display prints the symbol, not the name
-            let params_str: Vec<String> = params
-                .iter()
-                .map(|p| match &p.ty {
-                    Some(t) => format!("{}: {}", interner.get(p.name), t),
-                    None => interner.get(p.name).to_string(),
-                })
-                .collect();
-            let params_str = params_str.join(", ");
+            let params_str = format_params(params, interner);
             match (form, body.as_ref()) {
                 (DefForm::Action, Expr::Action(stmts)) => {
                     format!(

@@ -11,6 +11,29 @@ fn check_program(input: &str) -> Result<(), String> {
     node.run_static_checks(&prog).map_err(|e| e.to_string())
 }
 
+#[test]
+fn duplicate_service_names_are_rejected_before_member_resolution() {
+    let mut results = Vec::new();
+    for suffix in [
+        "",
+        "@test(app) { assert(x == 0); }",
+        "@test(app) { assert(y == 1); }",
+    ] {
+        let input = format!("service app {{ var x = 0; }} service app {{ var y = 1; }} {suffix}");
+        results.push(check_program(&input));
+    }
+    assert_eq!(
+        results,
+        vec![Err("type check error: service 'app' is declared more than once.".into()); 3]
+    );
+}
+
+#[test]
+fn distinct_services_and_updates_keep_passing_static_checks() {
+    let input = "service app { var x = 0; } service helper { var y = 1; } update app { var x = 2; } @test(app) { assert(x == 2); }";
+    assert_eq!(check_program(input), Ok(()));
+}
+
 /// Verify that basic primitive types check correctly
 #[test]
 fn test_integration_primitive_types() {

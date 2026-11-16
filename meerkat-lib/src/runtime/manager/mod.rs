@@ -934,24 +934,23 @@ impl Manager {
         // only when their `Stmt::Import` is reached would build `app` before
         // the `dep` it reads and fail with `ServiceNotFound`.
         let mut imported = HashMap::new();
-        self.unified_ast.retain(|stmt| match stmt {
-            Stmt::Service { name, decls }
-                if !local.contains(name) && !self.remote_services.contains_key(name) =>
-            {
-                if imported.contains_key(name) {
-                    false
-                } else {
-                    imported.insert(*name, decls.clone());
-                    true
-                }
+        for stmt in &self.unified_ast {
+            let Stmt::Service { name, decls } = stmt else {
+                continue;
+            };
+            if local.contains(name) || self.remote_services.contains_key(name) {
+                continue;
             }
-            _ => true,
-        });
+            let previous = imported.insert(*name, decls.clone());
+            debug_assert!(
+                previous.is_none(),
+                "static checks reject duplicate services"
+            );
+        }
 
         // Run each import's statements in file order, as on a node of its own:
-        // a service is built from the declaration kept above, and an update is
-        // applied where it stands, so whatever follows -- such as a later
-        // service whose `var` reads the updated member -- sees it.
+        // a service is built from the declaration collected above, and updates
+        // take effect before later services read their members.
         for stmt in imports {
             match stmt {
                 Stmt::Service { name, .. } => {

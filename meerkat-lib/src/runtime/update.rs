@@ -545,13 +545,13 @@ pub fn format_expr(expr: &Expr, interner: &Interner) -> String {
         }
         Expr::Variable { name } => interner.get(*name).to_string(),
         Expr::Unop { op, expr } => {
-            format!("{}{}", op, format_expr(expr, interner))
+            format!("{}{}", op, format_operator_operand(expr, interner))
         }
         Expr::Binop { op, expr1, expr2 } => format!(
             "{} {} {}",
-            format_expr(expr1, interner),
+            format_operator_operand(expr1, interner),
             op,
-            format_expr(expr2, interner)
+            format_operator_operand(expr2, interner)
         ),
         Expr::If { cond, expr1, expr2 } => format!(
             "if {} then {} else {}",
@@ -627,6 +627,16 @@ pub fn format_expr(expr: &Expr, interner: &Interner) -> String {
     }
 }
 
+fn format_operator_operand(expr: &Expr, interner: &Interner) -> String {
+    let source = format_expr(expr, interner);
+    // Preserve the tree when a nested binary operation is parsed again.
+    if matches!(expr, Expr::Binop { .. }) {
+        format!("({source})")
+    } else {
+        source
+    }
+}
+
 /// Format a `Decl` into a valid Meerkat declaration source code string
 ///
 /// Args:
@@ -699,6 +709,94 @@ mod tests {
     use super::*;
     use crate::runtime::ast::Expr;
     use crate::runtime::interner::Interner;
+
+    fn parse_formatted_expression(source: &str, interner: &mut Interner) -> Expr {
+        let program = crate::runtime::parser::parse_string(
+            &format!("service fixture {{ def result = {source}; }}"),
+            interner,
+        )
+        .expect("expression must parse");
+        let Stmt::Service { decls, .. } = program.into_iter().next().unwrap() else {
+            panic!("expected a service");
+        };
+        let Decl::DefDecl { val, .. } = decls.into_iter().next().unwrap() else {
+            panic!("expected an expression declaration");
+        };
+        val
+    }
+
+    #[test]
+    fn nested_binary_operators_keep_their_tree_after_source_round_trip() {
+        let mut interner = Interner::new();
+        let operators = ["+", "-", "*", "/", "==", "<", ">", "&&", "||"];
+        let mut mismatches = Vec::new();
+        for outer in operators {
+            for inner in operators {
+                for source in [
+                    format!("(a {inner} b) {outer} c"),
+                    format!("a {outer} (b {inner} c)"),
+                ] {
+                    let expected = parse_formatted_expression(&source, &mut interner);
+                    let rendered = format_expr(&expected, &interner);
+                    let actual = parse_formatted_expression(&rendered, &mut interner);
+                    if actual != expected {
+                        mismatches.push((source, rendered));
+                    }
+                }
+            }
+        }
+        assert!(mismatches.is_empty(), "grouping changed: {mismatches:?}");
+    }
+
+    #[test]
+    fn unary_operator_operands_keep_their_tree_after_source_round_trip() {
+        let mut interner = Interner::new();
+        for source in [
+            "!(a && b)",
+            "-(a + b)",
+            "!((a && b) || c)",
+            "-((a + b) * (c - d))",
+        ] {
+            let expected = parse_formatted_expression(source, &mut interner);
+            let rendered = format_expr(&expected, &interner);
+            assert_eq!(
+                parse_formatted_expression(&rendered, &mut interner),
+                expected,
+                "{source} -> {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_payload_keeps_operator_grouping_after_source_round_trip() {
+        let mut interner = Interner::new();
+        let original = crate::runtime::parser::parse_string(
+            "update board { def y = (n + 1) * 2; var ready = !(a && b); def z = a - (b - c); }",
+            &mut interner,
+        )
+        .unwrap();
+        let Stmt::Update {
+            service_name,
+            decls,
+        } = &original[0]
+        else {
+            panic!("expected an update");
+        };
+        let rendered = format_update_source(*service_name, decls, &interner);
+        assert_eq!(
+            crate::runtime::parser::parse_string(&rendered, &mut interner).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn flat_operator_source_keeps_its_spelling() {
+        let mut interner = Interner::new();
+        for source in ["a + b", "a - b", "a && b", "!a", "-a"] {
+            let expression = parse_formatted_expression(source, &mut interner);
+            assert_eq!(format_expr(&expression, &interner), source);
+        }
+    }
 
     /// Test creating a new transaction and validating initial state
     #[test]

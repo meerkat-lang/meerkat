@@ -131,10 +131,9 @@ pub fn parse_repl(input: &str, interner: &mut Interner) -> ReplParseResult {
 
 /// #39: Parse the raw body of an HTML literal into an `HtmlTemplate`.
 ///
-/// Lives in `runtime::parser` because it interns (via the expression parser),
-/// and only `parser`/`net::codec` may write to the append-only interner. The
-/// template representation itself is owned by `runtime::html`; this function
-/// builds one through the html builder without naming its internal parts.
+/// Uses the expression parser and its shared name pool. The template
+/// representation is owned by `runtime::html`; this function builds one
+/// through the HTML builder without naming its internal parts.
 ///
 /// Literal text is copied verbatim; each brace-delimited `{ ... }`
 /// interpolation is parsed as an expression through the public `Expr` rule.
@@ -316,7 +315,7 @@ mod tests {
                 service_name,
                 decls,
             } => {
-                assert_eq!(interner.get(*service_name), "MyService");
+                assert_eq!(service_name.as_str(), "MyService");
                 assert_eq!(decls.len(), 1);
             }
             _ => panic!("Expected Stmt::Update"),
@@ -520,13 +519,13 @@ mod tests {
                 assert_eq!(updates.len(), 2);
                 match &updates[0] {
                     Stmt::Update { service_name, .. } => {
-                        assert_eq!(interner.get(*service_name), "S1");
+                        assert_eq!(service_name.as_str(), "S1");
                     }
                     other => panic!("expected Stmt::Update, got {:?}", other),
                 }
                 match &updates[1] {
                     Stmt::Update { service_name, .. } => {
-                        assert_eq!(interner.get(*service_name), "S2");
+                        assert_eq!(service_name.as_str(), "S2");
                     }
                     other => panic!("expected Stmt::Update, got {:?}", other),
                 }

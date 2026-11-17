@@ -244,8 +244,8 @@ pub enum MeerkatMessage {
 
     /// #39: response to `ServiceCodeRequest` carrying the whole `.mkt` file
     /// source. The requester processes it through the normal program-loading
-    /// path. The source is unbounded in length; only the request path and
-    /// reply address are length-limited.
+    /// path. Source size is checked before parsing; the request path and
+    /// reply address have their own length limits.
     ServiceCodeResponse {
         request_id: u64,
         path: String,

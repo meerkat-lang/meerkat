@@ -176,7 +176,7 @@ fn test_integration_update_stmt_resolves() {
     let y = interner.insert("y");
 
     let s1_stmt = Stmt::Service {
-        name: s1,
+        name: s1.clone(),
         decls: vec![],
     };
     let update_stmt = Stmt::Update {
@@ -204,7 +204,7 @@ fn test_integration_update_unbound_errors() {
     let y = interner.insert("y");
 
     let update_stmt = Stmt::Update {
-        service_name: s2,
+        service_name: s2.clone(),
         decls: vec![Decl::DefDecl {
             name: y,
             ty: None,
@@ -589,7 +589,10 @@ fn test_integration_value_closure_resolves() {
     let mut interner = Interner::new();
     let x = interner.insert("x");
     let closure = Value::Closure {
-        params: vec![Param { name: x, ty: None }],
+        params: vec![Param {
+            name: x.clone(),
+            ty: None,
+        }],
         body: Box::new(Expr::Variable { name: x }),
         env: vec![],
         service_name: interner.insert("s1"),
@@ -697,20 +700,20 @@ fn test_integration_update_stmt_forward_reference_fails() {
     let y = interner.insert("y");
 
     let s1_stmt = Stmt::Service {
-        name: s1,
+        name: s1.clone(),
         decls: vec![],
     };
     let update_stmt = Stmt::Update {
-        service_name: s1,
+        service_name: s1.clone(),
         decls: vec![
             Decl::DefDecl {
                 name: y,
                 ty: None,
-                val: Expr::Variable { name: x },
+                val: Expr::Variable { name: x.clone() },
                 is_pub: false,
             },
             Decl::VarDecl {
-                name: x,
+                name: x.clone(),
                 ty: None,
                 val: Expr::Literal {
                     val: Value::Int { val: 5 },
@@ -739,13 +742,13 @@ fn test_integration_update_stmt_scoping() {
     let y = interner.insert("y");
 
     let s1_stmt = Stmt::Service {
-        name: s1,
+        name: s1.clone(),
         decls: vec![],
     };
     let update_stmt = Stmt::Update {
         service_name: s1,
         decls: vec![Decl::VarDecl {
-            name: y,
+            name: y.clone(),
             ty: None,
             val: Expr::Literal {
                 val: Value::Int { val: 5 },
@@ -753,7 +756,7 @@ fn test_integration_update_stmt_scoping() {
         }],
     };
     let watch_stmt = Stmt::Watch {
-        expr: Expr::Variable { name: y },
+        expr: Expr::Variable { name: y.clone() },
     };
 
     let stmts = vec![s1_stmt, update_stmt, watch_stmt];
@@ -777,9 +780,9 @@ fn test_integration_update_inherits_service_env() {
     let b = interner.insert("b");
 
     let s1_stmt = Stmt::Service {
-        name: s1,
+        name: s1.clone(),
         decls: vec![Decl::VarDecl {
-            name: a,
+            name: a.clone(),
             ty: None,
             val: Expr::Literal {
                 val: Value::Int { val: 10 },
@@ -810,14 +813,14 @@ fn test_integration_update_sequential_scoping() {
     let b = interner.insert("b");
 
     let s1_stmt = Stmt::Service {
-        name: s1,
+        name: s1.clone(),
         decls: vec![],
     };
     let update_stmt = Stmt::Update {
         service_name: s1,
         decls: vec![
             Decl::VarDecl {
-                name: a,
+                name: a.clone(),
                 ty: None,
                 val: Expr::Literal {
                     val: Value::Int { val: 10 },
@@ -846,13 +849,13 @@ fn test_integration_update_accumulates_across_blocks() {
     let b = interner.insert("b");
 
     let s1_stmt = Stmt::Service {
-        name: s1,
+        name: s1.clone(),
         decls: vec![],
     };
     let update1 = Stmt::Update {
-        service_name: s1,
+        service_name: s1.clone(),
         decls: vec![Decl::VarDecl {
-            name: a,
+            name: a.clone(),
             ty: None,
             val: Expr::Literal {
                 val: Value::Int { val: 5 },
@@ -883,9 +886,9 @@ fn test_integration_atomic_update_inherits_service_env() {
     let b = interner.insert("b");
 
     let s1_stmt = Stmt::Service {
-        name: s1,
+        name: s1.clone(),
         decls: vec![Decl::VarDecl {
-            name: a,
+            name: a.clone(),
             ty: None,
             val: Expr::Literal {
                 val: Value::Int { val: 1 },

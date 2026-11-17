@@ -38,12 +38,12 @@ fn test_deep_annotation_rejected() {
         ok_ty = Type::List(Box::new(ok_ty));
     }
     let decls_ok = vec![Decl::VarDecl {
-        name: var_x,
+        name: var_x.clone(),
         ty: Some(ok_ty),
         val: Expr::List(vec![]),
     }];
     let program_ok = vec![Stmt::Service {
-        name: name_s,
+        name: name_s.clone(),
         decls: decls_ok,
     }];
     let mut classes = Env::new(None);
@@ -55,12 +55,12 @@ fn test_deep_annotation_rejected() {
         fail_ty = Type::List(Box::new(fail_ty));
     }
     let decls_fail = vec![Decl::VarDecl {
-        name: var_x,
+        name: var_x.clone(),
         ty: Some(fail_ty),
         val: Expr::List(vec![]),
     }];
     let program_fail = vec![Stmt::Service {
-        name: name_s,
+        name: name_s.clone(),
         decls: decls_fail,
     }];
     let mut classes = Env::new(None);
@@ -75,21 +75,21 @@ fn test_primitive_checking() {
     let name_s = interner.insert("my_service");
     let var_x = interner.insert("x");
     let decls = vec![Decl::VarDecl {
-        name: var_x,
+        name: var_x.clone(),
         ty: Some(Type::Int),
         val: Expr::Literal {
             val: Value::Int { val: 42 },
         },
     }];
     let program = vec![Stmt::Service {
-        name: name_s,
+        name: name_s.clone(),
         decls,
     }];
     let mut classes = Env::new(None);
     let res = check(&program, &mut classes);
     assert!(res.is_ok());
-    let st = classes.find(name_s).unwrap();
-    assert_eq!(st.fields().find(var_x), Some(&Type::Int))
+    let st = classes.find(&name_s).unwrap();
+    assert_eq!(st.fields().find(&var_x), Some(&Type::Int))
 }
 
 /// Verify type mismatches are rejected
@@ -131,7 +131,7 @@ fn test_function_calls() {
     let var_x = interner.insert("x");
     let decls = vec![
         Decl::VarDecl {
-            name: var_f,
+            name: var_f.clone(),
             ty: Some(Type::Func(Box::new(Type::Int), Box::new(Type::Int))),
             val: Expr::Func {
                 params: vec![Param {
@@ -239,7 +239,7 @@ fn test_action_statements() {
     let name_s = interner.insert("s");
     let program = vec![
         Stmt::Service {
-            name: name_s,
+            name: name_s.clone(),
             decls: vec![Decl::VarDecl {
                 name: interner.insert("v"),
                 ty: Some(Type::Int),
@@ -299,7 +299,7 @@ fn test_action_assign_unbound() {
     let name_s = interner.insert("s");
     let program = vec![
         Stmt::Service {
-            name: name_s,
+            name: name_s.clone(),
             decls: vec![],
         },
         Stmt::Test {
@@ -324,7 +324,7 @@ fn test_for_loop_non_iterable() {
     let name_s = interner.insert("s");
     let program = vec![
         Stmt::Service {
-            name: name_s,
+            name: name_s.clone(),
             decls: vec![],
         },
         Stmt::Test {
@@ -428,7 +428,7 @@ fn test_list_checking() {
     let mut interner = Interner::new();
     let name_s = interner.insert("s");
     let program = vec![Stmt::Service {
-        name: name_s,
+        name: name_s.clone(),
         decls: vec![Decl::VarDecl {
             name: interner.insert("xs"),
             ty: None,
@@ -483,17 +483,21 @@ fn test_circular_dependency() {
     let name_a = interner.insert("a");
     let name_b = interner.insert("b");
     let program = vec![Stmt::Service {
-        name: name_s,
+        name: name_s.clone(),
         decls: vec![
             Decl::VarDecl {
-                name: name_a,
+                name: name_a.clone(),
                 ty: None,
-                val: Expr::Variable { name: name_b },
+                val: Expr::Variable {
+                    name: name_b.clone(),
+                },
             },
             Decl::VarDecl {
                 name: name_b,
                 ty: None,
-                val: Expr::Variable { name: name_a },
+                val: Expr::Variable {
+                    name: name_a.clone(),
+                },
             },
         ],
     }];
@@ -517,9 +521,9 @@ fn test_cross_service_member_access() {
     let val_x = interner.insert("x");
     let program = vec![
         Stmt::Service {
-            name: s1,
+            name: s1.clone(),
             decls: vec![Decl::VarDecl {
-                name: val_x,
+                name: val_x.clone(),
                 ty: Some(Type::Int),
                 val: Expr::Literal {
                     val: Value::Int { val: 42 },
@@ -617,7 +621,7 @@ fn test_function_parameter_mismatches() {
     let mut interner = Interner::new();
     let name_s = interner.insert("s");
     let p1 = vec![Stmt::Service {
-        name: name_s,
+        name: name_s.clone(),
         decls: vec![Decl::VarDecl {
             name: interner.insert("f"),
             ty: Some(Type::Func(Box::new(Type::Int), Box::new(Type::Int))),
@@ -666,7 +670,7 @@ fn test_call_mismatches() {
     let mut interner = Interner::new();
     let name_s = interner.insert("s");
     let p1 = vec![Stmt::Service {
-        name: name_s,
+        name: name_s.clone(),
         decls: vec![Decl::VarDecl {
             name: interner.insert("x"),
             ty: None,
@@ -816,7 +820,7 @@ fn test_lambda_annotations_in_checking_mode() {
     // Test contradictory return type: expected int -> int,
     // annotated int -> string
     let program1 = vec![Stmt::Service {
-        name: name_s,
+        name: name_s.clone(),
         decls: vec![Decl::VarDecl {
             name: interner.insert("f"),
             ty: Some(Type::Func(Box::new(Type::Int), Box::new(Type::Int))),
@@ -843,7 +847,7 @@ fn test_lambda_annotations_in_checking_mode() {
     // Test contradictory parameter type: expected int -> int,
     // annotated string -> int
     let program2 = vec![Stmt::Service {
-        name: name_s,
+        name: name_s.clone(),
         decls: vec![Decl::VarDecl {
             name: interner.insert("g"),
             ty: Some(Type::Func(Box::new(Type::Int), Box::new(Type::Int))),
@@ -925,12 +929,12 @@ fn test_import_member_access_resolves_with_unified_ast() {
     let program = vec![
         Stmt::Import {
             path: "na".to_string(),
-            service_name: remote_svc,
+            service_name: remote_svc.clone(),
         },
         Stmt::Service {
-            name: remote_svc,
+            name: remote_svc.clone(),
             decls: vec![Decl::DefDecl {
-                name: remote_member,
+                name: remote_member.clone(),
                 ty: None,
                 is_pub: true,
                 val: Expr::Literal {
@@ -976,7 +980,7 @@ fn test_unknown_service_member_access_errors() {
             ty: None,
             is_pub: false,
             val: Expr::MemberAccess {
-                service_name: ghost_svc,
+                service_name: ghost_svc.clone(),
                 member_name: ghost_member,
             },
         }],

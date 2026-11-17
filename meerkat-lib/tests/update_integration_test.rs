@@ -459,7 +459,9 @@ async fn test_update_new_field_conflict_service_lock_rejection() {
 
     let s1_sym = manager.interner.insert("s1");
     let holder_txn = TxnId::new(999);
-    manager.acquire_service_lock(s1_sym, &holder_txn).unwrap();
+    manager
+        .acquire_service_lock(s1_sym.clone(), &holder_txn)
+        .unwrap();
 
     let update_code = "
         update s1 {
@@ -627,7 +629,7 @@ async fn test_update_listener_rewiring_propagation() {
 
     // Assign x = 20 to trigger reactive propagation over newly re-wired listener
     manager
-        .assign(s1_sym, x_sym, Value::Int { val: 20 }, None)
+        .assign(s1_sym.clone(), x_sym, Value::Int { val: 20 }, None)
         .await
         .unwrap();
 
@@ -797,11 +799,11 @@ async fn test_update_def_to_var_unwires_same_service_listener() {
     let d_sym = manager.interner.insert("d");
 
     manager
-        .assign(s1_sym, d_sym, Value::Int { val: 50 }, None)
+        .assign(s1_sym.clone(), d_sym.clone(), Value::Int { val: 50 }, None)
         .await
         .unwrap();
     manager
-        .assign(s1_sym, x_sym, Value::Int { val: 11 }, None)
+        .assign(s1_sym.clone(), x_sym, Value::Int { val: 11 }, None)
         .await
         .unwrap();
 
@@ -841,7 +843,7 @@ async fn test_update_def_to_var_unwires_cross_service_listener() {
     let d_sym = manager.interner.insert("d");
 
     manager
-        .assign(a_sym, d_sym, Value::Int { val: 50 }, None)
+        .assign(a_sym.clone(), d_sym.clone(), Value::Int { val: 50 }, None)
         .await
         .unwrap();
     manager
@@ -897,16 +899,15 @@ async fn test_update_def_to_var_ignores_update_from_stale_subscription() {
     );
 
     manager
-        .assign(a_sym, d_sym, Value::Int { val: 50 }, None)
+        .assign(a_sym.clone(), d_sym.clone(), Value::Int { val: 50 }, None)
         .await
         .unwrap();
     let a_id = manager.services[&a_sym].id.clone();
-    let value =
-        meerkat_lib::net::codec::encode_value(&Value::Int { val: 11 }, &manager.interner).unwrap();
+    let value = Value::Int { val: 11 };
     manager
         .handle_update(
             a_id,
-            d_sym,
+            d_sym.clone(),
             (b_sym, mm_sym),
             value,
             Default::default(),
@@ -966,7 +967,7 @@ async fn test_integration_create_service_rollback_cleans_ast() {
         },
     }];
 
-    let create_result = manager.create_service(bad_s_sym, bad_decls).await;
+    let create_result = manager.create_service(bad_s_sym.clone(), bad_decls).await;
     assert!(create_result.is_err(), "Service creation should fail");
 
     assert!(
@@ -1178,7 +1179,7 @@ async fn test_update_waits_for_missing_input_without_publishing() {
     assert!(!manager.services[&local]
         .dep_cache
         .get(&result)
-        .and_then(|cache| cache.get(&(remote, current))?.newest())
+        .and_then(|cache| cache.get(&(remote.clone(), current.clone()))?.newest())
         .is_some_and(|entry| entry.1.is_some()));
 
     let (listener_service, listener_def, reply_to) = loop {
@@ -1222,7 +1223,7 @@ async fn test_update_waits_for_missing_input_without_publishing() {
         while !manager.services[&local]
             .dep_cache
             .get(&result)
-            .and_then(|cache| cache.get(&(remote, current))?.newest())
+            .and_then(|cache| cache.get(&(remote.clone(), current.clone()))?.newest())
             .is_some_and(|entry| entry.1.is_some())
         {
             manager.dispatch_network_events().await;
@@ -1232,9 +1233,9 @@ async fn test_update_waits_for_missing_input_without_publishing() {
     .await
     .expect("initial input must resume recomputation");
 
-    let clock = HashMap::from([((remote, input), 1)]);
+    let clock = HashMap::from([((remote.clone(), input.clone()), 1)]);
     assert_eq!(
-        manager.services[&local].dep_cache[&result][&(remote, current)]
+        manager.services[&local].dep_cache[&result][&(remote.clone(), current)]
             .retained
             .clone()
             .unwrap(),
@@ -1526,9 +1527,9 @@ async fn test_update_propagates_unchanged_value_with_new_clock() {
         ["local", "result", "downstream", "y"].map(|name| manager.interner.insert(name));
     manager
         .execute_action(
-            local,
+            local.clone(),
             &[ActionStmt::Assign {
-                name: y,
+                name: y.clone(),
                 expr: Expr::Literal {
                     val: Value::Int { val: 1 },
                 },
@@ -1536,7 +1537,7 @@ async fn test_update_propagates_unchanged_value_with_new_clock() {
         )
         .await
         .unwrap();
-    let clock = HashMap::from([((local, y), 1)]);
+    let clock = HashMap::from([((local.clone(), y.clone()), 1)]);
     assert_eq!(manager.services[&local].vars[&y].vector_clock, clock);
     assert!(manager.services[&local].vars[&result]
         .vector_clock

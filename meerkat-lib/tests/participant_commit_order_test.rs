@@ -77,14 +77,15 @@ async fn middle_node(net: NetworkActor, rc_net: &mut NetworkActor, rc_addr: &Add
 
     let rc = m.interner.insert("rc");
     m.remote_services
-        .insert(rc, Address::new(format!("{}/rc", rc_addr.0)));
+        .insert(rc.clone(), Address::new(format!("{}/rc", rc_addr.0)));
 
     let mid = m.interner.insert("mid");
     let mid_view = m.interner.insert("mid_view");
     let gc = m.interner.insert("gc");
     let cv = m.interner.insert("cv");
     let mid_id = m.services[&mid].id.clone();
-    m.subscribe_remote(rc, gc, mid_id, mid_view).await;
+    m.subscribe_remote(rc.clone(), gc.clone(), mid_id, mid_view.clone())
+        .await;
     tokio::select! {
         biased;
         _ = await_gc_update(&mut m, 1) => {}
@@ -96,7 +97,7 @@ async fn middle_node(net: NetworkActor, rc_net: &mut NetworkActor, rc_addr: &Add
         "before the transaction, mid_view is 0 + 1"
     );
     assert_eq!(
-        m.services[&mid].dep_cache[&mid_view][&(rc, gc)]
+        m.services[&mid].dep_cache[&mid_view][&(rc.clone(), gc)]
             .retained
             .clone()
             .unwrap(),
@@ -237,7 +238,7 @@ async fn await_gc_update(m: &mut Manager, val: i32) {
     let [mid, mid_view, rc, gc] = ["mid", "mid_view", "rc", "gc"].map(|n| m.interner.insert(n));
     let cached = |m: &Manager| {
         let deps = m.services[&mid].dep_cache.get(&mid_view);
-        deps.and_then(|deps| deps.get(&(rc, gc))?.newest())
+        deps.and_then(|deps| deps.get(&(rc.clone(), gc.clone()))?.newest())
             .is_some_and(|entry| entry.0 == Value::Int { val } && entry.1.is_some())
     };
     let pump = async {
@@ -263,21 +264,24 @@ fn assert_committed_and_recomputed(m: &mut Manager) {
         Value::Int { val: 1 },
         "mid's own write must be committed"
     );
-    let commit_clock = HashMap::from([((mid, mv), 1), ((rc, cv), 1)]);
+    let commit_clock = HashMap::from([
+        ((mid.clone(), mv.clone()), 1),
+        ((rc.clone(), cv.clone()), 1),
+    ]);
     assert_eq!(
         m.services[&mid].vars[&mv].vector_clock, commit_clock,
         "mid's own write is stamped with the transaction's one clock, which \
          advances the source clock of both writes (section 5.2)"
     );
     assert_eq!(
-        m.services[&mid].dep_cache[&mid_view][&(rc, gc)]
+        m.services[&mid].dep_cache[&mid_view][&(rc.clone(), gc)]
             .retained
             .clone()
             .unwrap(),
         (
             Value::Int { val: 11 },
             Some(commit_clock),
-            Some(HashSet::from([(rc, cv)]))
+            Some(HashSet::from([(rc.clone(), cv.clone())]))
         ),
         "the refreshed cache preserves rc.gc's committed value and the clock \
          rc's write was stamped with"
@@ -321,8 +325,10 @@ async fn commit_as_participant(m: &mut Manager, rc_net: &mut NetworkActor, rc_ad
         iteration: 0,
     };
     let mut txn = Transaction::new(tid.clone());
-    txn.written
-        .insert((m.service_net_id_for_name(mid), mv), Value::Int { val: 1 });
+    txn.written.insert(
+        (m.service_net_id_for_name(&mid), mv.clone()),
+        Value::Int { val: 1 },
+    );
     txn.participants.insert(rc_addr.clone());
     m.pending_txns.insert(tid.clone(), txn);
     // What the originator commits with: both writes, neither with any history
@@ -367,7 +373,7 @@ async fn test_propagation_does_not_use_cached_participant_values() {
         .entry(mid_view)
         .or_default()
         .insert(
-            (rc, gc),
+            (rc.clone(), gc),
             InputState::seeded((
                 Value::Int { val: 1 },
                 Some(HashMap::new()),

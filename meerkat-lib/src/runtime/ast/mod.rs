@@ -313,7 +313,7 @@ impl Decl {
         match self {
             Decl::VarDecl { name, .. }
             | Decl::DefDecl { name, .. }
-            | Decl::TableDecl { name, .. } => *name,
+            | Decl::TableDecl { name, .. } => name.clone(),
         }
     }
 }
@@ -662,7 +662,7 @@ pub fn apply_updates_to_ast(base_ast: &[Stmt], updates: &[Stmt]) -> Result<Vec<S
                         let up_name = match up_decl {
                             Decl::VarDecl { name: n, .. }
                             | Decl::DefDecl { name: n, .. }
-                            | Decl::TableDecl { name: n, .. } => *n,
+                            | Decl::TableDecl { name: n, .. } => n,
                         };
 
                         let mut matched_existing = false;
@@ -670,7 +670,7 @@ pub fn apply_updates_to_ast(base_ast: &[Stmt], updates: &[Stmt]) -> Result<Vec<S
                             let ex_name = match ex_decl {
                                 Decl::VarDecl { name: n, .. }
                                 | Decl::DefDecl { name: n, .. }
-                                | Decl::TableDecl { name: n, .. } => *n,
+                                | Decl::TableDecl { name: n, .. } => n,
                             };
                             if ex_name == up_name {
                                 *ex_decl = up_decl.clone();
@@ -688,7 +688,7 @@ pub fn apply_updates_to_ast(base_ast: &[Stmt], updates: &[Stmt]) -> Result<Vec<S
         }
 
         if !found_service {
-            return Err(*updated_svc_name);
+            return Err(updated_svc_name.clone());
         }
     }
 
@@ -709,7 +709,7 @@ mod tests {
 
         let base_ast: Vec<Stmt> = Vec::new();
         let updates: Vec<Stmt> = vec![Stmt::Update {
-            service_name: target_sym,
+            service_name: target_sym.clone(),
             decls: Vec::new(),
         }];
 

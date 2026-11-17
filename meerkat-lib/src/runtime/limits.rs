@@ -65,8 +65,8 @@ pub const MAX_NET_REQUEST_SOURCE_LENGTH: usize = 1_048_576;
 pub const MAX_NET_SOURCE_PAIRS: usize = 8192;
 
 /// Maximum number of clock dimensions accepted from a network message. A
-/// clock may name upstream sources this node has never seen, each interned
-/// for good, so an oversized clock is refused whole: truncating it would
+/// clock may name upstream sources this node has never seen. An oversized
+/// clock is refused whole: truncating it would
 /// count the missing dimensions as zero and let an inconsistent batch pass
 pub const MAX_NET_CLOCK_ENTRIES: usize = 8192;
 

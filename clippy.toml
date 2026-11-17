@@ -1,0 +1,3 @@
+# Symbol hashes and compares only immutable text. Its mutex manages the weak
+# interning index and never changes the key. Keep the standard exemptions too.
+ignore-interior-mutability = ["bytes::Bytes", "meerkat_lib::runtime::interner::Symbol"]

@@ -33,7 +33,7 @@ pub async fn execute_seq(
 ) -> Result<(), EvalError> {
     for stmt in stmts {
         if let ExecuteEffect::Binding(name, val) =
-            execute(stmt, env, manager, service_name, txn.as_deref_mut()).await?
+            execute(stmt, env, manager, service_name.clone(), txn.as_deref_mut()).await?
         {
             env.push((name, val));
         }
@@ -58,12 +58,14 @@ pub async fn execute(
                 env,
                 &mut EvalContext {
                     manager,
-                    service_name,
+                    service_name: service_name.clone(),
                     txn: txn.as_deref_mut(),
                 },
             )
             .await?;
-            manager.assign(service_name, *name, value, txn).await?;
+            manager
+                .assign(service_name, name.clone(), value, txn)
+                .await?;
             Ok(ExecuteEffect::None)
         }
         ActionStmt::Do(expr) => {
@@ -169,7 +171,7 @@ pub async fn execute(
                 },
             )
             .await?;
-            Ok(ExecuteEffect::Binding(*name, val))
+            Ok(ExecuteEffect::Binding(name.clone(), val))
         }
         ActionStmt::Expr(expr) => {
             let val = eval(
@@ -195,7 +197,7 @@ pub async fn execute(
                 env,
                 &mut EvalContext {
                     manager,
-                    service_name,
+                    service_name: service_name.clone(),
                     txn: txn.as_deref_mut(),
                 },
             )
@@ -215,12 +217,12 @@ pub async fn execute(
             let base_len = loop_env.len();
             for elem in elements {
                 loop_env.truncate(base_len);
-                loop_env.push((*var, elem));
+                loop_env.push((var.clone(), elem));
                 execute_seq(
                     body,
                     &mut loop_env,
                     manager,
-                    service_name,
+                    service_name.clone(),
                     txn.as_deref_mut(),
                 )
                 .await?;

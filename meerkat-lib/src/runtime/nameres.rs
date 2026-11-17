@@ -37,7 +37,7 @@ impl fmt::Display for ExpectedSort {
 }
 
 /// Errors that can occur during name resolution
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     /// An identifier was referenced but not declared in scope
     UnknownIdentifier {
@@ -147,11 +147,12 @@ impl<'a> Resolver<'a> {
         for stmt in stmts {
             match stmt {
                 Stmt::Service { name, decls } => {
-                    env.bind(*name, Binding::Value);
-                    self.local_services.insert(*name, decls.iter().collect());
+                    env.bind(name.clone(), Binding::Value);
+                    self.local_services
+                        .insert(name.clone(), decls.iter().collect());
                 }
                 Stmt::Import { service_name, .. } => {
-                    env.bind(*service_name, Binding::Value);
+                    env.bind(service_name.clone(), Binding::Value);
                 }
                 Stmt::ActionStmt(_)
                 | Stmt::Atomic { .. }
@@ -197,13 +198,12 @@ impl<'a> Resolver<'a> {
             } => {
                 if !self.local_services.contains_key(service_name) {
                     return Err(Error::UnknownIdentifier {
-                        name: *service_name,
+                        name: service_name.clone(),
                         expected: ExpectedSort::Service,
-                        context_name: self.current_context,
+                        context_name: self.current_context.clone(),
                     });
                 }
-                let prev_context = self.current_context;
-                self.current_context = Some(*service_name);
+                let prev_context = self.current_context.replace(service_name.clone());
                 for decl in decls {
                     match decl {
                         Decl::VarDecl { val, .. } | Decl::DefDecl { val, .. } => {
@@ -226,14 +226,13 @@ impl<'a> Resolver<'a> {
                 path: _,
                 service_name,
             } => {
-                env.bind(*service_name, Binding::Value);
+                env.bind(service_name.clone(), Binding::Value);
                 Ok(())
             }
             Stmt::Service { name, decls } => {
-                env.bind(*name, Binding::Value);
+                env.bind(name.clone(), Binding::Value);
                 let mut service_env = Env::new(Some(env));
-                let prev_context = self.current_context;
-                self.current_context = Some(*name);
+                let prev_context = self.current_context.replace(name.clone());
                 let res = self.resolve_service(decls, &mut service_env);
                 self.current_context = prev_context;
                 res
@@ -242,24 +241,23 @@ impl<'a> Resolver<'a> {
                 service_name,
                 stmts,
             } => {
-                if env.find(*service_name).is_none() {
+                if env.find(service_name).is_none() {
                     return Err(Error::UnknownIdentifier {
-                        name: *service_name,
+                        name: service_name.clone(),
                         expected: ExpectedSort::Service,
-                        context_name: self.current_context,
+                        context_name: self.current_context.clone(),
                     });
                 }
-                let prev_context = self.current_context;
-                self.current_context = Some(*service_name);
+                let prev_context = self.current_context.replace(service_name.clone());
                 let mut test_env = Env::new(Some(env));
                 let decls = match self.local_services.get(service_name) {
                     Some(decls) => decls,
                     None => {
                         self.current_context = prev_context;
                         return Err(Error::UnknownIdentifier {
-                            name: *service_name,
+                            name: service_name.clone(),
                             expected: ExpectedSort::Service,
-                            context_name: self.current_context,
+                            context_name: self.current_context.clone(),
                         });
                     }
                 };
@@ -268,7 +266,7 @@ impl<'a> Resolver<'a> {
                         Decl::VarDecl { name: mem, .. }
                         | Decl::DefDecl { name: mem, .. }
                         | Decl::TableDecl { name: mem, .. } => {
-                            test_env.bind(*mem, Binding::Value);
+                            test_env.bind(mem.clone(), Binding::Value);
                         }
                     }
                 }
@@ -299,7 +297,7 @@ impl<'a> Resolver<'a> {
             match decl {
                 Decl::VarDecl { name, ty: _, val } => {
                     self.resolve_expr(val, env, 0)?;
-                    env.bind(*name, Binding::Value);
+                    env.bind(name.clone(), Binding::Value);
                 }
                 Decl::DefDecl {
                     name,
@@ -308,14 +306,14 @@ impl<'a> Resolver<'a> {
                     is_pub: _,
                 } => {
                     self.resolve_expr(val, env, 0)?;
-                    env.bind(*name, Binding::Value);
+                    env.bind(name.clone(), Binding::Value);
                 }
                 Decl::TableDecl { name, fields: _ } => {
                     println!(
                         "warning: nameres: ignoring 'table' schema \
                          checks as not yet implemented"
                     );
-                    env.bind(*name, Binding::Value);
+                    env.bind(name.clone(), Binding::Value);
                 }
             }
         }
@@ -362,17 +360,18 @@ impl<'a> Resolver<'a> {
         match stmt {
             ActionStmt::Let { name, ty: _, expr } => {
                 self.resolve_expr(expr, env, depth + 1)?;
-                env.bind(*name, Binding::Value);
+                env.bind(name.clone(), Binding::Value);
                 Ok(())
             }
             ActionStmt::Expr(expr) => self.resolve_expr(expr, env, depth + 1),
             ActionStmt::Do(expr) => self.resolve_expr(expr, env, depth + 1),
             ActionStmt::Assert(expr, _text) => self.resolve_expr(expr, env, depth + 1),
             ActionStmt::Assign { name, expr } => {
-                if env.find(*name).is_none() {
+                if env.find(name).is_none() {
                     let is_local_member = self
                         .current_context
-                        .and_then(|ctx| self.local_services.get(&ctx))
+                        .as_ref()
+                        .and_then(|ctx| self.local_services.get(ctx))
                         .is_some_and(|decls| {
                             decls.iter().any(|decl| match decl {
                                 Decl::VarDecl { name: mem, .. }
@@ -383,9 +382,9 @@ impl<'a> Resolver<'a> {
 
                     if !is_local_member {
                         return Err(Error::UnknownIdentifier {
-                            name: *name,
+                            name: name.clone(),
                             expected: ExpectedSort::Variable,
-                            context_name: self.current_context,
+                            context_name: self.current_context.clone(),
                         });
                     }
                 }
@@ -408,7 +407,7 @@ impl<'a> Resolver<'a> {
             } => {
                 self.resolve_expr(iterable, env, depth + 1)?;
                 let mut loop_env = Env::new(Some(env));
-                loop_env.bind(*var, Binding::Value);
+                loop_env.bind(var.clone(), Binding::Value);
                 self.resolve_action_stmts(body, &mut loop_env, depth + 1)
             }
         }
@@ -440,10 +439,11 @@ impl<'a> Resolver<'a> {
                 Ok(())
             }
             Expr::Variable { name } => {
-                if env.find(*name).is_none() {
+                if env.find(name).is_none() {
                     let is_local_member = self
                         .current_context
-                        .and_then(|ctx| self.local_services.get(&ctx))
+                        .as_ref()
+                        .and_then(|ctx| self.local_services.get(ctx))
                         .is_some_and(|decls| {
                             decls.iter().any(|decl| match decl {
                                 Decl::VarDecl { name: mem, .. }
@@ -457,9 +457,9 @@ impl<'a> Resolver<'a> {
                     }
 
                     return Err(Error::UnknownIdentifier {
-                        name: *name,
+                        name: name.clone(),
                         expected: ExpectedSort::Variable,
-                        context_name: self.current_context,
+                        context_name: self.current_context.clone(),
                     });
                 }
                 Ok(())
@@ -492,7 +492,7 @@ impl<'a> Resolver<'a> {
             } => {
                 let mut inner_env = Env::new(Some(env));
                 for param in params {
-                    inner_env.bind(param.name, Binding::Value);
+                    inner_env.bind(param.name.clone(), Binding::Value);
                 }
                 self.resolve_expr(body.as_ref(), &inner_env, depth + 1)?;
                 Ok(())
@@ -521,16 +521,16 @@ impl<'a> Resolver<'a> {
                     });
                     if !has_member {
                         return Err(Error::UnknownIdentifier {
-                            name: *member_name,
+                            name: member_name.clone(),
                             expected: ExpectedSort::Variable,
-                            context_name: Some(*service_name),
+                            context_name: Some(service_name.clone()),
                         });
                     }
-                } else if env.find(*service_name).is_none() {
+                } else if env.find(service_name).is_none() {
                     return Err(Error::UnknownIdentifier {
-                        name: *service_name,
+                        name: service_name.clone(),
                         expected: ExpectedSort::Service,
-                        context_name: self.current_context,
+                        context_name: self.current_context.clone(),
                     });
                 }
                 Ok(())
@@ -608,7 +608,7 @@ impl<'a> Resolver<'a> {
             } => {
                 let mut inner_env = Env::new(Some(env));
                 for param in params {
-                    inner_env.bind(param.name, Binding::Value);
+                    inner_env.bind(param.name.clone(), Binding::Value);
                 }
                 self.resolve_expr(body.as_ref(), &inner_env, depth + 1)?;
                 Ok(())
@@ -662,7 +662,7 @@ mod tests {
         let y = interner.insert("y");
 
         let decl_x = Decl::VarDecl {
-            name: x,
+            name: x.clone(),
             ty: None,
             val: Expr::Literal {
                 val: Value::Int { val: 5 },
@@ -710,15 +710,19 @@ mod tests {
         // let x = 10;
         // do x;
         let action_expr = Expr::Action(vec![
-            ActionStmt::Expr(Expr::Variable { name: local_x }),
+            ActionStmt::Expr(Expr::Variable {
+                name: local_x.clone(),
+            }),
             ActionStmt::Let {
-                name: local_x,
+                name: local_x.clone(),
                 ty: None,
                 expr: Expr::Literal {
                     val: Value::Int { val: 10 },
                 },
             },
-            ActionStmt::Expr(Expr::Variable { name: local_x }),
+            ActionStmt::Expr(Expr::Variable {
+                name: local_x.clone(),
+            }),
         ]);
 
         let decl_action = Decl::DefDecl {
@@ -729,7 +733,7 @@ mod tests {
         };
 
         let stmt = Stmt::Service {
-            name: s,
+            name: s.clone(),
             decls: vec![decl_x, decl_action],
         };
 
@@ -742,9 +746,11 @@ mod tests {
         // action { do x; let x = 10; }
         // The first 'do x' must fail because x is not yet declared
         let bad_action = Expr::Action(vec![
-            ActionStmt::Expr(Expr::Variable { name: local_x }),
+            ActionStmt::Expr(Expr::Variable {
+                name: local_x.clone(),
+            }),
             ActionStmt::Let {
-                name: local_x,
+                name: local_x.clone(),
                 ty: None,
                 expr: Expr::Literal {
                     val: Value::Int { val: 10 },
@@ -760,7 +766,7 @@ mod tests {
         };
 
         let bad_stmt = Stmt::Service {
-            name: s,
+            name: s.clone(),
             decls: vec![bad_decl],
         };
 
@@ -789,7 +795,7 @@ mod tests {
         // block2: action { do x; }
         // block2 must fail because block1's let binding does not leak
         let block1 = ActionStmt::Expr(Expr::Action(vec![ActionStmt::Let {
-            name: x,
+            name: x.clone(),
             ty: None,
             expr: Expr::Literal {
                 val: Value::Int { val: 5 },
@@ -797,7 +803,7 @@ mod tests {
         }]));
 
         let block2 = ActionStmt::Expr(Expr::Action(vec![ActionStmt::Expr(Expr::Variable {
-            name: x,
+            name: x.clone(),
         })]));
 
         let decl = Decl::DefDecl {
@@ -809,7 +815,7 @@ mod tests {
 
         let s = interner.insert("s");
         let stmt = Stmt::Service {
-            name: s,
+            name: s.clone(),
             decls: vec![decl],
         };
 
@@ -837,18 +843,24 @@ mod tests {
         // fn a => fn b => (a + b)
         let body = Expr::Binop {
             op: crate::runtime::ast::BinOp::Add,
-            expr1: Box::new(Expr::Variable { name: a }),
-            expr2: Box::new(Expr::Variable { name: b }),
+            expr1: Box::new(Expr::Variable { name: a.clone() }),
+            expr2: Box::new(Expr::Variable { name: b.clone() }),
         };
 
         let inner_closure = Expr::Func {
-            params: vec![Param { name: b, ty: None }],
+            params: vec![Param {
+                name: b.clone(),
+                ty: None,
+            }],
             body: Box::new(body),
             return_ty: None,
         };
 
         let outer_closure = Expr::Func {
-            params: vec![Param { name: a, ty: None }],
+            params: vec![Param {
+                name: a.clone(),
+                ty: None,
+            }],
             body: Box::new(inner_closure),
             return_ty: None,
         };
@@ -867,11 +879,14 @@ mod tests {
         let escaped_body = Expr::Binop {
             op: crate::runtime::ast::BinOp::Add,
             expr1: Box::new(Expr::Func {
-                params: vec![Param { name: b, ty: None }],
-                body: Box::new(Expr::Variable { name: b }),
+                params: vec![Param {
+                    name: b.clone(),
+                    ty: None,
+                }],
+                body: Box::new(Expr::Variable { name: b.clone() }),
                 return_ty: None,
             }),
-            expr2: Box::new(Expr::Variable { name: b }),
+            expr2: Box::new(Expr::Variable { name: b.clone() }),
         };
 
         let escaped_closure = Expr::Func {
@@ -906,7 +921,7 @@ mod tests {
         let y = interner.insert("y");
 
         let s_stmt = Stmt::Service {
-            name: s,
+            name: s.clone(),
             decls: vec![],
         };
 
@@ -915,7 +930,7 @@ mod tests {
             service_name: s,
             decls: vec![
                 Decl::VarDecl {
-                    name: x,
+                    name: x.clone(),
                     ty: None,
                     val: Expr::Literal {
                         val: Value::Int { val: 5 },
@@ -946,22 +961,22 @@ mod tests {
         let y = interner.insert("y");
 
         let s_stmt = Stmt::Service {
-            name: s,
+            name: s.clone(),
             decls: vec![],
         };
 
         // update s { def y = x; var x = 5; } -- x is new, so y cannot forward ref x
         let update_stmt = Stmt::Update {
-            service_name: s,
+            service_name: s.clone(),
             decls: vec![
                 Decl::DefDecl {
                     name: y,
                     ty: None,
-                    val: Expr::Variable { name: x },
+                    val: Expr::Variable { name: x.clone() },
                     is_pub: false,
                 },
                 Decl::VarDecl {
-                    name: x,
+                    name: x.clone(),
                     ty: None,
                     val: Expr::Literal {
                         val: Value::Int { val: 5 },
@@ -994,9 +1009,9 @@ mod tests {
 
         // Representing `service s { var x = 5; }`
         let s_stmt = Stmt::Service {
-            name: s,
+            name: s.clone(),
             decls: vec![Decl::VarDecl {
-                name: x,
+                name: x.clone(),
                 ty: None,
                 val: Expr::Literal {
                     val: Value::Int { val: 5 },
@@ -1027,8 +1042,8 @@ mod tests {
 
         // Representing `@test(s) { x; }`
         let test_stmt = Stmt::Test {
-            service_name: s,
-            stmts: vec![ActionStmt::Expr(Expr::Variable { name: x })],
+            service_name: s.clone(),
+            stmts: vec![ActionStmt::Expr(Expr::Variable { name: x.clone() })],
         };
 
         // Representing `service s { var x = 5; }`
@@ -1064,9 +1079,9 @@ mod tests {
         //   service s { var x = 0; }
         //   @test(s) { x; }
         let service_stmt = Stmt::Service {
-            name: s,
+            name: s.clone(),
             decls: vec![Decl::VarDecl {
-                name: x,
+                name: x.clone(),
                 ty: None,
                 val: Expr::Literal {
                     val: Value::Int { val: 0 },
@@ -1096,7 +1111,7 @@ mod tests {
 
         // Representing `@test(s) { x; }`
         let test_stmt = Stmt::Test {
-            service_name: s,
+            service_name: s.clone(),
             stmts: vec![ActionStmt::Expr(Expr::Variable { name: x })],
         };
 
@@ -1130,7 +1145,7 @@ mod tests {
 
         // Create a deeply nested expression structure
         // Start with a simple variable expression
-        let mut deep_expr = Expr::Variable { name: x };
+        let mut deep_expr = Expr::Variable { name: x.clone() };
 
         // Nest 130 binary operations to trigger depth limit error
         for _ in 0..130 {
@@ -1167,8 +1182,8 @@ mod tests {
         // Nest 130 for loops to trigger depth limit error
         for _ in 0..130 {
             deep_stmt = ActionStmt::For {
-                var: x,
-                iterable: Expr::Variable { name: v },
+                var: x.clone(),
+                iterable: Expr::Variable { name: v.clone() },
                 body: vec![deep_stmt],
             };
         }
@@ -1192,9 +1207,9 @@ mod tests {
         let y = interner.insert("y");
 
         let service_stmt = Stmt::Service {
-            name: s,
+            name: s.clone(),
             decls: vec![Decl::VarDecl {
-                name: x,
+                name: x.clone(),
                 ty: None,
                 val: Expr::Literal {
                     val: Value::Int { val: 0 },
@@ -1248,7 +1263,7 @@ mod tests {
         let y = interner.insert("y");
 
         let service_stmt = Stmt::Service {
-            name: s,
+            name: s.clone(),
             decls: vec![Decl::VarDecl {
                 name: x,
                 ty: None,

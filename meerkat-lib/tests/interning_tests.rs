@@ -13,15 +13,15 @@ use std::collections::HashMap;
 /// Verify `AstPrinter` formatting for symbols
 ///
 /// Ensures that `AstPrinter::format_symbol` formats a `Symbol` using the
-/// correct format `id ("name")`
+/// symbol spelling
 #[test]
 fn test_ast_printer_format_symbol() {
     let mut interner = Interner::new();
     let symbol = interner.insert("my_variable");
-    let printer = AstPrinter::new(&interner);
-    let formatted = printer.format_symbol(symbol);
+    let printer = AstPrinter::new();
+    let formatted = printer.format_symbol(&symbol);
 
-    let expected = format!("{:?} (\"my_variable\")", symbol);
+    let expected = format!("{:?}", symbol);
     assert_eq!(formatted, expected);
 }
 
@@ -78,11 +78,11 @@ fn test_manager_wait_queue_indexing() {
 /// Verify new `Interner` initialization
 ///
 /// Ensures that a newly initialized `Interner` has the empty string
-/// mapped to symbol `0`
+/// represented by the empty symbol
 #[test]
 fn test_interner_new_empty() {
-    let interner = Interner::new();
-    assert_eq!(interner.get(Symbol::empty()), "");
+    let mut interner = Interner::new();
+    assert_eq!(interner.insert(""), Symbol::empty());
 }
 
 /// Verify `Interner` duplicate handling
@@ -99,25 +99,23 @@ fn test_interner_insert_duplicate() {
 
 /// Verify `AstPrinter` formatting for empty symbol
 ///
-/// Ensures that symbol `0` is formatted correctly as empty string
+/// Ensures that the empty symbol is formatted correctly
 #[test]
 fn test_ast_printer_format_symbol_empty() {
-    let interner = Interner::new();
-    let printer = AstPrinter::new(&interner);
+    let printer = AstPrinter::new();
     let symbol = Symbol::empty();
-    let formatted = printer.format_symbol(symbol);
-    let expected = format!("{:?} (\"\")", symbol);
+    let formatted = printer.format_symbol(&symbol);
+    let expected = format!("{:?}", symbol);
     assert_eq!(formatted, expected);
 }
 
-/// Verify `Symbol` copy semantics
+/// Verify `Symbol` clone semantics
 ///
-/// Ensures that `Symbol` implements copy semantics and behaves
-/// correctly when copied by value
+/// Ensures that cloning a symbol preserves its identity
 #[test]
-fn test_symbol_copy_semantics() {
+fn test_symbol_clone_semantics() {
     let sym1 = Symbol::empty();
-    let sym2 = sym1;
+    let sym2 = sym1.clone();
     assert_eq!(sym1, sym2);
 }
 
@@ -129,9 +127,9 @@ fn test_symbol_copy_semantics() {
 fn test_ast_printer_custom_spaces() {
     let mut interner = Interner::new();
     let symbol = interner.insert("test_spacing");
-    let printer = AstPrinter::with_spaces(4, &interner);
-    let formatted = printer.format_symbol(symbol);
-    let expected = format!("{:?} (\"test_spacing\")", symbol);
+    let printer = AstPrinter::with_spaces(4);
+    let formatted = printer.format_symbol(&symbol);
+    let expected = format!("{:?}", symbol);
     assert_eq!(formatted, expected);
 }
 
@@ -149,7 +147,7 @@ fn test_parser_simple_expression_interning() {
     assert_eq!(prog.len(), 1);
 
     if let Stmt::Service { name, decls } = &prog[0] {
-        assert_eq!(interner.get(*name), "my_service");
+        assert_eq!(name.as_str(), "my_service");
         assert_eq!(decls.len(), 1);
         if let Decl::VarDecl {
             name: var_name,
@@ -157,7 +155,7 @@ fn test_parser_simple_expression_interning() {
             val: _,
         } = &decls[0]
         {
-            assert_eq!(interner.get(*var_name), "my_var");
+            assert_eq!(var_name.as_str(), "my_var");
         } else {
             panic!("expected VarDecl statement");
         }
@@ -188,8 +186,7 @@ fn test_servicenetid_equality_and_hashing() {
 /// Verify that `AstPrinter` prints optional types using their display format
 #[test]
 fn test_ast_printer_type_display() {
-    let interner = Interner::new();
-    let printer = AstPrinter::new(&interner);
+    let printer = AstPrinter::new();
 
     use meerkat_lib::runtime::tt::{TupleType, Type};
 

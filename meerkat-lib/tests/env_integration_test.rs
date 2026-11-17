@@ -12,7 +12,7 @@ fn test_env_int_basic_empty() {
     let env: Env<'_, Type> = Env::new(None);
     let mut interner = Interner::new();
     let x = interner.insert("x");
-    assert!(env.find(x).is_none());
+    assert!(env.find(&x).is_none());
 }
 
 #[test]
@@ -21,8 +21,8 @@ fn test_env_int_single_bind() {
     let mut env = Env::new(None);
     let mut interner = Interner::new();
     let x = interner.insert("x");
-    env.bind(x, Type::Int);
-    assert_eq!(env.find(x), Some(&Type::Int));
+    env.bind(x.clone(), Type::Int);
+    assert_eq!(env.find(&x), Some(&Type::Int));
 }
 
 #[test]
@@ -32,12 +32,12 @@ fn test_env_int_shadowing_direct() {
     let x = interner.insert("x");
 
     let mut parent = Env::new(None);
-    parent.bind(x, Type::Int);
+    parent.bind(x.clone(), Type::Int);
 
     let mut child = Env::new(Some(&parent));
-    child.bind(x, Type::Bool);
+    child.bind(x.clone(), Type::Bool);
 
-    assert_eq!(child.find(x), Some(&Type::Bool));
+    assert_eq!(child.find(&x), Some(&Type::Bool));
 }
 
 #[test]
@@ -47,10 +47,10 @@ fn test_env_int_parent_fallback() {
     let x = interner.insert("x");
 
     let mut parent = Env::new(None);
-    parent.bind(x, Type::Int);
+    parent.bind(x.clone(), Type::Int);
 
     let child = Env::new(Some(&parent));
-    assert_eq!(child.find(x), Some(&Type::Int));
+    assert_eq!(child.find(&x), Some(&Type::Int));
 }
 
 #[test]
@@ -60,12 +60,12 @@ fn test_env_int_grandparent_fallback() {
     let x = interner.insert("x");
 
     let mut grandparent = Env::new(None);
-    grandparent.bind(x, Type::Int);
+    grandparent.bind(x.clone(), Type::Int);
 
     let parent = Env::new(Some(&grandparent));
     let child = Env::new(Some(&parent));
 
-    assert_eq!(child.find(x), Some(&Type::Int));
+    assert_eq!(child.find(&x), Some(&Type::Int));
 }
 
 #[test]
@@ -75,13 +75,13 @@ fn test_env_int_mutation_does_not_affect_parent() {
     let x = interner.insert("x");
 
     let mut parent = Env::new(None);
-    parent.bind(x, Type::Int);
+    parent.bind(x.clone(), Type::Int);
 
     let mut child = Env::new(Some(&parent));
-    child.bind(x, Type::String);
+    child.bind(x.clone(), Type::String);
 
-    assert_eq!(parent.find(x), Some(&Type::Int));
-    assert_eq!(child.find(x), Some(&Type::String));
+    assert_eq!(parent.find(&x), Some(&Type::Int));
+    assert_eq!(child.find(&x), Some(&Type::String));
 }
 
 #[test]
@@ -92,15 +92,15 @@ fn test_env_int_shadowing_multiple() {
     let y = interner.insert("y");
 
     let mut parent = Env::new(None);
-    parent.bind(x, Type::Int);
-    parent.bind(y, Type::String);
+    parent.bind(x.clone(), Type::Int);
+    parent.bind(y.clone(), Type::String);
 
     let mut child = Env::new(Some(&parent));
-    child.bind(x, Type::Bool);
-    child.bind(y, Type::Unit);
+    child.bind(x.clone(), Type::Bool);
+    child.bind(y.clone(), Type::Unit);
 
-    assert_eq!(child.find(x), Some(&Type::Bool));
-    assert_eq!(child.find(y), Some(&Type::Unit));
+    assert_eq!(child.find(&x), Some(&Type::Bool));
+    assert_eq!(child.find(&y), Some(&Type::Unit));
 }
 
 #[test]
@@ -110,13 +110,13 @@ fn test_env_int_remove_local() {
     let x = interner.insert("x");
 
     let mut parent = Env::new(None);
-    parent.bind(x, Type::Int);
+    parent.bind(x.clone(), Type::Int);
 
     let mut child = Env::new(Some(&parent));
-    child.bind(x, Type::Bool);
-    assert_eq!(child.remove(x), Some(Type::Bool));
+    child.bind(x.clone(), Type::Bool);
+    assert_eq!(child.remove(&x), Some(Type::Bool));
 
-    assert_eq!(child.find(x), Some(&Type::Int));
+    assert_eq!(child.find(&x), Some(&Type::Int));
 }
 
 #[test]
@@ -125,7 +125,7 @@ fn test_env_int_remove_missing() {
     let mut env: Env<'_, Type> = Env::new(None);
     let mut interner = Interner::new();
     let x = interner.insert("x");
-    assert!(env.remove(x).is_none());
+    assert!(env.remove(&x).is_none());
 }
 
 #[test]
@@ -135,8 +135,8 @@ fn test_env_int_bind_overwrite() {
     let mut interner = Interner::new();
     let x = interner.insert("x");
 
-    assert!(env.bind(x, Type::Int).is_none());
-    assert_eq!(env.bind(x, Type::Bool), Some(Type::Int));
+    assert!(env.bind(x.clone(), Type::Int).is_none());
+    assert_eq!(env.bind(x.clone(), Type::Bool), Some(Type::Int));
 }
 
 #[test]
@@ -146,12 +146,12 @@ fn test_env_int_find_with_env_child() {
     let x = interner.insert("x");
 
     let mut parent = Env::new(None);
-    parent.bind(x, Type::Int);
+    parent.bind(x.clone(), Type::Int);
 
     let mut child = Env::new(Some(&parent));
-    child.bind(x, Type::Bool);
+    child.bind(x.clone(), Type::Bool);
 
-    let res = child.find_with_env(x).unwrap();
+    let res = child.find_with_env(&x).unwrap();
     assert!(std::ptr::eq(res.0, &child));
     assert_eq!(res.1, &Type::Bool);
 }
@@ -163,10 +163,10 @@ fn test_env_int_find_with_env_parent() {
     let x = interner.insert("x");
 
     let mut parent = Env::new(None);
-    parent.bind(x, Type::Int);
+    parent.bind(x.clone(), Type::Int);
 
     let child = Env::new(Some(&parent));
-    let res = child.find_with_env(x).unwrap();
+    let res = child.find_with_env(&x).unwrap();
     assert!(std::ptr::eq(res.0, &parent));
     assert_eq!(res.1, &Type::Int);
 }
@@ -178,12 +178,12 @@ fn test_env_int_find_with_env_grandparent() {
     let x = interner.insert("x");
 
     let mut grandparent = Env::new(None);
-    grandparent.bind(x, Type::Int);
+    grandparent.bind(x.clone(), Type::Int);
 
     let parent = Env::new(Some(&grandparent));
     let child = Env::new(Some(&parent));
 
-    let res = child.find_with_env(x).unwrap();
+    let res = child.find_with_env(&x).unwrap();
     assert!(std::ptr::eq(res.0, &grandparent));
     assert_eq!(res.1, &Type::Int);
 }
@@ -195,14 +195,14 @@ fn test_env_int_remove_shadow_reveals_parent() {
     let x = interner.insert("x");
 
     let mut parent = Env::new(None);
-    parent.bind(x, Type::Int);
+    parent.bind(x.clone(), Type::Int);
 
     let mut child = Env::new(Some(&parent));
-    child.bind(x, Type::Bool);
+    child.bind(x.clone(), Type::Bool);
 
-    assert_eq!(child.find(x), Some(&Type::Bool));
-    child.remove(x);
-    assert_eq!(child.find(x), Some(&Type::Int));
+    assert_eq!(child.find(&x), Some(&Type::Bool));
+    child.remove(&x);
+    assert_eq!(child.find(&x), Some(&Type::Int));
 }
 
 #[test]
@@ -213,8 +213,8 @@ fn test_env_int_complex_types() {
     let x = interner.insert("x");
     let fun_ty = Type::Func(Box::new(Type::Int), Box::new(Type::Bool));
 
-    env.bind(x, fun_ty.clone());
-    assert_eq!(env.find(x), Some(&fun_ty));
+    env.bind(x.clone(), fun_ty.clone());
+    assert_eq!(env.find(&x), Some(&fun_ty));
 }
 
 #[test]
@@ -224,13 +224,13 @@ fn test_env_int_multiple_siblings() {
     let x = interner.insert("x");
 
     let mut parent = Env::new(None);
-    parent.bind(x, Type::Int);
+    parent.bind(x.clone(), Type::Int);
 
     let child1 = Env::new(Some(&parent));
     let child2 = Env::new(Some(&parent));
 
-    assert_eq!(child1.find(x), Some(&Type::Int));
-    assert_eq!(child2.find(x), Some(&Type::Int));
+    assert_eq!(child1.find(&x), Some(&Type::Int));
+    assert_eq!(child2.find(&x), Some(&Type::Int));
 }
 
 #[test]
@@ -242,20 +242,20 @@ fn test_env_int_grandchild_nested_shadowing() {
     let z = interner.insert("z");
 
     let mut grandparent = Env::new(None);
-    grandparent.bind(x, Type::Int);
-    grandparent.bind(y, Type::Int);
-    grandparent.bind(z, Type::Int);
+    grandparent.bind(x.clone(), Type::Int);
+    grandparent.bind(y.clone(), Type::Int);
+    grandparent.bind(z.clone(), Type::Int);
 
     let mut parent = Env::new(Some(&grandparent));
-    parent.bind(x, Type::Bool);
-    parent.bind(y, Type::Bool);
+    parent.bind(x.clone(), Type::Bool);
+    parent.bind(y.clone(), Type::Bool);
 
     let mut child = Env::new(Some(&parent));
-    child.bind(x, Type::String);
+    child.bind(x.clone(), Type::String);
 
-    assert_eq!(child.find(x), Some(&Type::String));
-    assert_eq!(child.find(y), Some(&Type::Bool));
-    assert_eq!(child.find(z), Some(&Type::Int));
+    assert_eq!(child.find(&x), Some(&Type::String));
+    assert_eq!(child.find(&y), Some(&Type::Bool));
+    assert_eq!(child.find(&z), Some(&Type::Int));
 }
 
 #[test]
@@ -268,7 +268,7 @@ fn test_env_int_deep_missing_lookup() {
     let parent = Env::new(Some(&grandparent));
     let child = Env::new(Some(&parent));
 
-    assert!(child.find(w).is_none());
+    assert!(child.find(&w).is_none());
 }
 
 #[test]
@@ -278,12 +278,12 @@ fn test_env_int_rebind_after_remove() {
     let mut interner = Interner::new();
     let x = interner.insert("x");
 
-    env.bind(x, Type::Int);
-    env.remove(x);
-    assert!(env.find(x).is_none());
+    env.bind(x.clone(), Type::Int);
+    env.remove(&x);
+    assert!(env.find(&x).is_none());
 
-    env.bind(x, Type::Bool);
-    assert_eq!(env.find(x), Some(&Type::Bool));
+    env.bind(x.clone(), Type::Bool);
+    assert_eq!(env.find(&x), Some(&Type::Bool));
 }
 
 #[test]
@@ -293,9 +293,9 @@ fn test_env_int_cloned_env() {
     let mut interner = Interner::new();
     let x = interner.insert("x");
 
-    env.bind(x, Type::Int);
+    env.bind(x.clone(), Type::Int);
     let cloned = env.clone();
-    assert_eq!(cloned.find(x), Some(&Type::Int));
+    assert_eq!(cloned.find(&x), Some(&Type::Int));
 }
 
 #[test]
@@ -307,17 +307,17 @@ fn test_env_int_multiple_shadows() {
     let z = interner.insert("z");
 
     let mut parent = Env::new(None);
-    parent.bind(x, Type::Int);
-    parent.bind(y, Type::String);
-    parent.bind(z, Type::Bool);
+    parent.bind(x.clone(), Type::Int);
+    parent.bind(y.clone(), Type::String);
+    parent.bind(z.clone(), Type::Bool);
 
     let mut child = Env::new(Some(&parent));
-    child.bind(x, Type::Bool);
-    child.bind(y, Type::Int);
+    child.bind(x.clone(), Type::Bool);
+    child.bind(y.clone(), Type::Int);
 
-    assert_eq!(child.find(x), Some(&Type::Bool));
-    assert_eq!(child.find(y), Some(&Type::Int));
-    assert_eq!(child.find(z), Some(&Type::Bool));
+    assert_eq!(child.find(&x), Some(&Type::Bool));
+    assert_eq!(child.find(&y), Some(&Type::Int));
+    assert_eq!(child.find(&z), Some(&Type::Bool));
 }
 
 #[test]
@@ -326,7 +326,7 @@ fn test_env_int_find_with_env_missing() {
     let mut interner = Interner::new();
     let x = interner.insert("x");
     let env: Env<'_, Type> = Env::new(None);
-    assert!(env.find_with_env(x).is_none());
+    assert!(env.find_with_env(&x).is_none());
 }
 
 #[test]
@@ -336,16 +336,16 @@ fn test_env_int_multiple_child_shadows() {
     let x = interner.insert("x");
 
     let mut parent = Env::new(None);
-    parent.bind(x, Type::Int);
+    parent.bind(x.clone(), Type::Int);
 
     let mut child1 = Env::new(Some(&parent));
-    child1.bind(x, Type::Bool);
+    child1.bind(x.clone(), Type::Bool);
 
     let mut child2 = Env::new(Some(&parent));
-    child2.bind(x, Type::String);
+    child2.bind(x.clone(), Type::String);
 
-    assert_eq!(child1.find(x), Some(&Type::Bool));
-    assert_eq!(child2.find(x), Some(&Type::String));
+    assert_eq!(child1.find(&x), Some(&Type::Bool));
+    assert_eq!(child2.find(&x), Some(&Type::String));
 }
 
 #[test]
@@ -356,18 +356,18 @@ fn test_env_int_find_with_env_nested_fallback() {
     let y = interner.insert("y");
 
     let mut grandparent = Env::new(None);
-    grandparent.bind(x, Type::Int);
+    grandparent.bind(x.clone(), Type::Int);
 
     let parent = Env::new(Some(&grandparent));
 
     let mut child = Env::new(Some(&parent));
-    child.bind(y, Type::Bool);
+    child.bind(y.clone(), Type::Bool);
 
-    let res_x = child.find_with_env(x).unwrap();
+    let res_x = child.find_with_env(&x).unwrap();
     assert!(std::ptr::eq(res_x.0, &grandparent));
     assert_eq!(res_x.1, &Type::Int);
 
-    let res_y = child.find_with_env(y).unwrap();
+    let res_y = child.find_with_env(&y).unwrap();
     assert!(std::ptr::eq(res_y.0, &child));
     assert_eq!(res_y.1, &Type::Bool);
 }

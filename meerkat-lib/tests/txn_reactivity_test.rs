@@ -36,10 +36,7 @@ async fn setup(code: &str) -> (Manager, Vec<(String, Vec<ActionStmt>)>) {
             Stmt::Test {
                 service_name,
                 stmts,
-            } => Some((
-                manager.interner.get(*service_name).to_string(),
-                stmts.clone(),
-            )),
+            } => Some((service_name.as_str().to_string(), stmts.clone())),
             _ => None,
         })
         .collect();
@@ -134,7 +131,10 @@ async fn test_aborted_txn_leaves_def_unchanged() {
     let s = m.interner.insert("s");
     let x = m.interner.insert("x");
     let y = m.interner.insert("y");
-    assert_eq!(m.lookup(x, s, None).await.unwrap(), Value::Int { val: 0 });
+    assert_eq!(
+        m.lookup(x, s.clone(), None).await.unwrap(),
+        Value::Int { val: 0 }
+    );
     assert_eq!(m.lookup(y, s, None).await.unwrap(), Value::Int { val: 1 });
 }
 
@@ -183,7 +183,7 @@ async fn test_var_initialized_from_another_service_is_not_reactive() {
     let names: Vec<_> = listeners
         .unwrap_or_default()
         .iter()
-        .map(|(_, def)| *def)
+        .map(|(_, def)| def.clone())
         .collect();
     assert!(
         !names.contains(&w),
@@ -266,14 +266,14 @@ async fn test_participant_transactional_read_sees_buffered_def() {
     })
     .unwrap();
 
-    m.execute_action_participant(svc, &stmts, &[], tid.clone())
+    m.execute_action_participant(svc.clone(), &stmts, &[], tid.clone())
         .await
         .unwrap();
 
     // The derived member, read under the shared transaction id, reflects the
     // participant's own uncommitted write.
     let seen = m
-        .remote_read_participant(svc, y, tid.clone())
+        .remote_read_participant(svc.clone(), y.clone(), tid.clone())
         .await
         .unwrap();
     assert_eq!(
@@ -283,7 +283,10 @@ async fn test_participant_transactional_read_sees_buffered_def() {
     );
 
     // Still uncommitted: a plain read outside the transaction sees the old values.
-    assert_eq!(m.lookup(x, svc, None).await.unwrap(), Value::Int { val: 0 });
+    assert_eq!(
+        m.lookup(x, svc.clone(), None).await.unwrap(),
+        Value::Int { val: 0 }
+    );
     assert_eq!(m.lookup(y, svc, None).await.unwrap(), Value::Int { val: 1 });
 }
 
@@ -331,7 +334,10 @@ async fn test_failed_recompute_aborts_the_transaction() {
     let d = m.interner.insert("d");
     let y = m.interner.insert("y");
     let s = m.interner.insert("s");
-    assert_eq!(m.lookup(d, s, None).await.unwrap(), Value::Int { val: 1 });
+    assert_eq!(
+        m.lookup(d, s.clone(), None).await.unwrap(),
+        Value::Int { val: 1 }
+    );
     assert_eq!(m.lookup(y, s, None).await.unwrap(), Value::Int { val: 100 });
 }
 
@@ -390,7 +396,7 @@ async fn test_remote_dependency_is_never_served_from_dep_cache() {
         .entry(z)
         .or_default()
         .insert(
-            (rmt, gb),
+            (rmt.clone(), gb),
             InputState::seeded((Value::Int { val: 100 }, Some(VClock::new()), None)),
         );
 
@@ -524,7 +530,7 @@ async fn test_recompute_in_txn_read_locks_same_service_dependencies() {
     };
     let y = m.interner.insert("y");
     m.execute_action_participant(
-        s,
+        s.clone(),
         &[
             ActionStmt::Assign {
                 name: x,
@@ -554,7 +560,7 @@ async fn test_recompute_in_txn_read_locks_same_service_dependencies() {
             .get(&older)
             .expect("the participant transaction is held until commit")
             .locked
-            .contains(&(m.service_net_id_for_name(s), b)),
+            .contains(&(m.service_net_id_for_name(&s), b.clone())),
         "`b` was read to recompute `y`, so the transaction must hold a read lock on it"
     );
 

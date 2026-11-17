@@ -148,12 +148,12 @@ impl std::fmt::Display for Error {
 }
 
 /// Service members have one declaration, both for type queries and installation.
-pub(crate) fn check_unique_members(service: Symbol, decls: &[Decl]) -> Result<(), Error> {
+pub(crate) fn check_unique_members(service: &Symbol, decls: &[Decl]) -> Result<(), Error> {
     let mut members = HashSet::new();
     for decl in decls {
         if !members.insert(decl.name()) {
             return Err(Error::DuplicateMember {
-                service,
+                service: service.clone(),
                 member: decl.name(),
             });
         }
@@ -226,16 +226,17 @@ impl<'a, 'b> Context<'a, 'b> {
         // unified AST passed from Node::static_checks.
         for stmt in self.program {
             if let Stmt::Service { name, decls } = stmt {
-                check_unique_members(*name, decls)?;
-                if self.local_services.find(*name).is_none() {
-                    self.local_services.bind(*name, ServiceType::default());
+                check_unique_members(name, decls)?;
+                if self.local_services.find(name).is_none() {
+                    self.local_services
+                        .bind(name.clone(), ServiceType::default());
                 }
             }
         }
 
         for stmt in self.program {
             if let Stmt::Service { name, .. } = stmt {
-                self.check_service(*name)?;
+                self.check_service(name)?;
             }
         }
 
@@ -253,7 +254,7 @@ impl<'a, 'b> Context<'a, 'b> {
                     service_name,
                     stmts,
                 } => {
-                    self.check_test(*service_name, stmts)?;
+                    self.check_test(service_name, stmts)?;
                 }
                 Stmt::Connect { .. }
                 | Stmt::Service { .. }
@@ -276,17 +277,17 @@ impl<'a, 'b> Context<'a, 'b> {
     ///
     /// Raises:
     ///     Error::UnboundVariable: If service is not found
-    fn find_service_decls(&self, service_name: Symbol) -> Result<&'a [Decl], Error> {
+    fn find_service_decls(&self, service_name: &Symbol) -> Result<&'a [Decl], Error> {
         // TODO(Issue #156): Support looking up declarations
         // from Stmt::Update (deferred per Issue #34)
         for stmt in self.program {
             if let Stmt::Service { name, decls } = stmt {
-                if *name == service_name {
+                if name == service_name {
                     return Ok(decls);
                 }
             }
         }
-        Err(Error::UnboundVariable(service_name))
+        Err(Error::UnboundVariable(service_name.clone()))
     }
 
     /// Retrieve or compute the type of a service member on-demand
@@ -301,7 +302,11 @@ impl<'a, 'b> Context<'a, 'b> {
     /// Raises:
     ///     Error::DependencyCycle: On cyclic member dependencies
     ///     Error::UnboundVariable: If member is not found
-    fn type_of_member(&mut self, service_name: Symbol, member_name: Symbol) -> Result<Type, Error> {
+    fn type_of_member(
+        &mut self,
+        service_name: &Symbol,
+        member_name: &Symbol,
+    ) -> Result<Type, Error> {
         // Fast path: member type already cached from a prior check
         if let Some(st) = self.local_services.find(service_name) {
             if let Some(ty) = st.fields().find(member_name) {
@@ -313,17 +318,16 @@ impl<'a, 'b> Context<'a, 'b> {
         // = b; def b = a;`). Execution-order dependencies are analyzed
         // in a separate compiler pass. This check strictly exists to
         // ensure type inference terminates and avoids stack overflows.
-        let key = (service_name, member_name);
+        let key = (service_name.clone(), member_name.clone());
         if self.checking_stack.contains(&key) {
             return Err(Error::RecursiveTypeInference {
-                service: service_name,
-                member: member_name,
+                service: service_name.clone(),
+                member: member_name.clone(),
             });
         }
 
         self.checking_stack.push(key);
-        let prev_service = self.current_service;
-        self.current_service = Some(service_name);
+        let prev_service = self.current_service.replace(service_name.clone());
 
         let res = self.type_of_member_inner(service_name, member_name);
 
@@ -335,17 +339,17 @@ impl<'a, 'b> Context<'a, 'b> {
 
     fn type_of_member_inner(
         &mut self,
-        service_name: Symbol,
-        member_name: Symbol,
+        service_name: &Symbol,
+        member_name: &Symbol,
     ) -> Result<Type, Error> {
         let decls = self.find_service_decls(service_name)?;
         let decl = decls
             .iter()
             .find(|d| match d {
-                Decl::VarDecl { name, .. } | Decl::DefDecl { name, .. } => *name == member_name,
-                Decl::TableDecl { name, .. } => *name == member_name,
+                Decl::VarDecl { name, .. } | Decl::DefDecl { name, .. } => name == member_name,
+                Decl::TableDecl { name, .. } => name == member_name,
             })
-            .ok_or(Error::UnboundVariable(member_name))?;
+            .ok_or(Error::UnboundVariable(member_name.clone()))?;
 
         let ty = match decl {
             Decl::VarDecl {
@@ -358,15 +362,15 @@ impl<'a, 'b> Context<'a, 'b> {
                 if let Some(expected) = annotated {
                     check_type(expected, 1)?;
                     if let Some(mut st) = self.local_services.remove(service_name) {
-                        let _ = st.add_field(member_name, expected.clone());
-                        self.local_services.bind(service_name, st);
+                        let _ = st.add_field(member_name.clone(), expected.clone());
+                        self.local_services.bind(service_name.clone(), st);
                     }
                     match self.check_expr(val, expected, &mut env) {
                         Ok(t) => t,
                         Err(e) => {
                             if let Some(mut st) = self.local_services.remove(service_name) {
                                 st.remove_field(member_name);
-                                self.local_services.bind(service_name, st);
+                                self.local_services.bind(service_name.clone(), st);
                             }
                             return Err(e);
                         }
@@ -379,8 +383,8 @@ impl<'a, 'b> Context<'a, 'b> {
         };
 
         if let Some(mut st) = self.local_services.remove(service_name) {
-            let _ = st.add_field(member_name, ty.clone());
-            self.local_services.bind(service_name, st);
+            let _ = st.add_field(member_name.clone(), ty.clone());
+            self.local_services.bind(service_name.clone(), st);
         }
 
         Ok(ty)
@@ -393,12 +397,12 @@ impl<'a, 'b> Context<'a, 'b> {
     ///
     /// Returns:
     ///     Result<(), Error>: Ok on success
-    fn check_service(&mut self, service_name: Symbol) -> Result<(), Error> {
+    fn check_service(&mut self, service_name: &Symbol) -> Result<(), Error> {
         let decls = self.find_service_decls(service_name)?;
         for decl in decls {
             match decl {
                 Decl::VarDecl { name, .. } | Decl::DefDecl { name, .. } => {
-                    self.type_of_member(service_name, *name)?;
+                    self.type_of_member(service_name, name)?;
                 }
                 Decl::TableDecl { .. } => {
                     // TODO(Issue #156): Implement Table type schema
@@ -421,18 +425,17 @@ impl<'a, 'b> Context<'a, 'b> {
     ///
     /// Returns:
     ///     Result<(), Error>: Ok on success
-    fn check_test(&mut self, service_name: Symbol, stmts: &[ActionStmt]) -> Result<(), Error> {
+    fn check_test(&mut self, service_name: &Symbol, stmts: &[ActionStmt]) -> Result<(), Error> {
         let mut test_env = Env::new(None);
         if let Some(st) = self.local_services.find(service_name) {
             for name in st.field_order() {
-                if let Some(ty) = st.fields().find(*name) {
-                    test_env.bind(*name, ty.clone());
+                if let Some(ty) = st.fields().find(name) {
+                    test_env.bind(name.clone(), ty.clone());
                 }
             }
         }
 
-        let prev_service = self.current_service;
-        self.current_service = Some(service_name);
+        let prev_service = self.current_service.replace(service_name.clone());
         for stmt in stmts {
             self.check_action_stmt(stmt, &mut test_env)?;
         }
@@ -459,10 +462,10 @@ impl<'a, 'b> Context<'a, 'b> {
                 if let Some(expected) = ty {
                     check_type(expected, 1)?;
                     let actual_ty = self.check_expr(expr, expected, env)?;
-                    env.bind(*name, actual_ty);
+                    env.bind(name.clone(), actual_ty);
                 } else {
                     let inferred = self.infer(expr, env, 1)?;
-                    env.bind(*name, inferred);
+                    env.bind(name.clone(), inferred);
                 }
                 Ok(())
             }
@@ -479,12 +482,12 @@ impl<'a, 'b> Context<'a, 'b> {
                 Ok(())
             }
             ActionStmt::Assign { name, expr } => {
-                let ty = if let Some(local_ty) = env.find(*name) {
+                let ty = if let Some(local_ty) = env.find(name) {
                     local_ty.clone()
-                } else if let Some(svc) = self.current_service {
-                    self.type_of_member(svc, *name)?
+                } else if let Some(svc) = self.current_service.clone() {
+                    self.type_of_member(&svc, name)?
                 } else {
-                    return Err(Error::UnboundVariable(*name));
+                    return Err(Error::UnboundVariable(name.clone()));
                 };
                 self.check_expr(expr, &ty, env)?;
                 Ok(())
@@ -507,7 +510,7 @@ impl<'a, 'b> Context<'a, 'b> {
                 let iter_ty = self.infer(iterable, env, 1)?;
                 if let Type::List(elem_ty) = iter_ty {
                     let mut for_env = Env::new(Some(env));
-                    for_env.bind(*var, (*elem_ty).clone());
+                    for_env.bind(var.clone(), (*elem_ty).clone());
                     for b_stmt in body {
                         self.check_action_stmt(b_stmt, &mut for_env)?;
                     }
@@ -603,7 +606,7 @@ impl<'a, 'b> Context<'a, 'b> {
                             });
                         }
                     }
-                    local_env.bind(params[0].name, (**expected_param).clone());
+                    local_env.bind(params[0].name.clone(), (**expected_param).clone());
                 } else if let Type::Tuple(ts) = expected_param.as_ref() {
                     if params.len() != ts.len() {
                         return Err(Error::InvalidTupleArity);
@@ -617,7 +620,7 @@ impl<'a, 'b> Context<'a, 'b> {
                                 });
                             }
                         }
-                        local_env.bind(param.name, ts[i].clone());
+                        local_env.bind(param.name.clone(), ts[i].clone());
                     }
                 } else {
                     let types = params.iter().map(|_| Type::Unit).collect();
@@ -708,12 +711,12 @@ impl<'a, 'b> Context<'a, 'b> {
             },
             Expr::Html(_) => Ok(Type::String),
             Expr::Variable { name } => {
-                if let Some(ty) = env.find(*name) {
+                if let Some(ty) = env.find(name) {
                     Ok(ty.clone())
-                } else if let Some(svc) = self.current_service {
-                    self.type_of_member(svc, *name)
+                } else if let Some(svc) = self.current_service.clone() {
+                    self.type_of_member(&svc, name)
                 } else {
-                    Err(Error::UnboundVariable(*name))
+                    Err(Error::UnboundVariable(name.clone()))
                 }
             }
             Expr::Tuple { val } => {
@@ -817,7 +820,7 @@ impl<'a, 'b> Context<'a, 'b> {
             Expr::MemberAccess {
                 service_name,
                 member_name,
-            } => self.type_of_member(*service_name, *member_name),
+            } => self.type_of_member(service_name, member_name),
             Expr::Select { .. } => Ok(Type::List(Box::new(Type::Unit))),
             Expr::Table { .. } => Ok(Type::Unit),
             Expr::Fold { .. } => Ok(Type::Unit),
@@ -869,7 +872,7 @@ impl<'a, 'b> Context<'a, 'b> {
         let mut param_types = Vec::new();
         for param in params {
             if let Some(p_ty) = &param.ty {
-                local_env.bind(param.name, p_ty.clone());
+                local_env.bind(param.name.clone(), p_ty.clone());
                 param_types.push(p_ty.clone());
             } else {
                 return Err(Error::CannotInferType);

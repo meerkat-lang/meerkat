@@ -176,15 +176,14 @@ fn service_boundary(
     service: &Service,
     txn_id: &TxnId,
     sid: &ServiceNetId,
-    service_name: Symbol,
-    interner: &Interner,
+    service_name: &Symbol,
 ) -> Result<(), EvalError> {
     if let Some(holder) = &service.service_lock {
         if holder != txn_id {
             if holder < txn_id {
                 return Err(EvalError::WaitDieAbort(format!(
                     "transaction died contending for service lock on '{}'",
-                    interner.get(service_name)
+                    service_name.as_str()
                 )));
             }
             return Err(EvalError::WaitOn(WaitKey::Service(sid.clone())));
@@ -246,7 +245,7 @@ fn join_receipts<'a>(
     let sources = receipts
         .map(|(_, _, sources)| sources.as_ref())
         .collect::<Option<Vec<_>>>()
-        .map(|all| all.into_iter().flatten().copied().collect());
+        .map(|all| all.into_iter().flatten().cloned().collect());
     (clock, sources)
 }
 
@@ -399,7 +398,7 @@ pub struct Manager {
 pub fn local_service_names(prog: &[Stmt]) -> HashSet<Symbol> {
     prog.iter()
         .filter_map(|s| match s {
-            Stmt::Service { name, .. } => Some(*name),
+            Stmt::Service { name, .. } => Some(name.clone()),
             _ => None,
         })
         .collect()
@@ -409,8 +408,8 @@ pub fn local_service_names(prog: &[Stmt]) -> HashSet<Symbol> {
 fn join_clocks<'a>(clocks: impl IntoIterator<Item = &'a VClock>) -> VClock {
     let mut joined = VClock::new();
     for clock in clocks {
-        for (&dim, &counter) in clock {
-            let entry = joined.entry(dim).or_insert(0);
+        for (dim, &counter) in clock {
+            let entry = joined.entry(dim.clone()).or_insert(0);
             *entry = (*entry).max(counter);
         }
     }
@@ -428,8 +427,8 @@ fn caught_up(target: &VClock, clock: &VClock, sources: Option<&Sources>) -> bool
 
 /// §5.2's `V_new`: the joined history `v_base` advanced once in each written var
 fn advance(mut v_base: VClock, write_set: &HashSet<(Symbol, Symbol)>) -> VClock {
-    for &var in write_set {
-        let counter = v_base.entry(var).or_insert(0);
+    for var in write_set {
+        let counter = v_base.entry(var.clone()).or_insert(0);
         // Wire counters are bounded far below the maximum (`MAX_NET_CLOCK_COUNTER`)
         *counter = counter.checked_add(1).expect("a clock counter overflowed");
     }
@@ -526,18 +525,22 @@ impl Manager {
             }
         }
         let mut published = HashMap::new();
-        for (&member, &value) in overrides {
-            publish(&mut published, member, value);
+        for (member, &value) in overrides {
+            publish(&mut published, member.clone(), value);
         }
         for service in self.services.values() {
             // The function a local var holds is part of its type, as a
             // version a remote owner delivered is of its member's; a write's
             // override stands in for what it would overwrite. A def's value
             // follows from its declaration
-            for &var in &service.graphs.vars {
-                if let Some(state) = service.vars.get(&var) {
-                    if !overrides.contains_key(&(service.name, var)) {
-                        publish(&mut published, (service.name, var), &state.value);
+            for var in &service.graphs.vars {
+                if let Some(state) = service.vars.get(var) {
+                    if !overrides.contains_key(&(service.name.clone(), var.clone())) {
+                        publish(
+                            &mut published,
+                            (service.name.clone(), var.clone()),
+                            &state.value,
+                        );
                     }
                 }
             }
@@ -548,7 +551,7 @@ impl Manager {
                         && inputs.is_some_and(|inputs| inputs.contains(member))
                     {
                         for (value, _, _) in state.versions() {
-                            publish(&mut published, *member, value);
+                            publish(&mut published, member.clone(), value);
                         }
                     }
                 }
@@ -559,7 +562,9 @@ impl Manager {
         services
             .into_iter()
             .filter_map(|name| match declarations.get(&name) {
-                Some(Stmt::Service { decls, .. }) => Some((name, effects.graphs(name, decls))),
+                Some(Stmt::Service { decls, .. }) => {
+                    Some((name.clone(), effects.graphs(&name, decls)))
+                }
                 _ => None,
             })
             .collect()
@@ -579,7 +584,7 @@ impl Manager {
         self.services
             .iter()
             .filter(|(_, service)| service.initializing.is_none())
-            .map(|(&name, _)| name)
+            .map(|(name, _)| name.clone())
             .collect()
     }
 
@@ -591,12 +596,14 @@ impl Manager {
         let remote: HashMap<_, _> = self
             .remote_services
             .keys()
-            .map(|&owner| (self.service_net_id_for_name(owner), owner))
+            .map(|owner| (self.service_net_id_for_name(owner), owner.clone()))
             .collect();
         txn.read_cache
             .iter()
             .filter(|(_, entry)| entry.0.is_function())
-            .filter_map(|((id, member), entry)| Some(((*remote.get(id)?, *member), &entry.0)))
+            .filter_map(|((id, member), entry)| {
+                Some(((remote.get(id)?.clone(), member.clone()), &entry.0))
+            })
             .collect()
     }
 
@@ -611,20 +618,23 @@ impl Manager {
         let mut readers: HashMap<_, Vec<_>> = HashMap::new();
         for service in self.running_services() {
             let graphs = &self.services[&service].graphs;
-            for &def in &graphs.defs {
-                for input in graphs.inputs(service, def) {
-                    readers.entry(input).or_default().push((service, def));
+            for def in &graphs.defs {
+                for input in graphs.inputs(&service, def) {
+                    readers
+                        .entry(input)
+                        .or_default()
+                        .push((service.clone(), def.clone()));
                 }
             }
         }
         let mut pending: Vec<_> = members.into_iter().collect();
-        let mut seen: HashSet<_> = pending.iter().copied().collect();
+        let mut seen: HashSet<_> = pending.iter().cloned().collect();
         let mut services = HashSet::new();
         while let Some(member) = pending.pop() {
-            for &(service, def) in readers.get(&member).into_iter().flatten() {
-                services.insert(service);
-                if seen.insert((service, def)) {
-                    pending.push((service, def));
+            for (service, def) in readers.get(&member).into_iter().flatten() {
+                services.insert(service.clone());
+                if seen.insert((service.clone(), def.clone())) {
+                    pending.push((service.clone(), def.clone()));
                 }
             }
         }
@@ -664,17 +674,17 @@ impl Manager {
                 member: def,
             },
         };
-        EvalError::RuntimeError(error.message(&self.interner))
+        EvalError::RuntimeError(error.message())
     }
 
     /// Whether storing `value` in `member` changes function code: the value
     /// or the one the var holds is a function
-    fn code_changes(&self, (service, var): (Symbol, Symbol), value: &Value) -> bool {
+    fn code_changes(&self, (service, var): &(Symbol, Symbol), value: &Value) -> bool {
         value.is_function()
             || self
                 .services
-                .get(&service)
-                .and_then(|service| service.vars.get(&var))
+                .get(service)
+                .and_then(|service| service.vars.get(var))
                 .is_some_and(|state| state.value.is_function())
     }
 
@@ -692,30 +702,33 @@ impl Manager {
     ) -> Result<(), EvalError> {
         let overrides: HashMap<_, _> = writes
             .into_iter()
-            .filter(|&(member, value)| self.code_changes(member, value))
+            .filter(|(member, value)| self.code_changes(member, value))
             .collect();
         if overrides.is_empty() {
             return Ok(());
         }
-        let readers = self.services_reading(overrides.keys().copied());
+        let readers = self.services_reading(overrides.keys().cloned());
         let graphs = self.graphs_of(&self.unified_ast, readers, &overrides);
-        for (&service, graphs) in &graphs {
-            let installed = &self.services[&service].graphs;
-            for &def in &graphs.defs {
-                if graphs.incomplete.contains(&def) {
-                    return Err(self.uninstallable_error((service, def), Uninstallable::Incomplete));
+        for (service, graphs) in &graphs {
+            let installed = &self.services[service].graphs;
+            for def in &graphs.defs {
+                if graphs.incomplete.contains(def) {
+                    return Err(self.uninstallable_error(
+                        (service.clone(), def.clone()),
+                        Uninstallable::Incomplete,
+                    ));
                 }
                 if let Some((owner, member)) = graphs
                     .inputs(service, def)
-                    .find(|&input| !installed.reads(service, def, input))
+                    .find(|input| !installed.reads(service, def, input))
                 {
                     return Err(EvalError::RuntimeError(format!(
                         "type error: the function stored would make '{}.{}' read '{}.{}', \
                          which its declarations do not; a code update declares that",
-                        self.interner.get(service),
-                        self.interner.get(def),
-                        self.interner.get(owner),
-                        self.interner.get(member)
+                        service.as_str(),
+                        def.as_str(),
+                        owner.as_str(),
+                        member.as_str()
                     )));
                 }
             }
@@ -733,36 +746,36 @@ impl Manager {
             .written
             .iter()
             .filter_map(|((sid, var), value)| {
-                Some(((self.service_name_for_net_id(sid)?, *var), value))
+                Some(((self.service_name_for_net_id(sid)?, var.clone()), value))
             })
-            .filter(|&(member, value)| self.code_changes(member, value))
+            .filter(|(member, value)| self.code_changes(member, value))
             .collect();
         if writes.is_empty() {
             return Ok(());
         }
         let holders: HashSet<_> = self
-            .services_reading(writes.keys().copied())
+            .services_reading(writes.keys().cloned())
             .into_iter()
             .flat_map(|service| {
                 let graphs = &self.services[&service].graphs;
                 graphs
                     .defs
                     .iter()
-                    .flat_map(move |&def| graphs.inputs(service, def))
+                    .flat_map(move |def| graphs.inputs(&service, def))
             })
             .filter(|input| !writes.contains_key(input))
-            .filter(|&(owner, var)| {
-                self.services.get(&owner).is_some_and(|service| {
-                    service.graphs.vars.contains(&var)
+            .filter(|(owner, var)| {
+                self.services.get(owner).is_some_and(|service| {
+                    service.graphs.vars.contains(var)
                         && service
                             .vars
-                            .get(&var)
+                            .get(var)
                             .is_some_and(|state| state.value.is_function())
                 })
             })
             .collect();
         for (owner, var) in holders {
-            let key = (self.service_net_id_for_name(owner), var);
+            let key = (self.service_net_id_for_name(&owner), var.clone());
             if !txn.locked.contains(&key) {
                 self.acquire_read_lock(owner, var, &txn.id)?;
                 txn.locked.insert(key);
@@ -786,7 +799,7 @@ impl Manager {
     /// It receives no reply until that variable's lock frees and it is
     /// re-dispatched
     pub fn park_request(&mut self, service: Symbol, var: Symbol, parked: ParkedRequest) {
-        let key = WaitKey::Member(self.service_net_id_for_name(service), var);
+        let key = WaitKey::Member(self.service_net_id_for_name(&service), var);
         self.park_request_key(key, parked);
     }
 
@@ -874,8 +887,8 @@ impl Manager {
     /// the node has a network address, the identity is that address plus
     /// the service slug; otherwise it falls back to the bare name for
     /// local-only execution
-    fn compute_service_net_id(&self, service_name: Symbol) -> ServiceNetId {
-        let name_str = self.interner.get(service_name);
+    fn compute_service_net_id(&self, service_name: &Symbol) -> ServiceNetId {
+        let name_str = service_name.as_str();
         match &self.local_address {
             Some(addr) if !addr.is_empty() => ServiceNetId::new(format!("{}/{}", addr, name_str)),
             Some(_) | None => {
@@ -941,7 +954,7 @@ impl Manager {
                 if imported.contains_key(name) {
                     false
                 } else {
-                    imported.insert(*name, decls.clone());
+                    imported.insert(name.clone(), decls.clone());
                     true
                 }
             }
@@ -961,8 +974,8 @@ impl Manager {
                     if self.services.contains_key(name) {
                         continue;
                     }
-                    self.create_service(*name, decls).await?;
-                    println!("Imported service '{}'", self.interner.get(*name));
+                    self.create_service(name.clone(), decls).await?;
+                    println!("Imported service '{}'", name.as_str());
                 }
                 Stmt::Update { .. } | Stmt::Atomic { .. } => self.run_update(stmt).await?,
                 Stmt::Import { .. }
@@ -982,10 +995,10 @@ impl Manager {
     pub async fn run_declaration(&mut self, stmt: &Stmt) -> Result<(), String> {
         match stmt {
             Stmt::Service { name, decls } => {
-                self.create_service(*name, decls.clone())
+                self.create_service(name.clone(), decls.clone())
                     .await
                     .map_err(|e| format!("Service error: {}", e))?;
-                println!("Service '{}' loaded", self.interner.get(*name));
+                println!("Service '{}' loaded", name.as_str());
             }
             Stmt::Update { .. } => self
                 .run_update(stmt)
@@ -1016,7 +1029,7 @@ impl Manager {
         txn.poll(self).await?;
         match stmt {
             Stmt::Update { service_name, .. } => {
-                println!("Service '{}' updated", self.interner.get(*service_name))
+                println!("Service '{}' updated", service_name.as_str())
             }
             _ => println!("Atomic update transaction completed ({} updates)", count),
         }
@@ -1062,13 +1075,11 @@ impl Manager {
         name: Symbol,
         decls: Vec<Decl>,
     ) -> Result<(), EvalError> {
-        self.ensure_service_visible(name, None)?;
-        crate::runtime::tt::check::check_unique_members(name, &decls).map_err(|e| {
-            EvalError::RuntimeError(
-                crate::runtime::node::StaticError::Types(e).message(&self.interner),
-            )
+        self.ensure_service_visible(&name, None)?;
+        crate::runtime::tt::check::check_unique_members(&name, &decls).map_err(|e| {
+            EvalError::RuntimeError(crate::runtime::node::StaticError::Types(e).message())
         })?;
-        let id = self.compute_service_net_id(name);
+        let id = self.compute_service_net_id(&name);
         let mut txn = Transaction::new(TxnId::new(self.node_id));
         txn.service_locked.insert(id.clone());
         // Register the service (with its real `ServiceNetId`) before
@@ -1078,25 +1089,25 @@ impl Manager {
         let inserted = !local_service_names(&self.unified_ast).contains(&name);
         if inserted {
             self.unified_ast.push(Stmt::Service {
-                name,
+                name: name.clone(),
                 decls: decls.clone(),
             });
         }
 
-        let mut graphs = self.service_graphs([name]);
+        let mut graphs = self.service_graphs([name.clone()]);
 
         // Earlier services may already depend on this not-yet-created owner.
         // Reuse initialization's deferred publication to complete those inputs.
         let mut listeners: HashMap<_, HashSet<_>> = HashMap::new();
         if !self.remote_services.contains_key(&name) {
             for service in self.services.values() {
-                for (&def, inputs) in &service.graphs.cross_deps {
-                    for &(owner, member) in inputs {
-                        if owner == name {
+                for (def, inputs) in &service.graphs.cross_deps {
+                    for (owner, member) in inputs {
+                        if owner == &name {
                             listeners
-                                .entry(member)
+                                .entry(member.clone())
                                 .or_default()
-                                .insert((service.id.clone(), def));
+                                .insert((service.id.clone(), def.clone()));
                         }
                     }
                 }
@@ -1104,7 +1115,7 @@ impl Manager {
         }
 
         let mut env: Vec<(Symbol, Value)> = vec![];
-        let svc_name = name;
+        let svc_name = name.clone();
 
         let result = async {
             // The graphs must be complete and acyclic, as those recomputed
@@ -1112,10 +1123,10 @@ impl Manager {
             // and do not change
             self.check_graphs(&graphs)?;
             self.services.insert(
-                name,
+                name.clone(),
                 Service {
                     id,
-                    name,
+                    name: name.clone(),
                     vars: HashMap::new(),
                     defs: HashMap::new(),
                     graphs: graphs.remove(&name).unwrap_or_default(),
@@ -1144,7 +1155,7 @@ impl Manager {
                     if is_def { &[] } else { &env },
                     &mut EvalContext {
                         manager: self,
-                        service_name: svc_name,
+                        service_name: svc_name.clone(),
                         txn: Some(&mut txn),
                     },
                 )
@@ -1157,7 +1168,8 @@ impl Manager {
                     let read = self.remote_functions_read(&txn);
                     if read.len() > published {
                         published = read.len();
-                        let mut graphs = self.graphs_of(&self.unified_ast, [svc_name], &read);
+                        let mut graphs =
+                            self.graphs_of(&self.unified_ast, [svc_name.clone()], &read);
                         self.check_graphs(&graphs)?;
                         self.services.get_mut(&svc_name).unwrap().graphs =
                             graphs.remove(&svc_name).unwrap_or_default();
@@ -1169,23 +1181,29 @@ impl Manager {
                     // Sources unknown
                     let inputs: Vec<_> = self.services[&svc_name]
                         .graphs
-                        .inputs(svc_name, name)
+                        .inputs(&svc_name, &name)
                         .collect();
                     // The pairs must form a batch, as any the def later selects
                     let chains: Vec<_> = inputs
                         .iter()
-                        .filter_map(|&input| {
-                            let state =
-                                self.input_candidates((svc_name, name), input, Some(&txn))?;
-                            Some(Chain { input, state })
+                        .filter_map(|input| {
+                            let state = self.input_candidates(
+                                (svc_name.clone(), name.clone()),
+                                input.clone(),
+                                Some(&txn),
+                            )?;
+                            Some(Chain {
+                                input: input.clone(),
+                                state,
+                            })
                         })
                         .collect();
                     let mut selection = vec![0; chains.len()];
                     if !Self::close_batch(&chains, &mut selection) {
                         return Err(EvalError::RuntimeError(format!(
                             "Cannot initialize '{}.{}': input clocks are missing or inconsistent",
-                            self.interner.get(svc_name),
-                            self.interner.get(name),
+                            svc_name.as_str(),
+                            name.as_str(),
                         )));
                     }
                     let (vector_clock, sources) = join_receipts(selected(&chains, &selection));
@@ -1197,12 +1215,12 @@ impl Manager {
                     var_value.vector_clock = vector_clock;
                     var_value.sources = sources.filter(|_| chains.len() == inputs.len());
                 } else {
-                    var_value.sources = Some(Sources::from([(svc_name, name)]));
+                    var_value.sources = Some(Sources::from([(svc_name.clone(), name.clone())]));
                 }
-                env.push((name, var_value.value.clone()));
+                env.push((name.clone(), var_value.value.clone()));
                 var_value.latest_write_txn = Some(txn.id.clone());
                 if let Some(service) = self.services.get_mut(&svc_name) {
-                    service.vars.insert(name, var_value);
+                    service.vars.insert(name.clone(), var_value);
                     if is_def {
                         service.defs.insert(name, val);
                     }
@@ -1215,10 +1233,12 @@ impl Manager {
                 .graphs
                 .cross_deps
                 .iter()
-                .flat_map(|(&def, inputs)| inputs.iter().map(move |&input| (def, input)))
+                .flat_map(|(def, inputs)| {
+                    inputs.iter().map(move |input| (def.clone(), input.clone()))
+                })
                 .filter(|(_, (owner, _))| self.remote_services.contains_key(owner))
                 .filter_map(|(def, input)| {
-                    let key = (self.service_net_id_for_name(input.0), input.1);
+                    let key = (self.service_net_id_for_name(&input.0), input.1.clone());
                     txn.read_cache
                         .get(&key)
                         .map(|entry| (def, input, entry.clone()))
@@ -1242,13 +1262,13 @@ impl Manager {
             // Requests received during initialization remain registered, but
             // receive their initial snapshot only after this instance commits.
             let deferred_members: Vec<_> =
-                self.services[&svc_name].listeners.keys().copied().collect();
+                self.services[&svc_name].listeners.keys().cloned().collect();
             let graphs = std::mem::take(&mut self.services.get_mut(&svc_name).unwrap().graphs);
-            self.update_service_graphs(svc_name, graphs).await;
+            self.update_service_graphs(svc_name.clone(), graphs).await;
             self.services.get_mut(&svc_name).unwrap().initializing = None;
             self.release_all_locks(&txn);
             for member in deferred_members {
-                self.propagate(svc_name, member).await;
+                self.propagate(svc_name.clone(), member).await;
             }
         } else {
             // Initialization only reads participants. Abort releases their locks.
@@ -1293,14 +1313,14 @@ impl Manager {
     pub async fn update_service_graphs(&mut self, svc_name: Symbol, new_graphs: ServiceGraphs) {
         let (updated_id, old_edges, edges) = match self.services.get_mut(&svc_name) {
             Some(service) => {
-                let old_edges: HashSet<_> = Self::listener_edges(svc_name, service).collect();
+                let old_edges: HashSet<_> = Self::listener_edges(service).collect();
                 service.graphs = new_graphs;
                 let graphs = &service.graphs;
                 service.dep_cache.retain(|def, _| graphs.defs.contains(def));
-                for (&def, cache) in service.dep_cache.iter_mut() {
-                    cache.retain(|&input, _| graphs.reads(svc_name, def, input));
+                for (def, cache) in service.dep_cache.iter_mut() {
+                    cache.retain(|input, _| graphs.reads(&svc_name, def, input));
                 }
-                let edges: HashSet<_> = Self::listener_edges(svc_name, service).collect();
+                let edges: HashSet<_> = Self::listener_edges(service).collect();
                 (service.id.clone(), old_edges, edges)
             }
             None => return,
@@ -1308,31 +1328,31 @@ impl Manager {
 
         // The registrations of this service's defs are those its graphs imply:
         // an edge no longer implied is retired, a new one followed
-        for &(owner, member, listener_def) in old_edges.difference(&edges) {
+        for (owner, member, listener_def) in old_edges.difference(&edges) {
             if let Some(listener_set) = self
                 .services
-                .get_mut(&owner)
-                .and_then(|service| service.listeners.get_mut(&member))
+                .get_mut(owner)
+                .and_then(|service| service.listeners.get_mut(member))
             {
-                listener_set.remove(&(updated_id.clone(), listener_def));
+                listener_set.remove(&(updated_id.clone(), listener_def.clone()));
             }
         }
-        for &(owner, member, listener_def) in edges.difference(&old_edges) {
-            self.follow_input((svc_name, listener_def), (owner, member))
-                .await;
+        for (owner, member, listener_def) in edges.difference(&old_edges) {
+            self.follow_input(
+                (svc_name.clone(), listener_def.clone()),
+                (owner.clone(), member.clone()),
+            )
+            .await;
         }
     }
 
     /// The `(owner, member, def)` listener registrations `service`'s graphs imply
-    fn listener_edges(
-        svc_name: Symbol,
-        service: &Service,
-    ) -> impl Iterator<Item = (Symbol, Symbol, Symbol)> + '_ {
+    fn listener_edges(service: &Service) -> impl Iterator<Item = (Symbol, Symbol, Symbol)> + '_ {
         let graphs = &service.graphs;
-        graphs.defs.iter().flat_map(move |&def| {
+        graphs.defs.iter().flat_map(move |def| {
             graphs
-                .inputs(svc_name, def)
-                .map(move |(owner, member)| (owner, member, def))
+                .inputs(&service.name, def)
+                .map(move |(owner, member)| (owner, member, def.clone()))
         })
     }
 
@@ -1340,18 +1360,18 @@ impl Manager {
     /// Ordinary service locks alone cannot protect non-transactional readers.
     pub(crate) fn ensure_service_visible(
         &self,
-        service: Symbol,
+        service: &Symbol,
         txn_id: Option<&TxnId>,
     ) -> Result<(), EvalError> {
         if self
             .services
-            .get(&service)
+            .get(service)
             .and_then(|s| s.initializing.as_ref())
             .is_some_and(|owner| Some(owner) != txn_id)
         {
             return Err(EvalError::RuntimeError(format!(
                 "Service '{}' is still initializing",
-                self.interner.get(service)
+                service.as_str()
             )));
         }
         Ok(())
@@ -1384,18 +1404,21 @@ impl Manager {
             return self.remote_lookup(service_name, var_name, txn).await;
         }
 
-        self.ensure_service_visible(service_name, txn.as_deref().map(|t| &t.id))?;
+        self.ensure_service_visible(&service_name, txn.as_deref().map(|t| &t.id))?;
         // Local var read. If inside a transaction, return the cached value if
         // present, otherwise acquire a read lock lazily and cache the value.
         // Transaction state is keyed by (service id, variable) so the same name
         // in different services never collides.
-        let key = (self.service_net_id_for_name(service_name), var_name);
+        let key = (
+            self.service_net_id_for_name(&service_name),
+            var_name.clone(),
+        );
         if let Some(t) = txn.as_deref_mut() {
             if let Some(cached) = t.read_cache.get(&key) {
                 return Ok(cached.0.clone());
             }
             if !t.locked.contains(&key) {
-                self.acquire_read_lock(service_name, var_name, &t.id)?;
+                self.acquire_read_lock(service_name.clone(), var_name.clone(), &t.id)?;
                 t.locked.insert(key.clone());
             }
         }
@@ -1412,8 +1435,8 @@ impl Manager {
         }
         Err(EvalError::VarNotFound(format!(
             "Variable '{}' not found in service '{}'",
-            self.interner.get(var_name),
-            self.interner.get(service_name)
+            var_name.as_str(),
+            service_name.as_str()
         )))
     }
 
@@ -1431,12 +1454,12 @@ impl Manager {
                 .await;
         }
         let value = self
-            .lookup(var_name, service_name, txn.as_deref_mut())
+            .lookup(var_name.clone(), service_name.clone(), txn.as_deref_mut())
             .await?;
         let (clock, sources) = match txn {
             Some(txn) => {
                 let entry =
-                    &txn.read_cache[&(self.service_net_id_for_name(service_name), var_name)];
+                    &txn.read_cache[&(self.service_net_id_for_name(&service_name), var_name)];
                 (entry.1.clone(), entry.2.clone())
             }
             None => {
@@ -1472,13 +1495,16 @@ impl Manager {
         value: Value,
         txn: Option<&mut Transaction>,
     ) -> Result<(), EvalError> {
-        self.ensure_service_visible(service_name, txn.as_deref().map(|t| &t.id))?;
+        self.ensure_service_visible(&service_name, txn.as_deref().map(|t| &t.id))?;
         // Inside a transaction: acquire the write lock lazily (upgrading from a
         // read lock for read-then-write patterns like x = x + 1) and buffer the
         // write. The buffered value is applied to the service only at commit, so
         // a transaction that fails partway leaves no partial writes behind.
         if txn.is_some() {
-            let key = (self.service_net_id_for_name(service_name), var_name);
+            let key = (
+                self.service_net_id_for_name(&service_name),
+                var_name.clone(),
+            );
             enum LockAction {
                 Acquire,
                 Upgrade,
@@ -1510,8 +1536,11 @@ impl Manager {
         // Non-transactional path: apply the write immediately and propagate.
         // A function value is stored only if the defs applying it keep the
         // reads they were installed with
-        self.check_function_writes([((service_name, var_name), &value)])?;
-        let clock = self.write_clock(VClock::new(), &HashSet::from([(service_name, var_name)]))?;
+        self.check_function_writes([((service_name.clone(), var_name.clone()), &value)])?;
+        let clock = self.write_clock(
+            VClock::new(),
+            &HashSet::from([(service_name.clone(), var_name.clone())]),
+        )?;
         if let Some(service) = self.services.get_mut(&service_name) {
             if let Some(var_state) = service.vars.get_mut(&var_name) {
                 var_state.value = value;
@@ -1521,14 +1550,14 @@ impl Manager {
                 // keep this in mind to guide future development
                 return Err(EvalError::VarNotFound(format!(
                     "Variable '{}' not found in service '{}'",
-                    self.interner.get(var_name),
-                    self.interner.get(service_name)
+                    var_name.as_str(),
+                    service_name.as_str()
                 )));
             }
         } else {
             return Err(EvalError::ServiceNotFound(format!(
                 "Service '{}' not found",
-                self.interner.get(service_name)
+                service_name.as_str()
             )));
         }
 
@@ -1571,7 +1600,7 @@ impl Manager {
         let local_writes: Vec<_> = txn
             .written
             .keys()
-            .filter_map(|(sid, var)| self.service_name_for_net_id(sid).map(|n| (n, *var)))
+            .filter_map(|(sid, var)| self.service_name_for_net_id(sid).map(|n| (n, var.clone())))
             .collect();
         let v_base = join_clocks(
             txn.read_cache
@@ -1607,12 +1636,12 @@ impl Manager {
             for (listener_id, listener_def) in listeners {
                 match self.service_name_for_net_id(&listener_id) {
                     Some(lsvc) => {
-                        if self.recompute_def(lsvc, listener_def).await {
+                        if self.recompute_def(lsvc.clone(), listener_def.clone()).await {
                             worklist.push((lsvc, listener_def));
                         }
                     }
                     None => {
-                        self.emit_update(&listener_id, listener_def, svc, member)
+                        self.emit_update(&listener_id, listener_def, svc.clone(), member.clone())
                             .await;
                     }
                 }
@@ -1632,11 +1661,11 @@ impl Manager {
         (owner, member): (Symbol, Symbol),
         txn: Option<&Transaction>,
     ) -> Option<InputState> {
-        self.ensure_service_visible(owner, txn.map(|txn| &txn.id))
+        self.ensure_service_visible(&owner, txn.map(|txn| &txn.id))
             .ok()?;
         if let Some(entry) = txn.and_then(|txn| {
             txn.read_cache
-                .get(&(self.service_net_id_for_name(owner), member))
+                .get(&(self.service_net_id_for_name(&owner), member.clone()))
         }) {
             return Some(InputState::seeded(entry.clone()));
         }
@@ -1646,7 +1675,7 @@ impl Manager {
                     .get(&svc)?
                     .dep_cache
                     .get(&def)?
-                    .get(&(owner, member))
+                    .get(&(owner.clone(), member.clone()))
             })
             .flatten();
         match delivered {
@@ -1691,7 +1720,7 @@ impl Manager {
         let Some(service) = self.services.get_mut(&svc) else {
             log::warn!(
                 "recompute_def: service '{}' disappeared after recompute",
-                self.interner.get(svc)
+                svc.as_str()
             );
             return false;
         };
@@ -1788,21 +1817,26 @@ impl Manager {
     ) -> Result<Option<bool>, EvalError> {
         let mut chains = Vec::new();
         let mut absent = false;
-        for &input in inputs {
+        for input in inputs {
             if !self.services.contains_key(&input.0) && !self.remote_services.contains_key(&input.0)
             {
                 absent = true;
                 continue;
             }
-            let Some(state) = self.input_candidates((svc, def), input, None) else {
+            let Some(state) =
+                self.input_candidates((svc.clone(), def.clone()), input.clone(), None)
+            else {
                 return Ok(None);
             };
-            chains.push(Chain { input, state });
+            chains.push(Chain {
+                input: input.clone(),
+                state,
+            });
         }
         let mut selection: Vec<_> = chains
             .iter()
-            .map(|chain| match root {
-                Some(root) if chain.input == root => chain.state.incorporated(),
+            .map(|chain| match &root {
+                Some(root) if &chain.input == root => chain.state.incorporated(),
                 _ => 0,
             })
             .collect();
@@ -1812,20 +1846,20 @@ impl Manager {
         let values = chains
             .iter()
             .zip(&selection)
-            .map(|(chain, &i)| (chain.input, chain.state.version(i).0.clone()))
+            .map(|(chain, &i)| (chain.input.clone(), chain.state.version(i).0.clone()))
             .collect();
         let result = super::interpreter::evaluator::eval_with_inputs(
             expr,
             &[],
             &mut EvalContext {
                 manager: self,
-                service_name: svc,
+                service_name: svc.clone(),
                 txn: None,
             },
             Some(&values),
         )
         .await;
-        self.adopt_batch((svc, def), &chains, &selection);
+        self.adopt_batch((svc.clone(), def.clone()), &chains, &selection);
         let value = result?;
         let (clock, sources) = join_receipts(selected(&chains, &selection));
         let sources = sources.filter(|_| !absent);
@@ -1859,8 +1893,8 @@ impl Manager {
         else {
             log::warn!(
                 "recompute_def: def '{}' not found in service '{}'",
-                self.interner.get(def),
-                self.interner.get(svc)
+                def.as_str(),
+                svc.as_str()
             );
             return (false, None);
         };
@@ -1868,25 +1902,32 @@ impl Manager {
         if service.initializing.is_some() {
             return (false, None);
         }
-        let inputs: Vec<_> = service.graphs.inputs(svc, def).collect();
+        let inputs: Vec<_> = service.graphs.inputs(&svc, &def).collect();
         let mut changed = false;
         let mut failed = None;
         let mut base = !delivered;
         let mut waited = HashSet::new();
         loop {
-            let root =
-                if base {
-                    base = false;
-                    None
-                } else {
-                    match inputs.iter().copied().find(|&input| {
-                        !waited.contains(&input) && self.has_pending((svc, def), input)
-                    }) {
-                        Some(root) => Some(root),
-                        None => break,
-                    }
-                };
-            match self.advance_batch((svc, def), &expr, root, &inputs).await {
+            let root = if base {
+                base = false;
+                None
+            } else {
+                match inputs
+                    .iter()
+                    .find(|&input| {
+                        !waited.contains(input)
+                            && self.has_pending((svc.clone(), def.clone()), input.clone())
+                    })
+                    .cloned()
+                {
+                    Some(root) => Some(root),
+                    None => break,
+                }
+            };
+            match self
+                .advance_batch((svc.clone(), def.clone()), &expr, root.clone(), &inputs)
+                .await
+            {
                 Ok(Some(differs)) => {
                     changed |= differs;
                     waited.clear();
@@ -1917,13 +1958,9 @@ impl Manager {
     /// evaluation is logged, as for any propagation; the batches installed
     /// before and after it are notified all the same
     async fn recompute_from(&mut self, svc: Symbol, def: Symbol, delivered: bool) -> bool {
-        let (changed, failed) = self.advance_def((svc, def), delivered).await;
+        let (changed, failed) = self.advance_def((svc, def.clone()), delivered).await;
         if let Some(e) = failed {
-            log::warn!(
-                "propagation of def '{}' failed: {}",
-                self.interner.get(def),
-                e
-            );
+            log::warn!("propagation of def '{}' failed: {}", def.as_str(), e);
         }
         changed
     }
@@ -1937,36 +1974,34 @@ impl Manager {
         &mut self,
         defs: &[(Symbol, Symbol)],
     ) -> Result<Option<(Symbol, Symbol)>, EvalError> {
-        for &(svc, def) in defs {
-            let Some(service) = self.services.get(&svc) else {
-                return Ok(Some((svc, def)));
+        for (svc, def) in defs {
+            let Some(service) = self.services.get(svc) else {
+                return Ok(Some((svc.clone(), def.clone())));
             };
-            if service.vars.contains_key(&def) {
+            if service.vars.contains_key(def) {
                 continue;
             }
-            if !service.defs.contains_key(&def) {
-                return Ok(Some((svc, def)));
+            if !service.defs.contains_key(def) {
+                return Ok(Some((svc.clone(), def.clone())));
             }
-            match self.advance_def((svc, def), false).await {
+            match self.advance_def((svc.clone(), def.clone()), false).await {
                 (false, Some(e)) => {
                     return Err(EvalError::RuntimeError(format!(
                         "Update committed, but '{}.{}' cannot be initialized: {}",
-                        self.interner.get(svc),
-                        self.interner.get(def),
+                        svc.as_str(),
+                        def.as_str(),
                         e
                     )))
                 }
-                (false, None) => return Ok(Some((svc, def))),
+                (false, None) => return Ok(Some((svc.clone(), def.clone()))),
                 // A batch after the one giving the first value failed, as
                 // any propagation may
-                (true, Some(e)) => log::warn!(
-                    "propagation of def '{}' failed: {}",
-                    self.interner.get(def),
-                    e
-                ),
+                (true, Some(e)) => {
+                    log::warn!("propagation of def '{}' failed: {}", def.as_str(), e)
+                }
                 (true, None) => {}
             }
-            self.propagate(svc, def).await;
+            self.propagate(svc.clone(), def.clone()).await;
         }
         Ok(None)
     }
@@ -1996,11 +2031,9 @@ impl Manager {
         let stmts = if pending >= MAX_PENDING_UPDATES_PER_PEER {
             Err("Too many pending updates from this peer".to_string())
         } else {
-            codec::decode_update_service_request(service_name, source, &mut self.interner)
+            codec::validate_update_service_request(service_name, source)
                 .map_err(|e| e.to_string())
-                .and_then(|(_, source)| {
-                    crate::runtime::parser::parse_string(&source, &mut self.interner)
-                })
+                .and_then(|()| crate::runtime::parser::parse_string(source, &mut self.interner))
         };
         let result = match stmts {
             Ok(stmts) => {
@@ -2108,8 +2141,8 @@ impl Manager {
     pub fn uninitialized(&self, (svc, def): (Symbol, Symbol)) -> EvalError {
         EvalError::RuntimeError(format!(
             "Update committed, but '{}.{}' has not received consistent inputs yet",
-            self.interner.get(svc),
-            self.interner.get(def)
+            svc.as_str(),
+            def.as_str()
         ))
     }
 
@@ -2136,7 +2169,7 @@ impl Manager {
         svc: Symbol,
         member: Symbol,
     ) {
-        if self.ensure_service_visible(svc, None).is_err() {
+        if self.ensure_service_visible(&svc, None).is_err() {
             return;
         }
         let reply_to = match self.listener_addrs.get(listener_id) {
@@ -2154,19 +2187,19 @@ impl Manager {
             None => {
                 log::warn!(
                     "emit_update: member '{}' not found in service '{}'",
-                    self.interner.get(member),
-                    self.interner.get(svc)
+                    member.as_str(),
+                    svc.as_str()
                 );
                 return;
             }
         };
-        let net_val = match codec::encode_value(&state.value, &self.interner) {
+        let net_val = match codec::encode_value(&state.value) {
             Ok(nv) => nv,
             Err(e) => {
                 log::warn!(
                     "emit_update: failed to encode value for '{}.{}': {}",
-                    self.interner.get(svc),
-                    self.interner.get(member),
+                    svc.as_str(),
+                    member.as_str(),
                     e
                 );
                 return;
@@ -2174,15 +2207,12 @@ impl Manager {
         };
         let msg = MeerkatMessage::Update {
             listener_service: listener_id.0.clone(),
-            listener_def: self.interner.get(listener_def).to_string(),
-            source_service: self.interner.get(svc).to_string(),
-            member: self.interner.get(member).to_string(),
+            listener_def: listener_def.as_str().to_string(),
+            source_service: svc.as_str().to_string(),
+            member: member.as_str().to_string(),
             value: net_val,
-            clock: codec::encode_clock(&state.vector_clock, &self.interner),
-            sources: state
-                .sources
-                .as_ref()
-                .map(|sources| codec::encode_sources(sources, &self.interner)),
+            clock: codec::encode_clock(&state.vector_clock),
+            sources: state.sources.as_ref().map(codec::encode_sources),
         };
         self.send_oneway(Address::new(&reply_to), msg).await;
     }
@@ -2206,7 +2236,7 @@ impl Manager {
     ) {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT_SUB_ID: AtomicU64 = AtomicU64::new(1);
-        let addr = match self.remote_addr(owner) {
+        let addr = match self.remote_addr(&owner) {
             Ok(a) => a,
             Err(_) => return,
         };
@@ -2214,10 +2244,10 @@ impl Manager {
         let request_id = NEXT_SUB_ID.fetch_add(1, Ordering::SeqCst);
         let msg = MeerkatMessage::RequestUpdates {
             request_id,
-            service: self.interner.get(owner).to_string(),
-            member: self.interner.get(member).to_string(),
+            service: owner.as_str().to_string(),
+            member: member.as_str().to_string(),
             listener_service: this_id.0,
-            listener_def: self.interner.get(listener_def).to_string(),
+            listener_def: listener_def.as_str().to_string(),
             reply_to,
         };
         self.send_oneway(addr, msg).await;
@@ -2237,8 +2267,8 @@ impl Manager {
         // service: one with a value, a def declared whose first value is still
         // to come (a code update introduced it), or one the service being
         // created declares. Without this guard, an unknown member from
-        // untrusted network input would permanently grow listeners,
-        // listener_addrs, and the interner with no-op subscriptions.
+        // untrusted network input would grow listeners and listener_addrs
+        // with no-op subscriptions.
         let Some(service) = self.services.get_mut(&service_sym) else {
             return;
         };
@@ -2253,9 +2283,9 @@ impl Manager {
         }
         service
             .listeners
-            .entry(member_sym)
+            .entry(member_sym.clone())
             .or_default()
-            .insert((listener_id.clone(), listener_def_sym));
+            .insert((listener_id.clone(), listener_def_sym.clone()));
         self.listener_addrs
             .insert(listener_id.clone(), reply_to.clone());
 
@@ -2273,14 +2303,10 @@ impl Manager {
         listener_id: ServiceNetId,
         listener_def_sym: Symbol,
         source: (Symbol, Symbol),
-        value: crate::net::ast::NetValue,
+        value: Value,
         clock: VClock,
         sources: Option<Sources>,
     ) {
-        let value = match codec::decode_value(value, &mut self.interner) {
-            Ok(v) => v,
-            Err(_) => return,
-        };
         let entry = (value, Some(clock), sources);
         // Function code changed the graphs: a delivery refused before may be
         // taken now. Data leaves them as they were
@@ -2302,9 +2328,11 @@ impl Manager {
         source: (Symbol, Symbol),
         entry: ReadEntry,
     ) -> Option<bool> {
-        let (svc, new_code) = self.accept_delivery(listener, def, source, entry).await?;
-        if self.recompute_from(svc, def, true).await {
-            self.propagate(svc, def).await;
+        let (svc, new_code) = self
+            .accept_delivery(listener, def.clone(), source, entry)
+            .await?;
+        if self.recompute_from(svc.clone(), def.clone(), true).await {
+            self.propagate(svc.clone(), def.clone()).await;
         }
         Some(new_code)
     }
@@ -2322,17 +2350,21 @@ impl Manager {
         source: (Symbol, Symbol),
         entry: ReadEntry,
     ) -> Option<(Symbol, bool)> {
-        let (&listener_svc, service) = self
+        let (listener_svc, service) = self
             .services
             .iter()
             .find(|(_, s)| s.id == listener_id && s.defs.contains_key(&listener_def_sym))?;
+        let listener_svc = listener_svc.clone();
         // A member of the def's own service is read in place and has no
         // queue (`input_candidates`): nothing delivered for it is taken
         if source.0 == listener_svc {
             return None;
         }
         // A member the def no longer reads: nothing it could incorporate
-        if !service.graphs.reads(listener_svc, listener_def_sym, source) {
+        if !service
+            .graphs
+            .reads(&listener_svc, &listener_def_sym, &source)
+        {
             return None;
         }
         let held = service
@@ -2349,9 +2381,9 @@ impl Manager {
             .services
             .get_mut(&listener_svc)?
             .dep_cache
-            .entry(listener_def_sym)
+            .entry(listener_def_sym.clone())
             .or_default()
-            .entry(source)
+            .entry(source.clone())
             .or_default();
         // A repeat, or a delivery the def's incorporated pair has overtaken:
         // a late delivery never rolls a history back
@@ -2363,17 +2395,17 @@ impl Manager {
             d.listener != listener_id || d.def != listener_def_sym || d.source != source
         });
         if let Some((held, entry)) = kept {
-            let graphs = self.service_graphs(self.services_reading([source]));
+            let graphs = self.service_graphs(self.services_reading([source.clone()]));
             // Nor is a function taken that would leave a def's reads
             // incomplete or close a cycle: the edge keeps the versions it
             // held, and the delivery waits for the graphs to change
             if let Err(e) = self.check_graphs(&graphs) {
                 log::warn!(
                     "update of {}.{} for {}.{} deferred: {}",
-                    self.interner.get(source.0),
-                    self.interner.get(source.1),
-                    self.interner.get(listener_svc),
-                    self.interner.get(listener_def_sym),
+                    source.0.as_str(),
+                    source.1.as_str(),
+                    listener_svc.as_str(),
+                    listener_def_sym.as_str(),
                     e
                 );
                 if let Some(cache) = self
@@ -2383,7 +2415,7 @@ impl Manager {
                 {
                     match held {
                         Some(held) if held.newest().is_some() => {
-                            cache.insert(source, held);
+                            cache.insert(source.clone(), held);
                         }
                         _ => {
                             cache.remove(&source);
@@ -2448,9 +2480,7 @@ impl Manager {
     /// suspended caller's state remain queued for the next request boundary.
     /// Handle a reactive message, a subscription or an Update: never a reply,
     /// and in need of no request boundary. Any other message is handed back.
-    /// Wire names are validated and interned through the codec, the sole
-    /// interning authority for network data; a message with a bad identifier
-    /// is dropped
+    /// Decode reactive fields through the codec; malformed messages are dropped.
     pub async fn serve_reactive(&mut self, msg: MeerkatMessage) -> Option<MeerkatMessage> {
         match msg {
             MeerkatMessage::RequestUpdates {
@@ -2489,11 +2519,12 @@ impl Manager {
                 clock,
                 sources,
             } => {
-                if let Ok((listener_def_sym, source_sym, member_sym, vclock, sources)) =
+                if let Ok((listener_def_sym, source_sym, member_sym, value, vclock, sources)) =
                     codec::decode_update(
                         &listener_def,
                         &source_service,
                         &member,
+                        value,
                         &mut self.interner,
                         clock,
                         sources,
@@ -2829,14 +2860,11 @@ impl Manager {
     ///
     /// Raises:
     ///     EvalError::ServiceNotFound: If the remote service is not registered
-    pub fn remote_addr(&self, service: Symbol) -> Result<Address, EvalError> {
-        let full_url = self.remote_services.get(&service).ok_or_else(|| {
-            EvalError::ServiceNotFound(format!(
-                "Remote service '{}' not found",
-                self.interner.get(service)
-            ))
+    pub fn remote_addr(&self, service: &Symbol) -> Result<Address, EvalError> {
+        let full_url = self.remote_services.get(service).ok_or_else(|| {
+            EvalError::ServiceNotFound(format!("Remote service '{}' not found", service.as_str()))
         })?;
-        Ok(full_url.node_address(self.interner.get(service)))
+        Ok(full_url.node_address(service.as_str()))
     }
 
     /// Get our local address with peer ID for use as reply_to
@@ -2939,7 +2967,11 @@ impl Manager {
             .await?;
 
         match reply {
-            MeerkatMessage::ServiceCodeResponse { source, .. } => Ok(source),
+            MeerkatMessage::ServiceCodeResponse { source, .. } => {
+                codec::validate_source(&source)
+                    .map_err(|e| EvalError::RemoteDispatchFailed(e.to_string()))?;
+                Ok(source)
+            }
             MeerkatMessage::ServiceCodeError { error, .. } => {
                 Err(EvalError::RemoteDispatchFailed(error))
             }
@@ -2992,7 +3024,7 @@ impl Manager {
         // the def would "stop updating". Re-fetching keeps reads consistent
         // with the owner's buffered state. (Caching provably-immutable reads to
         // save round-trips could be a later optimization.)
-        let addr = self.remote_addr(service)?;
+        let addr = self.remote_addr(&service)?;
         let request_id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
         let reply_to = self.local_reply_addr().await;
         let shared_tid = txn.as_ref().map(|t| t.id.clone());
@@ -3008,8 +3040,8 @@ impl Manager {
 
         let msg = MeerkatMessage::LookupRequest {
             request_id,
-            service: self.interner.get(service).to_string(),
-            member: self.interner.get(member).to_string(),
+            service: service.as_str().to_string(),
+            member: member.as_str().to_string(),
             reply_to,
             txn_id: shared_tid,
         };
@@ -3021,8 +3053,8 @@ impl Manager {
                 request_id,
                 format!(
                     "Timeout waiting for remote lookup of '{}.{}'",
-                    self.interner.get(service),
-                    self.interner.get(member)
+                    service.as_str(),
+                    member.as_str()
                 ),
             )
             .await?;
@@ -3060,7 +3092,7 @@ impl Manager {
                         .values()
                         .any(|s| s.initializing.as_ref() == Some(&txn.id))
                     {
-                        let key = (self.service_net_id_for_name(service), member);
+                        let key = (self.service_net_id_for_name(&service), member);
                         txn.read_cache.insert(key, entry.clone());
                     }
                 }
@@ -3169,15 +3201,15 @@ impl Manager {
         let mut net_stmts = Vec::new();
         for s in &stmts {
             net_stmts.push(
-                codec::encode_action_stmt(s, &self.interner)
+                codec::encode_action_stmt(s)
                     .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?,
             );
         }
 
         let mut net_env = Vec::new();
         for (sym, val) in env {
-            let key_str = self.interner.get(sym).to_string();
-            let enc_val = codec::encode_value(&val, &self.interner)
+            let key_str = sym.as_str().to_string();
+            let enc_val = codec::encode_value(&val)
                 .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?;
             net_env.push((key_str, enc_val));
         }
@@ -3312,7 +3344,7 @@ impl Manager {
                 tid,
             } => {
                 match self
-                    .execute_action_participant(service, &stmts, &env, tid.clone())
+                    .execute_action_participant(service.clone(), &stmts, &env, tid.clone())
                     .await
                 {
                     Err(EvalError::WaitOn(key)) => {
@@ -3336,8 +3368,8 @@ impl Manager {
                                 let (v_base, write_set) =
                                     self.transaction_history(&self.pending_txns[&tid]);
                                 (
-                                    codec::encode_clock(&v_base, &self.interner),
-                                    codec::encode_sources(&write_set, &self.interner),
+                                    codec::encode_clock(&v_base),
+                                    codec::encode_sources(&write_set),
                                 )
                             }
                             Err(_) => (Vec::new(), Vec::new()),
@@ -3361,7 +3393,7 @@ impl Manager {
                 tid,
             } => {
                 match self
-                    .remote_read_participant(service, member, tid.clone())
+                    .remote_read_participant(service.clone(), member.clone(), tid.clone())
                     .await
                 {
                     Err(EvalError::WaitOn(key)) => {
@@ -3447,10 +3479,9 @@ impl Manager {
             .and_then(|(value, clock, sources)| {
                 Ok(MeerkatMessage::LookupResponse {
                     request_id,
-                    value: codec::encode_value(&value, &self.interner)
-                        .map_err(|e| e.to_string())?,
-                    clock: clock.map(|clock| codec::encode_clock(&clock, &self.interner)),
-                    sources: sources.map(|sources| codec::encode_sources(&sources, &self.interner)),
+                    value: codec::encode_value(&value).map_err(|e| e.to_string())?,
+                    clock: clock.map(|clock| codec::encode_clock(&clock)),
+                    sources: sources.map(|sources| codec::encode_sources(&sources)),
                 })
             })
             .unwrap_or_else(|error| MeerkatMessage::LookupError { request_id, error })
@@ -3522,55 +3553,30 @@ impl Manager {
                 reply_to,
                 txn_id,
             } => {
-                if let Err(e) = codec::validate_action_request(&service) {
-                    let response = MeerkatMessage::ActionResponse {
-                        request_id,
-                        success: false,
-                        error: Some(e.to_string()),
-                        history: Vec::new(),
-                        writes: Vec::new(),
-                    };
-                    self.send_oneway(Address::new(&reply_to), response).await;
-                    return None;
-                }
+                let decoded = (|| -> crate::error::Result<_> {
+                    codec::validate_action_request(&service)?;
+                    let stmts = stmts
+                        .into_iter()
+                        .map(|stmt| codec::decode_action_stmt(stmt, &mut self.interner))
+                        .collect::<crate::error::Result<Vec<_>>>()?;
+                    let env = codec::decode_env(action_env, &mut self.interner)?;
+                    Ok((stmts, env))
+                })();
+                let (local_stmts, local_env) = match decoded {
+                    Ok(decoded) => decoded,
+                    Err(e) => {
+                        let response = MeerkatMessage::ActionResponse {
+                            request_id,
+                            success: false,
+                            error: Some(e.to_string()),
+                            history: Vec::new(),
+                            writes: Vec::new(),
+                        };
+                        self.send_oneway(Address::new(&reply_to), response).await;
+                        return None;
+                    }
+                };
                 let svc_sym = self.interner.insert(&service);
-                let mut local_stmts = Vec::new();
-                let mut decode_failed = false;
-                let mut error_msg = None;
-                for s in stmts {
-                    match codec::decode_action_stmt(s, &mut self.interner) {
-                        Ok(ds) => local_stmts.push(ds),
-                        Err(e) => {
-                            decode_failed = true;
-                            error_msg = Some(e.to_string());
-                            break;
-                        }
-                    }
-                }
-                let mut local_env = Vec::new();
-                if !decode_failed {
-                    for (k, v) in action_env {
-                        match codec::decode_value(v, &mut self.interner) {
-                            Ok(dv) => local_env.push((self.interner.insert(&k), dv)),
-                            Err(e) => {
-                                decode_failed = true;
-                                error_msg = Some(e.to_string());
-                                break;
-                            }
-                        }
-                    }
-                }
-                if decode_failed {
-                    let response = MeerkatMessage::ActionResponse {
-                        request_id,
-                        success: false,
-                        error: error_msg,
-                        history: Vec::new(),
-                        writes: Vec::new(),
-                    };
-                    self.send_oneway(Address::new(&reply_to), response).await;
-                    return None;
-                }
                 match txn_id {
                     // Part of a distributed transaction: park if older
                     // than a holder, otherwise reply
@@ -3674,13 +3680,13 @@ impl Manager {
     /// The bare-name fallback is a defensive default for an unknown
     /// name and is not used for genuine remote services, whose
     /// identities travel embedded in their `ActionClosure`s
-    pub fn service_net_id_for_name(&self, service_name: Symbol) -> ServiceNetId {
-        if let Some(service) = self.services.get(&service_name) {
+    pub fn service_net_id_for_name(&self, service_name: &Symbol) -> ServiceNetId {
+        if let Some(service) = self.services.get(service_name) {
             service.id.clone()
-        } else if let Some(addr) = self.remote_services.get(&service_name) {
+        } else if let Some(addr) = self.remote_services.get(service_name) {
             ServiceNetId::new(addr.0.clone())
         } else {
-            ServiceNetId::new(self.interner.get(service_name))
+            ServiceNetId::new(service_name.as_str())
         }
     }
 
@@ -3694,7 +3700,7 @@ impl Manager {
         self.services
             .iter()
             .find(|(_, s)| &s.id == service_net_id)
-            .map(|(n, _)| *n)
+            .map(|(n, _)| n.clone())
     }
 
     /// Split a service identity into the dialable node address and the
@@ -3738,17 +3744,14 @@ impl Manager {
         var: Symbol,
         txn_id: &TxnId,
     ) -> Result<(), EvalError> {
-        let sid = self.service_net_id_for_name(service_name);
+        let sid = self.service_net_id_for_name(&service_name);
         let service = self.services.get_mut(&service_name).ok_or_else(|| {
-            EvalError::ServiceNotFound(format!(
-                "Service '{}' not found",
-                self.interner.get(service_name)
-            ))
+            EvalError::ServiceNotFound(format!("Service '{}' not found", service_name.as_str()))
         })?;
-        service_boundary(service, txn_id, &sid, service_name, &self.interner)?;
+        service_boundary(service, txn_id, &sid, &service_name)?;
         let var_state = service
             .vars
-            .entry(var)
+            .entry(var.clone())
             .or_insert_with(|| VarState::new(Value::Int { val: 0 }));
         if var_state.lock.try_write(txn_id) {
             Ok(())
@@ -3756,7 +3759,7 @@ impl Manager {
             match var_state.lock.wait_die(txn_id) {
                 crate::runtime::txn::WaitDie::Die => Err(EvalError::WaitDieAbort(format!(
                     "transaction died contending for write lock on '{}'",
-                    self.interner.get(var)
+                    var.as_str()
                 ))),
                 crate::runtime::txn::WaitDie::Wait => {
                     Err(EvalError::WaitOn(WaitKey::Member(sid, var)))
@@ -3789,16 +3792,13 @@ impl Manager {
         var: Symbol,
         txn_id: &TxnId,
     ) -> Result<(), EvalError> {
-        let sid = self.service_net_id_for_name(service_name);
+        let sid = self.service_net_id_for_name(&service_name);
         let service = self.services.get_mut(&service_name).ok_or_else(|| {
-            EvalError::ServiceNotFound(format!(
-                "Service '{}' not found",
-                self.interner.get(service_name)
-            ))
+            EvalError::ServiceNotFound(format!("Service '{}' not found", service_name.as_str()))
         })?;
-        service_boundary(service, txn_id, &sid, service_name, &self.interner)?;
+        service_boundary(service, txn_id, &sid, &service_name)?;
         let var_state = service.vars.get_mut(&var).ok_or_else(|| {
-            EvalError::VarNotFound(format!("Variable '{}' not found", self.interner.get(var)))
+            EvalError::VarNotFound(format!("Variable '{}' not found", var.as_str()))
         })?;
         if var_state.lock.try_read(txn_id) {
             Ok(())
@@ -3806,7 +3806,7 @@ impl Manager {
             match var_state.lock.wait_die(txn_id) {
                 crate::runtime::txn::WaitDie::Die => Err(EvalError::WaitDieAbort(format!(
                     "transaction died contending for read lock on '{}'",
-                    self.interner.get(var)
+                    var.as_str()
                 ))),
                 crate::runtime::txn::WaitDie::Wait => {
                     Err(EvalError::WaitOn(WaitKey::Member(sid, var)))
@@ -3838,16 +3838,13 @@ impl Manager {
         var: Symbol,
         txn_id: &TxnId,
     ) -> Result<(), EvalError> {
-        let sid = self.service_net_id_for_name(service_name);
+        let sid = self.service_net_id_for_name(&service_name);
         let service = self.services.get_mut(&service_name).ok_or_else(|| {
-            EvalError::ServiceNotFound(format!(
-                "Service '{}' not found",
-                self.interner.get(service_name)
-            ))
+            EvalError::ServiceNotFound(format!("Service '{}' not found", service_name.as_str()))
         })?;
-        service_boundary(service, txn_id, &sid, service_name, &self.interner)?;
+        service_boundary(service, txn_id, &sid, &service_name)?;
         let var_state = service.vars.get_mut(&var).ok_or_else(|| {
-            EvalError::VarNotFound(format!("Variable '{}' not found", self.interner.get(var)))
+            EvalError::VarNotFound(format!("Variable '{}' not found", var.as_str()))
         })?;
         if var_state.lock.upgrade_to_write(txn_id) {
             Ok(())
@@ -3855,7 +3852,7 @@ impl Manager {
             match var_state.lock.wait_die(txn_id) {
                 crate::runtime::txn::WaitDie::Die => Err(EvalError::WaitDieAbort(format!(
                     "transaction died contending to upgrade lock on '{}'",
-                    self.interner.get(var)
+                    var.as_str()
                 ))),
                 crate::runtime::txn::WaitDie::Wait => {
                     Err(EvalError::WaitOn(WaitKey::Member(sid, var)))
@@ -3868,7 +3865,7 @@ impl Manager {
     fn all_locked_keys(&self, txn: &Transaction) -> HashSet<WaitKey> {
         let mut keys = HashSet::new();
         for (sid, var) in &txn.locked {
-            keys.insert(WaitKey::Member(sid.clone(), *var));
+            keys.insert(WaitKey::Member(sid.clone(), var.clone()));
         }
         for sid in &txn.service_locked {
             keys.insert(WaitKey::Service(sid.clone()));
@@ -3941,9 +3938,10 @@ impl Manager {
             let mut txn = Transaction::new(txn_id.clone());
 
             let mut env: Vec<(Symbol, Value)> = initial_env.to_vec();
-            let mut exec_error = execute_seq(stmts, &mut env, self, service_name, Some(&mut txn))
-                .await
-                .err();
+            let mut exec_error =
+                execute_seq(stmts, &mut env, self, service_name.clone(), Some(&mut txn))
+                    .await
+                    .err();
             // A function value written is committed only if the defs
             // applying it keep the reads they were installed with
             if exec_error.is_none() {
@@ -4002,13 +4000,13 @@ impl Manager {
     fn describe_wait_key(&self, key: &WaitKey) -> String {
         let name_of = |sid: &ServiceNetId| {
             self.service_name_for_net_id(sid)
-                .map(|n| self.interner.get(n).to_string())
+                .map(|n| n.as_str().to_string())
                 .unwrap_or_else(|| sid.0.clone())
         };
         match key {
             WaitKey::Service(sid) => format!("service '{}'", name_of(sid)),
             WaitKey::Member(sid, member) => {
-                format!("'{}.{}'", name_of(sid), self.interner.get(*member))
+                format!("'{}.{}'", name_of(sid), member.as_str())
             }
         }
     }
@@ -4058,7 +4056,7 @@ impl Manager {
         let error = self.commit_participants(txn, clock).await;
         for (sid, var) in txn.written.keys() {
             if let Some(name) = self.service_name_for_net_id(sid) {
-                self.propagate(name, *var).await;
+                self.propagate(name, var.clone()).await;
             }
         }
         error
@@ -4211,12 +4209,9 @@ impl Manager {
         service_name: Symbol,
         txn_id: &TxnId,
     ) -> Result<(), EvalError> {
-        let sid = self.service_net_id_for_name(service_name);
+        let sid = self.service_net_id_for_name(&service_name);
         let service = self.services.get_mut(&service_name).ok_or_else(|| {
-            EvalError::ServiceNotFound(format!(
-                "Service '{}' not found",
-                self.interner.get(service_name)
-            ))
+            EvalError::ServiceNotFound(format!("Service '{}' not found", service_name.as_str()))
         })?;
 
         // Step 1: Check whole-service lock boundary
@@ -4232,7 +4227,7 @@ impl Manager {
             if holder_older {
                 return Err(EvalError::WaitDieAbort(format!(
                     "transaction died contending for service lock on '{}'",
-                    self.interner.get(service_name)
+                    service_name.as_str()
                 )));
             } else {
                 return Err(EvalError::WaitOn(WaitKey::Service(sid.clone())));
@@ -4250,10 +4245,10 @@ impl Manager {
                 if holder_older {
                     return Err(EvalError::WaitDieAbort(format!(
                         "transaction died contending for service lock on '{}'",
-                        self.interner.get(service_name)
+                        service_name.as_str()
                     )));
                 } else {
-                    return Err(EvalError::WaitOn(WaitKey::Member(sid, *var_name)));
+                    return Err(EvalError::WaitOn(WaitKey::Member(sid, var_name.clone())));
                 }
             }
         }
@@ -4353,7 +4348,7 @@ impl Manager {
             let svc_sym = self.interner.insert(svc_name_str);
             if group.service_level_lock {
                 if self.services.contains_key(&svc_sym) {
-                    let net_id = self.service_net_id_for_name(svc_sym);
+                    let net_id = self.service_net_id_for_name(&svc_sym);
                     self.acquire_service_lock(svc_sym, &txn.id)?;
                     txn.service_locked.insert(net_id);
                 } else if self.remote_services.contains_key(&svc_sym) {
@@ -4375,11 +4370,11 @@ impl Manager {
             }
             for r in &group.reads {
                 let var_sym = self.interner.insert(r);
-                queue.push((svc_sym, var_sym, false));
+                queue.push((svc_sym.clone(), var_sym, false));
             }
             for w in &group.writes {
                 let var_sym = self.interner.insert(w);
-                queue.push((svc_sym, var_sym, true));
+                queue.push((svc_sym.clone(), var_sym, true));
             }
         }
 
@@ -4390,33 +4385,33 @@ impl Manager {
                 // dependencies. This prevents a race condition where a
                 // def expression is mutated by another transaction
                 // after we check its dependencies but before we lock it
-                let key = (self.service_net_id_for_name(svc_sym), mem_sym);
+                let key = (self.service_net_id_for_name(&svc_sym), mem_sym.clone());
 
                 if !txn.locked.contains(&key) {
                     // Acquire a new lock since the variable is not
                     // yet locked by the current transaction
                     if is_write {
-                        self.acquire_write_lock(svc_sym, mem_sym, &txn.id)?;
+                        self.acquire_write_lock(svc_sym.clone(), mem_sym.clone(), &txn.id)?;
                     } else {
-                        self.acquire_read_lock(svc_sym, mem_sym, &txn.id)?;
+                        self.acquire_read_lock(svc_sym.clone(), mem_sym.clone(), &txn.id)?;
                     }
                     txn.locked.insert(key);
                 } else if is_write {
                     // Upgrade the existing read lock to a write lock
                     // if a write lock is requested
-                    self.upgrade_to_write_lock(svc_sym, mem_sym, &txn.id)?;
+                    self.upgrade_to_write_lock(svc_sym.clone(), mem_sym.clone(), &txn.id)?;
                 }
 
                 // Queue the member's inputs after locking it. The queue
                 // reaches their inputs in turn, each member expanded once
-                if visited.insert((svc_sym, mem_sym)) {
+                if visited.insert((svc_sym.clone(), mem_sym.clone())) {
                     if let Some(service) = self.services.get(&svc_sym) {
-                        for (owner, input) in service.graphs.inputs(svc_sym, mem_sym) {
+                        for (owner, input) in service.graphs.inputs(&svc_sym, &mem_sym) {
                             if self.remote_services.contains_key(&owner) {
                                 // Track remote dependencies for a
                                 // remote service to request them
                                 // as a batch later
-                                let input_str = self.interner.get(input).to_string();
+                                let input_str = input.as_str().to_string();
                                 let entry =
                                     remote_locks.entry(owner).or_insert_with(|| LockGroup {
                                         service_level_lock: false,
@@ -4435,7 +4430,7 @@ impl Manager {
             } else if self.remote_services.contains_key(&svc_sym) {
                 // Accumulate remote lock requirements mapped to their
                 // host node address
-                let mem_str = self.interner.get(mem_sym).to_string();
+                let mem_str = mem_sym.as_str().to_string();
                 let entry = remote_locks.entry(svc_sym).or_insert_with(|| LockGroup {
                     service_level_lock: false,
                     reads: HashSet::new(),
@@ -4452,8 +4447,8 @@ impl Manager {
         // 4. Build and send remote lock requests
         let mut node_requests: HashMap<Address, HashMap<String, LockGroup>> = HashMap::new();
         for (remote_svc, group) in remote_locks {
-            if let Ok(addr) = self.remote_addr(remote_svc) {
-                let svc_name_str = self.interner.get(remote_svc).to_string();
+            if let Ok(addr) = self.remote_addr(&remote_svc) {
+                let svc_name_str = remote_svc.as_str().to_string();
                 node_requests
                     .entry(addr)
                     .or_default()
@@ -4518,7 +4513,7 @@ impl Manager {
             request_id,
             txn_id: tid.clone(),
             reply_to,
-            clock: codec::encode_clock(clock, &self.interner),
+            clock: codec::encode_clock(clock),
         };
         let reply = self
             .send_and_await_reply(
@@ -4654,18 +4649,18 @@ mod tests {
         // service s1 { var x = 1; pub def y = x + 1; }
         let s1_decls = vec![
             Decl::VarDecl {
-                name: tc.x,
+                name: tc.x.clone(),
                 ty: None,
                 val: Expr::Literal {
                     val: Value::Int { val: 1 },
                 },
             },
             Decl::DefDecl {
-                name: tc.y,
+                name: tc.y.clone(),
                 ty: None,
                 val: Expr::Binop {
                     op: crate::ast::BinOp::Add,
-                    expr1: Box::new(Expr::Variable { name: tc.x }),
+                    expr1: Box::new(Expr::Variable { name: tc.x.clone() }),
                     expr2: Box::new(Expr::Literal {
                         val: Value::Int { val: 1 },
                     }),
@@ -4673,17 +4668,20 @@ mod tests {
                 is_pub: true,
             },
         ];
-        tc.manager.create_service(tc.s1, s1_decls).await.unwrap();
+        tc.manager
+            .create_service(tc.s1.clone(), s1_decls)
+            .await
+            .unwrap();
 
         // service s2 { pub def z = s1.y + 2; }
         let s2_decls = vec![Decl::DefDecl {
-            name: z,
+            name: z.clone(),
             ty: None,
             val: Expr::Binop {
                 op: crate::ast::BinOp::Add,
                 expr1: Box::new(Expr::MemberAccess {
-                    service_name: tc.s1,
-                    member_name: tc.y,
+                    service_name: tc.s1.clone(),
+                    member_name: tc.y.clone(),
                 }),
                 expr2: Box::new(Expr::Literal {
                     val: Value::Int { val: 2 },
@@ -4691,7 +4689,10 @@ mod tests {
             },
             is_pub: true,
         }];
-        tc.manager.create_service(tc.s2, s2_decls).await.unwrap();
+        tc.manager
+            .create_service(tc.s2.clone(), s2_decls)
+            .await
+            .unwrap();
 
         // initial z = (1 + 1) + 2 = 4
         assert_eq!(
@@ -4723,7 +4724,7 @@ mod tests {
 
         // s1.x = 4  ->  s1.y = 5  ->  s2.z = 7, eagerly via the cascade
         tc.manager
-            .assign(tc.s1, tc.x, Value::Int { val: 4 }, None)
+            .assign(tc.s1.clone(), tc.x.clone(), Value::Int { val: 4 }, None)
             .await
             .unwrap();
 
@@ -4750,18 +4751,18 @@ mod tests {
 
         let s1_decls = vec![
             Decl::VarDecl {
-                name: tc.x,
+                name: tc.x.clone(),
                 ty: None,
                 val: Expr::Literal {
                     val: Value::Int { val: 1 },
                 },
             },
             Decl::DefDecl {
-                name: tc.y,
+                name: tc.y.clone(),
                 ty: None,
                 val: Expr::Binop {
                     op: crate::ast::BinOp::Add,
-                    expr1: Box::new(Expr::Variable { name: tc.x }),
+                    expr1: Box::new(Expr::Variable { name: tc.x.clone() }),
                     expr2: Box::new(Expr::Literal {
                         val: Value::Int { val: 1 },
                     }),
@@ -4769,16 +4770,19 @@ mod tests {
                 is_pub: true,
             },
         ];
-        tc.manager.create_service(tc.s1, s1_decls).await.unwrap();
+        tc.manager
+            .create_service(tc.s1.clone(), s1_decls)
+            .await
+            .unwrap();
 
         let s2_decls = vec![Decl::DefDecl {
-            name: z,
+            name: z.clone(),
             ty: None,
             val: Expr::Binop {
                 op: crate::ast::BinOp::Add,
                 expr1: Box::new(Expr::MemberAccess {
-                    service_name: tc.s1,
-                    member_name: tc.y,
+                    service_name: tc.s1.clone(),
+                    member_name: tc.y.clone(),
                 }),
                 expr2: Box::new(Expr::Literal {
                     val: Value::Int { val: 2 },
@@ -4786,23 +4790,26 @@ mod tests {
             },
             is_pub: true,
         }];
-        tc.manager.create_service(tc.s2, s2_decls).await.unwrap();
+        tc.manager
+            .create_service(tc.s2.clone(), s2_decls)
+            .await
+            .unwrap();
 
         let s2_id = tc.manager.services.get(&tc.s2).unwrap().id.0.clone();
-        let net_val = codec::encode_value(&Value::Int { val: 10 }, &tc.manager.interner).unwrap();
+        let value = Value::Int { val: 10 };
 
         // simulate a remote Update saying s1.y = 10, stamped with s1.y's clock.
         // z's only input is this cross-service member, so the gate joins a single
         // clock and passes trivially regardless of its contents.
         let z_sym = tc.manager.interner.insert("z");
-        let clock: VClock = HashMap::from([((tc.s1, tc.y), 1u64)]);
+        let clock: VClock = HashMap::from([((tc.s1.clone(), tc.y.clone()), 1u64)]);
         let sources = tc.manager.services[&tc.s1].vars[&tc.y].sources.clone();
         tc.manager
             .handle_update(
                 ServiceNetId(s2_id),
                 z_sym,
-                (tc.s1, tc.y),
-                net_val,
+                (tc.s1.clone(), tc.y.clone()),
+                value,
                 clock,
                 sources,
             )
@@ -4829,18 +4836,18 @@ mod tests {
         let mut tc = TestContext::new();
         let s1_decls = vec![
             Decl::VarDecl {
-                name: tc.x,
+                name: tc.x.clone(),
                 ty: None,
                 val: Expr::Literal {
                     val: Value::Int { val: 1 },
                 },
             },
             Decl::DefDecl {
-                name: tc.y,
+                name: tc.y.clone(),
                 ty: None,
                 val: Expr::Binop {
                     op: crate::ast::BinOp::Add,
-                    expr1: Box::new(Expr::Variable { name: tc.x }),
+                    expr1: Box::new(Expr::Variable { name: tc.x.clone() }),
                     expr2: Box::new(Expr::Literal {
                         val: Value::Int { val: 1 },
                     }),
@@ -4848,15 +4855,18 @@ mod tests {
                 is_pub: true,
             },
         ];
-        tc.manager.create_service(tc.s1, s1_decls).await.unwrap();
+        tc.manager
+            .create_service(tc.s1.clone(), s1_decls)
+            .await
+            .unwrap();
 
         let z = tc.manager.interner.insert("z");
         tc.manager
             .handle_request_updates(
-                tc.s1,
-                tc.y,
+                tc.s1.clone(),
+                tc.y.clone(),
                 ServiceNetId("remote-s2-id".to_string()),
-                z,
+                z.clone(),
                 "/ip4/1.2.3.4/tcp/9".to_string(),
             )
             .await;
@@ -4925,14 +4935,21 @@ mod tests {
     async fn test_create_service_with_var() {
         let mut tc = TestContext::new();
         let decls = vec![Decl::VarDecl {
-            name: tc.x,
+            name: tc.x.clone(),
             ty: None,
             val: Expr::Literal {
                 val: Value::Int { val: 1 },
             },
         }];
-        tc.manager.create_service(tc.foo, decls).await.unwrap();
-        let result = tc.manager.lookup(tc.x, tc.foo, None).await.unwrap();
+        tc.manager
+            .create_service(tc.foo.clone(), decls)
+            .await
+            .unwrap();
+        let result = tc
+            .manager
+            .lookup(tc.x.clone(), tc.foo.clone(), None)
+            .await
+            .unwrap();
         assert_eq!(result, Value::Int { val: 1 });
     }
 
@@ -4941,18 +4958,18 @@ mod tests {
         let mut tc = TestContext::new();
         let decls = vec![
             Decl::VarDecl {
-                name: tc.x,
+                name: tc.x.clone(),
                 ty: None,
                 val: Expr::Literal {
                     val: Value::Int { val: 2 },
                 },
             },
             Decl::DefDecl {
-                name: tc.f,
+                name: tc.f.clone(),
                 ty: None,
                 val: Expr::Binop {
                     op: crate::ast::BinOp::Add,
-                    expr1: Box::new(Expr::Variable { name: tc.x }),
+                    expr1: Box::new(Expr::Variable { name: tc.x.clone() }),
                     expr2: Box::new(Expr::Literal {
                         val: Value::Int { val: 3 },
                     }),
@@ -4960,8 +4977,15 @@ mod tests {
                 is_pub: true,
             },
         ];
-        tc.manager.create_service(tc.foo, decls).await.unwrap();
-        let result = tc.manager.lookup(tc.f, tc.foo, None).await.unwrap();
+        tc.manager
+            .create_service(tc.foo.clone(), decls)
+            .await
+            .unwrap();
+        let result = tc
+            .manager
+            .lookup(tc.f.clone(), tc.foo.clone(), None)
+            .await
+            .unwrap();
         assert_eq!(result, Value::Int { val: 5 });
     }
 
@@ -4976,18 +5000,18 @@ mod tests {
         let mut tc = TestContext::new();
         let decls = vec![
             Decl::VarDecl {
-                name: tc.x,
+                name: tc.x.clone(),
                 ty: None,
                 val: Expr::Literal {
                     val: Value::Int { val: 2 },
                 },
             },
             Decl::DefDecl {
-                name: tc.y,
+                name: tc.y.clone(),
                 ty: None,
                 val: Expr::Binop {
                     op: crate::ast::BinOp::Add,
-                    expr1: Box::new(Expr::Variable { name: tc.x }),
+                    expr1: Box::new(Expr::Variable { name: tc.x.clone() }),
                     expr2: Box::new(Expr::Literal {
                         val: Value::Int { val: 1 },
                     }),
@@ -4995,16 +5019,20 @@ mod tests {
                 is_pub: true,
             },
         ];
-        tc.manager.create_service(tc.foo, decls).await.unwrap();
+        tc.manager
+            .create_service(tc.foo.clone(), decls)
+            .await
+            .unwrap();
 
         // Stand in for an outer recompute with its own cross-service dep
         // among its fixed inputs.
-        let outer: HashMap<(Symbol, Symbol), Value> = [((tc.s1, tc.w), Value::Int { val: 7 })]
-            .into_iter()
-            .collect();
+        let outer: HashMap<(Symbol, Symbol), Value> =
+            [((tc.s1.clone(), tc.w.clone()), Value::Int { val: 7 })]
+                .into_iter()
+                .collect();
         let read_w = Expr::MemberAccess {
-            service_name: tc.s1,
-            member_name: tc.w,
+            service_name: tc.s1.clone(),
+            member_name: tc.w.clone(),
         };
         let read = async |manager: &mut Manager| {
             super::super::interpreter::evaluator::eval_with_inputs(
@@ -5012,7 +5040,7 @@ mod tests {
                 &[],
                 &mut EvalContext {
                     manager,
-                    service_name: tc.foo,
+                    service_name: tc.foo.clone(),
                     txn: None,
                 },
                 Some(&outer),
@@ -5022,7 +5050,7 @@ mod tests {
         };
         let before = read(&mut tc.manager).await;
 
-        tc.manager.recompute_def(tc.foo, tc.y).await;
+        tc.manager.recompute_def(tc.foo.clone(), tc.y.clone()).await;
 
         assert_eq!(
             (before, read(&mut tc.manager).await),
@@ -5054,7 +5082,7 @@ mod tests {
         let prog = vec![
             Stmt::Import {
                 path: "dep.mkt".to_string(),
-                service_name: dep,
+                service_name: dep.clone(),
             },
             service_stmt(&mut interner, "app", 0),
         ];
@@ -5186,8 +5214,14 @@ mod tests {
     #[tokio::test]
     async fn test_lookup_missing_var_returns_error() {
         let mut tc = TestContext::new();
-        tc.manager.create_service(tc.foo, vec![]).await.unwrap();
-        let result = tc.manager.lookup(tc.nonexistent, tc.foo, None).await;
+        tc.manager
+            .create_service(tc.foo.clone(), vec![])
+            .await
+            .unwrap();
+        let result = tc
+            .manager
+            .lookup(tc.nonexistent, tc.foo.clone(), None)
+            .await;
         assert!(result.is_err());
     }
 
@@ -5196,18 +5230,18 @@ mod tests {
         let mut tc = TestContext::new();
         let decls = vec![
             Decl::VarDecl {
-                name: tc.x,
+                name: tc.x.clone(),
                 ty: None,
                 val: Expr::Literal {
                     val: Value::Int { val: 1 },
                 },
             },
             Decl::DefDecl {
-                name: tc.f,
+                name: tc.f.clone(),
                 ty: None,
                 val: Expr::Binop {
                     op: crate::ast::BinOp::Add,
-                    expr1: Box::new(Expr::Variable { name: tc.x }),
+                    expr1: Box::new(Expr::Variable { name: tc.x.clone() }),
                     expr2: Box::new(Expr::Literal {
                         val: Value::Int { val: 10 },
                     }),
@@ -5215,18 +5249,29 @@ mod tests {
                 is_pub: true,
             },
         ];
-        tc.manager.create_service(tc.foo, decls).await.unwrap();
+        tc.manager
+            .create_service(tc.foo.clone(), decls)
+            .await
+            .unwrap();
 
         // f should be 11 initially
-        let result = tc.manager.lookup(tc.f, tc.foo, None).await.unwrap();
+        let result = tc
+            .manager
+            .lookup(tc.f.clone(), tc.foo.clone(), None)
+            .await
+            .unwrap();
         assert_eq!(result, Value::Int { val: 11 });
 
         // update x to 5, f should become 15
         tc.manager
-            .assign(tc.foo, tc.x, Value::Int { val: 5 }, None)
+            .assign(tc.foo.clone(), tc.x.clone(), Value::Int { val: 5 }, None)
             .await
             .unwrap();
-        let result = tc.manager.lookup(tc.f, tc.foo, None).await.unwrap();
+        let result = tc
+            .manager
+            .lookup(tc.f.clone(), tc.foo.clone(), None)
+            .await
+            .unwrap();
         assert_eq!(result, Value::Int { val: 15 });
     }
 
@@ -5265,41 +5310,56 @@ mod tests {
 
         let decls = vec![
             Decl::VarDecl {
-                name: tc.x,
+                name: tc.x.clone(),
                 ty: None,
                 val: lit_int(1),
             },
             Decl::DefDecl {
-                name: a,
+                name: a.clone(),
                 ty: None,
-                val: mk_add(Expr::Variable { name: tc.x }, lit_int(10)),
+                val: mk_add(Expr::Variable { name: tc.x.clone() }, lit_int(10)),
                 is_pub: true,
             },
             Decl::DefDecl {
-                name: b,
+                name: b.clone(),
                 ty: None,
-                val: mk_add(Expr::Variable { name: tc.x }, lit_int(20)),
+                val: mk_add(Expr::Variable { name: tc.x.clone() }, lit_int(20)),
                 is_pub: true,
             },
             Decl::DefDecl {
-                name: q,
+                name: q.clone(),
                 ty: None,
-                val: mk_add(Expr::Variable { name: a }, Expr::Variable { name: b }),
+                val: mk_add(
+                    Expr::Variable { name: a.clone() },
+                    Expr::Variable { name: b.clone() },
+                ),
                 is_pub: true,
             },
         ];
-        tc.manager.create_service(tc.foo, decls).await.unwrap();
+        tc.manager
+            .create_service(tc.foo.clone(), decls)
+            .await
+            .unwrap();
 
         // initial: a = 11, b = 21, q = 32
-        assert_eq!(tc.manager.lookup(q, tc.foo, None).await.unwrap(), vint(32));
+        assert_eq!(
+            tc.manager
+                .lookup(q.clone(), tc.foo.clone(), None)
+                .await
+                .unwrap(),
+            vint(32)
+        );
 
         // write x = 2  ->  a = 12, b = 22, q = 34
         tc.manager
-            .assign(tc.foo, tc.x, vint(2), None)
+            .assign(tc.foo.clone(), tc.x.clone(), vint(2), None)
             .await
             .unwrap();
         assert_eq!(
-            tc.manager.lookup(q, tc.foo, None).await.unwrap(),
+            tc.manager
+                .lookup(q.clone(), tc.foo.clone(), None)
+                .await
+                .unwrap(),
             vint(34),
             "sink must reflect the fully-updated generation, never a glitch (33)"
         );
@@ -5307,7 +5367,7 @@ mod tests {
         // one write to x => generation 1 on dimension (foo, x). Every node on the
         // frontier — the two intermediates and the sink — must agree on it.
         let foo = tc.manager.services.get(&tc.foo).unwrap();
-        let frontier: VClock = HashMap::from([((tc.foo, tc.x), 1u64)]);
+        let frontier: VClock = HashMap::from([((tc.foo.clone(), tc.x.clone()), 1u64)]);
         assert_eq!(
             foo.vars.get(&tc.x).unwrap().vector_clock,
             frontier,
@@ -5361,41 +5421,59 @@ mod tests {
 
         let decls = vec![
             Decl::VarDecl {
-                name: tc.x,
+                name: tc.x.clone(),
                 ty: None,
                 val: lit_int(1),
             },
             Decl::DefDecl {
-                name: a,
+                name: a.clone(),
                 ty: None,
-                val: mk_add(Expr::Variable { name: tc.x }, lit_int(10)),
+                val: mk_add(Expr::Variable { name: tc.x.clone() }, lit_int(10)),
                 is_pub: true,
             },
             Decl::DefDecl {
-                name: q,
+                name: q.clone(),
                 ty: None,
-                val: mk_add(Expr::Variable { name: a }, Expr::Variable { name: tc.x }),
+                val: mk_add(
+                    Expr::Variable { name: a.clone() },
+                    Expr::Variable { name: tc.x.clone() },
+                ),
                 is_pub: true,
             },
         ];
-        tc.manager.create_service(tc.foo, decls).await.unwrap();
+        tc.manager
+            .create_service(tc.foo.clone(), decls)
+            .await
+            .unwrap();
 
-        let gen1: VClock = HashMap::from([((tc.foo, tc.x), 1u64)]);
-        let gen2: VClock = HashMap::from([((tc.foo, tc.x), 2u64)]);
+        let gen1: VClock = HashMap::from([((tc.foo.clone(), tc.x.clone()), 1u64)]);
+        let gen2: VClock = HashMap::from([((tc.foo.clone(), tc.x.clone()), 2u64)]);
 
         // settle at generation 1: x = 2, a = 12, q = 14
         tc.manager
-            .assign(tc.foo, tc.x, vint(2), None)
+            .assign(tc.foo.clone(), tc.x.clone(), vint(2), None)
             .await
             .unwrap();
-        assert_eq!(tc.manager.lookup(q, tc.foo, None).await.unwrap(), vint(14));
+        assert_eq!(
+            tc.manager
+                .lookup(q.clone(), tc.foo.clone(), None)
+                .await
+                .unwrap(),
+            vint(14)
+        );
 
         // stage the inconsistency: x jumps to generation 2 with a new value,
         // while a is left behind at generation 1 with its old value.
-        stage_node(&mut tc.manager, tc.foo, tc.x, vint(5), gen2.clone());
+        stage_node(
+            &mut tc.manager,
+            tc.foo.clone(),
+            tc.x.clone(),
+            vint(5),
+            gen2.clone(),
+        );
 
         // gate must DEFER: a (gen 1) lags x (gen 2) on dimension (foo, x).
-        let changed = tc.manager.recompute_def(tc.foo, q).await;
+        let changed = tc.manager.recompute_def(tc.foo.clone(), q.clone()).await;
         assert!(!changed, "gate should defer while a is stale relative to x");
         {
             let foo = tc.manager.services.get(&tc.foo).unwrap();
@@ -5412,8 +5490,8 @@ mod tests {
         }
 
         // a catches up to generation 2; now the gate passes and q recomputes.
-        stage_node(&mut tc.manager, tc.foo, a, vint(15), gen2.clone());
-        let changed = tc.manager.recompute_def(tc.foo, q).await;
+        stage_node(&mut tc.manager, tc.foo.clone(), a, vint(15), gen2.clone());
+        let changed = tc.manager.recompute_def(tc.foo.clone(), q.clone()).await;
         assert!(changed, "gate should pass once a reaches generation 2");
         {
             let foo = tc.manager.services.get(&tc.foo).unwrap();
@@ -5445,13 +5523,12 @@ mod tests {
         value: Value,
         clock: VClock,
     ) {
-        let net_val = codec::encode_value(&value, &mgr.interner).unwrap();
         let sources = mgr.services[&source].vars[&member].sources.clone();
         mgr.handle_update(
             ServiceNetId(listener_net_id.to_string()),
             listener_def,
             (source, member),
-            net_val,
+            value,
             clock,
             sources,
         )
@@ -5465,44 +5542,50 @@ mod tests {
     // its delivered dep_cache, the result would be visibly wrong rather than
     // coincidentally correct.
     async fn setup_remote_diamond(tc: &mut TestContext, a: Symbol, b: Symbol, z: Symbol) -> String {
-        let w = || Expr::Variable { name: tc.w };
+        let w = || Expr::Variable { name: tc.w.clone() };
         let s1_decls = vec![
             Decl::VarDecl {
-                name: tc.w,
+                name: tc.w.clone(),
                 ty: None,
                 val: lit_int(0),
             },
             Decl::DefDecl {
-                name: a,
+                name: a.clone(),
                 ty: None,
                 val: mk_add(w(), lit_int(10)),
                 is_pub: true,
             },
             Decl::DefDecl {
-                name: b,
+                name: b.clone(),
                 ty: None,
                 val: mk_add(w(), lit_int(20)),
                 is_pub: true,
             },
         ];
-        tc.manager.create_service(tc.s1, s1_decls).await.unwrap();
+        tc.manager
+            .create_service(tc.s1.clone(), s1_decls)
+            .await
+            .unwrap();
 
         let s2_decls = vec![Decl::DefDecl {
             name: z,
             ty: None,
             val: mk_add(
                 Expr::MemberAccess {
-                    service_name: tc.s1,
+                    service_name: tc.s1.clone(),
                     member_name: a,
                 },
                 Expr::MemberAccess {
-                    service_name: tc.s1,
+                    service_name: tc.s1.clone(),
                     member_name: b,
                 },
             ),
             is_pub: true,
         }];
-        tc.manager.create_service(tc.s2, s2_decls).await.unwrap();
+        tc.manager
+            .create_service(tc.s2.clone(), s2_decls)
+            .await
+            .unwrap();
         tc.manager.services.get(&tc.s2).unwrap().id.0.clone()
     }
 
@@ -5520,19 +5603,43 @@ mod tests {
         let a = tc.manager.interner.insert("a");
         let b = tc.manager.interner.insert("b");
         let z = tc.manager.interner.insert("z");
-        let s2_id = setup_remote_diamond(&mut tc, a, b, z).await;
+        let s2_id = setup_remote_diamond(&mut tc, a.clone(), b.clone(), z.clone()).await;
 
         // generation 1: both arms carry (s1,w):1, plus their own dimension. z
         // cannot compute until both are cached, so it settles on the 2nd arrival.
-        let clk_a1: VClock = HashMap::from([((tc.s1, tc.w), 1u64), ((tc.s1, a), 1u64)]);
-        let clk_b1: VClock = HashMap::from([((tc.s1, tc.w), 1u64), ((tc.s1, b), 1u64)]);
-        deliver_update(&mut tc.manager, &s2_id, z, tc.s1, a, vint(11), clk_a1).await;
-        deliver_update(&mut tc.manager, &s2_id, z, tc.s1, b, vint(21), clk_b1).await;
+        let clk_a1: VClock = HashMap::from([
+            ((tc.s1.clone(), tc.w.clone()), 1u64),
+            ((tc.s1.clone(), a.clone()), 1u64),
+        ]);
+        let clk_b1: VClock = HashMap::from([
+            ((tc.s1.clone(), tc.w.clone()), 1u64),
+            ((tc.s1.clone(), b.clone()), 1u64),
+        ]);
+        deliver_update(
+            &mut tc.manager,
+            &s2_id,
+            z.clone(),
+            tc.s1.clone(),
+            a.clone(),
+            vint(11),
+            clk_a1,
+        )
+        .await;
+        deliver_update(
+            &mut tc.manager,
+            &s2_id,
+            z.clone(),
+            tc.s1.clone(),
+            b.clone(),
+            vint(21),
+            clk_b1,
+        )
+        .await;
 
         let z_gen1: VClock = HashMap::from([
-            ((tc.s1, tc.w), 1u64),
-            ((tc.s1, a), 1u64),
-            ((tc.s1, b), 1u64),
+            ((tc.s1.clone(), tc.w.clone()), 1u64),
+            ((tc.s1.clone(), a.clone()), 1u64),
+            ((tc.s1.clone(), b.clone()), 1u64),
         ]);
         {
             let vs = tc
@@ -5557,15 +5664,39 @@ mod tests {
         // generation 2: advance both arms consistently on (s1,w):2. The lone
         // a@gen-2 arrival transiently disagrees with the still-cached b@gen-1 and
         // is deferred by the gate; only once b@gen-2 lands does z advance.
-        let clk_a2: VClock = HashMap::from([((tc.s1, tc.w), 2u64), ((tc.s1, a), 2u64)]);
-        let clk_b2: VClock = HashMap::from([((tc.s1, tc.w), 2u64), ((tc.s1, b), 2u64)]);
-        deliver_update(&mut tc.manager, &s2_id, z, tc.s1, a, vint(12), clk_a2).await;
-        deliver_update(&mut tc.manager, &s2_id, z, tc.s1, b, vint(22), clk_b2).await;
+        let clk_a2: VClock = HashMap::from([
+            ((tc.s1.clone(), tc.w.clone()), 2u64),
+            ((tc.s1.clone(), a.clone()), 2u64),
+        ]);
+        let clk_b2: VClock = HashMap::from([
+            ((tc.s1.clone(), tc.w.clone()), 2u64),
+            ((tc.s1.clone(), b.clone()), 2u64),
+        ]);
+        deliver_update(
+            &mut tc.manager,
+            &s2_id,
+            z.clone(),
+            tc.s1.clone(),
+            a.clone(),
+            vint(12),
+            clk_a2,
+        )
+        .await;
+        deliver_update(
+            &mut tc.manager,
+            &s2_id,
+            z.clone(),
+            tc.s1.clone(),
+            b.clone(),
+            vint(22),
+            clk_b2,
+        )
+        .await;
 
         let z_gen2: VClock = HashMap::from([
-            ((tc.s1, tc.w), 2u64),
-            ((tc.s1, a), 2u64),
-            ((tc.s1, b), 2u64),
+            ((tc.s1.clone(), tc.w.clone()), 2u64),
+            ((tc.s1.clone(), a), 2u64),
+            ((tc.s1.clone(), b), 2u64),
         ]);
         let vs = tc
             .manager
@@ -5598,18 +5729,42 @@ mod tests {
         let a = tc.manager.interner.insert("a");
         let b = tc.manager.interner.insert("b");
         let z = tc.manager.interner.insert("z");
-        let s2_id = setup_remote_diamond(&mut tc, a, b, z).await;
+        let s2_id = setup_remote_diamond(&mut tc, a.clone(), b.clone(), z.clone()).await;
 
         // settle a consistent generation-1 frontier: z = 11 + 21 = 32.
-        let clk_a1: VClock = HashMap::from([((tc.s1, tc.w), 1u64), ((tc.s1, a), 1u64)]);
-        let clk_b1: VClock = HashMap::from([((tc.s1, tc.w), 1u64), ((tc.s1, b), 1u64)]);
-        deliver_update(&mut tc.manager, &s2_id, z, tc.s1, a, vint(11), clk_a1).await;
-        deliver_update(&mut tc.manager, &s2_id, z, tc.s1, b, vint(21), clk_b1).await;
+        let clk_a1: VClock = HashMap::from([
+            ((tc.s1.clone(), tc.w.clone()), 1u64),
+            ((tc.s1.clone(), a.clone()), 1u64),
+        ]);
+        let clk_b1: VClock = HashMap::from([
+            ((tc.s1.clone(), tc.w.clone()), 1u64),
+            ((tc.s1.clone(), b.clone()), 1u64),
+        ]);
+        deliver_update(
+            &mut tc.manager,
+            &s2_id,
+            z.clone(),
+            tc.s1.clone(),
+            a.clone(),
+            vint(11),
+            clk_a1,
+        )
+        .await;
+        deliver_update(
+            &mut tc.manager,
+            &s2_id,
+            z.clone(),
+            tc.s1.clone(),
+            b.clone(),
+            vint(21),
+            clk_b1,
+        )
+        .await;
 
         let z_gen1: VClock = HashMap::from([
-            ((tc.s1, tc.w), 1u64),
-            ((tc.s1, a), 1u64),
-            ((tc.s1, b), 1u64),
+            ((tc.s1.clone(), tc.w.clone()), 1u64),
+            ((tc.s1.clone(), a.clone()), 1u64),
+            ((tc.s1.clone(), b.clone()), 1u64),
         ]);
         assert_eq!(
             tc.manager
@@ -5625,8 +5780,20 @@ mod tests {
         );
 
         // a runs ahead to generation 2 (new value + (s1,w):2), b stays at gen-1.
-        let clk_a2: VClock = HashMap::from([((tc.s1, tc.w), 2u64), ((tc.s1, a), 2u64)]);
-        deliver_update(&mut tc.manager, &s2_id, z, tc.s1, a, vint(12), clk_a2).await;
+        let clk_a2: VClock = HashMap::from([
+            ((tc.s1.clone(), tc.w.clone()), 2u64),
+            ((tc.s1.clone(), a.clone()), 2u64),
+        ]);
+        deliver_update(
+            &mut tc.manager,
+            &s2_id,
+            z.clone(),
+            tc.s1.clone(),
+            a.clone(),
+            vint(12),
+            clk_a2,
+        )
+        .await;
 
         // gate must DEFER: b (gen-1) lags a (gen-2) on dimension (s1,w). z keeps
         // its consistent value and clock rather than glitching to 12 + 21 = 33.
@@ -5651,13 +5818,25 @@ mod tests {
         }
 
         // b catches up to generation 2; the gate now passes and z recomputes.
-        let clk_b2: VClock = HashMap::from([((tc.s1, tc.w), 2u64), ((tc.s1, b), 2u64)]);
-        deliver_update(&mut tc.manager, &s2_id, z, tc.s1, b, vint(22), clk_b2).await;
+        let clk_b2: VClock = HashMap::from([
+            ((tc.s1.clone(), tc.w.clone()), 2u64),
+            ((tc.s1.clone(), b.clone()), 2u64),
+        ]);
+        deliver_update(
+            &mut tc.manager,
+            &s2_id,
+            z.clone(),
+            tc.s1.clone(),
+            b.clone(),
+            vint(22),
+            clk_b2,
+        )
+        .await;
 
         let z_gen2: VClock = HashMap::from([
-            ((tc.s1, tc.w), 2u64),
-            ((tc.s1, a), 2u64),
-            ((tc.s1, b), 2u64),
+            ((tc.s1.clone(), tc.w.clone()), 2u64),
+            ((tc.s1.clone(), a), 2u64),
+            ((tc.s1.clone(), b), 2u64),
         ]);
         let vs = tc
             .manager
@@ -5694,21 +5873,16 @@ mod tests {
         sources: Sources,
     }
 
-    async fn send_update_over_wire(
-        src: &Manager,
-        dst: &mut Manager,
-        listener_net_id: &str,
-        update: WireUpdate,
-    ) {
+    async fn send_update_over_wire(dst: &mut Manager, listener_net_id: &str, update: WireUpdate) {
         // send side (mirrors emit_update)
         let msg = MeerkatMessage::Update {
             listener_service: listener_net_id.to_string(),
-            listener_def: src.interner.get(update.listener_def).to_string(),
-            source_service: src.interner.get(update.source).to_string(),
-            member: src.interner.get(update.member).to_string(),
-            value: codec::encode_value(&update.value, &src.interner).unwrap(),
-            clock: codec::encode_clock(&update.clock, &src.interner),
-            sources: Some(codec::encode_sources(&update.sources, &src.interner)),
+            listener_def: update.listener_def.as_str().to_string(),
+            source_service: update.source.as_str().to_string(),
+            member: update.member.as_str().to_string(),
+            value: codec::encode_value(&update.value).unwrap(),
+            clock: codec::encode_clock(&update.clock),
+            sources: Some(codec::encode_sources(&update.sources)),
         };
 
         // real transport: the exact serde_json framing recv_message uses
@@ -5744,33 +5918,31 @@ mod tests {
             ),
             other => panic!("expected Update, got {:?}", other),
         };
-        let (listener_def_sym, source_sym, member_sym, vclock, sources) = codec::decode_update(
-            &listener_def,
-            &source_service,
-            &member,
-            &mut dst.interner,
-            wire_clock,
-            wire_sources,
-        )
-        .unwrap();
+        let (listener_def_sym, source_sym, member_sym, value, vclock, sources) =
+            codec::decode_update(
+                &listener_def,
+                &source_service,
+                &member,
+                net_val,
+                &mut dst.interner,
+                wire_clock,
+                wire_sources,
+            )
+            .unwrap();
         dst.handle_update(
             ServiceNetId(listener_service),
             listener_def_sym,
             (source_sym, member_sym),
-            net_val,
+            value,
             vclock,
             sources,
         )
         .await;
     }
 
-    // Route B: two independent Managers with SEPARATE interners exchange the
-    // remote-diamond updates through the real wire codec + a serde_json
-    // round-trip. This is the guarantee the single-interner diamond tests cannot
-    // give: a clock's (service, var) dimensions must survive re-interning into a
-    // *different* symbol space. We deliberately offset node B's interner so the
-    // same name maps to a different Symbol id on each node — only because the
-    // wire clock is string-keyed does the clock still land on the right names.
+    // Two independent managers exchange the remote-diamond updates through
+    // the wire codec and serde_json. Source identities must survive decoding
+    // into a separate name pool.
     #[tokio::test]
     async fn test_wire_clock_crosses_interner_boundary() {
         // node A: the source side. It owns no services here; we only need its
@@ -5783,23 +5955,16 @@ mod tests {
         let a_b = node_a.interner.insert("b");
         let a_z = node_a.interner.insert("z");
 
-        // node B: the listener side, owns s2.z = s1.a + s1.b. Pad its interner
-        // first so identical names get different ids than on node A.
+        // node B: the listener side, owns s2.z = s1.a + s1.b.
         let mut node_b = Manager::default();
-        for pad in ["pad0", "pad1", "pad2", "pad3", "pad4"] {
-            node_b.interner.insert(pad);
-        }
         let b_s1 = node_b.interner.insert("s1");
         let b_w = node_b.interner.insert("w");
         let b_a = node_b.interner.insert("a");
         let b_b = node_b.interner.insert("b");
         let b_z = node_b.interner.insert("z");
         let b_s2 = node_b.interner.insert("s2");
-        assert_ne!(
-            a_s1, b_s1,
-            "test setup: the two nodes must not share a symbol space, else the \
-             re-interning path isn't exercised"
-        );
+        assert!(!std::ptr::eq(a_s1.as_str(), b_s1.as_str()));
+        assert_eq!(a_s1, b_s1, "separate storage must preserve source identity");
 
         // Local sentinel s1 on B: it only lets s2.z evaluate at creation and
         // resolves the not-yet-cached arm during the first delivery. z's clock
@@ -5807,15 +5972,15 @@ mod tests {
         // the wire via dep_cache, not from local s1's (empty) clock.
         node_b
             .create_service(
-                b_s1,
+                b_s1.clone(),
                 vec![
                     Decl::VarDecl {
-                        name: b_a,
+                        name: b_a.clone(),
                         ty: None,
                         val: lit_int(0),
                     },
                     Decl::VarDecl {
-                        name: b_b,
+                        name: b_b.clone(),
                         ty: None,
                         val: lit_int(0),
                     },
@@ -5825,18 +5990,18 @@ mod tests {
             .unwrap();
         node_b
             .create_service(
-                b_s2,
+                b_s2.clone(),
                 vec![Decl::DefDecl {
-                    name: b_z,
+                    name: b_z.clone(),
                     ty: None,
                     val: mk_add(
                         Expr::MemberAccess {
-                            service_name: b_s1,
-                            member_name: b_a,
+                            service_name: b_s1.clone(),
+                            member_name: b_a.clone(),
                         },
                         Expr::MemberAccess {
-                            service_name: b_s1,
-                            member_name: b_b,
+                            service_name: b_s1.clone(),
+                            member_name: b_b.clone(),
                         },
                     ),
                     is_pub: true,
@@ -5849,30 +6014,31 @@ mod tests {
         // Deliver both arms at a consistent generation 1, each stamped in A's
         // symbol space: a = 11 @ {(s1,w):1,(s1,a):1}, b = 21 @ {(s1,w):1,(s1,b):1}.
         send_update_over_wire(
-            &node_a,
             &mut node_b,
             &b_s2_id,
             WireUpdate {
-                listener_def: a_z,
-                source: a_s1,
-                member: a_a,
+                listener_def: a_z.clone(),
+                source: a_s1.clone(),
+                member: a_a.clone(),
                 value: vint(11),
-                sources: Sources::from([(a_s1, a_w)]),
-                clock: HashMap::from([((a_s1, a_w), 1u64), ((a_s1, a_a), 1u64)]),
+                sources: Sources::from([(a_s1.clone(), a_w.clone())]),
+                clock: HashMap::from([
+                    ((a_s1.clone(), a_w.clone()), 1u64),
+                    ((a_s1.clone(), a_a), 1u64),
+                ]),
             },
         )
         .await;
         send_update_over_wire(
-            &node_a,
             &mut node_b,
             &b_s2_id,
             WireUpdate {
                 listener_def: a_z,
-                source: a_s1,
-                member: a_b,
+                source: a_s1.clone(),
+                member: a_b.clone(),
                 value: vint(21),
-                sources: Sources::from([(a_s1, a_w)]),
-                clock: HashMap::from([((a_s1, a_w), 1u64), ((a_s1, a_b), 1u64)]),
+                sources: Sources::from([(a_s1.clone(), a_w.clone())]),
+                clock: HashMap::from([((a_s1.clone(), a_w), 1u64), ((a_s1, a_b), 1u64)]),
             },
         )
         .await;
@@ -5881,8 +6047,8 @@ mod tests {
         // entirely in B's symbol space — proving the dimensions were re-interned,
         // not carried as raw ids.
         let expected: VClock = HashMap::from([
-            ((b_s1, b_w), 1u64),
-            ((b_s1, b_a), 1u64),
+            ((b_s1.clone(), b_w), 1u64),
+            ((b_s1.clone(), b_a), 1u64),
             ((b_s1, b_b), 1u64),
         ]);
         let vs = node_b.services.get(&b_s2).unwrap().vars.get(&b_z).unwrap();
@@ -5904,28 +6070,31 @@ mod tests {
         let mut tc = TestContext::new();
         let decls = vec![
             Decl::VarDecl {
-                name: tc.x,
+                name: tc.x.clone(),
                 ty: None,
                 val: lit_int(1),
             },
             Decl::VarDecl {
-                name: tc.y,
+                name: tc.y.clone(),
                 ty: None,
                 val: lit_int(2),
             },
         ];
-        tc.manager.create_service(tc.foo, decls).await.unwrap();
+        tc.manager
+            .create_service(tc.foo.clone(), decls)
+            .await
+            .unwrap();
 
         tc.manager
             .execute_action(
-                tc.foo,
+                tc.foo.clone(),
                 &[
                     ActionStmt::Assign {
-                        name: tc.x,
+                        name: tc.x.clone(),
                         expr: lit_int(3),
                     },
                     ActionStmt::Assign {
-                        name: tc.y,
+                        name: tc.y.clone(),
                         expr: lit_int(4),
                     },
                 ],
@@ -5936,7 +6105,10 @@ mod tests {
         let foo = tc.manager.services.get(&tc.foo).unwrap();
         let xc = foo.vars.get(&tc.x).unwrap().vector_clock.clone();
         let yc = foo.vars.get(&tc.y).unwrap().vector_clock.clone();
-        let expected: VClock = HashMap::from([((tc.foo, tc.x), 1), ((tc.foo, tc.y), 1)]);
+        let expected: VClock = HashMap::from([
+            ((tc.foo.clone(), tc.x.clone()), 1),
+            ((tc.foo.clone(), tc.y.clone()), 1),
+        ]);
         assert_eq!(xc, expected);
         assert_eq!(yc, expected);
         assert_eq!(xc, yc, "co-written vars must share one identical stamp");
@@ -5949,30 +6121,33 @@ mod tests {
         let mut tc = TestContext::new();
         let decls = vec![
             Decl::VarDecl {
-                name: tc.x,
+                name: tc.x.clone(),
                 ty: None,
                 val: lit_int(1),
             },
             Decl::VarDecl {
-                name: tc.y,
+                name: tc.y.clone(),
                 ty: None,
                 val: lit_int(2),
             },
         ];
-        tc.manager.create_service(tc.foo, decls).await.unwrap();
+        tc.manager
+            .create_service(tc.foo.clone(), decls)
+            .await
+            .unwrap();
 
         // advance y to generation 1 first
         tc.manager
-            .assign(tc.foo, tc.y, vint(9), None)
+            .assign(tc.foo.clone(), tc.y.clone(), vint(9), None)
             .await
             .unwrap();
         // now write x having READ y
         tc.manager
             .execute_action(
-                tc.foo,
+                tc.foo.clone(),
                 &[ActionStmt::Assign {
-                    name: tc.x,
-                    expr: Expr::Variable { name: tc.y },
+                    name: tc.x.clone(),
+                    expr: Expr::Variable { name: tc.y.clone() },
                 }],
             )
             .await
@@ -5988,12 +6163,12 @@ mod tests {
             .unwrap()
             .vector_clock;
         assert_eq!(
-            xc.get(&(tc.foo, tc.y)).copied(),
+            xc.get(&(tc.foo.clone(), tc.y.clone())).cloned(),
             Some(1),
             "x dominates the y it read"
         );
         assert_eq!(
-            xc.get(&(tc.foo, tc.x)).copied(),
+            xc.get(&(tc.foo.clone(), tc.x.clone())).cloned(),
             Some(1),
             "x still +1 on its own dimension"
         );
@@ -6006,16 +6181,19 @@ mod tests {
     async fn test_clock_monotonic_on_repeated_writes() {
         let mut tc = TestContext::new();
         let decls = vec![Decl::VarDecl {
-            name: tc.x,
+            name: tc.x.clone(),
             ty: None,
             val: lit_int(0),
         }];
-        tc.manager.create_service(tc.foo, decls).await.unwrap();
+        tc.manager
+            .create_service(tc.foo.clone(), decls)
+            .await
+            .unwrap();
 
-        let key = (tc.foo, tc.x);
+        let key = (tc.foo.clone(), tc.x.clone());
         for expected in 1..=3u64 {
             tc.manager
-                .assign(tc.foo, tc.x, vint(7), None)
+                .assign(tc.foo.clone(), tc.x.clone(), vint(7), None)
                 .await
                 .unwrap();
             let c = tc
@@ -6028,7 +6206,7 @@ mod tests {
                 .unwrap()
                 .vector_clock
                 .get(&key)
-                .copied()
+                .cloned()
                 .unwrap_or(0);
             assert_eq!(c, expected, "clock must increase by exactly 1 per write");
         }
@@ -6038,13 +6216,16 @@ mod tests {
     async fn manager_with_x() -> TestContext {
         let mut tc = TestContext::new();
         let decls = vec![Decl::VarDecl {
-            name: tc.x,
+            name: tc.x.clone(),
             ty: None,
             val: Expr::Literal {
                 val: Value::Int { val: 0 },
             },
         }];
-        tc.manager.create_service(tc.foo, decls).await.unwrap();
+        tc.manager
+            .create_service(tc.foo.clone(), decls)
+            .await
+            .unwrap();
         tc
     }
 
@@ -6073,17 +6254,24 @@ mod tests {
         // analysis mishandled
         let mut tc = manager_with_x().await;
         let stmts = vec![ActionStmt::Assign {
-            name: tc.x,
+            name: tc.x.clone(),
             expr: Expr::Binop {
                 op: crate::ast::BinOp::Add,
-                expr1: Box::new(Expr::Variable { name: tc.x }),
+                expr1: Box::new(Expr::Variable { name: tc.x.clone() }),
                 expr2: Box::new(Expr::Literal {
                     val: Value::Int { val: 1 },
                 }),
             },
         }];
-        tc.manager.execute_action(tc.foo, &stmts).await.unwrap();
-        let result = tc.manager.lookup(tc.x, tc.foo, None).await.unwrap();
+        tc.manager
+            .execute_action(tc.foo.clone(), &stmts)
+            .await
+            .unwrap();
+        let result = tc
+            .manager
+            .lookup(tc.x.clone(), tc.foo.clone(), None)
+            .await
+            .unwrap();
         assert_eq!(result, Value::Int { val: 1 });
     }
 
@@ -6094,18 +6282,28 @@ mod tests {
         // should yield `x == 2`
         let mut tc = manager_with_x().await;
         let stmts = vec![ActionStmt::Assign {
-            name: tc.x,
+            name: tc.x.clone(),
             expr: Expr::Binop {
                 op: crate::ast::BinOp::Add,
-                expr1: Box::new(Expr::Variable { name: tc.x }),
+                expr1: Box::new(Expr::Variable { name: tc.x.clone() }),
                 expr2: Box::new(Expr::Literal {
                     val: Value::Int { val: 1 },
                 }),
             },
         }];
-        tc.manager.execute_action(tc.foo, &stmts).await.unwrap();
-        tc.manager.execute_action(tc.foo, &stmts).await.unwrap();
-        let result = tc.manager.lookup(tc.x, tc.foo, None).await.unwrap();
+        tc.manager
+            .execute_action(tc.foo.clone(), &stmts)
+            .await
+            .unwrap();
+        tc.manager
+            .execute_action(tc.foo.clone(), &stmts)
+            .await
+            .unwrap();
+        let result = tc
+            .manager
+            .lookup(tc.x.clone(), tc.foo.clone(), None)
+            .await
+            .unwrap();
         assert_eq!(result, Value::Int { val: 2 });
     }
 
@@ -6115,12 +6313,15 @@ mod tests {
         // be `Unlocked`
         let mut tc = manager_with_x().await;
         let stmts = vec![ActionStmt::Assign {
-            name: tc.x,
+            name: tc.x.clone(),
             expr: Expr::Literal {
                 val: Value::Int { val: 42 },
             },
         }];
-        tc.manager.execute_action(tc.foo, &stmts).await.unwrap();
+        tc.manager
+            .execute_action(tc.foo.clone(), &stmts)
+            .await
+            .unwrap();
         assert_x_unlocked(&tc);
     }
 
@@ -6130,13 +6331,16 @@ mod tests {
         // the transaction as the latest writer for that variable
         let mut tc = manager_with_x().await;
         let stmts = vec![ActionStmt::Assign {
-            name: tc.x,
+            name: tc.x.clone(),
             expr: Expr::Literal {
                 val: Value::Int { val: 42 },
             },
         }];
 
-        tc.manager.execute_action(tc.foo, &stmts).await.unwrap();
+        tc.manager
+            .execute_action(tc.foo.clone(), &stmts)
+            .await
+            .unwrap();
 
         let state = x_state(&tc);
         assert_eq!(state.value, Value::Int { val: 42 });
@@ -6153,20 +6357,27 @@ mod tests {
         let mut tc = manager_with_x().await;
         // outer action: `do` (action { `x` = `x` + 1 })
         let inner = Expr::Action(vec![ActionStmt::Assign {
-            name: tc.x,
+            name: tc.x.clone(),
             expr: Expr::Binop {
                 op: crate::ast::BinOp::Add,
-                expr1: Box::new(Expr::Variable { name: tc.x }),
+                expr1: Box::new(Expr::Variable { name: tc.x.clone() }),
                 expr2: Box::new(Expr::Literal {
                     val: Value::Int { val: 1 },
                 }),
             },
         }]);
         let stmts = vec![ActionStmt::Do(inner)];
-        tc.manager.execute_action(tc.foo, &stmts).await.unwrap();
+        tc.manager
+            .execute_action(tc.foo.clone(), &stmts)
+            .await
+            .unwrap();
 
         // inner write took effect
-        let result = tc.manager.lookup(tc.x, tc.foo, None).await.unwrap();
+        let result = tc
+            .manager
+            .lookup(tc.x.clone(), tc.foo.clone(), None)
+            .await
+            .unwrap();
         // and the lock was released
         assert_eq!(result, Value::Int { val: 1 });
         assert_x_unlocked(&tc);
@@ -6181,10 +6392,10 @@ mod tests {
         // whole statement list is one transaction
         let mut tc = manager_with_x().await;
         let bump = Expr::Action(vec![ActionStmt::Assign {
-            name: tc.x,
+            name: tc.x.clone(),
             expr: Expr::Binop {
                 op: crate::ast::BinOp::Add,
-                expr1: Box::new(Expr::Variable { name: tc.x }),
+                expr1: Box::new(Expr::Variable { name: tc.x.clone() }),
                 expr2: Box::new(Expr::Literal {
                     val: Value::Int { val: 1 },
                 }),
@@ -6201,7 +6412,7 @@ mod tests {
             ),
         ];
 
-        let result = tc.manager.execute_test_block(tc.foo, &stmts).await;
+        let result = tc.manager.execute_test_block(tc.foo.clone(), &stmts).await;
 
         assert!(matches!(result, Err(EvalError::AssertionError(_))));
         // Each `do` committed as it ran, and the failing assert left them be
@@ -6218,7 +6429,7 @@ mod tests {
         let mut tc = manager_with_x().await;
         let stmts = vec![
             ActionStmt::Assign {
-                name: tc.x,
+                name: tc.x.clone(),
                 expr: Expr::Literal {
                     val: Value::Int { val: 99 },
                 },
@@ -6230,10 +6441,14 @@ mod tests {
                 "false".to_string(),
             ),
         ];
-        let result = tc.manager.execute_action(tc.foo, &stmts).await;
+        let result = tc.manager.execute_action(tc.foo.clone(), &stmts).await;
         assert!(result.is_err());
         // `x` must remain 0 — the buffered write to 99 was never committed
-        let x = tc.manager.lookup(tc.x, tc.foo, None).await.unwrap();
+        let x = tc
+            .manager
+            .lookup(tc.x.clone(), tc.foo.clone(), None)
+            .await
+            .unwrap();
         // and the lock was released
         assert_eq!(x, Value::Int { val: 0 });
         assert_x_unlocked(&tc);
@@ -6246,13 +6461,13 @@ mod tests {
         // successful commit
         let mut tc = manager_with_x().await;
         let successful_write = vec![ActionStmt::Assign {
-            name: tc.x,
+            name: tc.x.clone(),
             expr: Expr::Literal {
                 val: Value::Int { val: 1 },
             },
         }];
         tc.manager
-            .execute_action(tc.foo, &successful_write)
+            .execute_action(tc.foo.clone(), &successful_write)
             .await
             .unwrap();
         let previous_txn = x_state(&tc).latest_write_txn.clone();
@@ -6260,7 +6475,7 @@ mod tests {
 
         let failing_write = vec![
             ActionStmt::Assign {
-                name: tc.x,
+                name: tc.x.clone(),
                 expr: Expr::Literal {
                     val: Value::Int { val: 99 },
                 },
@@ -6273,7 +6488,10 @@ mod tests {
             ),
         ];
 
-        let result = tc.manager.execute_action(tc.foo, &failing_write).await;
+        let result = tc
+            .manager
+            .execute_action(tc.foo.clone(), &failing_write)
+            .await;
 
         assert!(result.is_err());
         let state = x_state(&tc);
@@ -6289,11 +6507,11 @@ mod tests {
         let mut tc = manager_with_x().await;
         let last_txn = x_state(&tc).latest_write_txn.clone();
         let stmts = vec![ActionStmt::Assert(
-            Expr::Variable { name: tc.x },
+            Expr::Variable { name: tc.x.clone() },
             "x".to_string(),
         )];
 
-        let result = tc.manager.execute_action(tc.foo, &stmts).await;
+        let result = tc.manager.execute_action(tc.foo.clone(), &stmts).await;
 
         assert!(result.is_err());
         assert_eq!(x_state(&tc).value, Value::Int { val: 0 });
@@ -6313,10 +6531,10 @@ mod tests {
         let mut tc = TestContext::new();
         // s2 owns `w` and an action that bumps it
         let bump = Expr::Action(vec![ActionStmt::Assign {
-            name: tc.w,
+            name: tc.w.clone(),
             expr: Expr::Binop {
                 op: crate::ast::BinOp::Add,
-                expr1: Box::new(Expr::Variable { name: tc.w }),
+                expr1: Box::new(Expr::Variable { name: tc.w.clone() }),
                 expr2: Box::new(Expr::Literal {
                     val: Value::Int { val: 5 },
                 }),
@@ -6324,17 +6542,17 @@ mod tests {
         }]);
         tc.manager
             .create_service(
-                tc.s2,
+                tc.s2.clone(),
                 vec![
                     Decl::VarDecl {
-                        name: tc.w,
+                        name: tc.w.clone(),
                         ty: None,
                         val: Expr::Literal {
                             val: Value::Int { val: 10 },
                         },
                     },
                     Decl::DefDecl {
-                        name: tc.bump,
+                        name: tc.bump.clone(),
                         ty: None,
                         val: bump,
                         is_pub: true,
@@ -6346,9 +6564,9 @@ mod tests {
         // s1 owns `x`
         tc.manager
             .create_service(
-                tc.s1,
+                tc.s1.clone(),
                 vec![Decl::VarDecl {
-                    name: tc.x,
+                    name: tc.x.clone(),
                     ty: None,
                     val: Expr::Literal {
                         val: Value::Int { val: 0 },
@@ -6361,29 +6579,38 @@ mod tests {
         // Transaction on `s1`: `x` = `x` + 1; `do` `s2.bump`
         let stmts = vec![
             ActionStmt::Assign {
-                name: tc.x,
+                name: tc.x.clone(),
                 expr: Expr::Binop {
                     op: crate::ast::BinOp::Add,
-                    expr1: Box::new(Expr::Variable { name: tc.x }),
+                    expr1: Box::new(Expr::Variable { name: tc.x.clone() }),
                     expr2: Box::new(Expr::Literal {
                         val: Value::Int { val: 1 },
                     }),
                 },
             },
             ActionStmt::Do(Expr::MemberAccess {
-                service_name: tc.s2,
+                service_name: tc.s2.clone(),
                 member_name: tc.bump,
             }),
         ];
-        tc.manager.execute_action(tc.s1, &stmts).await.unwrap();
+        tc.manager
+            .execute_action(tc.s1.clone(), &stmts)
+            .await
+            .unwrap();
 
         // Both services' writes committed
         assert_eq!(
-            tc.manager.lookup(tc.x, tc.s1, None).await.unwrap(),
+            tc.manager
+                .lookup(tc.x.clone(), tc.s1.clone(), None)
+                .await
+                .unwrap(),
             Value::Int { val: 1 }
         );
         assert_eq!(
-            tc.manager.lookup(tc.w, tc.s2, None).await.unwrap(),
+            tc.manager
+                .lookup(tc.w.clone(), tc.s2.clone(), None)
+                .await
+                .unwrap(),
             Value::Int { val: 15 }
         );
         // Locks released on both services
@@ -6418,9 +6645,9 @@ mod tests {
         let mut tc = TestContext::new();
         tc.manager
             .create_service(
-                tc.s1,
+                tc.s1.clone(),
                 vec![Decl::VarDecl {
-                    name: tc.x,
+                    name: tc.x.clone(),
                     ty: None,
                     val: Expr::Literal {
                         val: Value::Int { val: 0 },
@@ -6447,7 +6674,9 @@ mod tests {
             node_id: 1,
             iteration: 0,
         };
-        let result = tc.manager.acquire_write_lock(tc.s1, tc.x, &younger);
+        let result = tc
+            .manager
+            .acquire_write_lock(tc.s1.clone(), tc.x.clone(), &younger);
         assert!(matches!(result, Err(EvalError::WaitDieAbort(_))));
     }
 
@@ -6460,9 +6689,9 @@ mod tests {
         let mut tc = TestContext::new();
         tc.manager
             .create_service(
-                tc.s1,
+                tc.s1.clone(),
                 vec![Decl::VarDecl {
-                    name: tc.x,
+                    name: tc.x.clone(),
                     ty: None,
                     val: Expr::Literal {
                         val: Value::Int { val: 0 },
@@ -6489,7 +6718,9 @@ mod tests {
             node_id: 1,
             iteration: 0,
         };
-        let result = tc.manager.acquire_write_lock(tc.s1, tc.x, &older);
+        let result = tc
+            .manager
+            .acquire_write_lock(tc.s1.clone(), tc.x.clone(), &older);
         assert!(matches!(result, Err(EvalError::WaitOn(_))));
     }
 
@@ -6498,9 +6729,9 @@ mod tests {
         let mut tc = TestContext::new();
         tc.manager
             .create_service(
-                tc.s1,
+                tc.s1.clone(),
                 vec![Decl::VarDecl {
-                    name: tc.x,
+                    name: tc.x.clone(),
                     ty: None,
                     val: Expr::Literal {
                         val: Value::Int { val: 0 },
@@ -6523,16 +6754,16 @@ mod tests {
             .unwrap()
             .lock = crate::runtime::txn::VarLock::WriteLocked(older);
         let stmts = vec![ActionStmt::Assign {
-            name: tc.x,
+            name: tc.x.clone(),
             expr: Expr::Binop {
                 op: crate::ast::BinOp::Add,
-                expr1: Box::new(Expr::Variable { name: tc.x }),
+                expr1: Box::new(Expr::Variable { name: tc.x.clone() }),
                 expr2: Box::new(Expr::Literal {
                     val: Value::Int { val: 1 },
                 }),
             },
         }];
-        let result = tc.manager.execute_action(tc.s1, &stmts).await;
+        let result = tc.manager.execute_action(tc.s1.clone(), &stmts).await;
         assert!(matches!(result, Err(EvalError::WaitDieAbort(_))));
         assert!(matches!(
             tc.manager
@@ -6576,13 +6807,13 @@ mod tests {
                 .unwrap()
                 .lock = crate::runtime::txn::VarLock::WriteLocked(holder);
             let stmts = vec![ActionStmt::Assign {
-                name: tc.x,
-                expr: Expr::Variable { name: tc.x },
+                name: tc.x.clone(),
+                expr: Expr::Variable { name: tc.x.clone() },
             }];
             let started = tokio::time::Instant::now();
             let err = tc
                 .manager
-                .execute_action(tc.foo, &stmts)
+                .execute_action(tc.foo.clone(), &stmts)
                 .await
                 .expect_err("`x` is held for the whole run");
             assert!(matches!(err, EvalError::WaitDieAbort(_)), "got {err:?}");
@@ -6642,7 +6873,7 @@ mod tests {
         let younger = TxnId::new(tc.manager.node_id);
         let err = tc
             .manager
-            .remote_read_participant(tc.foo, tc.x, younger)
+            .remote_read_participant(tc.foo.clone(), tc.x.clone(), younger)
             .await
             .expect_err("a younger transaction must die against an older holder");
         assert!(matches!(err, EvalError::WaitDieAbort(_)));
@@ -6700,7 +6931,7 @@ mod tests {
             },
             "note == \"Wait-die abort: seen in the log\"".to_string(),
         );
-        let on_the_wire = match execute(&stmt, &[], &mut tc.manager, tc.foo, None).await {
+        let on_the_wire = match execute(&stmt, &[], &mut tc.manager, tc.foo.clone(), None).await {
             Err(e) => e.to_string(),
             Ok(_) => panic!("a false assertion must fail"),
         };
@@ -6726,17 +6957,17 @@ mod tests {
         let mut tc = TestContext::new();
         tc.manager
             .create_service(
-                tc.s1,
+                tc.s1.clone(),
                 vec![
                     Decl::VarDecl {
-                        name: tc.y,
+                        name: tc.y.clone(),
                         ty: None,
                         val: Expr::Literal {
                             val: Value::Int { val: 0 },
                         },
                     },
                     Decl::VarDecl {
-                        name: tc.x,
+                        name: tc.x.clone(),
                         ty: None,
                         val: Expr::Literal {
                             val: Value::Int { val: 0 },
@@ -6769,16 +7000,16 @@ mod tests {
         // (conflict, waits)
         let stmts = vec![
             ActionStmt::Assign {
-                name: tc.y,
+                name: tc.y.clone(),
                 expr: Expr::Literal {
                     val: Value::Int { val: 5 },
                 },
             },
             ActionStmt::Assign {
-                name: tc.x,
+                name: tc.x.clone(),
                 expr: Expr::Binop {
                     op: crate::ast::BinOp::Add,
-                    expr1: Box::new(Expr::Variable { name: tc.x }),
+                    expr1: Box::new(Expr::Variable { name: tc.x.clone() }),
                     expr2: Box::new(Expr::Literal {
                         val: Value::Int { val: 1 },
                     }),
@@ -6787,7 +7018,7 @@ mod tests {
         ];
         let result = tc
             .manager
-            .execute_action_participant(tc.s1, &stmts, &[], older.clone())
+            .execute_action_participant(tc.s1.clone(), &stmts, &[], older.clone())
             .await;
         // Parked: returns `WaitOn`, and the partial transaction is preserved
         assert!(matches!(result, Err(EvalError::WaitOn(_))));
@@ -6814,9 +7045,9 @@ mod tests {
         let mut tc = TestContext::new();
         tc.manager
             .create_service(
-                tc.s1,
+                tc.s1.clone(),
                 vec![Decl::VarDecl {
-                    name: tc.x,
+                    name: tc.x.clone(),
                     ty: None,
                     val: Expr::Literal {
                         val: Value::Int { val: 0 },
@@ -6828,7 +7059,7 @@ mod tests {
         let make = |rid: u64, tid: crate::runtime::txn::TxnId| ParkedRequest::Action {
             request_id: rid,
             reply_to: String::new(),
-            service: tc.s1,
+            service: tc.s1.clone(),
             stmts: vec![],
             env: vec![],
             tid,
@@ -6843,13 +7074,15 @@ mod tests {
             node_id: 1,
             iteration: 0,
         };
-        tc.manager.park_request(tc.s1, tc.x, make(1, mid.clone()));
-        tc.manager.park_request(tc.s1, tc.x, make(2, old.clone()));
+        tc.manager
+            .park_request(tc.s1.clone(), tc.x.clone(), make(1, mid.clone()));
+        tc.manager
+            .park_request(tc.s1.clone(), tc.x.clone(), make(2, old.clone()));
         // Freeing `x` yields the oldest waiter first; the other stays parked
         let mut freed = std::collections::HashSet::new();
         freed.insert(WaitKey::Member(
-            tc.manager.service_net_id_for_name(tc.s1),
-            tc.x,
+            tc.manager.service_net_id_for_name(&tc.s1),
+            tc.x.clone(),
         ));
         let ready = tc.manager.take_ready_waiters(&freed);
         assert_eq!(ready.len(), 1);
@@ -6870,9 +7103,9 @@ mod tests {
         let mut tc = TestContext::new();
         tc.manager
             .create_service(
-                tc.s1,
+                tc.s1.clone(),
                 vec![Decl::VarDecl {
-                    name: tc.x,
+                    name: tc.x.clone(),
                     ty: None,
                     val: Expr::Literal {
                         val: Value::Int { val: 0 },
@@ -6900,7 +7133,7 @@ mod tests {
         let mut younger_txn = crate::runtime::txn::Transaction::new(younger.clone());
         younger_txn
             .locked
-            .insert((tc.manager.service_net_id_for_name(tc.s1), tc.x));
+            .insert((tc.manager.service_net_id_for_name(&tc.s1), tc.x.clone()));
         tc.manager.pending_txns.insert(younger.clone(), younger_txn);
 
         let older = crate::runtime::txn::TxnId {
@@ -6910,10 +7143,10 @@ mod tests {
         };
         // Older transaction: `x` = `x` + 1 conflicts -> `WaitOn` -> park it
         let stmts = vec![ActionStmt::Assign {
-            name: tc.x,
+            name: tc.x.clone(),
             expr: Expr::Binop {
                 op: crate::ast::BinOp::Add,
-                expr1: Box::new(Expr::Variable { name: tc.x }),
+                expr1: Box::new(Expr::Variable { name: tc.x.clone() }),
                 expr2: Box::new(Expr::Literal {
                     val: Value::Int { val: 1 },
                 }),
@@ -6921,16 +7154,16 @@ mod tests {
         }];
         let r1 = tc
             .manager
-            .execute_action_participant(tc.s1, &stmts, &[], older.clone())
+            .execute_action_participant(tc.s1.clone(), &stmts, &[], older.clone())
             .await;
         assert!(matches!(r1, Err(EvalError::WaitOn(_))));
         tc.manager.park_request(
-            tc.s1,
-            tc.x,
+            tc.s1.clone(),
+            tc.x.clone(),
             ParkedRequest::Action {
                 request_id: 1,
                 reply_to: String::new(),
-                service: tc.s1,
+                service: tc.s1.clone(),
                 stmts: stmts.clone(),
                 env: vec![],
                 tid: older.clone(),
@@ -6966,7 +7199,7 @@ mod tests {
         {
             let r2 = tc
                 .manager
-                .execute_action_participant(*service, stmts, env, tid.clone())
+                .execute_action_participant(service.clone(), stmts, env, tid.clone())
                 .await;
             assert!(r2.is_ok());
         } else {
@@ -6992,31 +7225,34 @@ mod tests {
         let mut tc = TestContext::new();
         let decls = vec![
             Decl::VarDecl {
-                name: tc.x,
+                name: tc.x.clone(),
                 ty: None,
                 val: Expr::Literal {
                     val: Value::Int { val: 1 },
                 },
             },
             Decl::VarDecl {
-                name: tc.y,
+                name: tc.y.clone(),
                 ty: None,
                 val: Expr::Literal {
                     val: Value::Int { val: 2 },
                 },
             },
             Decl::DefDecl {
-                name: tc.f,
+                name: tc.f.clone(),
                 ty: None,
                 val: Expr::Binop {
                     op: crate::ast::BinOp::Add,
-                    expr1: Box::new(Expr::Variable { name: tc.x }),
-                    expr2: Box::new(Expr::Variable { name: tc.y }),
+                    expr1: Box::new(Expr::Variable { name: tc.x.clone() }),
+                    expr2: Box::new(Expr::Variable { name: tc.y.clone() }),
                 },
                 is_pub: true,
             },
         ];
-        tc.manager.create_service(tc.foo, decls).await.unwrap();
+        tc.manager
+            .create_service(tc.foo.clone(), decls)
+            .await
+            .unwrap();
 
         let foo = tc.manager.services.get(&tc.foo).unwrap();
         let tid = foo.vars.get(&tc.x).unwrap().latest_write_txn.clone();
@@ -7034,7 +7270,7 @@ mod tests {
         let mut tc = TestContext::new();
         let decls = vec![
             Decl::VarDecl {
-                name: tc.x,
+                name: tc.x.clone(),
                 ty: None,
                 val: Expr::Literal {
                     val: Value::Int { val: 1 },
@@ -7042,7 +7278,7 @@ mod tests {
             },
             // adding a bool and number should be a type error
             Decl::VarDecl {
-                name: tc.y,
+                name: tc.y.clone(),
                 ty: None,
                 val: Expr::Binop {
                     op: crate::ast::BinOp::Add,
@@ -7055,7 +7291,7 @@ mod tests {
                 },
             },
         ];
-        let result = tc.manager.create_service(tc.foo, decls).await;
+        let result = tc.manager.create_service(tc.foo.clone(), decls).await;
         assert!(result.is_err());
         assert!(
             tc.manager.services.is_empty(),
@@ -7064,7 +7300,7 @@ mod tests {
         assert!(
             !tc.manager.unified_ast.iter().any(|s| {
                 if let Stmt::Service { name, .. } = s {
-                    *name == tc.foo
+                    *name == tc.foo.clone()
                 } else {
                     false
                 }
@@ -7080,9 +7316,9 @@ mod tests {
         let mut tc = TestContext::new();
         tc.manager
             .create_service(
-                tc.s1,
+                tc.s1.clone(),
                 vec![Decl::VarDecl {
-                    name: tc.x,
+                    name: tc.x.clone(),
                     ty: None,
                     val: Expr::Literal {
                         val: Value::Int { val: 7 },
@@ -7118,13 +7354,13 @@ mod tests {
         let result = tc
             .manager
             .create_service(
-                tc.s2,
+                tc.s2.clone(),
                 vec![Decl::DefDecl {
-                    name: tc.f,
+                    name: tc.f.clone(),
                     ty: None,
                     val: Expr::MemberAccess {
-                        service_name: tc.s1,
-                        member_name: tc.x,
+                        service_name: tc.s1.clone(),
+                        member_name: tc.x.clone(),
                     },
                     is_pub: true,
                 }],
@@ -7151,9 +7387,9 @@ mod tests {
         let mut tc = TestContext::new();
         tc.manager
             .create_service(
-                tc.s1,
+                tc.s1.clone(),
                 vec![Decl::VarDecl {
-                    name: tc.x,
+                    name: tc.x.clone(),
                     ty: None,
                     val: Expr::Literal {
                         val: Value::Int { val: 42 },
@@ -7175,14 +7411,21 @@ mod tests {
         };
 
         // Acquire service lock under older transaction
-        assert!(tc.manager.acquire_service_lock(tc.s1, &older).is_ok());
+        assert!(tc
+            .manager
+            .acquire_service_lock(tc.s1.clone(), &older)
+            .is_ok());
 
         // Younger transaction trying to read member should die
-        let res_read = tc.manager.acquire_read_lock(tc.s1, tc.x, &younger);
+        let res_read = tc
+            .manager
+            .acquire_read_lock(tc.s1.clone(), tc.x.clone(), &younger);
         assert!(matches!(res_read, Err(EvalError::WaitDieAbort(_))));
 
         // Younger transaction trying to write member should die
-        let res_write = tc.manager.acquire_write_lock(tc.s1, tc.x, &younger);
+        let res_write = tc
+            .manager
+            .acquire_write_lock(tc.s1.clone(), tc.x.clone(), &younger);
         assert!(matches!(res_write, Err(EvalError::WaitDieAbort(_))));
     }
 
@@ -7191,9 +7434,9 @@ mod tests {
         let mut tc = TestContext::new();
         tc.manager
             .create_service(
-                tc.s1,
+                tc.s1.clone(),
                 vec![Decl::VarDecl {
-                    name: tc.x,
+                    name: tc.x.clone(),
                     ty: None,
                     val: Expr::Literal {
                         val: Value::Int { val: 42 },
@@ -7215,14 +7458,20 @@ mod tests {
         };
 
         // Acquire member write lock under older transaction
-        assert!(tc.manager.acquire_write_lock(tc.s1, tc.x, &older).is_ok());
+        assert!(tc
+            .manager
+            .acquire_write_lock(tc.s1.clone(), tc.x.clone(), &older)
+            .is_ok());
 
         // Younger transaction trying to acquire service lock should die
-        let res_svc = tc.manager.acquire_service_lock(tc.s1, &younger);
+        let res_svc = tc.manager.acquire_service_lock(tc.s1.clone(), &younger);
         assert!(matches!(res_svc, Err(EvalError::WaitDieAbort(_))));
 
         // Older transaction should be able to acquire service lock on its own service
-        assert!(tc.manager.acquire_service_lock(tc.s1, &older).is_ok());
+        assert!(tc
+            .manager
+            .acquire_service_lock(tc.s1.clone(), &older)
+            .is_ok());
     }
 
     #[tokio::test]
@@ -7230,17 +7479,17 @@ mod tests {
         let mut tc = TestContext::new();
         tc.manager
             .create_service(
-                tc.s1,
+                tc.s1.clone(),
                 vec![
                     Decl::VarDecl {
-                        name: tc.x,
+                        name: tc.x.clone(),
                         ty: None,
                         val: Expr::Literal {
                             val: Value::Int { val: 1 },
                         },
                     },
                     Decl::VarDecl {
-                        name: tc.y,
+                        name: tc.y.clone(),
                         ty: None,
                         val: Expr::Literal {
                             val: Value::Int { val: 2 },
@@ -7263,19 +7512,22 @@ mod tests {
         };
 
         // Younger transaction locks member x
-        assert!(tc.manager.acquire_write_lock(tc.s1, tc.x, &younger).is_ok());
+        assert!(tc
+            .manager
+            .acquire_write_lock(tc.s1.clone(), tc.x.clone(), &younger)
+            .is_ok());
 
         // Older transaction requests LockGroup covering y and x
         let mut writes = HashSet::new();
-        writes.insert(tc.manager.interner.get(tc.y).to_string());
-        writes.insert(tc.manager.interner.get(tc.x).to_string());
+        writes.insert(tc.y.as_str().to_string());
+        writes.insert(tc.x.as_str().to_string());
         let lg = LockGroup {
             service_level_lock: false,
             reads: HashSet::new(),
             writes,
         };
         let mut services = HashMap::new();
-        services.insert(tc.manager.interner.get(tc.s1).to_string(), lg);
+        services.insert(tc.s1.as_str().to_string(), lg);
 
         // Seed the older transaction in `pending_txns` with a dummy
         // participant address to verify that `participants` are drained
@@ -7336,10 +7588,10 @@ mod tests {
     /// `x = x + 1`
     fn incr_x(tc: &TestContext) -> ActionStmt {
         ActionStmt::Assign {
-            name: tc.x,
+            name: tc.x.clone(),
             expr: Expr::Binop {
                 op: crate::ast::BinOp::Add,
-                expr1: Box::new(Expr::Variable { name: tc.x }),
+                expr1: Box::new(Expr::Variable { name: tc.x.clone() }),
                 expr2: Box::new(Expr::Literal {
                     val: Value::Int { val: 1 },
                 }),
@@ -7352,7 +7604,7 @@ mod tests {
         ParkedRequest::Lookup {
             request_id: 1,
             reply_to: String::new(),
-            service: tc.foo,
+            service: tc.foo.clone(),
             member,
             tid: TxnId::new(tc.manager.node_id),
         }
@@ -7368,7 +7620,7 @@ mod tests {
     #[tokio::test]
     async fn test_freed_keys_are_queued_only_when_something_is_parked_on_them() {
         let mut tc = manager_with_x().await;
-        let key = WaitKey::Member(tc.manager.service_net_id_for_name(tc.foo), tc.x);
+        let key = WaitKey::Member(tc.manager.service_net_id_for_name(&tc.foo), tc.x.clone());
 
         // Locks `x`, then fails terminally, so `x` is released.
         let stmts = vec![
@@ -7382,7 +7634,7 @@ mod tests {
         ];
         let tid = TxnId::new(tc.manager.node_id);
         tc.manager
-            .execute_action_participant(tc.foo, &stmts, &[], tid)
+            .execute_action_participant(tc.foo.clone(), &stmts, &[], tid)
             .await
             .expect_err("the assertion fails the action");
         assert!(
@@ -7391,11 +7643,11 @@ mod tests {
         );
 
         // With a waiter, the same failure queues exactly that key.
-        let parked = parked_lookup(&tc, tc.x);
+        let parked = parked_lookup(&tc, tc.x.clone());
         tc.manager.park_request_key(key.clone(), parked);
         let tid = TxnId::new(tc.manager.node_id);
         tc.manager
-            .execute_action_participant(tc.foo, &stmts, &[], tid)
+            .execute_action_participant(tc.foo.clone(), &stmts, &[], tid)
             .await
             .expect_err("the assertion fails the action");
         assert_eq!(
@@ -7414,12 +7666,12 @@ mod tests {
     #[tokio::test]
     async fn test_commit_reports_its_freed_keys_once() {
         let mut tc = manager_with_x().await;
-        let key = WaitKey::Member(tc.manager.service_net_id_for_name(tc.foo), tc.x);
+        let key = WaitKey::Member(tc.manager.service_net_id_for_name(&tc.foo), tc.x.clone());
 
         // A prepared participant transaction holding the write lock on `x`.
         let holder = TxnId::new(tc.manager.node_id);
         tc.manager
-            .execute_action_participant(tc.foo, &[incr_x(&tc)], &[], holder.clone())
+            .execute_action_participant(tc.foo.clone(), &[incr_x(&tc)], &[], holder.clone())
             .await
             .unwrap();
 
@@ -7427,7 +7679,7 @@ mod tests {
         let parked_action = |timestamp| ParkedRequest::Action {
             request_id: 1,
             reply_to: String::new(),
-            service: tc.foo,
+            service: tc.foo.clone(),
             stmts: vec![incr_x(&tc)],
             env: vec![],
             tid: TxnId {
@@ -7442,7 +7694,7 @@ mod tests {
         tc.manager.park_request_key(key.clone(), second);
 
         // The server loop commits, then wakes what the queue reports.
-        let clock = HashMap::from([((tc.foo, tc.x), 1)]);
+        let clock = HashMap::from([((tc.foo.clone(), tc.x.clone()), 1)]);
         tc.manager
             .commit_participant(&holder, &clock)
             .await
@@ -7455,7 +7707,7 @@ mod tests {
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].tid(), &first_tid);
         tc.manager
-            .execute_action_participant(tc.foo, &[incr_x(&tc)], &[], first_tid)
+            .execute_action_participant(tc.foo.clone(), &[incr_x(&tc)], &[], first_tid)
             .await
             .expect("the freed lock is now the first waiter's");
         assert!(
@@ -7484,12 +7736,15 @@ mod tests {
                 val: zero(),
             },
             Decl::VarDecl {
-                name: tc.x,
+                name: tc.x.clone(),
                 ty: None,
                 val: zero(),
             },
         ];
-        tc.manager.create_service(tc.foo, decls).await.unwrap();
+        tc.manager
+            .create_service(tc.foo.clone(), decls)
+            .await
+            .unwrap();
         tc
     }
 
@@ -7498,12 +7753,12 @@ mod tests {
     #[tokio::test]
     async fn test_originator_reports_locks_released_on_success() {
         let mut tc = manager_with_x().await;
-        let key = WaitKey::Member(tc.manager.service_net_id_for_name(tc.foo), tc.x);
-        let parked = parked_lookup(&tc, tc.x);
+        let key = WaitKey::Member(tc.manager.service_net_id_for_name(&tc.foo), tc.x.clone());
+        let parked = parked_lookup(&tc, tc.x.clone());
         tc.manager.park_request_key(key.clone(), parked);
 
         tc.manager
-            .execute_action(tc.foo, &[incr_x(&tc)])
+            .execute_action(tc.foo.clone(), &[incr_x(&tc)])
             .await
             .expect("an uncontended write commits");
 
@@ -7520,7 +7775,7 @@ mod tests {
     async fn test_originator_reports_locks_released_when_it_gives_up() {
         let mut tc = manager_with_a_and_x().await;
         let a = tc.manager.interner.insert("a");
-        let key_a = WaitKey::Member(tc.manager.service_net_id_for_name(tc.foo), a);
+        let key_a = WaitKey::Member(tc.manager.service_net_id_for_name(&tc.foo), a.clone());
 
         // A younger transaction holds `x` for the whole run.
         tc.manager
@@ -7538,7 +7793,7 @@ mod tests {
 
         // Someone is parked on `a`, which the transaction locks before it
         // contends on `x`.
-        let parked = parked_lookup(&tc, a);
+        let parked = parked_lookup(&tc, a.clone());
         tc.manager.park_request_key(key_a.clone(), parked);
 
         let stmts = vec![
@@ -7551,7 +7806,7 @@ mod tests {
             incr_x(&tc),
         ];
         tc.manager
-            .execute_action(tc.foo, &stmts)
+            .execute_action(tc.foo.clone(), &stmts)
             .await
             .expect_err("`x` is held for the whole run");
 
@@ -7571,7 +7826,7 @@ mod tests {
     async fn test_parked_participant_run_rolls_back_what_it_buffered() {
         let mut tc = manager_with_a_and_x().await;
         let a = tc.manager.interner.insert("a");
-        let sid = tc.manager.service_net_id_for_name(tc.foo);
+        let sid = tc.manager.service_net_id_for_name(&tc.foo);
 
         // A younger transaction holds `a`, so the older one below waits on it
         let lock_a = |tc: &mut TestContext, lock| {
@@ -7598,7 +7853,7 @@ mod tests {
         let stmts = vec![
             incr_x(&tc),
             ActionStmt::Assign {
-                name: a,
+                name: a.clone(),
                 expr: Expr::Literal {
                     val: Value::Int { val: 1 },
                 },
@@ -7608,15 +7863,15 @@ mod tests {
         // First attempt: `x` is buffered, then the write to `a` parks
         let parked = tc
             .manager
-            .execute_action_participant(tc.foo, &stmts, &[], older.clone())
+            .execute_action_participant(tc.foo.clone(), &stmts, &[], older.clone())
             .await;
         assert!(
             matches!(parked, Err(EvalError::WaitOn(_))),
             "writing `a` must wait, got {parked:?}"
         );
         let txn = &tc.manager.pending_txns[&older];
-        assert_eq!(txn.written.get(&(sid.clone(), tc.x)), None);
-        assert_eq!(txn.read_cache.get(&(sid.clone(), tc.x)), None);
+        assert_eq!(txn.written.get(&(sid.clone(), tc.x.clone())), None);
+        assert_eq!(txn.read_cache.get(&(sid.clone(), tc.x.clone())), None);
         // The write lock on `x` is kept: it holds this transaction's place
         assert!(matches!(
             tc.manager.services[&tc.foo].vars[&tc.x].lock,
@@ -7626,11 +7881,11 @@ mod tests {
         // `a` frees and the parked action is re-run from the top
         lock_a(&mut tc, crate::runtime::txn::VarLock::Unlocked);
         tc.manager
-            .execute_action_participant(tc.foo, &stmts, &[], older.clone())
+            .execute_action_participant(tc.foo.clone(), &stmts, &[], older.clone())
             .await
             .expect("with `a` free the action completes");
         assert_eq!(
-            tc.manager.pending_txns[&older].written[&(sid, tc.x)],
+            tc.manager.pending_txns[&older].written[&(sid, tc.x.clone())],
             Value::Int { val: 1 },
             "2 means the re-run read the value the parked attempt buffered"
         );
@@ -7643,14 +7898,14 @@ mod tests {
     async fn test_second_action_under_one_txn_keeps_the_first_write() {
         let mut tc = manager_with_a_and_x().await;
         let a = tc.manager.interner.insert("a");
-        let sid = tc.manager.service_net_id_for_name(tc.foo);
+        let sid = tc.manager.service_net_id_for_name(&tc.foo);
         let tid = TxnId::new(tc.manager.node_id);
 
         tc.manager
             .execute_action_participant(
-                tc.foo,
+                tc.foo.clone(),
                 &[ActionStmt::Assign {
-                    name: a,
+                    name: a.clone(),
                     expr: Expr::Literal {
                         val: Value::Int { val: 7 },
                     },
@@ -7661,13 +7916,13 @@ mod tests {
             .await
             .unwrap();
         tc.manager
-            .execute_action_participant(tc.foo, &[incr_x(&tc)], &[], tid.clone())
+            .execute_action_participant(tc.foo.clone(), &[incr_x(&tc)], &[], tid.clone())
             .await
             .unwrap();
 
         let written = &tc.manager.pending_txns[&tid].written;
         assert_eq!(written[&(sid.clone(), a)], Value::Int { val: 7 });
-        assert_eq!(written[&(sid, tc.x)], Value::Int { val: 1 });
+        assert_eq!(written[&(sid, tc.x.clone())], Value::Int { val: 1 });
     }
 
     async fn start_local_manager(code: &str) -> Manager {
@@ -7697,7 +7952,7 @@ mod tests {
         )
         .await;
         let [s, x, y, a, b] = ["s", "x", "y", "a", "b"].map(|name| manager.interner.insert(name));
-        let original = HashSet::from([(s, x), (s, y)]);
+        let original = HashSet::from([(s.clone(), x.clone()), (s.clone(), y.clone())]);
         assert_eq!(
             manager.services[&s].vars[&a].sources.as_ref(),
             Some(&original)
@@ -7706,12 +7961,12 @@ mod tests {
             manager.services[&s].vars[&b].sources.as_ref(),
             Some(&original)
         );
-        let listener = (manager.services[&s].id.clone(), a);
+        let listener = (manager.services[&s].id.clone(), a.clone());
         assert!(manager.services[&s].listeners[&y].contains(&listener));
 
         update_service_code(&mut manager, "update s { pub def a = x; }").await;
 
-        let expected = HashSet::from([(s, x)]);
+        let expected = HashSet::from([(s.clone(), x.clone())]);
         assert_eq!(
             manager.services[&s].vars[&b].sources.as_ref(),
             Some(&expected)
@@ -7729,7 +7984,7 @@ mod tests {
         assert_eq!(manager.services[&s].vars[&b].value, Value::Int { val: 2 });
 
         manager
-            .assign(s, y, Value::Int { val: 20 }, None)
+            .assign(s.clone(), y, Value::Int { val: 20 }, None)
             .await
             .unwrap();
         assert_eq!(manager.services[&s].vars[&a].value, Value::Int { val: 1 });
@@ -7738,10 +7993,10 @@ mod tests {
         assert!(manager.services[&s].vars[&b].vector_clock.is_empty());
 
         manager
-            .assign(s, x, Value::Int { val: 7 }, None)
+            .assign(s.clone(), x.clone(), Value::Int { val: 7 }, None)
             .await
             .unwrap();
-        let clock = HashMap::from([((s, x), 1)]);
+        let clock = HashMap::from([((s.clone(), x), 1)]);
         assert_eq!(manager.services[&s].vars[&a].value, Value::Int { val: 7 });
         assert_eq!(manager.services[&s].vars[&a].vector_clock, clock);
         assert_eq!(manager.services[&s].vars[&b].value, Value::Int { val: 8 });

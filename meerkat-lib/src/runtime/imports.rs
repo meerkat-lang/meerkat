@@ -93,7 +93,7 @@ impl<'a> Imports<'a> {
         // Register local services in visited set to prevent loops
         for stmt in base_ast {
             if let Stmt::Service { name, .. } = stmt {
-                visited_services.insert(*name);
+                visited_services.insert(name.clone());
             }
         }
 
@@ -113,7 +113,7 @@ impl<'a> Imports<'a> {
         let imports_in_base: Vec<Symbol> = base_ast
             .iter()
             .filter_map(|stmt| match stmt {
-                Stmt::Import { service_name, .. } => Some(*service_name),
+                Stmt::Import { service_name, .. } => Some(service_name.clone()),
                 Stmt::Service { .. } => None,
                 Stmt::ActionStmt(_) => None,
                 Stmt::Atomic { .. } => None,
@@ -259,9 +259,9 @@ impl<'a> Imports<'a> {
         // Mark all services in received file as visited
         for stmt in &parsed_stmts {
             if let Stmt::Service { name, .. } = stmt {
-                self.visited_services.insert(*name);
+                self.visited_services.insert(name.clone());
                 if remote_peer.is_none() {
-                    self.local_declares.insert(*name);
+                    self.local_declares.insert(name.clone());
                 }
             }
         }
@@ -274,14 +274,14 @@ impl<'a> Imports<'a> {
             declares: parsed_stmts
                 .iter()
                 .filter_map(|s| match s {
-                    Stmt::Service { name, .. } => Some(*name),
+                    Stmt::Service { name, .. } => Some(name.clone()),
                     _ => None,
                 })
                 .collect(),
             imports: parsed_stmts
                 .iter()
                 .filter_map(|s| match s {
-                    Stmt::Import { service_name, .. } => Some(*service_name),
+                    Stmt::Import { service_name, .. } => Some(service_name.clone()),
                     _ => None,
                 })
                 .collect(),
@@ -295,7 +295,7 @@ impl<'a> Imports<'a> {
                 Stmt::Import {
                     service_name: sym, ..
                 } => {
-                    let cmds = self.resolve_import(*sym, base_dir)?;
+                    let cmds = self.resolve_import(sym.clone(), base_dir)?;
                     new_cmds.extend(cmds);
                 }
                 Stmt::Service { .. } => {}
@@ -448,7 +448,7 @@ impl<'a> Imports<'a> {
                 if module.remote_peer.is_some() && self.local_declares.contains(svc) {
                     continue;
                 }
-                owner.entry(*svc).or_insert(idx);
+                owner.entry(svc.clone()).or_insert(idx);
             }
         }
 
@@ -530,7 +530,7 @@ impl<'a> Imports<'a> {
         let folded = apply_updates_to_ast(&peer_services, &peer_updates).map_err(|name| {
             Error::Message(format!(
                 "a module fetched from a peer updates service '{}', which that peer does not serve",
-                self.interner.get(name)
+                name.as_str()
             ))
         })?;
         // Folding preserves the declarations' order, including repeated names.
@@ -570,7 +570,7 @@ impl<'a> Imports<'a> {
                     if self.local_declares.contains(declared) {
                         continue;
                     }
-                    let name = self.interner.get(*declared).to_string();
+                    let name = declared.as_str().to_string();
                     let url = format!("{}/{}", peer.0, name);
                     owners.insert(name, url);
                 }
@@ -589,8 +589,8 @@ impl<'a> Imports<'a> {
             return Ok(Vec::new());
         }
 
-        self.visited_services.insert(service_sym);
-        let service_name = self.interner.get(service_sym).to_string();
+        self.visited_services.insert(service_sym.clone());
+        let service_name = service_sym.as_str().to_string();
 
         if !self.my_addr.is_empty() {
             if let Some(target_url) = self.remote_url_map.get(&service_name).cloned() {

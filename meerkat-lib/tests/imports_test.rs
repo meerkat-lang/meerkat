@@ -55,7 +55,7 @@ fn test_imports_local_resolution_and_circular_prevention() {
     let (final_ast, _) = imports.finalize().expect("finalize");
     let has_service_b = final_ast.iter().any(|stmt| {
         if let Stmt::Service { name, .. } = stmt {
-            interner.get(*name) == "B"
+            name.as_str() == "B"
         } else {
             false
         }
@@ -334,7 +334,7 @@ fn service_order(node: &meerkat_lib::runtime::Node) -> Vec<String> {
     node.unified_ast
         .iter()
         .filter_map(|s| match s {
-            Stmt::Service { name, .. } => Some(node.interner.get(*name).to_string()),
+            Stmt::Service { name, .. } => Some(name.as_str().to_string()),
             _ => None,
         })
         .collect()
@@ -518,7 +518,7 @@ fn test_network_imports_are_dependency_ordered_regardless_of_arrival() {
         .0
         .iter()
         .filter_map(|s| match s {
-            Stmt::Service { name, .. } => Some(node.interner.get(*name).to_string()),
+            Stmt::Service { name, .. } => Some(name.as_str().to_string()),
             _ => None,
         })
         .collect();
@@ -856,11 +856,11 @@ async fn test_imports_fold_a_peers_startup_updates_into_its_declarations() {
         })
     };
     assert!(
-        declares(&imported, dep, y),
+        declares(&imported, dep.clone(), y),
         "dep.y must be part of dep's declarations"
     );
     assert!(
-        !declares(&imported, helper, w),
+        !declares(&imported, helper.clone(), w),
         "helper's own update is not folded: this node runs it"
     );
     assert!(
@@ -891,7 +891,7 @@ async fn test_imports_fold_a_peers_startup_updates_into_its_declarations() {
         if let Stmt::Service { name, decls } = stmt {
             if !manager.remote_services.contains_key(name) {
                 manager
-                    .create_service(*name, decls.clone())
+                    .create_service(name.clone(), decls.clone())
                     .await
                     .expect("local services start");
             }

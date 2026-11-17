@@ -59,7 +59,7 @@ fn test_free_var_closure_parameter_shadowing() {
             ..
         } = &decls[1]
         {
-            let bound: HashSet<_> = params.iter().map(|p| p.name).collect();
+            let bound: HashSet<_> = params.iter().map(|p| p.name.clone()).collect();
             assert!(bound.contains(&x_sym));
 
             let free_vars = meerkat_lib::runtime::graphs::free_var::free_var(body, &bound);
@@ -201,7 +201,7 @@ fn test_complex_closure_free_variables() {
             ..
         } = &decls[0]
         {
-            let bound: HashSet<_> = params.iter().map(|param| param.name).collect();
+            let bound: HashSet<_> = params.iter().map(|param| param.name.clone()).collect();
             assert!(bound.contains(&p_sym));
 
             let free_vars = meerkat_lib::runtime::graphs::free_var::free_var(body, &bound);

@@ -179,7 +179,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
             // print. These modes are designed to work both in
             // isolation and in tandem
             if args.ast {
-                let printer = AstPrinter::new(&node.interner);
+                let printer = AstPrinter::new();
                 printer.print_program(&prog);
             }
 
@@ -362,17 +362,17 @@ fn advertised_services(manager: &Manager) -> Vec<Symbol> {
         .unified_ast()
         .iter()
         .filter_map(|stmt| match stmt {
-            Stmt::Service { name, .. } => Some(*name),
+            Stmt::Service { name, .. } => Some(name.clone()),
             _ => None,
         })
-        .filter(|name| manager.services.contains_key(name) && seen.insert(*name))
+        .filter(|name| manager.services.contains_key(name) && seen.insert(name.clone()))
         .collect()
 }
 
 /// Print a `Service URL` line for each of `advertised_services`.
 fn print_service_urls(manager: &Manager, full_addr: &str) {
     for name in advertised_services(manager) {
-        println!("Service URL: {}/{}", full_addr, manager.interner.get(name));
+        println!("Service URL: {}/{}", full_addr, name.as_str());
     }
 }
 
@@ -620,23 +620,19 @@ async fn run_client(
             Stmt::Service { .. } | Stmt::Update { .. } | Stmt::Atomic { .. } => {
                 manager.run_declaration(stmt).await?;
             }
-            &Stmt::Test {
+            Stmt::Test {
                 service_name,
-                ref stmts,
+                stmts,
             } => {
                 // Watch mode only observes; it does not run @test actions.
                 if !watch {
                     manager
-                        .execute_test_block(service_name, stmts)
+                        .execute_test_block(service_name.clone(), stmts)
                         .await
                         .map_err(|e| {
-                            format!(
-                                "Test failed in '{}': {}",
-                                manager.interner.get(service_name),
-                                e
-                            )
+                            format!("Test failed in '{}': {}", service_name.as_str(), e)
                         })?;
-                    println!("@test({}) passed", manager.interner.get(service_name));
+                    println!("@test({}) passed", service_name.as_str());
                 }
             }
             Stmt::Import { path, .. } => {
@@ -676,28 +672,28 @@ async fn run_client(
                 sources,
             }) = msg
             {
-                if let Ok(parsed) = codec::decode_value(value.clone(), &mut manager.interner) {
-                    println!("[update] {}.{} = {:?}", source_service, member, parsed);
-                }
                 let lid = ServiceNetId(listener_service);
                 // #24: validate + intern wire names through codec; skip on bad
                 // input. The clock's dimension names are interned here too, so
                 // a bad one drops the whole message.
-                let (def_sym, source_sym, member_sym, vclock, sources) = match codec::decode_update(
-                    &listener_def,
-                    &source_service,
-                    &member,
-                    &mut manager.interner,
-                    clock,
-                    sources,
-                ) {
-                    Ok(syms) => syms,
-                    Err(_) => continue,
-                };
+                let (def_sym, source_sym, member_sym, value, vclock, sources) =
+                    match codec::decode_update(
+                        &listener_def,
+                        &source_service,
+                        &member,
+                        value,
+                        &mut manager.interner,
+                        clock,
+                        sources,
+                    ) {
+                        Ok(syms) => syms,
+                        Err(_) => continue,
+                    };
+                println!("[update] {}.{} = {:?}", source_service, member, value);
                 manager
                     .handle_update(
                         lid.clone(),
-                        def_sym,
+                        def_sym.clone(),
                         (source_sym, member_sym),
                         value,
                         vclock,
@@ -766,7 +762,7 @@ async fn run_lock_test_client(
         // all transitive members are successfully read-locked.
         "cascade_lock_success" => {
             let svc_a_sym = manager.interner.insert("A");
-            let addr_a = manager.remote_addr(svc_a_sym)?;
+            let addr_a = manager.remote_addr(&svc_a_sym)?;
 
             let txn_id = TxnId::new(manager.node_id);
             let mut services = HashMap::new();
@@ -813,7 +809,7 @@ async fn run_lock_test_client(
         // Node F, per the wait-die deadlock prevention protocol.
         "cascade_abort_wait_die" => {
             let svc_f_sym = manager.interner.insert("F");
-            let addr_f = manager.remote_addr(svc_f_sym)?;
+            let addr_f = manager.remote_addr(&svc_f_sym)?;
 
             // Phase 1: Establish a high-priority (old) conflicting
             // write lock on Node F.
@@ -863,7 +859,7 @@ async fn run_lock_test_client(
                 iteration: 0,
             };
             let svc_a_sym = manager.interner.insert("A");
-            let addr_a = manager.remote_addr(svc_a_sym)?;
+            let addr_a = manager.remote_addr(&svc_a_sym)?;
 
             let mut services_a = HashMap::new();
             services_a.insert(
@@ -921,7 +917,7 @@ async fn run_lock_test_client(
         // when the younger transaction commits.
         "cascade_lock_wait" => {
             let svc_f_sym = manager.interner.insert("F");
-            let addr_f = manager.remote_addr(svc_f_sym)?;
+            let addr_f = manager.remote_addr(&svc_f_sym)?;
 
             // Phase 1: Establish a low-priority (young) write lock
             // on Node F to create the blocking condition.
@@ -970,7 +966,7 @@ async fn run_lock_test_client(
                 iteration: 0,
             };
             let svc_a_sym = manager.interner.insert("A");
-            let addr_a = manager.remote_addr(svc_a_sym)?;
+            let addr_a = manager.remote_addr(&svc_a_sym)?;
 
             let mut services_a = HashMap::new();
             services_a.insert(
@@ -1325,8 +1321,8 @@ mod tests {
         let mut manager = manager_from("service foo { var x = 0; }").await;
         let foo = manager.interner.insert("foo");
         let x = manager.interner.insert("x");
-        let key = WaitKey::Member(manager.service_net_id_for_name(foo), x);
-        let parked = parked_lookup(&manager, foo, x);
+        let key = WaitKey::Member(manager.service_net_id_for_name(&foo), x.clone());
+        let parked = parked_lookup(&manager, foo.clone(), x.clone());
         manager.park_request_key(key.clone(), parked);
 
         // A composed action that write-locks `foo.x` and then fails terminally.
@@ -1373,7 +1369,7 @@ mod tests {
         let foo = manager.interner.insert("foo");
         let x = manager.interner.insert("x");
         let y = manager.interner.insert("y");
-        let foo_sid = manager.service_net_id_for_name(foo);
+        let foo_sid = manager.service_net_id_for_name(&foo);
 
         // An older transaction holds `foo.x`, so a younger reader dies on it.
         let older = TxnId {
@@ -1388,11 +1384,11 @@ mod tests {
         let mine = TxnId::new(manager.node_id);
         vars.get_mut(&y).unwrap().lock = VarLock::WriteLocked(mine.clone());
         let mut txn = Transaction::new(mine.clone());
-        txn.locked.insert((foo_sid.clone(), y));
+        txn.locked.insert((foo_sid.clone(), y.clone()));
         manager.pending_txns.insert(mine.clone(), txn);
 
-        let key = WaitKey::Member(foo_sid, y);
-        let parked = parked_lookup(&manager, foo, y);
+        let key = WaitKey::Member(foo_sid, y.clone());
+        let parked = parked_lookup(&manager, foo.clone(), y);
         manager.park_request_key(key.clone(), parked);
 
         let read = ParkedRequest::Lookup {

@@ -23,12 +23,12 @@ fn collect_free_vars(expr: &Expr, var_binded: &HashSet<Symbol>, free: &mut HashS
     match expr {
         Expr::Variable { name } => {
             if !var_binded.contains(name) {
-                free.insert(*name);
+                free.insert(name.clone());
             }
         }
         Expr::Func { params, body, .. } => {
             let mut new_binds = var_binded.clone();
-            new_binds.extend(params.iter().map(|p| p.name));
+            new_binds.extend(params.iter().map(|p| p.name.clone()));
             collect_free_vars(body, &new_binds, free);
         }
         Expr::Action(stmts) => {
@@ -44,7 +44,7 @@ fn collect_free_vars(expr: &Expr, var_binded: &HashSet<Symbol>, free: &mut HashS
         } => {
             collect_free_vars(where_clause, var_binded, free);
             if !var_binded.contains(table_name) {
-                free.insert(*table_name);
+                free.insert(table_name.clone());
             }
         }
         // A table literal holds data, not code to evaluate
@@ -82,7 +82,7 @@ fn collect_free_vars_action_stmt(
         } => {
             collect_free_vars(iterable, var_binded, free);
             let mut body_binds = var_binded.clone();
-            body_binds.insert(*var);
+            body_binds.insert(var.clone());
             for s in body {
                 body_binds = collect_free_vars_action_stmt(s, &body_binds, free);
             }
@@ -91,7 +91,7 @@ fn collect_free_vars_action_stmt(
 
     let mut new_binds = var_binded.clone();
     if let ActionStmt::Let { name, .. } = stmt {
-        new_binds.insert(*name);
+        new_binds.insert(name.clone());
     }
     new_binds
 }
@@ -115,17 +115,17 @@ mod tests {
         };
         assert!(free_var(&lit, &HashSet::new()).is_empty());
 
-        let var_x = Expr::Variable { name: x };
+        let var_x = Expr::Variable { name: x.clone() };
         let free_vars = free_var(&var_x, &HashSet::new());
         assert_eq!(free_vars.len(), 1);
         assert!(free_vars.contains(&x));
 
-        let bound_vars = HashSet::from([x]);
+        let bound_vars = HashSet::from([x.clone()]);
         assert!(free_var(&var_x, &bound_vars).is_empty());
 
         let kv = Expr::KeyVal {
-            name: x,
-            value: Box::new(Expr::Variable { name: y }),
+            name: x.clone(),
+            value: Box::new(Expr::Variable { name: y.clone() }),
         };
         assert!(free_var(&kv, &HashSet::new()).contains(&y));
     }
@@ -139,37 +139,40 @@ mod tests {
 
         let unop = Expr::Unop {
             op: UnOp::Neg,
-            expr: Box::new(Expr::Variable { name: a }),
+            expr: Box::new(Expr::Variable { name: a.clone() }),
         };
         assert!(free_var(&unop, &HashSet::new()).contains(&a));
 
         let binop = Expr::Binop {
             op: BinOp::Add,
-            expr1: Box::new(Expr::Variable { name: a }),
-            expr2: Box::new(Expr::Variable { name: b }),
+            expr1: Box::new(Expr::Variable { name: a.clone() }),
+            expr2: Box::new(Expr::Variable { name: b.clone() }),
         };
         let bin_vars = free_var(&binop, &HashSet::new());
         assert_eq!(bin_vars.len(), 2);
 
         let if_expr = Expr::If {
-            cond: Box::new(Expr::Variable { name: a }),
-            expr1: Box::new(Expr::Variable { name: b }),
-            expr2: Box::new(Expr::Variable { name: c }),
+            cond: Box::new(Expr::Variable { name: a.clone() }),
+            expr1: Box::new(Expr::Variable { name: b.clone() }),
+            expr2: Box::new(Expr::Variable { name: c.clone() }),
         };
         let if_vars = free_var(&if_expr, &HashSet::new());
         assert_eq!(if_vars.len(), 3);
 
         let tuple_expr = Expr::Tuple {
-            val: vec![Expr::Variable { name: a }, Expr::Variable { name: b }],
+            val: vec![
+                Expr::Variable { name: a.clone() },
+                Expr::Variable { name: b.clone() },
+            ],
         };
         assert_eq!(free_var(&tuple_expr, &HashSet::new()).len(), 2);
 
-        let list_expr = Expr::List(vec![Expr::Variable { name: a }]);
+        let list_expr = Expr::List(vec![Expr::Variable { name: a.clone() }]);
         assert_eq!(free_var(&list_expr, &HashSet::new()).len(), 1);
 
         let range_expr = Expr::Range {
-            start: Box::new(Expr::Variable { name: a }),
-            end: Box::new(Expr::Variable { name: b }),
+            start: Box::new(Expr::Variable { name: a.clone() }),
+            end: Box::new(Expr::Variable { name: b.clone() }),
         };
         assert_eq!(free_var(&range_expr, &HashSet::new()).len(), 2);
     }
@@ -182,11 +185,14 @@ mod tests {
         let tbl = interner.insert("tbl");
 
         let func_expr = Expr::Func {
-            params: vec![Param { name: p, ty: None }],
+            params: vec![Param {
+                name: p.clone(),
+                ty: None,
+            }],
             body: Box::new(Expr::Binop {
                 op: BinOp::Add,
-                expr1: Box::new(Expr::Variable { name: p }),
-                expr2: Box::new(Expr::Variable { name: x }),
+                expr1: Box::new(Expr::Variable { name: p.clone() }),
+                expr2: Box::new(Expr::Variable { name: x.clone() }),
             }),
             return_ty: None,
         };
@@ -197,7 +203,7 @@ mod tests {
 
         let call_expr = Expr::Call {
             func: Box::new(func_expr),
-            args: vec![Expr::Variable { name: x }],
+            args: vec![Expr::Variable { name: x.clone() }],
         };
         assert_eq!(free_var(&call_expr, &HashSet::new()).len(), 1);
 
@@ -207,8 +213,8 @@ mod tests {
         assert!(free_var(&html_expr, &HashSet::new()).is_empty());
 
         let select_expr = Expr::Select {
-            table_name: tbl,
-            where_clause: Box::new(Expr::Variable { name: x }),
+            table_name: tbl.clone(),
+            where_clause: Box::new(Expr::Variable { name: x.clone() }),
             column_names: vec![],
         };
         let sel_vars = free_var(&select_expr, &HashSet::new());
@@ -216,9 +222,9 @@ mod tests {
         assert!(sel_vars.contains(&x));
 
         let fold_expr = Expr::Fold {
-            table_name: tbl,
-            column_name: x,
-            operation: Box::new(Expr::Variable { name: x }),
+            table_name: tbl.clone(),
+            column_name: x.clone(),
+            operation: Box::new(Expr::Variable { name: x.clone() }),
             identity: Box::new(Expr::Literal {
                 val: Value::Int { val: 0 },
             }),
@@ -236,25 +242,25 @@ mod tests {
 
         let action_expr = Expr::Action(vec![
             ActionStmt::Let {
-                name: a,
+                name: a.clone(),
                 ty: None,
-                expr: Expr::Variable { name: b },
+                expr: Expr::Variable { name: b.clone() },
             },
             ActionStmt::Assign {
-                name: a,
-                expr: Expr::Variable { name: a },
+                name: a.clone(),
+                expr: Expr::Variable { name: a.clone() },
             },
-            ActionStmt::Do(Expr::Variable { name: a }),
-            ActionStmt::Assert(Expr::Variable { name: a }, "assert".to_string()),
-            ActionStmt::Expr(Expr::Variable { name: a }),
+            ActionStmt::Do(Expr::Variable { name: a.clone() }),
+            ActionStmt::Assert(Expr::Variable { name: a.clone() }, "assert".to_string()),
+            ActionStmt::Expr(Expr::Variable { name: a.clone() }),
             ActionStmt::Insert {
-                table_name: tbl,
-                row: Expr::Variable { name: b },
+                table_name: tbl.clone(),
+                row: Expr::Variable { name: b.clone() },
             },
             ActionStmt::For {
-                var: i,
-                iterable: Expr::Variable { name: b },
-                body: vec![ActionStmt::Expr(Expr::Variable { name: i })],
+                var: i.clone(),
+                iterable: Expr::Variable { name: b.clone() },
+                body: vec![ActionStmt::Expr(Expr::Variable { name: i.clone() })],
             },
         ]);
 

@@ -61,7 +61,7 @@ fn validate_string_literal(s: &str) -> Result<()> {
 /// #39: validate the length-bounded string fields of a `ServiceCodeRequest`
 /// arriving over the wire. `path` and `reply_to` are a resource path and a
 /// network address, not identifiers, so they are length-checked but not
-/// charset-validated or interned. The source in the response is unbounded.
+/// charset-validated or interned. Response source is checked by `validate_source`.
 pub fn validate_service_code_request(path: &str, reply_to: &str) -> Result<()> {
     for (field, value) in [("path", path), ("reply_to", reply_to)] {
         if value.len() > MAX_NET_REQUEST_STRING_LENGTH {
@@ -70,6 +70,17 @@ pub fn validate_service_code_request(path: &str, reply_to: &str) -> Result<()> {
                 field, MAX_NET_REQUEST_STRING_LENGTH
             )));
         }
+    }
+    Ok(())
+}
+
+/// Enforce the common size limit for source received over the network.
+pub fn validate_source(source: &str) -> Result<()> {
+    if source.len() > MAX_NET_REQUEST_SOURCE_LENGTH {
+        return Err(Error::LimitExceeded(format!(
+            "source size exceeds maximum length of {} bytes",
+            MAX_NET_REQUEST_SOURCE_LENGTH
+        )));
     }
     Ok(())
 }
@@ -87,46 +98,16 @@ pub fn validate_service_code_request(path: &str, reply_to: &str) -> Result<()> {
 /// Raises:
 ///     `Error::LimitExceeded`: If `source` length exceeds limit or `path` is invalid
 pub fn decode_source_response(path: &str, source: &str) -> Result<String> {
-    if source.len() > MAX_NET_REQUEST_SOURCE_LENGTH {
-        return Err(Error::LimitExceeded(format!(
-            "source size exceeds maximum length of {} bytes",
-            MAX_NET_REQUEST_SOURCE_LENGTH
-        )));
-    }
+    validate_source(source)?;
     let service_name = path.strip_suffix(".mkt").unwrap_or(path);
     validate_identifier(service_name)?;
     Ok(service_name.to_string())
 }
 
-/// Validate and decode an `UpdateServiceRequest` arriving over the wire
-///
-/// Enforces zero-trust identifier and payload size limits
-///
-/// Args:
-///     `service_name` (`&str`): Name of the service to update
-///     `source` (`&str`): Source code payload
-///     `interner` (`&mut Interner`): Interner for symbol creation
-///
-/// Returns:
-///     `Result<(Symbol, String)>`: Validated interned service symbol
-///     and source string
-///
-/// Raises:
-///     `Error::LimitExceeded`: If identifier is invalid or source exceeds
-///     max length
-pub fn decode_update_service_request(
-    service_name: &str,
-    source: &str,
-    interner: &mut Interner,
-) -> Result<(Symbol, String)> {
+/// Validate an incoming code update without interning its envelope name.
+pub fn validate_update_service_request(service_name: &str, source: &str) -> Result<()> {
     validate_identifier(service_name)?;
-    if source.len() > MAX_NET_REQUEST_SOURCE_LENGTH {
-        return Err(Error::LimitExceeded(format!(
-            "source size exceeds maximum length of {} bytes",
-            MAX_NET_REQUEST_SOURCE_LENGTH
-        )));
-    }
-    Ok((interner.insert(service_name), source.to_string()))
+    validate_source(source)
 }
 
 /// Validate identifier fields of a `LookupRequest` message arriving over
@@ -160,6 +141,19 @@ pub fn validate_lookup_request(service: &str, member: &str) -> Result<()> {
 ///     Error::LimitExceeded: If identifier is invalid or exceeds max length
 pub fn validate_action_request(service: &str) -> Result<()> {
     validate_identifier(service)
+}
+
+/// Decode captured bindings shared by closure values and action requests.
+pub fn decode_env(
+    env: Vec<(String, NetValue)>,
+    interner: &mut Interner,
+) -> Result<Vec<(Symbol, Value)>> {
+    env.into_iter()
+        .map(|(name, value)| {
+            validate_identifier(&name)?;
+            Ok((interner.insert(&name), decode_value(value, interner)?))
+        })
+        .collect()
 }
 
 /// Validate identifier fields of a `LockRequest` message arriving over
@@ -402,31 +396,31 @@ pub fn decode_sources(sources: Vec<(String, String)>, interner: &mut Interner) -
         .collect())
 }
 
-/// #24: validate and intern the identifier fields of an `Update` message
-/// arriving over the wire (the `value` is decoded separately via
-/// `decode_value`). As with `decode_request_updates`, all interning of
-/// network-sourced names happens here after validation.
-///
-/// Returns the interned identifiers, vector clock and paired source identities.
+/// Decode an update's identifiers, value and causal metadata together.
 pub fn decode_update(
     listener_def: &str,
     source_service: &str,
     member: &str,
+    value: NetValue,
     interner: &mut Interner,
     clock: Vec<ClockEntry>,
     sources: Option<Vec<(String, String)>>,
-) -> Result<(Symbol, Symbol, Symbol, VClock, Option<Sources>)> {
+) -> Result<(Symbol, Symbol, Symbol, Value, VClock, Option<Sources>)> {
     validate_identifier(listener_def)?;
     validate_identifier(source_service)?;
     validate_identifier(member)?;
+    let clock = clock_entry_to_vclock(clock, interner)?;
+    let sources = sources
+        .map(|sources| decode_sources(sources, interner))
+        .transpose()?;
+    let value = decode_value(value, interner)?;
     Ok((
         interner.insert(listener_def),
         interner.insert(source_service),
         interner.insert(member),
-        clock_entry_to_vclock(clock, interner)?,
-        sources
-            .map(|sources| decode_sources(sources, interner))
-            .transpose()?,
+        value,
+        clock,
+        sources,
     ))
 }
 
@@ -498,23 +492,22 @@ pub fn encode_type(ty: &Type) -> Result<NetType> {
 ///
 /// Args:
 ///     `st` (`&ServiceType`): The runtime service type to encode
-///     `interner` (`&Interner`): The interner for symbol lookup
 ///
 /// Returns:
 ///     `Result<NetServiceType>`: The encoded network service type
 ///
 /// Raises:
 ///     `Error::Message`: If a field is missing due to a broken invariant
-pub fn encode_servicetype(st: &ServiceType, interner: &Interner) -> Result<NetServiceType> {
+pub fn encode_servicetype(st: &ServiceType) -> Result<NetServiceType> {
     let mut fields = Vec::new();
     for name in st.field_order() {
-        let name_str = interner.get(*name).to_string();
+        let name_str = name.as_str().to_string();
         // While `ServiceType` encapsulation theoretically guarantees
         // that `field_order` entries exist in `fields`, we
         // defensively return an `Error::Message` instead of
         // panicking to ensure the network service fails
         // gracefully if an internal bug occurs
-        let field_ty = st.fields().find(*name).ok_or_else(|| {
+        let field_ty = st.fields().find(name).ok_or_else(|| {
             Error::Message(format!(
                 "Internal invariant broken: field_order \
                      entry missing from fields map: {}",
@@ -624,13 +617,12 @@ pub fn decode_servicetype(nst: NetServiceType, interner: &mut Interner) -> Resul
 ///
 /// Args:
 ///     `param` (`&Param`): The runtime parameter to encode
-///     `interner` (`&Interner`): The interner for symbol lookup
 ///
 /// Returns:
 ///     `Result<NetParam>`: The encoded network parameter
 ///     representation
-pub fn encode_param(param: &Param, interner: &Interner) -> Result<NetParam> {
-    let name_str = interner.get(param.name);
+pub fn encode_param(param: &Param) -> Result<NetParam> {
+    let name_str = param.name.as_str();
     validate_identifier(name_str)?;
     let ty = param.ty.as_ref().map(encode_type).transpose()?;
     Ok(NetParam {
@@ -661,11 +653,10 @@ pub fn decode_param(param: NetParam, interner: &mut Interner) -> Result<Param> {
 ///
 /// Args:
 ///     val (`&Value`): The runtime `Value` to encode
-///     interner (`&Interner`): The `Interner` for symbol lookup
 ///
 /// Returns:
 ///     `Result<NetValue>`: The encoded `NetValue` network representation
-pub fn encode_value(val: &Value, interner: &Interner) -> Result<NetValue> {
+pub fn encode_value(val: &Value) -> Result<NetValue> {
     match val {
         Value::Int { val } => Ok(NetValue::Int { val: *val }),
         Value::Bool { val } => Ok(NetValue::Bool { val: *val }),
@@ -687,16 +678,16 @@ pub fn encode_value(val: &Value, interner: &Interner) -> Result<NetValue> {
         } => {
             let mut encoded_params = Vec::new();
             for p in params {
-                encoded_params.push(encode_param(p, interner)?);
+                encoded_params.push(encode_param(p)?);
             }
-            let encoded_body = Box::new(encode_expr(body, interner)?);
+            let encoded_body = Box::new(encode_expr(body)?);
             let mut encoded_env = Vec::new();
             for (k, v) in env {
-                let k_str = interner.get(*k);
+                let k_str = k.as_str();
                 validate_identifier(k_str)?;
-                encoded_env.push((k_str.to_string(), encode_value(v, interner)?));
+                encoded_env.push((k_str.to_string(), encode_value(v)?));
             }
-            let service_str = interner.get(*service_name);
+            let service_str = service_name.as_str();
             validate_identifier(service_str)?;
             let encoded_return_ty = return_ty.as_ref().map(encode_type).transpose()?;
             Ok(NetValue::Closure {
@@ -714,13 +705,13 @@ pub fn encode_value(val: &Value, interner: &Interner) -> Result<NetValue> {
         } => {
             let mut encoded_stmts = Vec::new();
             for s in stmts {
-                encoded_stmts.push(encode_action_stmt(s, interner)?);
+                encoded_stmts.push(encode_action_stmt(s)?);
             }
             let mut encoded_env = Vec::new();
             for (k, v) in env {
-                let k_str = interner.get(*k);
+                let k_str = k.as_str();
                 validate_identifier(k_str)?;
-                encoded_env.push((k_str.to_string(), encode_value(v, interner)?));
+                encoded_env.push((k_str.to_string(), encode_value(v)?));
             }
             Ok(NetValue::ActionClosure {
                 stmts: encoded_stmts,
@@ -731,7 +722,7 @@ pub fn encode_value(val: &Value, interner: &Interner) -> Result<NetValue> {
         Value::List { vals } => {
             let mut encoded = Vec::new();
             for v in vals {
-                encoded.push(encode_value(v, interner)?);
+                encoded.push(encode_value(v)?);
             }
             Ok(NetValue::List { vals: encoded })
         }
@@ -746,33 +737,27 @@ pub fn encode_value(val: &Value, interner: &Interner) -> Result<NetValue> {
 ///
 /// Args:
 ///     clock (`&VClock`): The vector clock to encode
-///     interner (`&Interner`): The `Interner` for symbol lookup
 ///
 /// Returns:
 ///     Vec<ClockEntry>: The resulting encoded vector clock, which is a vector of
 ///     ClockEntry { service, member, counter } structs. Note that this is the direct mechanical
 ///     translation of the key-value mappings in a vector clock.
-pub fn encode_clock(clock: &VClock, interner: &Interner) -> Vec<ClockEntry> {
+pub fn encode_clock(clock: &VClock) -> Vec<ClockEntry> {
     let clock_vec = clock.iter();
     clock_vec
         .map(|((svc_sym, var_sym), i)| ClockEntry {
-            service: interner.get(*svc_sym).to_string(),
-            member: interner.get(*var_sym).to_string(),
+            service: svc_sym.as_str().to_string(),
+            member: var_sym.as_str().to_string(),
             counter: *i,
         })
         .collect()
 }
 
 /// Encode the source identities paired with a runtime value.
-pub fn encode_sources(sources: &Sources, interner: &Interner) -> Vec<(String, String)> {
+pub fn encode_sources(sources: &Sources) -> Vec<(String, String)> {
     sources
         .iter()
-        .map(|(service, member)| {
-            (
-                interner.get(*service).to_string(),
-                interner.get(*member).to_string(),
-            )
-        })
+        .map(|(service, member)| (service.as_str().to_string(), member.as_str().to_string()))
         .collect()
 }
 
@@ -804,11 +789,7 @@ pub fn decode_value(val: NetValue, interner: &mut Interner) -> Result<Value> {
                 decoded_params.push(decode_param(p, interner)?);
             }
             let decoded_body = Box::new(decode_expr(*body, interner)?);
-            let mut decoded_env = Vec::new();
-            for (k, v) in env {
-                validate_identifier(&k)?;
-                decoded_env.push((interner.insert(&k), decode_value(v, interner)?));
-            }
+            let decoded_env = decode_env(env, interner)?;
             validate_identifier(&service_name)?;
             let decoded_service = interner.insert(&service_name);
             let decoded_return_ty = return_ty.map(decode_type).transpose()?;
@@ -829,11 +810,7 @@ pub fn decode_value(val: NetValue, interner: &mut Interner) -> Result<Value> {
             for s in stmts {
                 decoded_stmts.push(decode_action_stmt(s, interner)?);
             }
-            let mut decoded_env = Vec::new();
-            for (k, v) in env {
-                validate_identifier(&k)?;
-                decoded_env.push((interner.insert(&k), decode_value(v, interner)?));
-            }
+            let decoded_env = decode_env(env, interner)?;
             Ok(Value::ActionClosure {
                 stmts: decoded_stmts,
                 env: decoded_env,
@@ -855,14 +832,13 @@ pub fn decode_value(val: NetValue, interner: &mut Interner) -> Result<Value> {
 ///
 /// Args:
 ///     expr (`&Expr`): The runtime `Expr` to encode
-///     interner (`&Interner`): The `Interner` for symbol lookup
 ///
 /// Returns:
 ///     `Result<NetExpr>`: The encoded `NetExpr` network representation
-pub fn encode_expr(expr: &Expr, interner: &Interner) -> Result<NetExpr> {
+pub fn encode_expr(expr: &Expr) -> Result<NetExpr> {
     match expr {
         Expr::Literal { val } => Ok(NetExpr::Literal {
-            val: encode_value(val, interner)?,
+            val: encode_value(val)?,
         }),
         // HTML templates have no network representation yet; deferred to the
         // code-transport PR alongside the html value wire form.
@@ -870,7 +846,7 @@ pub fn encode_expr(expr: &Expr, interner: &Interner) -> Result<NetExpr> {
             "html expressions cannot yet be sent over the network".to_string(),
         )),
         Expr::Variable { name } => {
-            let name_str = interner.get(*name);
+            let name_str = name.as_str();
             validate_identifier(name_str)?;
             Ok(NetExpr::Variable {
                 name: name_str.to_string(),
@@ -879,31 +855,31 @@ pub fn encode_expr(expr: &Expr, interner: &Interner) -> Result<NetExpr> {
         Expr::Tuple { val } => {
             let mut encoded_val = Vec::new();
             for e in val {
-                encoded_val.push(encode_expr(e, interner)?);
+                encoded_val.push(encode_expr(e)?);
             }
             Ok(NetExpr::Tuple { val: encoded_val })
         }
         Expr::KeyVal { name, value } => {
-            let name_str = interner.get(*name);
+            let name_str = name.as_str();
             validate_identifier(name_str)?;
             Ok(NetExpr::KeyVal {
                 name: name_str.to_string(),
-                value: Box::new(encode_expr(value, interner)?),
+                value: Box::new(encode_expr(value)?),
             })
         }
         Expr::Unop { op, expr } => Ok(NetExpr::Unop {
             op: encode_unop(*op),
-            expr: Box::new(encode_expr(expr, interner)?),
+            expr: Box::new(encode_expr(expr)?),
         }),
         Expr::Binop { op, expr1, expr2 } => Ok(NetExpr::Binop {
             op: encode_binop(*op),
-            expr1: Box::new(encode_expr(expr1, interner)?),
-            expr2: Box::new(encode_expr(expr2, interner)?),
+            expr1: Box::new(encode_expr(expr1)?),
+            expr2: Box::new(encode_expr(expr2)?),
         }),
         Expr::If { cond, expr1, expr2 } => Ok(NetExpr::If {
-            cond: Box::new(encode_expr(cond, interner)?),
-            expr1: Box::new(encode_expr(expr1, interner)?),
-            expr2: Box::new(encode_expr(expr2, interner)?),
+            cond: Box::new(encode_expr(cond)?),
+            expr1: Box::new(encode_expr(expr1)?),
+            expr2: Box::new(encode_expr(expr2)?),
         }),
         Expr::Func {
             params,
@@ -912,9 +888,9 @@ pub fn encode_expr(expr: &Expr, interner: &Interner) -> Result<NetExpr> {
         } => {
             let mut encoded_params = Vec::new();
             for p in params {
-                encoded_params.push(encode_param(p, interner)?);
+                encoded_params.push(encode_param(p)?);
             }
-            let encoded_body = Box::new(encode_expr(body, interner)?);
+            let encoded_body = Box::new(encode_expr(body)?);
             let encoded_return_ty = return_ty.as_ref().map(encode_type).transpose()?;
             Ok(NetExpr::Func {
                 params: encoded_params,
@@ -923,10 +899,10 @@ pub fn encode_expr(expr: &Expr, interner: &Interner) -> Result<NetExpr> {
             })
         }
         Expr::Call { func, args } => {
-            let encoded_func = Box::new(encode_expr(func, interner)?);
+            let encoded_func = Box::new(encode_expr(func)?);
             let mut encoded_args = Vec::new();
             for e in args {
-                encoded_args.push(encode_expr(e, interner)?);
+                encoded_args.push(encode_expr(e)?);
             }
             Ok(NetExpr::Call {
                 func: encoded_func,
@@ -936,7 +912,7 @@ pub fn encode_expr(expr: &Expr, interner: &Interner) -> Result<NetExpr> {
         Expr::Action(stmts) => {
             let mut encoded_stmts = Vec::new();
             for s in stmts {
-                encoded_stmts.push(encode_action_stmt(s, interner)?);
+                encoded_stmts.push(encode_action_stmt(s)?);
             }
             Ok(NetExpr::Action(encoded_stmts))
         }
@@ -944,8 +920,8 @@ pub fn encode_expr(expr: &Expr, interner: &Interner) -> Result<NetExpr> {
             service_name,
             member_name,
         } => {
-            let service_str = interner.get(*service_name);
-            let member_str = interner.get(*member_name);
+            let service_str = service_name.as_str();
+            let member_str = member_name.as_str();
             validate_identifier(service_str)?;
             validate_identifier(member_str)?;
             Ok(NetExpr::MemberAccess {
@@ -958,28 +934,28 @@ pub fn encode_expr(expr: &Expr, interner: &Interner) -> Result<NetExpr> {
             column_names,
             where_clause,
         } => {
-            let table_str = interner.get(*table_name);
+            let table_str = table_name.as_str();
             validate_identifier(table_str)?;
             let mut encoded_cols = Vec::new();
             for c in column_names {
-                let c_str = interner.get(*c);
+                let c_str = c.as_str();
                 validate_identifier(c_str)?;
                 encoded_cols.push(c_str.to_string());
             }
             Ok(NetExpr::Select {
                 table_name: table_str.to_string(),
                 column_names: encoded_cols,
-                where_clause: Box::new(encode_expr(where_clause, interner)?),
+                where_clause: Box::new(encode_expr(where_clause)?),
             })
         }
         Expr::Table { schema, records } => {
             let mut encoded_schema = Vec::new();
             for f in schema {
-                encoded_schema.push(encode_field(f, interner)?);
+                encoded_schema.push(encode_field(f)?);
             }
             let mut encoded_records = Vec::new();
             for r in records {
-                encoded_records.push(encode_expr(r, interner)?);
+                encoded_records.push(encode_expr(r)?);
             }
             Ok(NetExpr::Table {
                 schema: encoded_schema,
@@ -992,27 +968,27 @@ pub fn encode_expr(expr: &Expr, interner: &Interner) -> Result<NetExpr> {
             operation,
             identity,
         } => {
-            let table_str = interner.get(*table_name);
-            let column_str = interner.get(*column_name);
+            let table_str = table_name.as_str();
+            let column_str = column_name.as_str();
             validate_identifier(table_str)?;
             validate_identifier(column_str)?;
             Ok(NetExpr::Fold {
                 table_name: table_str.to_string(),
                 column_name: column_str.to_string(),
-                operation: Box::new(encode_expr(operation, interner)?),
-                identity: Box::new(encode_expr(identity, interner)?),
+                operation: Box::new(encode_expr(operation)?),
+                identity: Box::new(encode_expr(identity)?),
             })
         }
         Expr::List(exprs) => {
             let mut encoded = Vec::new();
             for e in exprs {
-                encoded.push(encode_expr(e, interner)?);
+                encoded.push(encode_expr(e)?);
             }
             Ok(NetExpr::List(encoded))
         }
         Expr::Range { start, end } => Ok(NetExpr::Range {
-            start: Box::new(encode_expr(start, interner)?),
-            end: Box::new(encode_expr(end, interner)?),
+            start: Box::new(encode_expr(start)?),
+            end: Box::new(encode_expr(end)?),
         }),
     }
 }
@@ -1176,45 +1152,41 @@ pub fn decode_expr(expr: NetExpr, interner: &mut Interner) -> Result<Expr> {
 ///
 /// Args:
 ///     stmt (`&ActionStmt`): The runtime `ActionStmt` to encode
-///     interner (`&Interner`): The `Interner` for symbol lookup
 ///
 /// Returns:
 ///     `Result<NetActionStmt>`: The encoded `NetActionStmt` network
 ///     representation
-pub fn encode_action_stmt(stmt: &ActionStmt, interner: &Interner) -> Result<NetActionStmt> {
+pub fn encode_action_stmt(stmt: &ActionStmt) -> Result<NetActionStmt> {
     match stmt {
         ActionStmt::Let { name, ty, expr } => {
-            let name_str = interner.get(*name);
+            let name_str = name.as_str();
             validate_identifier(name_str)?;
             let encoded_ty = ty.as_ref().map(encode_type).transpose()?;
             Ok(NetActionStmt::Let {
                 name: name_str.to_string(),
                 ty: encoded_ty,
-                expr: encode_expr(expr, interner)?,
+                expr: encode_expr(expr)?,
             })
         }
-        ActionStmt::Expr(expr) => Ok(NetActionStmt::Expr(encode_expr(expr, interner)?)),
-        ActionStmt::Do(expr) => Ok(NetActionStmt::Do(encode_expr(expr, interner)?)),
+        ActionStmt::Expr(expr) => Ok(NetActionStmt::Expr(encode_expr(expr)?)),
+        ActionStmt::Do(expr) => Ok(NetActionStmt::Do(encode_expr(expr)?)),
         ActionStmt::Assert(expr, text) => {
             validate_string_literal(text)?;
-            Ok(NetActionStmt::Assert(
-                encode_expr(expr, interner)?,
-                text.clone(),
-            ))
+            Ok(NetActionStmt::Assert(encode_expr(expr)?, text.clone()))
         }
         ActionStmt::Assign { name, expr } => {
-            let name_str = interner.get(*name);
+            let name_str = name.as_str();
             validate_identifier(name_str)?;
             Ok(NetActionStmt::Assign {
                 name: name_str.to_string(),
-                expr: encode_expr(expr, interner)?,
+                expr: encode_expr(expr)?,
             })
         }
         ActionStmt::Insert { row, table_name } => {
-            let table_str = interner.get(*table_name);
+            let table_str = table_name.as_str();
             validate_identifier(table_str)?;
             Ok(NetActionStmt::Insert {
-                row: encode_expr(row, interner)?,
+                row: encode_expr(row)?,
                 table_name: table_str.to_string(),
             })
         }
@@ -1223,12 +1195,12 @@ pub fn encode_action_stmt(stmt: &ActionStmt, interner: &Interner) -> Result<NetA
             iterable,
             body,
         } => {
-            let var_str = interner.get(*var).to_string();
+            let var_str = var.as_str().to_string();
             validate_identifier(&var_str)?;
-            let encoded_iterable = encode_expr(iterable, interner)?;
+            let encoded_iterable = encode_expr(iterable)?;
             let mut encoded_body = Vec::new();
             for s in body {
-                encoded_body.push(encode_action_stmt(s, interner)?);
+                encoded_body.push(encode_action_stmt(s)?);
             }
             Ok(NetActionStmt::For {
                 var: var_str,
@@ -1302,12 +1274,11 @@ pub fn decode_action_stmt(stmt: NetActionStmt, interner: &mut Interner) -> Resul
 ///
 /// Args:
 ///     field (`&Field`): The runtime `Field` to encode
-///     interner (`&Interner`): The `Interner` for symbol lookup
 ///
 /// Returns:
 ///     `Result<NetField>`: The encoded `NetField` network representation
-pub fn encode_field(field: &Field, interner: &Interner) -> Result<NetField> {
-    let name_str = interner.get(field.name);
+pub fn encode_field(field: &Field) -> Result<NetField> {
+    let name_str = field.name.as_str();
     validate_identifier(name_str)?;
     Ok(NetField {
         name: name_str.to_string(),
@@ -1447,7 +1418,7 @@ mod tests {
         let tbl_t = interner_orig.insert("t");
 
         let stmt1 = ActionStmt::Let {
-            name: var_x,
+            name: var_x.clone(),
             ty: Some(Type::Int),
             expr: Expr::Literal {
                 val: Value::Int { val: 42 },
@@ -1469,7 +1440,7 @@ mod tests {
 
         let orig_str = format!("{}", original_value);
 
-        let encoded = encode_value(&original_value, &interner_orig).unwrap();
+        let encoded = encode_value(&original_value).unwrap();
 
         let json_str = serde_json::to_string(&encoded).unwrap();
         let decoded_net_val: NetValue = serde_json::from_str(&json_str).unwrap();
@@ -1508,7 +1479,7 @@ mod tests {
             return_ty: Some(Type::String),
         };
 
-        let encoded = encode_value(&original_value, &interner_orig).unwrap();
+        let encoded = encode_value(&original_value).unwrap();
         let mut interner_new = Interner::new();
         let decoded = decode_value(encoded, &mut interner_new).unwrap();
 
@@ -1519,15 +1490,15 @@ mod tests {
     /// KeyVal, Unop, Binop, and If expressions
     #[test]
     fn test_expr_codec_exhaustive_1() {
-        let run_expr_test = |expr: &Expr, interner_orig: &Interner| {
-            let encoded = encode_expr(expr, interner_orig).unwrap();
+        let run_expr_test = |expr: &Expr| {
+            let encoded = encode_expr(expr).unwrap();
             let mut interner_new = Interner::new();
             let decoded = decode_expr(encoded, &mut interner_new).unwrap();
             assert_eq!(format!("{}", expr), format!("{}", decoded));
         };
 
         // 1. Tuple
-        let interner = Interner::new();
+
         let tuple_expr = Expr::Tuple {
             val: vec![
                 Expr::Literal {
@@ -1538,7 +1509,7 @@ mod tests {
                 },
             ],
         };
-        run_expr_test(&tuple_expr, &interner);
+        run_expr_test(&tuple_expr);
 
         // 2. KeyVal
         let mut interner = Interner::new();
@@ -1549,18 +1520,17 @@ mod tests {
                 val: Value::Int { val: 3 },
             }),
         };
-        run_expr_test(&key_val_expr, &interner);
+        run_expr_test(&key_val_expr);
 
         // 3. Unop (Neg, Not)
         for op in &[UnOp::Neg, UnOp::Not] {
-            let interner = Interner::new();
             let unop_expr = Expr::Unop {
                 op: *op,
                 expr: Box::new(Expr::Literal {
                     val: Value::Bool { val: true },
                 }),
             };
-            run_expr_test(&unop_expr, &interner);
+            run_expr_test(&unop_expr);
         }
 
         // 4. Binop
@@ -1576,7 +1546,6 @@ mod tests {
             BinOp::Or,
         ];
         for op in binops {
-            let interner = Interner::new();
             let binop_expr = Expr::Binop {
                 op: *op,
                 expr1: Box::new(Expr::Literal {
@@ -1586,11 +1555,11 @@ mod tests {
                     val: Value::Int { val: 6 },
                 }),
             };
-            run_expr_test(&binop_expr, &interner);
+            run_expr_test(&binop_expr);
         }
 
         // 5. If
-        let interner = Interner::new();
+
         let if_expr = Expr::If {
             cond: Box::new(Expr::Literal {
                 val: Value::Bool { val: true },
@@ -1602,15 +1571,15 @@ mod tests {
                 val: Value::Int { val: 8 },
             }),
         };
-        run_expr_test(&if_expr, &interner);
+        run_expr_test(&if_expr);
     }
 
     /// Verify round-trip encoding and decoding for Func,
     /// Call, Action, and MemberAccess expressions
     #[test]
     fn test_expr_codec_exhaustive_2() {
-        let run_expr_test = |expr: &Expr, interner_orig: &Interner| {
-            let encoded = encode_expr(expr, interner_orig).unwrap();
+        let run_expr_test = |expr: &Expr| {
+            let encoded = encode_expr(expr).unwrap();
             let mut interner_new = Interner::new();
             let decoded = decode_expr(encoded, &mut interner_new).unwrap();
             assert_eq!(format!("{}", expr), format!("{}", decoded));
@@ -1629,7 +1598,7 @@ mod tests {
             }),
             return_ty: Some(Type::Int),
         };
-        run_expr_test(&func_expr, &interner);
+        run_expr_test(&func_expr);
 
         // 2. Call
         let mut interner = Interner::new();
@@ -1650,7 +1619,7 @@ mod tests {
                 val: Value::Int { val: 10 },
             }],
         };
-        run_expr_test(&call_expr, &interner);
+        run_expr_test(&call_expr);
 
         // 3. MemberAccess
         let mut interner = Interner::new();
@@ -1660,22 +1629,22 @@ mod tests {
             service_name,
             member_name,
         };
-        run_expr_test(&member_expr, &interner);
+        run_expr_test(&member_expr);
 
         // 4. Action
-        let interner = Interner::new();
+
         let action_expr = Expr::Action(vec![ActionStmt::Do(Expr::Literal {
             val: Value::Int { val: 11 },
         })]);
-        run_expr_test(&action_expr, &interner);
+        run_expr_test(&action_expr);
     }
 
     /// Verify round-trip encoding and decoding for Select,
     /// Table, and Fold expressions
     #[test]
     fn test_expr_codec_exhaustive_3() {
-        let run_expr_test = |expr: &Expr, interner_orig: &Interner| {
-            let encoded = encode_expr(expr, interner_orig).unwrap();
+        let run_expr_test = |expr: &Expr| {
+            let encoded = encode_expr(expr).unwrap();
             let mut interner_new = Interner::new();
             let decoded = decode_expr(encoded, &mut interner_new).unwrap();
             assert_eq!(format!("{}", expr), format!("{}", decoded));
@@ -1693,7 +1662,7 @@ mod tests {
                 val: Value::Bool { val: true },
             }),
         };
-        run_expr_test(&select_expr, &interner);
+        run_expr_test(&select_expr);
 
         // 2. Table
         let mut interner = Interner::new();
@@ -1704,7 +1673,7 @@ mod tests {
             ty: TableType::String,
         };
         let f2 = Field {
-            name: col2,
+            name: col2.clone(),
             ty: TableType::Int,
         };
         let f3 = Field {
@@ -1719,7 +1688,7 @@ mod tests {
                 },
             }],
         };
-        run_expr_test(&table_expr, &interner);
+        run_expr_test(&table_expr);
 
         // 3. Fold
         let mut interner = Interner::new();
@@ -1735,43 +1704,43 @@ mod tests {
                 val: Value::Int { val: 0 },
             }),
         };
-        run_expr_test(&fold_expr, &interner);
+        run_expr_test(&fold_expr);
     }
 
     /// Verify round-trip encoding and decoding for Expr,
     /// Do, Assert, and Assign ActionStmts
     #[test]
     fn test_action_stmt_codec_exhaustive() {
-        let run_stmt_test = |stmt: &ActionStmt, interner_orig: &Interner| {
-            let encoded = encode_action_stmt(stmt, interner_orig).unwrap();
+        let run_stmt_test = |stmt: &ActionStmt| {
+            let encoded = encode_action_stmt(stmt).unwrap();
             let mut interner_new = Interner::new();
             let decoded = decode_action_stmt(encoded, &mut interner_new).unwrap();
             assert_eq!(format!("{}", stmt), format!("{}", decoded));
         };
 
         // 1. Expr
-        let interner = Interner::new();
+
         let stmt_expr = ActionStmt::Expr(Expr::Literal {
             val: Value::Int { val: 100 },
         });
-        run_stmt_test(&stmt_expr, &interner);
+        run_stmt_test(&stmt_expr);
 
         // 2. Do
-        let interner = Interner::new();
+
         let stmt_do = ActionStmt::Do(Expr::Literal {
             val: Value::Int { val: 200 },
         });
-        run_stmt_test(&stmt_do, &interner);
+        run_stmt_test(&stmt_do);
 
         // 3. Assert
-        let interner = Interner::new();
+
         let stmt_assert = ActionStmt::Assert(
             Expr::Literal {
                 val: Value::Bool { val: true },
             },
             "true".to_string(),
         );
-        run_stmt_test(&stmt_assert, &interner);
+        run_stmt_test(&stmt_assert);
 
         // 4. Assign
         let mut interner = Interner::new();
@@ -1782,7 +1751,7 @@ mod tests {
                 val: Value::Int { val: 300 },
             },
         };
-        run_stmt_test(&stmt_assign, &interner);
+        run_stmt_test(&stmt_assign);
     }
 
     /// Verify that deserializing a structurally corrupted JSON
@@ -1821,7 +1790,7 @@ mod tests {
             };
         }
 
-        let encoded = encode_expr(&expr, &interner).unwrap();
+        let encoded = encode_expr(&expr).unwrap();
         let json_str = serde_json::to_string(&encoded).unwrap();
         let decoded_net: NetExpr = serde_json::from_str(&json_str).unwrap();
         let decoded = decode_expr(decoded_net, &mut interner).unwrap();
@@ -1877,7 +1846,15 @@ mod tests {
                 "decode_request_updates should reject service {:?}",
                 bad
             );
-            let res = decode_update("ldef", bad, "member", &mut interner, vec![], None);
+            let res = decode_update(
+                "ldef",
+                bad,
+                "member",
+                NetValue::Int { val: 0 },
+                &mut interner,
+                vec![],
+                None,
+            );
             assert!(
                 res.is_err(),
                 "decode_update should reject source_service {:?}",
@@ -1886,12 +1863,19 @@ mod tests {
         }
         // A well-formed identifier is accepted.
         assert!(decode_request_updates("svc", "y", "z", &mut interner).is_ok());
-        assert!(decode_update("z", "svc", "y", &mut interner, vec![], None).is_ok());
+        assert!(decode_update(
+            "z",
+            "svc",
+            "y",
+            NetValue::Int { val: 0 },
+            &mut interner,
+            vec![],
+            None
+        )
+        .is_ok());
     }
 
-    /// A clock survives an encode/decode round-trip through the wire form. Using one interner means the re-interned `(service, member)`
-    /// keys resolve to the same `Symbol`s, so the decoded clock equals the
-    /// original.
+    /// A clock retains its source identities through a wire round-trip.
     #[test]
     fn test_codec_clock_roundtrip() {
         let mut interner = Interner::new();
@@ -1899,7 +1883,7 @@ mod tests {
         let (svc_b, y) = (interner.insert("other"), interner.insert("y"));
         let original: VClock = HashMap::from([((svc_a, x), 3u64), ((svc_b, y), 7u64)]);
 
-        let wire = encode_clock(&original, &interner);
+        let wire = encode_clock(&original);
         assert_eq!(wire.len(), 2);
         let decoded = clock_entry_to_vclock(wire, &mut interner).expect("valid clock decodes");
         assert_eq!(decoded, original);
@@ -1917,19 +1901,19 @@ mod tests {
             member: "x".to_string(),
             counter: 1,
         }];
-        let res = decode_update("ldef", "svc", "member", &mut interner, bad, None);
+        let res = decode_update(
+            "ldef",
+            "svc",
+            "member",
+            NetValue::Int { val: 0 },
+            &mut interner,
+            bad,
+            None,
+        );
         assert!(
             res.is_err(),
             "decode_update should reject a clock with a non-identifier dimension"
         );
-    }
-
-    /// The numeric id of a symbol, from its debug form
-    fn symbol_id(symbol: Symbol) -> u32 {
-        let text = format!("{symbol:?}");
-        text.trim_matches(|c: char| !c.is_ascii_digit())
-            .parse()
-            .expect("a symbol prints its id")
     }
 
     fn clock_of(dimensions: usize, counter: u64) -> Vec<ClockEntry> {
@@ -1947,14 +1931,8 @@ mod tests {
     #[test]
     fn test_codec_clock_bounds_its_dimensions_before_interning() {
         let mut interner = Interner::new();
-        let before = symbol_id(interner.insert("probe"));
         let res = clock_entry_to_vclock(clock_of(MAX_NET_CLOCK_ENTRIES + 1, 1), &mut interner);
         assert!(matches!(res, Err(Error::LimitExceeded(_))), "{res:?}");
-        assert_eq!(
-            symbol_id(interner.insert("next")),
-            before + 1,
-            "the refused clock must not have interned any name"
-        );
         let at_limit = clock_entry_to_vclock(clock_of(MAX_NET_CLOCK_ENTRIES, 1), &mut interner)
             .expect("a clock at the limit decodes");
         assert_eq!(at_limit.len(), MAX_NET_CLOCK_ENTRIES);
@@ -1969,6 +1947,7 @@ mod tests {
             "ldef",
             "svc",
             "member",
+            NetValue::Int { val: 0 },
             &mut interner,
             clock_of(1, MAX_NET_CLOCK_COUNTER + 1),
             None,
@@ -1982,8 +1961,8 @@ mod tests {
     fn test_codec_encode_oversized_string_literal() {
         let long_str = "a".repeat(MAX_STRING_LITERAL_LENGTH + 1);
         let val = Value::String { val: long_str };
-        let interner = Interner::new();
-        let res = encode_value(&val, &interner);
+
+        let res = encode_value(&val);
         assert!(res.is_err());
         assert!(matches!(res.unwrap_err(), Error::LimitExceeded(_)));
     }
@@ -1992,14 +1971,13 @@ mod tests {
     /// assertion statement
     #[test]
     fn test_codec_assert_roundtrip() {
-        let interner = Interner::new();
         let stmt = ActionStmt::Assert(
             Expr::Literal {
                 val: Value::Bool { val: false },
             },
             "x == 5".to_string(),
         );
-        let encoded = encode_action_stmt(&stmt, &interner).unwrap();
+        let encoded = encode_action_stmt(&stmt).unwrap();
         let mut interner_new = Interner::new();
         let decoded = decode_action_stmt(encoded, &mut interner_new).unwrap();
         match decoded {
@@ -2048,7 +2026,7 @@ mod tests {
         };
 
         let encoded_type = encode_type(&original_type).unwrap();
-        let encoded_param = encode_param(&original_param, &interner_orig).unwrap();
+        let encoded_param = encode_param(&original_param).unwrap();
 
         let mut interner_new = Interner::new();
         let decoded_type = decode_type(encoded_type).unwrap();
@@ -2310,42 +2288,27 @@ mod service_code_tests {
         original_type.add_field(field_a, Type::Int).unwrap();
         original_type.add_field(field_b, Type::String).unwrap();
 
-        let encoded = encode_servicetype(&original_type, &interner).unwrap();
+        let encoded = encode_servicetype(&original_type).unwrap();
 
         let mut interner_new = Interner::new();
         let decoded = decode_servicetype(encoded.clone(), &mut interner_new).unwrap();
 
-        // Note: We re-encode to compare `NetServiceType` values
-        // instead of comparing the decoded runtime `ServiceType`
-        // instances directly. Runtime `ServiceType` equality
-        // depends on `Interner` `Symbol` IDs, which might
-        // misalign between the original and new `Interner`
-        // instances, causing brittle test failures. The
-        // `NetServiceType` correctly reflects network equivalence
-        let reencoded = encode_servicetype(&decoded, &interner_new).unwrap();
+        let reencoded = encode_servicetype(&decoded).unwrap();
         assert_eq!(encoded, reencoded);
     }
 
     /// Verify round-trip encoding and decoding for an empty ServiceType (zero fields)
     #[test]
     fn test_codec_service_type_empty_roundtrip() {
-        let interner = Interner::new();
         let original_type = ServiceType::default();
 
-        let encoded = encode_servicetype(&original_type, &interner).unwrap();
+        let encoded = encode_servicetype(&original_type).unwrap();
         assert!(encoded.fields.is_empty());
 
         let mut interner_new = Interner::new();
         let decoded = decode_servicetype(encoded.clone(), &mut interner_new).unwrap();
 
-        // Note: We re-encode to compare `NetServiceType` values
-        // instead of comparing the decoded runtime `ServiceType`
-        // instances directly. Runtime `ServiceType` equality
-        // depends on `Interner` `Symbol` IDs, which might
-        // misalign between the original and new `Interner`
-        // instances, causing brittle test failures. The
-        // `NetServiceType` correctly reflects network equivalence
-        let reencoded = encode_servicetype(&decoded, &interner_new).unwrap();
+        let reencoded = encode_servicetype(&decoded).unwrap();
         assert_eq!(encoded, reencoded);
     }
 
@@ -2363,19 +2326,12 @@ mod service_code_tests {
         original_type.add_field(field_tuple, tuple_ty).unwrap();
         original_type.add_field(field_func, func_ty).unwrap();
 
-        let encoded = encode_servicetype(&original_type, &interner).unwrap();
+        let encoded = encode_servicetype(&original_type).unwrap();
 
         let mut interner_new = Interner::new();
         let decoded = decode_servicetype(encoded.clone(), &mut interner_new).unwrap();
 
-        // Note: We re-encode to compare `NetServiceType` values
-        // instead of comparing the decoded runtime `ServiceType`
-        // instances directly. Runtime `ServiceType` equality
-        // depends on `Interner` `Symbol` IDs, which might
-        // misalign between the original and new `Interner`
-        // instances, causing brittle test failures. The
-        // `NetServiceType` correctly reflects network equivalence
-        let reencoded = encode_servicetype(&decoded, &interner_new).unwrap();
+        let reencoded = encode_servicetype(&decoded).unwrap();
         assert_eq!(encoded, reencoded);
     }
 
@@ -2465,32 +2421,20 @@ mod service_code_tests {
         assert!(validate_lock_request(&invalid_read_map).is_err());
     }
 
-    /// Verify that `decode_update_service_request` validates service identifiers
+    /// Verify that `validate_update_service_request` validates service identifiers
     /// and enforces maximum source length limits
     #[test]
-    fn test_decode_update_service_request() {
-        let mut interner = Interner::new();
-
-        let valid_res = decode_update_service_request(
-            "MyService",
-            "update MyService { var x = 1; }",
-            &mut interner,
-        );
+    fn test_validate_update_service_request() {
+        let valid_res =
+            validate_update_service_request("MyService", "update MyService { var x = 1; }");
         assert!(valid_res.is_ok());
-        let (sym, src) = valid_res.unwrap();
-        assert_eq!(interner.get(sym), "MyService");
-        assert_eq!(src, "update MyService { var x = 1; }");
 
-        let invalid_svc = decode_update_service_request(
-            "invalid-service!",
-            "update invalid-service! {}",
-            &mut interner,
-        );
+        let invalid_svc =
+            validate_update_service_request("invalid-service!", "update invalid-service! {}");
         assert!(invalid_svc.is_err());
 
         let oversized_source = "a".repeat(MAX_NET_REQUEST_SOURCE_LENGTH + 1);
-        let oversized_res =
-            decode_update_service_request("MyService", &oversized_source, &mut interner);
+        let oversized_res = validate_update_service_request("MyService", &oversized_source);
         assert!(oversized_res.is_err());
     }
 }

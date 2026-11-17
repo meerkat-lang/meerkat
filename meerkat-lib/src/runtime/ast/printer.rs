@@ -5,40 +5,38 @@
 //! levels with the `INDENTATION` constant
 
 use crate::runtime::ast::{ActionStmt, Decl, Expr, Field, Stmt, Value};
-use crate::runtime::interner::{Interner, Symbol};
+use crate::runtime::interner::Symbol;
 use crate::runtime::tt::Type;
 
 const INDENTATION: usize = 2;
 
 /// Pretty printer for formatting and displaying the abstract syntax tree
-pub struct AstPrinter<'a> {
+pub struct AstPrinter {
     spaces: usize,
-    interner: &'a Interner,
 }
 
-impl<'a> AstPrinter<'a> {
+impl AstPrinter {
     /// Creates a new `AstPrinter` instance with default indentation
-    pub fn new(interner: &'a Interner) -> Self {
+    pub fn new() -> Self {
         Self {
             spaces: INDENTATION,
-            interner,
         }
     }
 
     /// Creates a new `AstPrinter` instance with custom indentation level
-    pub fn with_spaces(spaces: usize, interner: &'a Interner) -> Self {
-        Self { spaces, interner }
+    pub fn with_spaces(spaces: usize) -> Self {
+        Self { spaces }
     }
 
-    /// Helper function to format a `Symbol` with its ID and string representation
+    /// Helper function to format a `Symbol` using its spelling
     ///
     /// Args:
     ///     `sym` (`Symbol`): The symbol to format
     ///
     /// Returns:
     ///     `String`: The formatted symbol string representation
-    pub fn format_symbol(&self, sym: Symbol) -> String {
-        format!("{:?} (\"{}\")", sym, self.interner.get(sym))
+    pub fn format_symbol(&self, sym: &Symbol) -> String {
+        format!("{:?}", sym)
     }
 
     /// Helper function to format an optional type using `Display` representation
@@ -85,7 +83,6 @@ impl<'a> AstPrinter<'a> {
                 service_name,
                 decls,
             } => {
-                let service_name = *service_name;
                 println!(
                     "Update: {{ service_name: {} }}",
                     self.format_symbol(service_name)
@@ -98,7 +95,6 @@ impl<'a> AstPrinter<'a> {
                 println!("Connect: {{ path: \"{}\", addr: \"{}\" }}", path, addr);
             }
             Stmt::Import { path, service_name } => {
-                let service_name = *service_name;
                 println!(
                     "Import: {{ path: \"{}\", service_name: {} }}",
                     path,
@@ -106,7 +102,6 @@ impl<'a> AstPrinter<'a> {
                 );
             }
             Stmt::Service { name, decls } => {
-                let name = *name;
                 println!("Service: {{ name: {} }}", self.format_symbol(name));
                 for decl in decls {
                     self.print_decl(decl, indent + 1);
@@ -116,7 +111,6 @@ impl<'a> AstPrinter<'a> {
                 service_name,
                 stmts,
             } => {
-                let service_name = *service_name;
                 println!(
                     "Test: {{ service_name: {} }}",
                     self.format_symbol(service_name)
@@ -137,7 +131,6 @@ impl<'a> AstPrinter<'a> {
         self.print_indent(indent);
         match decl {
             Decl::VarDecl { name, ty, val } => {
-                let name = *name;
                 println!(
                     "VarDecl: {{ name: {}, ty: {} }}",
                     self.format_symbol(name),
@@ -151,8 +144,6 @@ impl<'a> AstPrinter<'a> {
                 val,
                 is_pub,
             } => {
-                let name = *name;
-                let is_pub = *is_pub;
                 println!(
                     "DefDecl: {{ name: {}, ty: {}, is_pub: {} }}",
                     self.format_symbol(name),
@@ -162,7 +153,6 @@ impl<'a> AstPrinter<'a> {
                 self.print_expr(val, indent + 1);
             }
             Decl::TableDecl { name, fields } => {
-                let name = *name;
                 println!("TableDecl: {{ name: {} }}", self.format_symbol(name));
                 for field in fields {
                     self.print_field(field, indent + 1);
@@ -176,7 +166,7 @@ impl<'a> AstPrinter<'a> {
         self.print_indent(indent);
         println!(
             "Field: {{ name: {}, ty: {:?} }}",
-            self.format_symbol(field.name),
+            self.format_symbol(&field.name),
             field.ty
         );
     }
@@ -186,7 +176,6 @@ impl<'a> AstPrinter<'a> {
         self.print_indent(indent);
         match stmt {
             ActionStmt::Let { name, ty, expr } => {
-                let name = *name;
                 println!(
                     "Let: {{ name: {}, ty: {} }}",
                     self.format_symbol(name),
@@ -207,12 +196,10 @@ impl<'a> AstPrinter<'a> {
                 self.print_expr(expr, indent + 1);
             }
             ActionStmt::Assign { name, expr } => {
-                let name = *name;
                 println!("Assign: {{ name: {} }}", self.format_symbol(name));
                 self.print_expr(expr, indent + 1);
             }
             ActionStmt::Insert { row, table_name } => {
-                let table_name = *table_name;
                 println!(
                     "Insert: {{ table_name: {} }}",
                     self.format_symbol(table_name)
@@ -224,7 +211,6 @@ impl<'a> AstPrinter<'a> {
                 iterable,
                 body,
             } => {
-                let var = *var;
                 println!("For: {{ var: {} }}", self.format_symbol(var));
                 self.print_expr(iterable, indent + 1);
                 for stmt in body {
@@ -243,7 +229,6 @@ impl<'a> AstPrinter<'a> {
                 self.print_value(val, indent + 1);
             }
             Expr::Variable { name } => {
-                let name = *name;
                 println!("Variable: {{ name: {} }}", self.format_symbol(name));
             }
             Expr::Html(template) => {
@@ -259,17 +244,14 @@ impl<'a> AstPrinter<'a> {
                 }
             }
             Expr::KeyVal { name, value } => {
-                let name = *name;
                 println!("KeyVal: {{ name: {} }}", self.format_symbol(name));
                 self.print_expr(value, indent + 1);
             }
             Expr::Unop { op, expr } => {
-                let op = *op;
                 println!("Unop: {{ op: {:?} }}", op);
                 self.print_expr(expr, indent + 1);
             }
             Expr::Binop { op, expr1, expr2 } => {
-                let op = *op;
                 println!("Binop: {{ op: {:?} }}", op);
                 self.print_expr(expr1, indent + 1);
                 self.print_expr(expr2, indent + 1);
@@ -289,9 +271,9 @@ impl<'a> AstPrinter<'a> {
                     .iter()
                     .map(|p| {
                         if let Some(ref t) = p.ty {
-                            format!("{}: {}", self.format_symbol(p.name), t)
+                            format!("{}: {}", self.format_symbol(&p.name), t)
                         } else {
-                            self.format_symbol(p.name)
+                            self.format_symbol(&p.name)
                         }
                     })
                     .collect();
@@ -319,8 +301,6 @@ impl<'a> AstPrinter<'a> {
                 service_name,
                 member_name,
             } => {
-                let service_name = *service_name;
-                let member_name = *member_name;
                 println!(
                     "MemberAccess: {{ service_name: {}, member_name: {} }}",
                     self.format_symbol(service_name),
@@ -332,11 +312,8 @@ impl<'a> AstPrinter<'a> {
                 column_names,
                 where_clause,
             } => {
-                let table_name = *table_name;
-                let cols_str: Vec<String> = column_names
-                    .iter()
-                    .map(|c| self.format_symbol(*c))
-                    .collect();
+                let cols_str: Vec<String> =
+                    column_names.iter().map(|c| self.format_symbol(c)).collect();
                 println!(
                     "Select: {{ table_name: {}, column_names: {:?} }}",
                     self.format_symbol(table_name),
@@ -359,8 +336,6 @@ impl<'a> AstPrinter<'a> {
                 operation,
                 identity,
             } => {
-                let table_name = *table_name;
-                let column_name = *column_name;
                 println!(
                     "Fold: {{ table_name: {}, column_name: {} }}",
                     self.format_symbol(table_name),
@@ -388,11 +363,9 @@ impl<'a> AstPrinter<'a> {
         self.print_indent(indent);
         match val {
             Value::Int { val } => {
-                let val = *val;
                 println!("Int: {}", val);
             }
             Value::Bool { val } => {
-                let val = *val;
                 println!("Bool: {}", val);
             }
             Value::String { val } => {
@@ -408,14 +381,13 @@ impl<'a> AstPrinter<'a> {
                 return_ty,
                 ..
             } => {
-                let service_name = *service_name;
                 let params_str: Vec<String> = params
                     .iter()
                     .map(|p| {
                         if let Some(ref t) = p.ty {
-                            format!("{}: {}", self.format_symbol(p.name), t)
+                            format!("{}: {}", self.format_symbol(&p.name), t)
                         } else {
-                            self.format_symbol(p.name)
+                            self.format_symbol(&p.name)
                         }
                     })
                     .collect();
@@ -450,5 +422,11 @@ impl<'a> AstPrinter<'a> {
                 println!("Range: {}..{}", start, end);
             }
         }
+    }
+}
+
+impl Default for AstPrinter {
+    fn default() -> Self {
+        Self::new()
     }
 }

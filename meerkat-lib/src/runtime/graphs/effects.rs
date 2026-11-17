@@ -34,9 +34,9 @@
 //! function value that would leave a def's reads incomplete
 
 use super::free_var::free_var;
-use super::{cyclic_members, ServiceGraphs};
+use super::{cyclic_members, node_index, ServiceGraphs};
 use crate::ast::{Decl, Expr, Stmt, Value};
-use crate::runtime::interner::{Interner, Symbol};
+use crate::runtime::interner::Symbol;
 use crate::runtime::limits::{MAX_ANALYSIS_DEPTH, MAX_ANALYSIS_ROUNDS};
 use crate::runtime::tt::Param;
 use petgraph::graphmap::DiGraphMap;
@@ -82,7 +82,7 @@ struct Reads {
 
 impl Reads {
     fn all(&self) -> impl Iterator<Item = Member> + '_ {
-        self.direct.iter().chain(&self.activated).copied()
+        self.direct.iter().chain(&self.activated).cloned()
     }
 }
 
@@ -166,7 +166,7 @@ impl<'a> Effects<'a> {
             };
             for (index, decl) in services[name].iter().enumerate() {
                 decls
-                    .entry((*name, decl.name()))
+                    .entry((name.clone(), decl.name()))
                     .or_insert(((position, index), decl));
             }
         }
@@ -182,16 +182,21 @@ impl<'a> Effects<'a> {
     /// cross-service dependency for each member a def's code reads. A var or a
     /// table is a source: what a var's initializer reads, the transaction
     /// initializing it reads once, and is no input of its value afterwards
-    pub(crate) fn graphs(&mut self, service: Symbol, decls: &'a [Decl]) -> ServiceGraphs {
+    pub(crate) fn graphs(&mut self, service: &Symbol, decls: &'a [Decl]) -> ServiceGraphs {
         let mut graphs = ServiceGraphs::new();
         for decl in decls {
             let name = decl.name();
             match decl {
-                Decl::VarDecl { .. } => graphs.vars.insert(name),
-                Decl::DefDecl { .. } => graphs.defs.insert(name),
-                Decl::TableDecl { .. } => graphs.tables.insert(name),
+                Decl::VarDecl { .. } => graphs.vars.insert(name.clone()),
+                Decl::DefDecl { .. } => graphs.defs.insert(name.clone()),
+                Decl::TableDecl { .. } => graphs.tables.insert(name.clone()),
             };
-            graphs.reactive_graph.add_node(name);
+            node_index(
+                &mut graphs.reactive_graph,
+                &mut graphs.names,
+                &mut graphs.nodes,
+                name,
+            );
         }
         for decl in decls {
             let Decl::DefDecl { .. } = decl else {
@@ -201,17 +206,19 @@ impl<'a> Effects<'a> {
                 continue;
             };
             if !complete {
-                graphs.incomplete.insert(name);
+                graphs.incomplete.insert(name.clone());
             }
             for (owner, member) in reads.all() {
-                if owner != service {
+                if &owner != service {
                     graphs
                         .cross_deps
-                        .entry(name)
+                        .entry(name.clone())
                         .or_default()
                         .insert((owner, member));
-                } else if graphs.reactive_graph.contains_node(member) {
-                    graphs.reactive_graph.add_edge(member, name, ());
+                } else if graphs.nodes.contains_key(&member) {
+                    graphs
+                        .reactive_graph
+                        .add_edge(graphs.nodes[&member], graphs.nodes[&name], ());
                 }
             }
         }
@@ -222,7 +229,7 @@ impl<'a> Effects<'a> {
     /// and whether the analysis found all of it within the depth limit
     fn member_reads(
         &mut self,
-        service: Symbol,
+        service: &Symbol,
         decl: &'a Decl,
         initializing: bool,
     ) -> Option<(Symbol, Reads, bool)> {
@@ -237,15 +244,15 @@ impl<'a> Effects<'a> {
         Some((decl.name(), reads, complete))
     }
 
-    fn decl(&self, member: Member) -> Option<&'a Decl> {
-        self.decls.get(&member).map(|(_, decl)| *decl)
+    fn decl(&self, member: &Member) -> Option<&'a Decl> {
+        self.decls.get(member).map(|(_, decl)| *decl)
     }
 
     /// A var keeps its initialized value. A def can be evaluated both during
     /// initialization and later, when all its service's members exist.
     fn member_value(
         &mut self,
-        service: Symbol,
+        service: &Symbol,
         decl: &'a Decl,
         initializing: bool,
         reads: &mut Reads,
@@ -253,7 +260,7 @@ impl<'a> Effects<'a> {
         let (Decl::VarDecl { val, .. } | Decl::DefDecl { val, .. }) = decl else {
             return Ok(Functions::new());
         };
-        let position = self.decls[&(service, decl.name())].0;
+        let position = self.decls[&(service.clone(), decl.name())].0;
         let previous = self.initializing;
         self.initializing = initializing.then_some(position);
         let result = self.visit(val, service, &[], reads);
@@ -277,7 +284,7 @@ impl<'a> Effects<'a> {
     fn visit(
         &mut self,
         expr: &'a Expr,
-        service: Symbol,
+        service: &Symbol,
         locals: &[(Symbol, Functions)],
         reads: &mut Reads,
     ) -> Result<Functions, DepthLimit> {
@@ -299,7 +306,7 @@ impl<'a> Effects<'a> {
     fn visit_expr(
         &mut self,
         expr: &'a Expr,
-        service: Symbol,
+        service: &Symbol,
         locals: &[(Symbol, Functions)],
         reads: &mut Reads,
     ) -> Result<Functions, DepthLimit> {
@@ -309,16 +316,16 @@ impl<'a> Effects<'a> {
             // declared here or not
             Expr::Variable { name } => match locals.iter().rev().find(|(local, _)| local == name) {
                 Some((_, functions)) => functions.clone(),
-                None => self.read((service, *name), reads)?,
+                None => self.read((service.clone(), name.clone()), reads)?,
             },
-            &Expr::MemberAccess {
+            Expr::MemberAccess {
                 service_name,
                 member_name,
-            } => self.read((service_name, member_name), reads)?,
+            } => self.read((service_name.clone(), member_name.clone()), reads)?,
             Expr::Func { params, body, .. } => {
                 // As in `eval`, a closure captures the locals free in its body,
                 // except one named like a member that already exists.
-                let bound = params.iter().map(|param| param.name).collect();
+                let bound = params.iter().map(|param| param.name.clone()).collect();
                 let free = free_var(body, &bound);
                 let env = locals
                     .iter()
@@ -326,7 +333,9 @@ impl<'a> Effects<'a> {
                         if !free.contains(local) {
                             return false;
                         }
-                        let Some(&(position, _)) = self.decls.get(&(service, *local)) else {
+                        let Some(&(position, _)) =
+                            self.decls.get(&(service.clone(), local.clone()))
+                        else {
                             return true;
                         };
                         self.shadowing = true;
@@ -335,7 +344,7 @@ impl<'a> Effects<'a> {
                     .cloned()
                     .collect();
                 BTreeSet::from([self.function(Lambda {
-                    service,
+                    service: service.clone(),
                     params,
                     body,
                     env,
@@ -362,7 +371,7 @@ impl<'a> Effects<'a> {
             } => {
                 let result = self.visit(where_clause, service, locals, reads);
                 if !locals.iter().any(|(local, _)| local == table_name) {
-                    reads.direct.insert((service, *table_name));
+                    reads.direct.insert((service.clone(), table_name.clone()));
                 }
                 result?;
                 Functions::new()
@@ -391,11 +400,14 @@ impl<'a> Effects<'a> {
                 self.descend()?;
                 let result = env
                     .iter()
-                    .map(|(name, value)| self.literal(value).map(|functions| (*name, functions)))
+                    .map(|(name, value)| {
+                        self.literal(value)
+                            .map(|functions| (name.clone(), functions))
+                    })
                     .collect::<Result<_, _>>()
                     .map(|env| {
                         BTreeSet::from([self.function(Lambda {
-                            service: *service_name,
+                            service: service_name.clone(),
                             params,
                             body,
                             env,
@@ -415,12 +427,12 @@ impl<'a> Effects<'a> {
     /// point's summary, one function capturing what every lambda of the
     /// family captured, so the functions of a program stay finite
     fn function(&mut self, lambda: Lambda<'a>) -> Function {
-        let point = (lambda.service, lambda.body as *const Expr);
-        if self.nests(point, &lambda.env) {
+        let point = (lambda.service.clone(), lambda.body as *const Expr);
+        if self.nests(&point, &lambda.env) {
             return self.summarize(point, lambda);
         }
         let identity = (
-            lambda.service,
+            lambda.service.clone(),
             lambda.body as *const Expr,
             lambda.env.clone(),
         );
@@ -433,7 +445,7 @@ impl<'a> Effects<'a> {
 
     /// Whether a function some local of `env` may be is a lambda of `point`
     /// with the same captured names, itself or through what it captured.
-    fn nests(&self, point: Point, env: &Locals) -> bool {
+    fn nests(&self, point: &Point, env: &Locals) -> bool {
         let mut seen = HashSet::new();
         let mut pending: Vec<Function> = env.iter().flat_map(|(_, f)| f.iter().copied()).collect();
         while let Some(function) = pending.pop() {
@@ -443,7 +455,8 @@ impl<'a> Effects<'a> {
             if !seen.insert(function) {
                 continue;
             }
-            if (lambda.service, lambda.body as *const Expr) == point
+            if lambda.service == point.0
+                && std::ptr::eq(lambda.body, point.1)
                 && lambda
                     .env
                     .iter()
@@ -462,17 +475,20 @@ impl<'a> Effects<'a> {
     /// summary, and what it captured joins. The applications analyzed with
     /// a smaller summary are forgotten, to be analyzed again with this one
     fn summarize(&mut self, point: Point, lambda: Lambda<'a>) -> Function {
-        let names: Vec<_> = lambda.env.iter().map(|(name, _)| *name).collect();
+        let names: Vec<_> = lambda.env.iter().map(|(name, _)| name.clone()).collect();
         let summary = *self
             .summaries
             .entry((
-                point,
+                point.clone(),
                 names.clone(),
                 self.initializing.filter(|_| self.shadowing),
             ))
             .or_insert_with(|| {
                 self.lambdas.push(Lambda {
-                    env: names.iter().map(|&name| (name, Functions::new())).collect(),
+                    env: names
+                        .iter()
+                        .map(|name| (name.clone(), Functions::new()))
+                        .collect(),
                     ..lambda.clone()
                 });
                 self.lambdas.len() - 1
@@ -484,7 +500,8 @@ impl<'a> Effects<'a> {
             for (name, functions) in env {
                 for function in functions {
                     let of_point = self.lambdas.get(function).is_some_and(|l| {
-                        (l.service, l.body as *const Expr) == point
+                        l.service == point.0
+                            && std::ptr::eq(l.body, point.1)
                             && l.env.iter().map(|(name, _)| name).eq(names.iter())
                     });
                     if of_point && folded.insert(function) {
@@ -495,7 +512,7 @@ impl<'a> Effects<'a> {
                     match env.iter_mut().find(|(local, _)| *local == name) {
                         Some((_, set)) => grew |= set.insert(captured),
                         None => {
-                            env.push((name, BTreeSet::from([captured])));
+                            env.push((name.clone(), BTreeSet::from([captured])));
                             grew = true;
                         }
                     }
@@ -510,11 +527,11 @@ impl<'a> Effects<'a> {
 
     /// Record a read of `member`, and return the functions it may hold
     fn read(&mut self, member: Member, reads: &mut Reads) -> Result<Functions, DepthLimit> {
-        reads.direct.insert(member);
-        let decl = self.decl(member);
+        reads.direct.insert(member.clone());
+        let decl = self.decl(&member);
         let initializing =
             self.initializing.is_some() || matches!(decl, Some(Decl::VarDecl { .. }));
-        let key = (member, initializing);
+        let key = (member.clone(), initializing);
         if let Some((functions, shadowing)) = self.values.get(&key) {
             self.shadowing |= shadowing;
             return functions.clone();
@@ -534,7 +551,7 @@ impl<'a> Effects<'a> {
                 return Ok(published);
             }
         };
-        if !self.computing.insert(key) {
+        if !self.computing.insert(key.clone()) {
             return Ok(BTreeSet::from([UNKNOWN]));
         }
         // What the member's own code reads belongs to that member, not here,
@@ -542,7 +559,7 @@ impl<'a> Effects<'a> {
         let applying = std::mem::take(&mut self.applying);
         let outer_shadowing = std::mem::take(&mut self.shadowing);
         let functions = self
-            .member_value(member.0, decl, initializing, &mut Reads::default())
+            .member_value(&member.0, decl, initializing, &mut Reads::default())
             .map(|mut declared| {
                 declared.append(&mut published);
                 declared
@@ -581,7 +598,7 @@ impl<'a> Effects<'a> {
                 .filter(|(_, _, shadowing)| !shadowing)
         });
         if let Some((more, result, shadowing)) = cached {
-            reads.activated.extend(more);
+            reads.activated.extend(more.iter().cloned());
             self.shadowing |= shadowing;
             return Ok(result.clone());
         }
@@ -619,10 +636,10 @@ impl<'a> Effects<'a> {
             locals.extend(
                 params
                     .iter()
-                    .map(|param| param.name)
+                    .map(|param| param.name.clone())
                     .zip(args.iter().cloned()),
             );
-            let result = self.visit(body, service, &locals, &mut own);
+            let result = self.visit(body, &service, &locals, &mut own);
             let widened = self.lambdas[function].env != env;
             let current = self.applying.last_mut().expect("pushed above");
             match result {
@@ -651,7 +668,7 @@ impl<'a> Effects<'a> {
             ..
         } = self.applying.pop().expect("pushed above");
         let own: HashSet<Member> = own.all().collect();
-        reads.activated.extend(&own);
+        reads.activated.extend(own.iter().cloned());
         let shadowing = self.shadowing;
         self.shadowing |= outer_shadowing;
         let result = result?;
@@ -688,22 +705,20 @@ pub enum Error {
 
 impl Error {
     /// The error in program terms
-    pub(crate) fn message(&self, interner: &Interner) -> String {
+    pub(crate) fn message(&self) -> String {
         match self {
             Error::Cycle { service, member } => format!(
                 "dependency cycle detected at service '{}', member '{}'",
-                interner.get(*service),
-                interner.get(*member)
+                service.as_str(),
+                member.as_str()
             ),
             Error::ForwardReference(member) => format!(
                 "illegal eager forward reference or dependency cycle on '{}'",
-                interner.get(*member)
+                member.as_str()
             ),
-            Error::DepthLimitExceeded { service, member } => depth_limit_message(&format!(
-                "{}.{}",
-                interner.get(*service),
-                interner.get(*member)
-            )),
+            Error::DepthLimitExceeded { service, member } => {
+                depth_limit_message(&format!("{}.{}", service.as_str(), member.as_str()))
+            }
         }
     }
 }
@@ -730,13 +745,13 @@ pub(crate) fn check(program: &[Stmt]) -> Result<(), Error> {
     for stmt in program {
         if let Stmt::Service { name, .. } = stmt {
             if !services.contains(name) {
-                services.push(*name);
+                services.push(name.clone());
             }
         }
     }
     let mut declared = Vec::new();
-    for (position, &service) in services.iter().enumerate() {
-        let Some(decls) = effects.services.get(&service).copied() else {
+    for (position, service) in services.iter().enumerate() {
+        let Some(decls) = effects.services.get(service).copied() else {
             continue;
         };
         for (index, decl) in decls.iter().enumerate() {
@@ -744,7 +759,7 @@ pub(crate) fn check(program: &[Stmt]) -> Result<(), Error> {
             let reads = match effects.member_reads(service, decl, true) {
                 Some((_, _, false)) => {
                     return Err(Error::DepthLimitExceeded {
-                        service,
+                        service: service.clone(),
                         member: name,
                     })
                 }
@@ -752,7 +767,7 @@ pub(crate) fn check(program: &[Stmt]) -> Result<(), Error> {
                 None => None,
             };
             declared.push(Declared {
-                member: (service, name),
+                member: (service.clone(), name),
                 at: (position, index),
                 def: matches!(decl, Decl::DefDecl { .. }),
                 shadowing: effects.shadowing,
@@ -767,14 +782,14 @@ pub(crate) fn check(program: &[Stmt]) -> Result<(), Error> {
         .iter_mut()
         .filter(|member| member.def && member.shadowing)
     {
-        let decl = effects.decl(member.member).expect("collected above");
-        let Some((name, reads, complete)) = effects.member_reads(member.member.0, decl, false)
+        let decl = effects.decl(&member.member).expect("collected above");
+        let Some((name, reads, complete)) = effects.member_reads(&member.member.0, decl, false)
         else {
             continue;
         };
         if !complete {
             return Err(Error::DepthLimitExceeded {
-                service: member.member.0,
+                service: member.member.0.clone(),
                 member: name,
             });
         }
@@ -791,8 +806,14 @@ pub(crate) fn check(program: &[Stmt]) -> Result<(), Error> {
 /// applies, one of a service declared after its own. Of several such reads,
 /// the one declared first
 fn forward_reference(declared: &[Declared]) -> Option<Symbol> {
-    let position: HashMap<Symbol, usize> = declared.iter().map(|d| (d.member.0, d.at.0)).collect();
-    let index: HashMap<Member, usize> = declared.iter().map(|d| (d.member, d.at.1)).collect();
+    let position: HashMap<Symbol, usize> = declared
+        .iter()
+        .map(|d| (d.member.0.clone(), d.at.0))
+        .collect();
+    let index: HashMap<Member, usize> = declared
+        .iter()
+        .map(|d| (d.member.clone(), d.at.1))
+        .collect();
     for Declared {
         member: (service, _),
         at: (p, i),
@@ -822,16 +843,21 @@ fn forward_reference(declared: &[Declared]) -> Option<Symbol> {
 /// the direct dependency graph of a program must be acyclic (§2.1.4). Vars
 /// are sources, so a cycle runs through defs only
 fn dependency_cycle(declared: &[Declared]) -> Option<Member> {
-    let mut graph = DiGraphMap::<Member, ()>::new();
+    let mut graph = DiGraphMap::new();
+    let mut names = Vec::new();
+    let mut nodes = HashMap::new();
     for d in declared.iter().filter(|d| d.def) {
-        graph.add_node(d.member);
+        let member = node_index(&mut graph, &mut names, &mut nodes, d.member.clone());
         for input in d.reads.iter().flat_map(Reads::all) {
-            graph.add_edge(input, d.member, ());
+            let input = node_index(&mut graph, &mut names, &mut nodes, input);
+            graph.add_edge(input, member, ());
         }
     }
-    let cyclic: HashSet<Member> = cyclic_members(&graph).collect();
+    let cyclic: HashSet<Member> = cyclic_members(&graph)
+        .map(|node| names[node].clone())
+        .collect();
     declared
         .iter()
         .find(|d| d.def && cyclic.contains(&d.member))
-        .map(|d| d.member)
+        .map(|d| d.member.clone())
 }

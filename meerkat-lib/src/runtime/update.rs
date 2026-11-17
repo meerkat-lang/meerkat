@@ -8,7 +8,7 @@
 use crate::net::LockGroup;
 use crate::runtime::ast::{apply_updates_to_ast, Decl, Expr, Stmt, Value};
 use crate::runtime::graphs::analysis::service_declarations;
-use crate::runtime::interner::{Interner, Symbol};
+use crate::runtime::interner::Symbol;
 use crate::runtime::interpreter::evaluator::{eval, EvalContext, EvalError};
 use crate::runtime::manager::Manager;
 use crate::runtime::txn::{Transaction as LockTxn, TxnId, VClock, VarLock};
@@ -128,12 +128,12 @@ impl Transaction {
                 } => (name, decls),
                 _ => continue,
             };
-            let svc_name_str = manager.interner.get(*name).to_string();
+            let svc_name_str = name.as_str().to_string();
             let mut has_new_field = false;
             if let Some(service) = manager.services.get(name) {
                 for decl in decls {
                     let decl_name = match decl {
-                        Decl::VarDecl { name: n, .. } | Decl::DefDecl { name: n, .. } => *n,
+                        Decl::VarDecl { name: n, .. } | Decl::DefDecl { name: n, .. } => n.clone(),
                         Decl::TableDecl { .. } => continue,
                     };
                     if !service.vars.contains_key(&decl_name)
@@ -156,7 +156,7 @@ impl Transaction {
             for decl in decls {
                 match decl {
                     Decl::VarDecl { name: var_name, .. } | Decl::DefDecl { name: var_name, .. } => {
-                        let var_str = manager.interner.get(*var_name).to_string();
+                        let var_str = var_name.as_str().to_string();
                         group.writes.insert(var_str);
                     }
                     Decl::TableDecl { .. } => {
@@ -197,7 +197,7 @@ impl Transaction {
         match apply_updates_to_ast(manager.unified_ast(), &self.updates) {
             Ok(patched) => self.ast = patched,
             Err(sym) => {
-                let name_str = manager.interner.get(sym);
+                let name_str = sym.as_str();
                 return Err(EvalError::RuntimeError(format!(
                     "Target service '{}' for update not found",
                     name_str
@@ -208,7 +208,7 @@ impl Transaction {
         if let Err(e) = crate::runtime::node::check_program(&self.ast) {
             return Err(EvalError::RuntimeError(format!(
                 "Static check failed on update: {}",
-                e.message(&manager.interner)
+                e.message()
             )));
         }
         for stmt in &self.updates {
@@ -227,7 +227,7 @@ impl Transaction {
             };
             for decl in decls {
                 let (var_name, expr) = match decl {
-                    Decl::VarDecl { name, val, .. } => (*name, val),
+                    Decl::VarDecl { name, val, .. } => (name.clone(), val),
                     Decl::DefDecl { .. } => continue,
                     Decl::TableDecl { .. } => {
                         return Err(EvalError::NotImplemented);
@@ -238,7 +238,7 @@ impl Transaction {
                 let eval_res = {
                     let mut ctx = EvalContext {
                         manager,
-                        service_name: *svc_name,
+                        service_name: svc_name.clone(),
                         txn: self.lock_txn.as_mut(),
                     };
                     eval(expr, &env, &mut ctx).await
@@ -250,7 +250,7 @@ impl Transaction {
                         return Err(e);
                     }
                 };
-                self.values.insert((*svc_name, var_name), val);
+                self.values.insert((svc_name.clone(), var_name), val);
             }
         }
 
@@ -260,13 +260,13 @@ impl Transaction {
         // acyclic as well. Those of the services declared may change, as may
         // those of every running service reading a member declared
         let running = manager.running_services();
-        let mut services = manager.services_reading(
-            declared(&self.updates)
-                .flat_map(|(&name, decls)| decls.iter().map(move |decl| (name, decl.name()))),
-        );
+        let mut services =
+            manager.services_reading(declared(&self.updates).flat_map(|(name, decls)| {
+                decls.iter().map(move |decl| (name.clone(), decl.name()))
+            }));
         services.extend(
             declared(&self.updates)
-                .map(|(&name, _)| name)
+                .map(|(name, _)| name.clone())
                 .filter(|name| running.contains(name)),
         );
         // The values the declarations evaluated to stand in for those the
@@ -274,7 +274,7 @@ impl Transaction {
         let staged = self
             .values
             .iter()
-            .map(|(&var, value)| (var, value))
+            .map(|(var, value)| (var.clone(), value))
             .collect();
         let graphs = manager.graphs_of(&self.ast, services, &staged);
         manager.check_graphs(&graphs)?;
@@ -308,13 +308,16 @@ impl Transaction {
                         Decl::VarDecl {
                             name: decl_name, ..
                         } => {
-                            manager.propagate(*svc_name, *decl_name).await;
+                            manager.propagate(svc_name.clone(), decl_name.clone()).await;
                         }
                         Decl::DefDecl {
                             name: decl_name, ..
                         } => {
-                            if manager.recompute_def(*svc_name, *decl_name).await {
-                                manager.propagate(*svc_name, *decl_name).await;
+                            if manager
+                                .recompute_def(svc_name.clone(), decl_name.clone())
+                                .await
+                            {
+                                manager.propagate(svc_name.clone(), decl_name.clone()).await;
                             }
                         }
                         Decl::TableDecl { .. } => {}
@@ -322,8 +325,8 @@ impl Transaction {
                 }
             }
             if let Some(addr) = manager.remote_services.get(svc_name).cloned() {
-                let source = format_update_source(*svc_name, decls, &manager.interner);
-                let svc_str = manager.interner.get(*svc_name).to_string();
+                let source = format_update_source(svc_name, decls);
+                let svc_str = svc_name.as_str().to_string();
                 static NEXT_UPDATE_REQ_ID: std::sync::atomic::AtomicU64 =
                     std::sync::atomic::AtomicU64::new(1);
                 let request_id =
@@ -394,12 +397,12 @@ impl Transaction {
                 | Stmt::Update {
                     service_name: name,
                     decls,
-                } => Some((*name, decls)),
+                } => Some((name.clone(), decls)),
                 _ => None,
             })
             .flat_map(|(svc, decls)| {
                 decls.iter().filter_map(move |decl| match decl {
-                    Decl::DefDecl { name, .. } => Some((svc, *name)),
+                    Decl::DefDecl { name, .. } => Some((svc.clone(), name.clone())),
                     Decl::VarDecl { .. } | Decl::TableDecl { .. } => None,
                 })
             })
@@ -421,7 +424,7 @@ impl Transaction {
             .values
             .keys()
             .filter(|(svc, _)| manager.services.contains_key(svc))
-            .copied()
+            .cloned()
             .collect();
         // Include initializer reads and the prior clocks of overwritten vars,
         // and admit the complete stamp before installing values or declarations.
@@ -446,7 +449,7 @@ impl Transaction {
                 } else {
                     let mut state = crate::runtime::txn::VarState::new(val);
                     state.vector_clock = clock.clone();
-                    state.sources = Some(HashSet::from([(svc_name, var_name)]));
+                    state.sources = Some(HashSet::from([(svc_name, var_name.clone())]));
                     service.vars.insert(var_name, state);
                 }
             }
@@ -459,7 +462,7 @@ impl Transaction {
                 service.defs = decls
                     .iter()
                     .filter_map(|decl| match decl {
-                        Decl::DefDecl { name, val, .. } => Some((*name, val.clone())),
+                        Decl::DefDecl { name, val, .. } => Some((name.clone(), val.clone())),
                         _ => None,
                     })
                     .collect();
@@ -470,45 +473,38 @@ impl Transaction {
     }
 }
 
-/// Format an `ActionStmt` into a valid Meerkat string, resolving symbols with the interner.
-fn format_action_stmt(stmt: &crate::runtime::ast::ActionStmt, interner: &Interner) -> String {
+/// Format an `ActionStmt` into a valid Meerkat string.
+fn format_action_stmt(stmt: &crate::runtime::ast::ActionStmt) -> String {
     use crate::runtime::ast::ActionStmt;
     match stmt {
         ActionStmt::Let { name, ty, expr } => {
-            let name_str = interner.get(*name);
-            let expr_str = format_expr(expr, interner);
+            let name_str = name.as_str();
+            let expr_str = format_expr(expr);
             if let Some(t) = ty {
                 format!("let {}: {} = {}", name_str, t, expr_str)
             } else {
                 format!("let {} = {}", name_str, expr_str)
             }
         }
-        ActionStmt::Expr(expr) => format_expr(expr, interner),
-        ActionStmt::Do(expr) => format!("do {}", format_expr(expr, interner)),
-        ActionStmt::Assert(expr, _) => format!("assert {}", format_expr(expr, interner)),
+        ActionStmt::Expr(expr) => format_expr(expr),
+        ActionStmt::Do(expr) => format!("do {}", format_expr(expr)),
+        ActionStmt::Assert(expr, _) => format!("assert {}", format_expr(expr)),
         ActionStmt::Assign { name, expr } => {
-            format!("{} = {}", interner.get(*name), format_expr(expr, interner))
+            format!("{} = {}", name.as_str(), format_expr(expr))
         }
         ActionStmt::Insert { row, table_name } => {
-            format!(
-                "insert {} into {}",
-                format_expr(row, interner),
-                interner.get(*table_name)
-            )
+            format!("insert {} into {}", format_expr(row), table_name.as_str())
         }
         ActionStmt::For {
             var,
             iterable,
             body,
         } => {
-            let body_strs: Vec<String> = body
-                .iter()
-                .map(|s| format_action_stmt(s, interner))
-                .collect();
+            let body_strs: Vec<String> = body.iter().map(format_action_stmt).collect();
             format!(
                 "for {} in {} {{ {} }}",
-                interner.get(*var),
-                format_expr(iterable, interner),
+                var.as_str(),
+                format_expr(iterable),
                 body_strs.join("; ")
             )
         }
@@ -519,11 +515,10 @@ fn format_action_stmt(stmt: &crate::runtime::ast::ActionStmt, interner: &Interne
 ///
 /// Args:
 ///     `expr` (`&Expr`): The expression AST node
-///     `interner` (`&Interner`): Symbol interner for resolving names
 ///
 /// Returns:
 ///     `String`: Valid Meerkat expression source string
-pub fn format_expr(expr: &Expr, interner: &Interner) -> String {
+pub fn format_expr(expr: &Expr) -> String {
     match expr {
         Expr::Literal { val } => match val {
             Value::Int { val } => val.to_string(),
@@ -537,27 +532,24 @@ pub fn format_expr(expr: &Expr, interner: &Interner) -> String {
         },
         Expr::Html(_) => "<html>".to_string(),
         Expr::Tuple { val } => {
-            let elems: Vec<String> = val.iter().map(|e| format_expr(e, interner)).collect();
+            let elems: Vec<String> = val.iter().map(format_expr).collect();
             format!("({})", elems.join(", "))
         }
         Expr::KeyVal { name, value } => {
-            format!("{}: {}", interner.get(*name), format_expr(value, interner))
+            format!("{}: {}", name.as_str(), format_expr(value))
         }
-        Expr::Variable { name } => interner.get(*name).to_string(),
+        Expr::Variable { name } => name.as_str().to_string(),
         Expr::Unop { op, expr } => {
-            format!("{}{}", op, format_expr(expr, interner))
+            format!("{}{}", op, format_expr(expr))
         }
-        Expr::Binop { op, expr1, expr2 } => format!(
-            "{} {} {}",
-            format_expr(expr1, interner),
-            op,
-            format_expr(expr2, interner)
-        ),
+        Expr::Binop { op, expr1, expr2 } => {
+            format!("{} {} {}", format_expr(expr1), op, format_expr(expr2))
+        }
         Expr::If { cond, expr1, expr2 } => format!(
             "if {} then {} else {}",
-            format_expr(cond, interner),
-            format_expr(expr1, interner),
-            format_expr(expr2, interner)
+            format_expr(cond),
+            format_expr(expr1),
+            format_expr(expr2)
         ),
         Expr::Func {
             params,
@@ -570,60 +562,47 @@ pub fn format_expr(expr: &Expr, interner: &Interner) -> String {
                     "fn({}) -> {}[{}]",
                     params_str.join(","),
                     ty,
-                    format_expr(body, interner)
+                    format_expr(body)
                 )
             } else {
-                format!(
-                    "fn({})[{}]",
-                    params_str.join(","),
-                    format_expr(body, interner)
-                )
+                format!("fn({})[{}]", params_str.join(","), format_expr(body))
             }
         }
         Expr::Call { func, args } => {
-            let arg_strs: Vec<String> = args.iter().map(|a| format_expr(a, interner)).collect();
-            format!("{}({})", format_expr(func, interner), arg_strs.join(", "))
+            let arg_strs: Vec<String> = args.iter().map(format_expr).collect();
+            format!("{}({})", format_expr(func), arg_strs.join(", "))
         }
         Expr::Action(stmts) => {
             let stmts_str: Vec<String> = stmts
                 .iter()
-                .map(|s| format!("{:?}", format_action_stmt(s, interner)))
+                .map(|s| format!("{:?}", format_action_stmt(s)))
                 .collect();
             format!("Action([{}])", stmts_str.join(", "))
         }
         Expr::MemberAccess {
             service_name,
             member_name,
-        } => format!(
-            "{}.{}",
-            interner.get(*service_name),
-            interner.get(*member_name)
-        ),
-        Expr::Select { where_clause, .. } => format_expr(where_clause, interner),
+        } => format!("{}.{}", service_name.as_str(), member_name.as_str()),
+        Expr::Select { where_clause, .. } => format_expr(where_clause),
         Expr::Table { records, .. } => {
             let records_str: Vec<String> = records
                 .iter()
                 .map(|r| match r {
                     Expr::Tuple { val } => {
-                        let entries: Vec<String> =
-                            val.iter().map(|e| format_expr(e, interner)).collect();
+                        let entries: Vec<String> = val.iter().map(format_expr).collect();
                         format!("{{{}}}", entries.join(", "))
                     }
-                    other => format!("{{{}}}", format_expr(other, interner)),
+                    other => format!("{{{}}}", format_expr(other)),
                 })
                 .collect();
             format!("[{}]", records_str.join(", "))
         }
         Expr::Fold { .. } => "fold".to_string(),
         Expr::List(exprs) => {
-            let elems: Vec<String> = exprs.iter().map(|e| format_expr(e, interner)).collect();
+            let elems: Vec<String> = exprs.iter().map(format_expr).collect();
             format!("[{}]", elems.join(", "))
         }
-        Expr::Range { start, end } => format!(
-            "{}..{}",
-            format_expr(start, interner),
-            format_expr(end, interner)
-        ),
+        Expr::Range { start, end } => format!("{}..{}", format_expr(start), format_expr(end)),
     }
 }
 
@@ -631,15 +610,14 @@ pub fn format_expr(expr: &Expr, interner: &Interner) -> String {
 ///
 /// Args:
 ///     `decl` (`&Decl`): The declaration AST node
-///     `interner` (`&Interner`): Symbol interner for resolving names
 ///
 /// Returns:
 ///     `String`: Valid Meerkat declaration source string
-pub fn format_decl(decl: &Decl, interner: &Interner) -> String {
+pub fn format_decl(decl: &Decl) -> String {
     match decl {
         Decl::VarDecl { name, ty, val } => {
-            let name_str = interner.get(*name);
-            let val_str = format_expr(val, interner);
+            let name_str = name.as_str();
+            let val_str = format_expr(val);
             if let Some(t) = ty {
                 format!("var {}: {} = {};", name_str, t, val_str)
             } else {
@@ -653,8 +631,8 @@ pub fn format_decl(decl: &Decl, interner: &Interner) -> String {
             is_pub,
         } => {
             let prefix = if *is_pub { "pub " } else { "" };
-            let name_str = interner.get(*name);
-            let val_str = format_expr(val, interner);
+            let name_str = name.as_str();
+            let val_str = format_expr(val);
             if let Some(t) = ty {
                 format!("{}def {}: {} = {};", prefix, name_str, t, val_str)
             } else {
@@ -662,7 +640,7 @@ pub fn format_decl(decl: &Decl, interner: &Interner) -> String {
             }
         }
         Decl::TableDecl { name, .. } => {
-            format!("table {};", interner.get(*name))
+            format!("table {};", name.as_str())
         }
     }
 }
@@ -670,15 +648,14 @@ pub fn format_decl(decl: &Decl, interner: &Interner) -> String {
 /// Format a service update block into valid Meerkat source code string
 ///
 /// Args:
-///     `service_name` (`Symbol`): Symbol for service name
+///     `service_name` (`&Symbol`): Symbol for service name
 ///     `decls` (`&[Decl]`): Declarations in update block
-///     `interner` (`&Interner`): Symbol interner for resolving names
 ///
 /// Returns:
 ///     `String`: Valid Meerkat update statement source string
-pub fn format_update_source(service_name: Symbol, decls: &[Decl], interner: &Interner) -> String {
-    let svc_str = interner.get(service_name);
-    let decl_strs: Vec<String> = decls.iter().map(|d| format_decl(d, interner)).collect();
+pub fn format_update_source(service_name: &Symbol, decls: &[Decl]) -> String {
+    let svc_str = service_name.as_str();
+    let decl_strs: Vec<String> = decls.iter().map(format_decl).collect();
     format!("update {} {{\n  {}\n}}", svc_str, decl_strs.join("\n  "))
 }
 

@@ -8,7 +8,7 @@ pub(crate) fn service_declarations(program: &[Stmt]) -> HashMap<Symbol, &Stmt> {
     program
         .iter()
         .filter_map(|stmt| match stmt {
-            Stmt::Service { name, .. } => Some((*name, stmt)),
+            Stmt::Service { name, .. } => Some((name.clone(), stmt)),
             _ => None,
         })
         .collect()

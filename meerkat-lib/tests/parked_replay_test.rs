@@ -134,7 +134,7 @@ impl Setup {
     async fn run_action(&mut self, stmts: &[ActionStmt], tid: &TxnId) -> Result<(), EvalError> {
         tokio::select! {
             biased;
-            r = self.mid.execute_action_participant(self.mid_sym, stmts, &[], tid.clone()) => r,
+            r = self.mid.execute_action_participant(self.mid_sym.clone(), stmts, &[], tid.clone()) => r,
             _ = child_peer(&mut self.peer_net, &mut self.child, &mut self.served) => {
                 unreachable!("the stand-in child runs until the action under test finishes")
             }
@@ -146,12 +146,12 @@ impl Setup {
     fn child_cv(&mut self, tid: &TxnId) -> i32 {
         let rc = self.child.interner.insert("rc");
         let cv = self.child.interner.insert("cv");
-        let sid = self.child.service_net_id_for_name(rc);
+        let sid = self.child.service_net_id_for_name(&rc);
         let buffered = self
             .child
             .pending_txns
             .get(tid)
-            .and_then(|t| t.written.get(&(sid, cv)).cloned());
+            .and_then(|t| t.written.get(&(sid, cv.clone())).cloned());
         let value = buffered.unwrap_or_else(|| self.child.services[&rc].vars[&cv].value.clone());
         match value {
             Value::Int { val } => val,
@@ -169,10 +169,12 @@ impl Setup {
         ActionStmt::Do(Expr::Literal {
             val: Value::ActionClosure {
                 stmts: vec![ActionStmt::Assign {
-                    name: self.cv,
+                    name: self.cv.clone(),
                     expr: Expr::Binop {
                         op: BinOp::Add,
-                        expr1: Box::new(Expr::Variable { name: self.cv }),
+                        expr1: Box::new(Expr::Variable {
+                            name: self.cv.clone(),
+                        }),
                         expr2: Box::new(Expr::Literal {
                             val: Value::Int { val: by },
                         }),
@@ -191,7 +193,7 @@ impl Setup {
     /// Write `1` to `mid.guard`, which parks while the lock is contended.
     fn touch_guard(&self) -> ActionStmt {
         ActionStmt::Assign {
-            name: self.guard,
+            name: self.guard.clone(),
             expr: Expr::Literal {
                 val: Value::Int { val: 1 },
             },
@@ -242,8 +244,8 @@ async fn child_peer(net: &mut NetworkActor, child: &mut Manager, served: &mut Ve
                 let (history, writes) = if outcome.is_ok() {
                     let (history, writes) = child.transaction_history(&child.pending_txns[&tid]);
                     (
-                        codec::encode_clock(&history, &child.interner),
-                        codec::encode_sources(&writes, &child.interner),
+                        codec::encode_clock(&history),
+                        codec::encode_sources(&writes),
                     )
                 } else {
                     (Vec::new(), Vec::new())

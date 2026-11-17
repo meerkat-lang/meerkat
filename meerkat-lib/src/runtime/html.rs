@@ -199,8 +199,7 @@ impl HtmlTemplate {
 /// The parser constructs a template through this builder, appending literal
 /// text and embedded expressions, without naming the internal `HtmlPart`
 /// representation. This keeps the template representation encapsulated in this
-/// module while interning stays in `runtime::parser` (the interner is
-/// append-only and only `parser`/`net::codec` may write to it).
+/// module while name creation stays in `runtime::parser`.
 #[derive(Debug, Default)]
 pub struct HtmlTemplateBuilder {
     parts: Vec<HtmlPart>,

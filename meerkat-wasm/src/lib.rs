@@ -51,10 +51,10 @@ fn status(msg: &str) {
 /// Read the current rendered value of any loaded service's `html` def.
 fn current_html(
     manager: &Manager,
-    html_sym: meerkat_lib::runtime::interner::Symbol,
+    html_sym: &meerkat_lib::runtime::interner::Symbol,
 ) -> Option<String> {
     for svc in manager.services.values() {
-        if let Some(vs) = svc.vars.get(&html_sym) {
+        if let Some(vs) = svc.vars.get(html_sym) {
             if let Value::Html(h) = &vs.value {
                 return Some(h.to_string());
             }
@@ -68,10 +68,10 @@ fn current_html(
 /// manager is held while listeners are attached.
 fn current_handlers(
     manager: &Manager,
-    html_sym: meerkat_lib::runtime::interner::Symbol,
+    html_sym: &meerkat_lib::runtime::interner::Symbol,
 ) -> Vec<(String, Value)> {
     for svc in manager.services.values() {
-        if let Some(vs) = svc.vars.get(&html_sym) {
+        if let Some(vs) = svc.vars.get(html_sym) {
             if let Value::Html(h) = &vs.value {
                 return h.handlers().to_vec();
             }
@@ -212,18 +212,15 @@ pub async fn load_service(server_ws_addr: String, path: String) -> Result<String
             } => {
                 manager
                     .remote_services
-                    .insert(service_name, server_addr.clone());
-                summary.push_str(&format!(
-                    "import {} (remote)\n",
-                    manager.interner.get(service_name)
-                ));
+                    .insert(service_name.clone(), server_addr.clone());
+                summary.push_str(&format!("import {} (remote)\n", service_name.as_str()));
             }
             Stmt::Service { name, decls } => {
-                manager.create_service(name, decls).await.map_err(js_err)?;
-                summary.push_str(&format!(
-                    "service {} instantiated\n",
-                    manager.interner.get(name)
-                ));
+                manager
+                    .create_service(name.clone(), decls)
+                    .await
+                    .map_err(js_err)?;
+                summary.push_str(&format!("service {} instantiated\n", name.as_str()));
             }
             _ => {}
         }
@@ -242,9 +239,9 @@ pub async fn load_service(server_ws_addr: String, path: String) -> Result<String
     let manager = Rc::new(RefCell::new(manager));
 
     // Initial render, then attach click listeners for any handlers.
-    if let Some(html) = current_html(&manager.borrow(), html_sym) {
+    if let Some(html) = current_html(&manager.borrow(), &html_sym) {
         render_to_dom(&html);
-        let handlers = current_handlers(&manager.borrow(), html_sym);
+        let handlers = current_handlers(&manager.borrow(), &html_sym);
         attach_handlers(&manager, handlers);
     }
 
@@ -253,7 +250,7 @@ pub async fn load_service(server_ws_addr: String, path: String) -> Result<String
     //    def whenever it changes. Runs on spawn_local; no tokio runtime needed.
     let manager_loop = Rc::clone(&manager);
     wasm_bindgen_futures::spawn_local(async move {
-        let mut last = current_html(&manager_loop.borrow(), html_sym);
+        let mut last = current_html(&manager_loop.borrow(), &html_sym);
         loop {
             // #153: skip this tick if a click task currently holds the
             // manager, instead of an unconditional borrow_mut that panics on a
@@ -269,13 +266,13 @@ pub async fn load_service(server_ws_addr: String, path: String) -> Result<String
                 };
                 manager.serve_network_events().await;
             }
-            let now = current_html(&manager_loop.borrow(), html_sym);
+            let now = current_html(&manager_loop.borrow(), &html_sym);
             if now != last {
                 if let Some(html) = &now {
                     render_to_dom(html);
                     // #153: re-attach listeners; set_inner_html replaced the
                     // DOM nodes, so previous listeners are gone with them.
-                    let handlers = current_handlers(&manager_loop.borrow(), html_sym);
+                    let handlers = current_handlers(&manager_loop.borrow(), &html_sym);
                     attach_handlers(&manager_loop, handlers);
                 }
                 last = now;

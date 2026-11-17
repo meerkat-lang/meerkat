@@ -8,11 +8,15 @@ use crate::runtime::interner::Symbol;
 use petgraph::graphmap::DiGraphMap;
 use petgraph::Direction;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::Hash;
 
 /// Pre-computed dependency graphs and analysis state for a service
 pub struct ServiceGraphs {
     /// Reactive propagation graph (edge `A -> B` means `A` notifies `B`)
-    pub reactive_graph: DiGraphMap<Symbol, ()>,
+    reactive_graph: DiGraphMap<usize, ()>,
+    /// Node numbers are positions in this graph's owned names, never symbol identities.
+    names: Vec<Symbol>,
+    nodes: HashMap<Symbol, usize>,
     /// Cross-service member dependencies per local definition
     pub cross_deps: HashMap<Symbol, HashSet<(Symbol, Symbol)>>,
     /// Set of local variable symbols defined in the service
@@ -34,6 +38,8 @@ impl ServiceGraphs {
     pub fn new() -> Self {
         ServiceGraphs {
             reactive_graph: DiGraphMap::new(),
+            names: Vec::new(),
+            nodes: HashMap::new(),
             cross_deps: HashMap::new(),
             vars: HashSet::new(),
             defs: HashSet::new(),
@@ -54,13 +60,20 @@ impl ServiceGraphs {
     ///   `impl Iterator<Item = (Symbol, Symbol)>`: The inputs of `member`
     pub(crate) fn inputs(
         &self,
-        service: Symbol,
-        member: Symbol,
+        service: &Symbol,
+        member: &Symbol,
     ) -> impl Iterator<Item = (Symbol, Symbol)> + '_ {
-        self.reactive_graph
-            .neighbors_directed(member, Direction::Incoming)
-            .map(move |input| (service, input))
-            .chain(self.cross_deps.get(&member).into_iter().flatten().copied())
+        let service = service.clone();
+        self.nodes
+            .get(member)
+            .copied()
+            .into_iter()
+            .flat_map(|node| {
+                self.reactive_graph
+                    .neighbors_directed(node, Direction::Incoming)
+            })
+            .map(move |input| (service.clone(), self.names[input].clone()))
+            .chain(self.cross_deps.get(member).into_iter().flatten().cloned())
     }
 
     /// Whether `member` of `service` reads `input`: the relation `inputs`
@@ -68,17 +81,24 @@ impl ServiceGraphs {
     /// cross-service dependency otherwise
     pub(crate) fn reads(
         &self,
-        service: Symbol,
-        member: Symbol,
-        (owner, input): (Symbol, Symbol),
+        service: &Symbol,
+        member: &Symbol,
+        input: &(Symbol, Symbol),
     ) -> bool {
-        if owner == service {
-            self.reactive_graph.contains_edge(input, member)
+        if &input.0 == service {
+            self.contains_edge(&input.1, member)
         } else {
             self.cross_deps
-                .get(&member)
-                .is_some_and(|inputs| inputs.contains(&(owner, input)))
+                .get(member)
+                .is_some_and(|inputs| inputs.contains(input))
         }
+    }
+
+    fn contains_edge(&self, input: &Symbol, member: &Symbol) -> bool {
+        self.nodes
+            .get(input)
+            .zip(self.nodes.get(member))
+            .is_some_and(|(&input, &member)| self.reactive_graph.contains_edge(input, member))
     }
 }
 
@@ -91,18 +111,15 @@ impl PartialEq for ServiceGraphs {
             && self.cross_deps == other.cross_deps
             && self.incomplete == other.incomplete
             && self.reactive_graph.edge_count() == other.reactive_graph.edge_count()
-            && self
-                .reactive_graph
-                .all_edges()
-                .all(|(input, member, _)| other.reactive_graph.contains_edge(input, member))
+            && self.reactive_graph.all_edges().all(|(input, member, _)| {
+                other.contains_edge(&self.names[input], &self.names[member])
+            })
     }
 }
 
-/// The members on a cycle of `graph`: in a strongly connected component of
-/// several members, or reading themselves
-pub(crate) fn cyclic_members(
-    graph: &DiGraphMap<(Symbol, Symbol), ()>,
-) -> impl Iterator<Item = (Symbol, Symbol)> + '_ {
+/// The graph-local nodes in a strongly connected component of several
+/// members, or reading themselves.
+fn cyclic_members(graph: &DiGraphMap<usize, ()>) -> impl Iterator<Item = usize> + '_ {
     petgraph::algo::tarjan_scc(graph)
         .into_iter()
         .filter(|component| component.len() > 1 || graph.contains_edge(component[0], component[0]))
@@ -123,21 +140,46 @@ pub(crate) enum Uninstallable {
 pub(crate) fn uninstallable(
     graphs: &HashMap<Symbol, ServiceGraphs>,
 ) -> BTreeMap<(Symbol, Symbol), Uninstallable> {
-    let mut graph = DiGraphMap::<(Symbol, Symbol), ()>::new();
+    let mut graph = DiGraphMap::new();
+    let mut names = Vec::new();
+    let mut nodes = HashMap::new();
     let mut failing = BTreeMap::new();
-    for (&service, graphs) in graphs {
-        for &def in &graphs.defs {
-            graph.add_node((service, def));
+    for (service, graphs) in graphs {
+        for def in &graphs.defs {
+            let member = node_index(
+                &mut graph,
+                &mut names,
+                &mut nodes,
+                (service.clone(), def.clone()),
+            );
             for input in graphs.inputs(service, def) {
-                graph.add_edge(input, (service, def), ());
+                let input = node_index(&mut graph, &mut names, &mut nodes, input);
+                graph.add_edge(input, member, ());
             }
         }
-        for &def in &graphs.incomplete {
-            failing.insert((service, def), Uninstallable::Incomplete);
+        for def in &graphs.incomplete {
+            failing.insert((service.clone(), def.clone()), Uninstallable::Incomplete);
         }
     }
-    failing.extend(cyclic_members(&graph).map(|def| (def, Uninstallable::Cycle)));
+
+    failing.extend(cyclic_members(&graph).map(|def| (names[def].clone(), Uninstallable::Cycle)));
     failing
+}
+
+/// Return this graph's index for a name, retaining the name until the graph
+/// is dropped. Existing names keep their index throughout construction.
+fn node_index<N: Clone + Eq + Hash>(
+    graph: &mut DiGraphMap<usize, ()>,
+    names: &mut Vec<N>,
+    nodes: &mut HashMap<N, usize>,
+    name: N,
+) -> usize {
+    *nodes.entry(name).or_insert_with_key(|name| {
+        let node = names.len();
+        names.push(name.clone());
+        graph.add_node(node);
+        node
+    })
 }
 
 impl Default for ServiceGraphs {

@@ -74,7 +74,7 @@ async fn middle_node(net: NetworkActor, rc_net: &mut NetworkActor, rc_addr: &Add
         .expect("service init must succeed");
     let rc = m.interner.insert("rc");
     m.remote_services
-        .insert(rc, Address::new(format!("{}/rc", rc_addr.0)));
+        .insert(rc.clone(), Address::new(format!("{}/rc", rc_addr.0)));
     let [mid, mid_view, gc] = ["mid", "mid_view", "gc"].map(|n| m.interner.insert(n));
     let mid_id = m.services[&mid].id.clone();
     m.subscribe_remote(rc, gc, mid_id, mid_view).await;
@@ -171,7 +171,7 @@ async fn await_gc_update(m: &mut Manager, rc_net: &mut NetworkActor) {
     let [mid, mid_view, rc, gc] = ["mid", "mid_view", "rc", "gc"].map(|n| m.interner.insert(n));
     let cached = |m: &Manager| {
         let deps = m.services[&mid].dep_cache.get(&mid_view);
-        deps.and_then(|deps| deps.get(&(rc, gc))?.newest())
+        deps.and_then(|deps| deps.get(&(rc.clone(), gc.clone()))?.newest())
             .is_some_and(|entry| entry.1.is_some())
     };
     let pump = async {
@@ -233,7 +233,7 @@ fn hold_participant_txn(
         node_id: 7,
         iteration: 0,
     };
-    let key = (m.service_net_id_for_name(mid), mv);
+    let key = (m.service_net_id_for_name(&mid), mv.clone());
     m.services
         .get_mut(&mid)
         .unwrap()
@@ -311,13 +311,13 @@ async fn test_participant_reports_a_failed_commit_forward_and_still_propagates()
     let mut m = middle_node(mid_net, &mut rc_net, &rc_addr).await;
 
     let (tid, (sid, mv)) = hold_participant_txn(&mut m, &[&rc_addr]);
-    let key = WaitKey::Member(sid, mv);
+    let key = WaitKey::Member(sid, mv.clone());
     let mid = m.interner.insert("mid");
     let waiter = ParkedRequest::Lookup {
         request_id: 1,
         reply_to: String::new(),
-        service: mid,
-        member: mv,
+        service: mid.clone(),
+        member: mv.clone(),
         tid: TxnId::new(m.node_id),
     };
     m.park_request_key(key.clone(), waiter);

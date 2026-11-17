@@ -47,7 +47,7 @@ pub(crate) enum StaticError {
 
 impl StaticError {
     /// The failure as the user sees it, with the interned names resolved
-    pub(crate) fn message(&self, interner: &Interner) -> String {
+    pub(crate) fn message(&self) -> String {
         match self {
             StaticError::Names(nameres::Error::UnknownIdentifier {
                 name,
@@ -56,42 +56,38 @@ impl StaticError {
             }) => match context_name {
                 Some(ctx) => format!(
                     "Unknown identifier '{}' (expected {}) in service '{}'",
-                    interner.get(*name),
+                    name.as_str(),
                     expected,
-                    interner.get(*ctx)
+                    ctx.as_str()
                 ),
                 None => format!(
                     "Unknown identifier '{}' (expected {})",
-                    interner.get(*name),
+                    name.as_str(),
                     expected
                 ),
             },
             StaticError::Names(nameres::Error::ForwardReference(name)) => format!(
                 "Invalid forward reference to uninitialized value '{}'",
-                interner.get(*name)
+                name.as_str()
             ),
             StaticError::Names(e @ nameres::Error::DepthLimit) => e.to_string(),
             StaticError::Types(tt::check::Error::RecursiveTypeInference { service, member }) => {
                 format!(
                     "type check error: dependency cycle detected at service '{}', member '{}'.",
-                    interner.get(*service),
-                    interner.get(*member)
+                    service.as_str(),
+                    member.as_str()
                 )
             }
             StaticError::Types(tt::check::Error::UnboundVariable(s)) => {
-                format!(
-                    "type check error: unbound variable: '{}'.",
-                    interner.get(*s)
-                )
+                format!("type check error: unbound variable: '{}'.", s.as_str())
             }
-            StaticError::Types(tt::check::Error::UnknownUpdateTarget(service)) => format!(
-                "Target service '{}' for update not found",
-                interner.get(*service)
-            ),
+            StaticError::Types(tt::check::Error::UnknownUpdateTarget(service)) => {
+                format!("Target service '{}' for update not found", service.as_str())
+            }
             StaticError::Types(tt::check::Error::DuplicateMember { service, member }) => format!(
                 "type check error: duplicate member '{}' in service '{}'.",
-                interner.get(*member),
-                interner.get(*service)
+                member.as_str(),
+                service.as_str()
             ),
             StaticError::Types(tt::check::Error::TypeMismatch { expected, found }) => format!(
                 "type check error: type mismatch: expected {}, found {}.",
@@ -111,9 +107,9 @@ impl StaticError {
             }
             // Ends a sentence, as the type checker's cycle text does
             StaticError::Effects(e @ effects::Error::Cycle { .. }) => {
-                format!("type check error: {}.", e.message(interner))
+                format!("type check error: {}.", e.message())
             }
-            StaticError::Effects(e) => format!("type check error: {}", e.message(interner)),
+            StaticError::Effects(e) => format!("type check error: {}", e.message()),
         }
     }
 }
@@ -677,7 +673,7 @@ impl Node {
             service_ast = apply_updates_to_ast(&service_ast, &batch).map_err(|sym| {
                 Error::Message(format!(
                     "Target service '{}' for update not found",
-                    self.interner.get(sym)
+                    sym.as_str()
                 ))
             })?;
 
@@ -688,7 +684,7 @@ impl Node {
         service_ast = apply_updates_to_ast(&service_ast, &last_batch).map_err(|sym| {
             Error::Message(format!(
                 "Target service '{}' for update not found",
-                self.interner.get(sym)
+                sym.as_str()
             ))
         })?;
 
@@ -704,7 +700,7 @@ impl Node {
 
     /// Render a failed static check as the user sees it
     fn format_static_error(&self, err: StaticError) -> Error {
-        Error::Message(err.message(&self.interner))
+        Error::Message(err.message())
     }
 
     /// Perform static analysis checks on external program statements
@@ -785,7 +781,7 @@ mod tests {
         let mut node = Node::new();
         let s2 = node.interner.insert("s2");
         let local_ast = vec![Stmt::Service {
-            name: s2,
+            name: s2.clone(),
             decls: vec![Decl::VarDecl {
                 name: node.interner.insert("x"),
                 ty: None,
@@ -831,9 +827,9 @@ mod tests {
         let y = node.interner.insert("y");
 
         let dep_stmt = Stmt::Service {
-            name: dep,
+            name: dep.clone(),
             decls: vec![Decl::VarDecl {
-                name: x,
+                name: x.clone(),
                 ty: None,
                 val: Expr::Literal {
                     val: Value::Int { val: 1 },
@@ -841,12 +837,12 @@ mod tests {
             }],
         };
         let app_stmt = Stmt::Service {
-            name: app,
+            name: app.clone(),
             decls: vec![Decl::DefDecl {
                 name: y,
                 ty: None,
                 val: Expr::MemberAccess {
-                    service_name: dep,
+                    service_name: dep.clone(),
                     member_name: x,
                 },
                 is_pub: false,
@@ -897,8 +893,12 @@ mod tests {
             }],
         };
         let x = node.interner.insert("x");
-        let local_ast = vec![svc(app, x)];
-        node.unified_ast = vec![svc(a, x), svc(b, x), svc(app, x)];
+        let local_ast = vec![svc(app.clone(), x.clone())];
+        node.unified_ast = vec![
+            svc(a.clone(), x.clone()),
+            svc(b.clone(), x.clone()),
+            svc(app.clone(), x),
+        ];
 
         // What resolving `import a` against `-i /ip4/.../peer_a/a` produces
         // when the returned `a.mkt` declares both `a` and `b`.
@@ -952,7 +952,7 @@ mod tests {
         let res = apply_updates_to_ast(&node.unified_ast, &[update_stmt]).map_err(|s| {
             Error::Message(format!(
                 "Target service '{}' for update not found",
-                node.interner.get(s)
+                s.as_str()
             ))
         });
 
@@ -986,7 +986,7 @@ mod tests {
         let x = node.interner.insert("x");
 
         let service_stmt = Stmt::Service {
-            name: s,
+            name: s.clone(),
             decls: vec![],
         };
         let update_stmt = Stmt::Update {
@@ -1041,7 +1041,7 @@ mod tests {
         let x = node.interner.insert("x");
 
         let service_stmt = Stmt::Service {
-            name: s,
+            name: s.clone(),
             decls: vec![],
         };
         let update_stmt = Stmt::Update {
@@ -1069,9 +1069,9 @@ mod tests {
         let b = node.interner.insert("b");
 
         let service_stmt = Stmt::Service {
-            name: s,
+            name: s.clone(),
             decls: vec![Decl::VarDecl {
-                name: a,
+                name: a.clone(),
                 ty: Some(Type::Int),
                 val: Expr::Literal {
                     val: Value::Int { val: 10 },
@@ -1102,7 +1102,7 @@ mod tests {
         let b = node.interner.insert("b");
 
         let service_stmt = Stmt::Service {
-            name: s,
+            name: s.clone(),
             decls: vec![],
         };
 
@@ -1112,7 +1112,7 @@ mod tests {
                 Decl::DefDecl {
                     name: b,
                     ty: None,
-                    val: Expr::Variable { name: a },
+                    val: Expr::Variable { name: a.clone() },
                     is_pub: false,
                 },
                 Decl::VarDecl {
@@ -1139,13 +1139,13 @@ mod tests {
         let b = node.interner.insert("b");
 
         let service_stmt = Stmt::Service {
-            name: s,
+            name: s.clone(),
             decls: vec![],
         };
         let update1 = Stmt::Update {
-            service_name: s,
+            service_name: s.clone(),
             decls: vec![Decl::VarDecl {
-                name: a,
+                name: a.clone(),
                 ty: Some(Type::Int),
                 val: Expr::Literal {
                     val: Value::Int { val: 5 },
@@ -1175,7 +1175,7 @@ mod tests {
         let x = node.interner.insert("x");
 
         let service_stmt = Stmt::Service {
-            name: s1,
+            name: s1.clone(),
             decls: vec![],
         };
         let atomic_stmt = Stmt::Atomic {
@@ -1205,14 +1205,14 @@ mod tests {
         let y = node.interner.insert("y");
 
         let service_stmt = Stmt::Service {
-            name: s1,
+            name: s1.clone(),
             decls: vec![],
         };
         let atomic_stmt1 = Stmt::Atomic {
             updates: vec![Stmt::Update {
-                service_name: s1,
+                service_name: s1.clone(),
                 decls: vec![Decl::VarDecl {
-                    name: x,
+                    name: x.clone(),
                     ty: Some(Type::Int),
                     val: Expr::Literal {
                         val: Value::Int { val: 100 },
@@ -1247,21 +1247,21 @@ mod tests {
         let y = node1.interner.insert("y");
 
         let service_stmt = Stmt::Service {
-            name: s,
+            name: s.clone(),
             decls: vec![
                 Decl::VarDecl {
-                    name: x,
+                    name: x.clone(),
                     ty: Some(Type::Int),
                     val: Expr::Literal {
                         val: Value::Int { val: 1 },
                     },
                 },
                 Decl::DefDecl {
-                    name: y,
+                    name: y.clone(),
                     ty: Some(Type::Int),
                     val: Expr::Binop {
                         op: BinOp::Add,
-                        expr1: Box::new(Expr::Variable { name: x }),
+                        expr1: Box::new(Expr::Variable { name: x.clone() }),
                         expr2: Box::new(Expr::Literal {
                             val: Value::Int { val: 1 },
                         }),
@@ -1272,9 +1272,9 @@ mod tests {
         };
 
         let update1 = Stmt::Update {
-            service_name: s,
+            service_name: s.clone(),
             decls: vec![Decl::VarDecl {
-                name: x,
+                name: x.clone(),
                 ty: Some(Type::String),
                 val: Expr::Literal {
                     val: Value::String {
@@ -1304,21 +1304,21 @@ mod tests {
         let y_2 = node2.interner.insert("y");
 
         let service_stmt_2 = Stmt::Service {
-            name: s_2,
+            name: s_2.clone(),
             decls: vec![
                 Decl::VarDecl {
-                    name: x_2,
+                    name: x_2.clone(),
                     ty: Some(Type::Int),
                     val: Expr::Literal {
                         val: Value::Int { val: 1 },
                     },
                 },
                 Decl::DefDecl {
-                    name: y_2,
+                    name: y_2.clone(),
                     ty: Some(Type::Int),
                     val: Expr::Binop {
                         op: BinOp::Add,
-                        expr1: Box::new(Expr::Variable { name: x_2 }),
+                        expr1: Box::new(Expr::Variable { name: x_2.clone() }),
                         expr2: Box::new(Expr::Literal {
                             val: Value::Int { val: 1 },
                         }),
@@ -1329,9 +1329,9 @@ mod tests {
         };
 
         let update1_2 = Stmt::Update {
-            service_name: s_2,
+            service_name: s_2.clone(),
             decls: vec![Decl::VarDecl {
-                name: x_2,
+                name: x_2.clone(),
                 ty: Some(Type::String),
                 val: Expr::Literal {
                     val: Value::String {
@@ -1372,12 +1372,12 @@ mod tests {
         let x = node.interner.insert("x");
 
         let service_stmt = Stmt::Service {
-            name: s,
+            name: s.clone(),
             decls: vec![],
         };
 
         let update1 = Stmt::Update {
-            service_name: s,
+            service_name: s.clone(),
             decls: vec![Decl::VarDecl {
                 name: a,
                 ty: Some(Type::Int),
@@ -1388,9 +1388,9 @@ mod tests {
         };
 
         let update2 = Stmt::Update {
-            service_name: s,
+            service_name: s.clone(),
             decls: vec![Decl::VarDecl {
-                name: b,
+                name: b.clone(),
                 ty: Some(Type::String),
                 val: Expr::Literal {
                     val: Value::String {
@@ -1423,9 +1423,9 @@ mod tests {
         let a = node.interner.insert("a");
 
         let service_stmt = Stmt::Service {
-            name: s,
+            name: s.clone(),
             decls: vec![Decl::VarDecl {
-                name: x,
+                name: x.clone(),
                 ty: Some(Type::Int),
                 val: Expr::Literal {
                     val: Value::Int { val: 10 },
@@ -1459,12 +1459,12 @@ mod tests {
         let b = node.interner.insert("b");
 
         let service_stmt = Stmt::Service {
-            name: s,
+            name: s.clone(),
             decls: vec![],
         };
 
         let update1 = Stmt::Update {
-            service_name: s,
+            service_name: s.clone(),
             decls: vec![Decl::VarDecl {
                 name: a,
                 ty: Some(Type::Int),
@@ -1475,9 +1475,9 @@ mod tests {
         };
 
         let update2 = Stmt::Update {
-            service_name: s,
+            service_name: s.clone(),
             decls: vec![Decl::VarDecl {
-                name: b,
+                name: b.clone(),
                 ty: Some(Type::String),
                 val: Expr::Literal {
                     val: Value::String {
@@ -1510,12 +1510,12 @@ mod tests {
         let x = node.interner.insert("x");
 
         let service_stmt = Stmt::Service {
-            name: s,
+            name: s.clone(),
             decls: vec![],
         };
 
         let update1 = Stmt::Update {
-            service_name: s,
+            service_name: s.clone(),
             decls: vec![Decl::VarDecl {
                 name: a,
                 ty: Some(Type::Int),
@@ -1526,9 +1526,9 @@ mod tests {
         };
 
         let update2 = Stmt::Update {
-            service_name: s,
+            service_name: s.clone(),
             decls: vec![Decl::VarDecl {
-                name: b,
+                name: b.clone(),
                 ty: Some(Type::String),
                 val: Expr::Literal {
                     val: Value::String {

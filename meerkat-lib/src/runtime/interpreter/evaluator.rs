@@ -91,11 +91,7 @@ async fn lookup_input(
 ) -> Result<Value, EvalError> {
     if let Some(inputs) = inputs {
         return inputs.get(&input).cloned().ok_or_else(|| {
-            EvalError::InputNotReady(format!(
-                "{}.{}",
-                ctx.manager.interner.get(input.0),
-                ctx.manager.interner.get(input.1)
-            ))
+            EvalError::InputNotReady(format!("{}.{}", input.0.as_str(), input.1.as_str()))
         });
     }
     ctx.manager
@@ -148,7 +144,7 @@ pub(crate) async fn eval_with_inputs(
                 } => {
                     let mut new_env = closure_env.clone();
                     for (param, arg_val) in params.iter().zip(arg_vals) {
-                        new_env.push((param.name, arg_val));
+                        new_env.push((param.name.clone(), arg_val));
                     }
                     eval_with_inputs(
                         &body,
@@ -168,13 +164,13 @@ pub(crate) async fn eval_with_inputs(
             }
         }
 
-        &Expr::Variable { name } => {
+        Expr::Variable { name } => {
             for (var_name, var_val) in env.iter().rev() {
-                if *var_name == name {
+                if var_name == name {
                     return Ok(var_val.clone());
                 }
             }
-            lookup_input((ctx.service_name, name), ctx, inputs).await
+            lookup_input((ctx.service_name.clone(), name.clone()), ctx, inputs).await
         }
 
         Expr::Binop { op, expr1, expr2 } => {
@@ -276,7 +272,7 @@ pub(crate) async fn eval_with_inputs(
             body,
             return_ty,
         } => {
-            let var_binded: HashSet<Symbol> = params.iter().map(|p| p.name).collect();
+            let var_binded: HashSet<Symbol> = params.iter().map(|p| p.name.clone()).collect();
             let free_vars = free_var(body, &var_binded);
             let captured_env: Vec<(Symbol, Value)> = env
                 .iter()
@@ -295,7 +291,7 @@ pub(crate) async fn eval_with_inputs(
                 params: params.clone(),
                 body: body.clone(),
                 env: captured_env,
-                service_name: ctx.service_name,
+                service_name: ctx.service_name.clone(),
                 return_ty: return_ty.clone(),
             })
         }
@@ -326,14 +322,14 @@ pub(crate) async fn eval_with_inputs(
                 // Stamp the action with its owning service's identity
                 // (which embeds this node's address), so it stays
                 // executable wherever the `closure` travels
-                service_net_id: ctx.manager.service_net_id_for_name(ctx.service_name),
+                service_net_id: ctx.manager.service_net_id_for_name(&ctx.service_name),
             })
         }
 
-        &Expr::MemberAccess {
+        Expr::MemberAccess {
             service_name,
             member_name,
-        } => lookup_input((service_name, member_name), ctx, inputs).await,
+        } => lookup_input((service_name.clone(), member_name.clone()), ctx, inputs).await,
         Expr::Tuple { .. }
         | Expr::KeyVal { .. }
         | Expr::Select { .. }
@@ -419,7 +415,10 @@ mod tests {
             txn: None,
         };
         let func_expr = Expr::Func {
-            params: vec![Param { name: x, ty: None }],
+            params: vec![Param {
+                name: x.clone(),
+                ty: None,
+            }],
             body: Box::new(Expr::Binop {
                 op: BinOp::Add,
                 expr1: Box::new(Expr::Variable { name: x }),
@@ -476,16 +475,19 @@ mod tests {
             txn: None,
         };
         let env = vec![
-            (v1, Value::Int { val: 1 }),
+            (v1.clone(), Value::Int { val: 1 }),
             (v2, Value::Int { val: 2 }),
             (v3, Value::Int { val: 3 }),
         ];
         let func_expr = Expr::Func {
-            params: vec![Param { name: v4, ty: None }],
+            params: vec![Param {
+                name: v4.clone(),
+                ty: None,
+            }],
             body: Box::new(Expr::Binop {
                 op: BinOp::Add,
                 expr1: Box::new(Expr::Variable { name: v4 }),
-                expr2: Box::new(Expr::Variable { name: v1 }),
+                expr2: Box::new(Expr::Variable { name: v1.clone() }),
             }),
             return_ty: None,
         };

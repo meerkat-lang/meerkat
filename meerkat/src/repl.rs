@@ -196,33 +196,28 @@ async fn exec_stmt(
     match stmt {
         Stmt::Service { name, decls } => {
             manager
-                .create_service(name, decls)
+                .create_service(name.clone(), decls)
                 .await
-                .map_err(|e| format!("Service '{}': {}", manager.interner.get(name), e))?;
-            Ok(Some(format!(
-                "Service '{}' loaded.",
-                manager.interner.get(name)
-            )))
+                .map_err(|e| format!("Service '{}': {}", name.as_str(), e))?;
+            Ok(Some(format!("Service '{}' loaded.", name.as_str())))
         }
         Stmt::Test {
             service_name,
             stmts,
         } => {
             manager
-                .execute_test_block(service_name, &stmts)
+                .execute_test_block(service_name.clone(), &stmts)
                 .await
-                .map_err(|e| format!("@test({}): {}", manager.interner.get(service_name), e))?;
-            Ok(Some(format!(
-                "@test({}) passed.",
-                manager.interner.get(service_name)
-            )))
+                .map_err(|e| format!("@test({}): {}", service_name.as_str(), e))?;
+            Ok(Some(format!("@test({}) passed.", service_name.as_str())))
         }
         Stmt::Import { path, service_name } => {
-            let svc_name_str = manager.interner.get(service_name);
+            let svc_name_str = service_name.as_str();
             if let Some(url) = remote_url_map.get(svc_name_str) {
-                manager
-                    .remote_services
-                    .insert(service_name, meerkat_lib::net::Address::new(url.as_str()));
+                manager.remote_services.insert(
+                    service_name.clone(),
+                    meerkat_lib::net::Address::new(url.as_str()),
+                );
                 return Ok(Some(format!(
                     "Remote service '{}' registered at {}.",
                     svc_name_str, url
@@ -233,10 +228,11 @@ async fn exec_stmt(
             let mut loaded = Vec::new();
             for s in import_stmts {
                 if let Stmt::Service { name, decls } = s {
-                    manager.create_service(name, decls).await.map_err(|e| {
-                        format!("Imported service '{}': {}", manager.interner.get(name), e)
-                    })?;
-                    loaded.push(manager.interner.get(name).to_string());
+                    manager
+                        .create_service(name.clone(), decls)
+                        .await
+                        .map_err(|e| format!("Imported service '{}': {}", name.as_str(), e))?;
+                    loaded.push(name.as_str().to_string());
                 }
             }
             Ok(Some(format!("Imported service(s): {}.", loaded.join(", "))))
@@ -255,7 +251,7 @@ async fn exec_stmt(
             }
         }
         Stmt::Watch { expr } => {
-            let label = meerkat_lib::runtime::update::format_expr(&expr, &manager.interner);
+            let label = meerkat_lib::runtime::update::format_expr(&expr);
             // Evaluate initial value
             let initial = eval(
                 &expr,

@@ -43,23 +43,23 @@ impl<'a, T> Env<'a, T> {
     /// Remove a symbol binding from the current local environment scope
     ///
     /// Args:
-    ///     `name` (`Symbol`): The symbol to remove
+    ///     `name` (`&Symbol`): The symbol to remove
     ///
     /// Returns:
     ///     `Option<T>`: The removed value if it was bound locally
-    pub fn remove(&mut self, name: Symbol) -> Option<T> {
-        self.bindings.remove(&name)
+    pub fn remove(&mut self, name: &Symbol) -> Option<T> {
+        self.bindings.remove(name)
     }
 
     /// Find a symbol in the environment chain, returning a reference to it
     ///
     /// Args:
-    ///     `name` (`Symbol`): The symbol to search
+    ///     `name` (`&Symbol`): The symbol to search
     ///
     /// Returns:
     ///     `Option<&T>`: Reference to the value if found
-    pub fn find(&self, name: Symbol) -> Option<&T> {
-        if let Some(val) = self.bindings.get(&name) {
+    pub fn find(&self, name: &Symbol) -> Option<&T> {
+        if let Some(val) = self.bindings.get(name) {
             Some(val)
         } else if let Some(parent) = self.parent {
             parent.find(name)
@@ -71,12 +71,12 @@ impl<'a, T> Env<'a, T> {
     /// Find a symbol and return both the environment and the value
     ///
     /// Args:
-    ///     `name` (`Symbol`): The symbol to search
+    ///     `name` (`&Symbol`): The symbol to search
     ///
     /// Returns:
     ///     `Option<(&Env<'a, T>, &T)>`: The environment and the value
-    pub fn find_with_env(&self, name: Symbol) -> Option<(&Env<'a, T>, &T)> {
-        if let Some(val) = self.bindings.get(&name) {
+    pub fn find_with_env(&self, name: &Symbol) -> Option<(&Env<'a, T>, &T)> {
+        if let Some(val) = self.bindings.get(name) {
             Some((self, val))
         } else if let Some(parent) = self.parent {
             parent.find_with_env(name)
@@ -115,7 +115,7 @@ impl<'parent, T: Clone> Env<'parent, T> {
             parent.flatten_into(out);
         }
         for (k, v) in &self.bindings {
-            out.insert(*k, v.clone());
+            out.insert(k.clone(), v.clone());
         }
     }
 }
@@ -137,10 +137,10 @@ mod tests {
     fn test_unit_env_bind_and_find() {
         let mut env = Env::new(None);
         let s = Symbol::empty();
-        assert_eq!(env.bind(s, 42), None);
-        assert_eq!(env.find(s), Some(&42));
-        assert_eq!(env.bind(s, 43), Some(42));
-        assert_eq!(env.find(s), Some(&43));
+        assert_eq!(env.bind(s.clone(), 42), None);
+        assert_eq!(env.find(&s), Some(&42));
+        assert_eq!(env.bind(s.clone(), 43), Some(42));
+        assert_eq!(env.find(&s), Some(&43));
     }
 
     #[test]
@@ -148,10 +148,10 @@ mod tests {
     fn test_unit_env_remove() {
         let mut env = Env::new(None);
         let s = Symbol::empty();
-        env.bind(s, 100);
-        assert_eq!(env.remove(s), Some(100));
-        assert_eq!(env.find(s), None);
-        assert_eq!(env.remove(s), None);
+        env.bind(s.clone(), 100);
+        assert_eq!(env.remove(&s), Some(100));
+        assert_eq!(env.find(&s), None);
+        assert_eq!(env.remove(&s), None);
     }
 
     #[test]
@@ -159,18 +159,18 @@ mod tests {
     fn test_unit_env_hierarchical_lookup() {
         let mut parent = Env::new(None);
         let s1 = Symbol::empty();
-        parent.bind(s1, 1);
+        parent.bind(s1.clone(), 1);
 
         let mut child = Env::new(Some(&parent));
-        assert_eq!(child.find(s1), Some(&1));
+        assert_eq!(child.find(&s1), Some(&1));
 
-        let res = child.find_with_env(s1).unwrap();
+        let res = child.find_with_env(&s1).unwrap();
         assert!(std::ptr::eq(res.0, &parent));
         assert_eq!(res.1, &1);
 
-        child.bind(s1, 2);
-        assert_eq!(child.find(s1), Some(&2));
-        let res_shadowed = child.find_with_env(s1).unwrap();
+        child.bind(s1.clone(), 2);
+        assert_eq!(child.find(&s1), Some(&2));
+        let res_shadowed = child.find_with_env(&s1).unwrap();
         assert!(std::ptr::eq(res_shadowed.0, &child));
         assert_eq!(res_shadowed.1, &2);
     }
@@ -180,13 +180,13 @@ mod tests {
     fn test_unit_env_lookup_missing() {
         let env: Env<'_, i32> = Env::new(None);
         let s = Symbol::empty();
-        assert_eq!(env.find(s), None);
-        assert!(env.find_with_env(s).is_none());
+        assert_eq!(env.find(&s), None);
+        assert!(env.find_with_env(&s).is_none());
 
         let parent: Env<'_, i32> = Env::new(None);
         let child = Env::new(Some(&parent));
-        assert_eq!(child.find(s), None);
-        assert!(child.find_with_env(s).is_none());
+        assert_eq!(child.find(&s), None);
+        assert!(child.find_with_env(&s).is_none());
     }
 
     #[test]
@@ -195,11 +195,11 @@ mod tests {
     fn test_unit_env_stack_borrow_with_parent_lifetime() {
         let mut parent = Env::new(None);
         let s = Symbol::empty();
-        parent.bind(s, 42);
+        parent.bind(s.clone(), 42);
 
         fn helper<'a>(parent: &'a Env<'a, i32>, s: Symbol) -> Option<i32> {
             let child = Env::new(Some(parent));
-            child.find(s).copied()
+            child.find(&s).copied()
         }
 
         assert_eq!(helper(&parent, s), Some(42));
@@ -211,12 +211,12 @@ mod tests {
     fn test_unit_env_flatten_shadowing() {
         let mut parent = Env::new(None);
         let s = Symbol::empty();
-        parent.bind(s, 1);
+        parent.bind(s.clone(), 1);
 
         let mut child = Env::new(Some(&parent));
-        child.bind(s, 2);
+        child.bind(s.clone(), 2);
 
         let flat = child.flatten();
-        assert_eq!(flat.find(s), Some(&2));
+        assert_eq!(flat.find(&s), Some(&2));
     }
 }

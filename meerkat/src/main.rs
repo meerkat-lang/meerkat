@@ -167,6 +167,15 @@ fn remote_url_map(import_urls: &[String]) -> HashMap<String, String> {
         .collect()
 }
 
+fn explicit_import_path(prog: &[Stmt]) -> Option<&str> {
+    prog.iter().find_map(|stmt| match stmt {
+        Stmt::Import {
+            path: Some(path), ..
+        } => Some(path.as_str()),
+        _ => None,
+    })
+}
+
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
@@ -197,6 +206,14 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
             let prog = node
                 .load_file(file)
                 .map_err(|e| format!("Parse error: {}", e))?;
+
+            if let Some(path) = explicit_import_path(&prog) {
+                return Err(format!(
+                    "Explicit imports are not supported in file-based execution: '{}'",
+                    path
+                )
+                .into());
+            }
 
             // This must appear prior to `check_only` or it will never
             // print. These modes are designed to work both in

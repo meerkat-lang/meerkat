@@ -362,14 +362,18 @@ impl Node {
         remote_url_map: HashMap<String, String>,
         identity: Option<Keypair>,
     ) -> Result<(Option<NetworkActor>, Vec<NetworkEvent>, Vec<Stmt>)> {
-        let mut local_prog = self.load_file(file)?;
-        local_prog.retain(|stmt| match stmt {
-            Stmt::Import { path: Some(_), .. } => {
-                println!("Explicit imports are not currently supported in file-based execution!");
-                false
-            }
-            _ => true,
-        });
+        let local_prog = self.load_file(file)?;
+        if let Some(Stmt::Import {
+            path: Some(path), ..
+        }) = local_prog
+            .iter()
+            .find(|stmt| matches!(stmt, Stmt::Import { path: Some(_), .. }))
+        {
+            return Err(Error::Message(format!(
+                "Explicit imports are not supported in file-based execution: '{}'",
+                path
+            )));
+        }
         let base_dir = Path::new(file).parent().unwrap_or_else(|| Path::new("."));
 
         let mut opt_net = None;

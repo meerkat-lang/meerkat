@@ -378,6 +378,13 @@ impl Manager {
         name: Symbol,
         decls: Vec<Decl>,
     ) -> Result<(), EvalError> {
+        if self.remote_services.contains_key(&name) {
+            return Err(EvalError::RuntimeError(format!(
+                "Cannot create local service '{}': it is already registered as remote",
+                self.interner.get(name)
+            )));
+        }
+
         let id = self.compute_service_net_id(name);
         // Register the service (with its real `ServiceNetId`) before
         // evaluating any declarations, so action closures built during

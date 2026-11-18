@@ -1702,14 +1702,31 @@ impl Manager {
             );
             return false;
         };
+
         if let Some(state) = service.vars.get_mut(&def) {
-            let differs =
-                state.value != value || state.vector_clock != clock || state.sources != sources;
+            let value_changed = state.value != value;
+            let differs = value_changed || state.vector_clock != clock || state.sources != sources;
+            if value_changed {
+                log::warn!(
+                    target: "WATCH",
+                    "    def {}.{} changed to {:?}",
+                    self.interner.get(svc),
+                    self.interner.get(def),
+                    value,
+                );
+            }
             state.value = value;
             state.vector_clock = clock;
             state.sources = sources;
             differs
         } else {
+            log::warn!(
+                target: "WATCH",
+                "    def {}.{} changed to {:?}",
+                self.interner.get(svc),
+                self.interner.get(def),
+                value,
+            );
             let mut state = VarState::new(value);
             state.vector_clock = clock;
             state.sources = sources;

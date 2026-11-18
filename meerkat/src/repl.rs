@@ -238,7 +238,7 @@ pub async fn run_repl(
                     }
                     None => println!("{}", line),
                 };
-                if crate::poll_and_print_update(&mut manager, &mut last_keepalive, &mut print).await {
+                if crate::poll_and_log_updates(&mut manager, &mut last_keepalive).await {
                     check_watches(&mut watches, &mut manager, &repl_env, &mut print).await;
                 }
             }

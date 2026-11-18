@@ -114,8 +114,7 @@ struct Args {
     #[arg(long = "ast", default_value_t = false)]
     ast: bool,
 
-    /// Watch mode: subscribe to cross-service dependencies and print change
-    /// notifications asynchronously as they arrive (issue #24)
+    /// Watch mode: log incoming network updates and changed local definitions
     #[arg(long = "watch", default_value_t = false)]
     watch: bool,
 
@@ -168,6 +167,15 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
     };
     env_logger::Builder::from_default_env()
         .filter_level(log_level)
+        .filter_module(
+            "WATCH",
+            if args.watch {
+                log::LevelFilter::Warn
+            } else {
+                log::LevelFilter::Off
+            },
+        )
+        // .target(env_logger::Target::Pipe(Box::new(repl::LogWriter)))
         .init();
 
     let mut remote_url_map = remote_url_map(&args.import_urls);
@@ -669,10 +677,7 @@ async fn run_client(
         println!("Watching for changes, press Ctrl+C to stop...");
         let mut last_keepalive = tokio::time::Instant::now();
         loop {
-            poll_and_print_update(&mut manager, &mut last_keepalive, |line| {
-                println!("{}", line)
-            })
-            .await;
+            poll_and_log_updates(&mut manager, &mut last_keepalive).await;
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         }
     }
@@ -680,18 +685,11 @@ async fn run_client(
     Ok(())
 }
 
-/// Poll one pending network event and, if it is an `Update`, apply it via
-/// `Manager::handle_update` and report what happened through `print`.
-/// `print` is called zero, one, or two times: once for the raw
-/// `[update] source.member = value` notification, and once more for the
-/// `-> listener_def = value` line if the update's target service/def still
-/// exist locally. Factored out of the `--watch` loop so interactive mode
-/// (`repl::run_repl`) can drive the same logic alongside reading stdin.
+/// Poll one pending network event and log incoming updates through `WATCH`.
 /// Returns whether an update was decoded and passed to the manager.
-async fn poll_and_print_update(
+async fn poll_and_log_updates(
     manager: &mut Manager,
     last_keepalive: &mut tokio::time::Instant,
-    mut print: impl FnMut(String),
 ) -> bool {
     if last_keepalive.elapsed() >= meerkat_lib::runtime::limits::KEEPALIVE_INTERVAL {
         manager.keepalive_waiters().await;
@@ -718,10 +716,7 @@ async fn poll_and_print_update(
     }) = msg
     {
         if let Ok(parsed) = codec::decode_value(value.clone(), &mut manager.interner) {
-            print(format!(
-                "[update] {}.{} = {:?}",
-                source_service, member, parsed
-            ));
+            log::warn!(target: "WATCH", "[update] {}.{} = {:?}", source_service, member, parsed);
         }
         let lid = ServiceNetId(listener_service);
         // Validate wire names and clock dimensions before applying the update.
@@ -746,11 +741,6 @@ async fn poll_and_print_update(
                 sources,
             )
             .await;
-        if let Some((_, svc)) = manager.services.iter().find(|(_, s)| s.id == lid) {
-            if let Some(vs) = svc.vars.get(&def_sym) {
-                print(format!("          -> {} = {:?}", listener_def, vs.value));
-            }
-        }
         return true;
     }
     false

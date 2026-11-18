@@ -184,20 +184,20 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                 .load_file(file)
                 .map_err(|e| format!("Parse error: {}", e))?;
 
-            if let Some(path) = explicit_import_path(&prog) {
-                return Err(format!(
-                    "Explicit imports are not supported in file-based execution: '{}'",
-                    path
-                )
-                .into());
-            }
-
             // This must appear prior to `check_only` or it will never
             // print. These modes are designed to work both in
             // isolation and in tandem
             if args.ast {
                 let printer = AstPrinter::new(&node.interner);
                 printer.print_program(&prog);
+            }
+
+            if let Some(path) = explicit_import_path(&prog) {
+                return Err(format!(
+                    "Explicit imports are not supported in file-based execution: '{}'",
+                    path
+                )
+                .into());
             }
 
             let mut opt_server_net: Option<NetworkActor> = None;

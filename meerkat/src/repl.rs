@@ -249,12 +249,22 @@ async fn exec_stmt(
                 if !found {
                     return Err(format!("Import '{}': Service not found", p).into());
                 }
+                if manager.remote_services.contains_key(&service_name) {
+                    return Err(format!(
+                        "Import '{}': Request service is already registered
+                    as a remote service",
+                        svc_name_str
+                    )
+                    .into());
+                }
                 for s in import_stmts {
                     if let Stmt::Service { name, decls } = s {
-                        manager.create_service(name, decls).await.map_err(|e| {
-                            format!("Imported service '{}': {}", manager.interner.get(name), e)
-                        })?;
-                        loaded.push(manager.interner.get(name).to_string());
+                        if !manager.remote_services.contains_key(&name) {
+                            manager.create_service(name, decls).await.map_err(|e| {
+                                format!("Imported service '{}': {}", manager.interner.get(name), e)
+                            })?;
+                            loaded.push(manager.interner.get(name).to_string());
+                        }
                     }
                 }
                 Ok(Some(format!("Imported service(s): {}.", loaded.join(", "))))
@@ -277,10 +287,16 @@ async fn exec_stmt(
                     let mut loaded = Vec::new();
                     for s in import_stmts {
                         if let Stmt::Service { name, decls } = s {
-                            manager.create_service(name, decls).await.map_err(|e| {
-                                format!("Imported service '{}': {}", manager.interner.get(name), e)
-                            })?;
-                            loaded.push(manager.interner.get(name).to_string());
+                            if !manager.remote_services.contains_key(&name) {
+                                manager.create_service(name, decls).await.map_err(|e| {
+                                    format!(
+                                        "Imported service '{}': {}",
+                                        manager.interner.get(name),
+                                        e
+                                    )
+                                })?;
+                                loaded.push(manager.interner.get(name).to_string());
+                            }
                         }
                     }
                     Ok(Some(format!("Imported service(s): {}.", loaded.join(", "))))

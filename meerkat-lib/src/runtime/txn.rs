@@ -211,6 +211,11 @@ impl VarLock {
         }
     }
 }
+pub type VClock = HashMap<(Symbol, Symbol), u64>;
+pub type Sources = HashSet<(Symbol, Symbol)>;
+
+/// A read value and its committed clock. Buffered writes have no clock yet.
+pub type ReadEntry = (Value, Option<VClock>, Option<Sources>);
 
 /// Composite state for a single variable represented by `VarState`
 ///
@@ -224,6 +229,13 @@ pub struct VarState {
     pub lock: VarLock,
     /// Most recent transaction to write this variable
     pub latest_write_txn: Option<TxnId>,
+    // we represent a vector clock as a map from a (service, var) pair to a counter
+    // the counter should always be non zero. We interpret the lack of a key to be counter = 0.
+    // we shouldn't need to deal with any complicated removal semantics since the clock
+    // should be monotonically increasing?
+    pub vector_clock: VClock,
+    /// Sources paired with this value and clock; None means not yet known.
+    pub sources: Option<Sources>,
 }
 
 impl VarState {
@@ -233,7 +245,19 @@ impl VarState {
             value,
             lock: VarLock::new(),
             latest_write_txn: None,
+            vector_clock: HashMap::new(),
+            sources: None,
         }
+    }
+
+    /// The value with the clock and Sources paired with it, as a read of the
+    /// variable returns them
+    pub fn entry(&self) -> ReadEntry {
+        (
+            self.value.clone(),
+            Some(self.vector_clock.clone()),
+            self.sources.clone(),
+        )
     }
 }
 
@@ -252,9 +276,9 @@ pub struct Transaction {
     pub locked: HashSet<(ServiceNetId, Symbol)>,
     /// Services this transaction currently holds a whole-service lock on
     pub service_locked: HashSet<ServiceNetId>,
-    /// Values already read in this transaction, keyed by (service, variable)
-    /// (avoids re-fetching, including redundant network round-trips)
-    pub read_cache: HashMap<(ServiceNetId, Symbol), Value>,
+    /// Read snapshots keyed by (service, member). Local reads reuse the pair.
+    /// Initialization also records remote pairs without skipping later RPCs.
+    pub read_cache: HashMap<(ServiceNetId, Symbol), ReadEntry>,
     /// Values written by this transaction, keyed by (service, variable),
     /// buffered and applied only on successful commit (so a failed
     /// transaction leaves no partial writes)
@@ -262,6 +286,36 @@ pub struct Transaction {
     /// Remote nodes that joined this transaction (executed a composed action
     /// under this `id` and are holding locks or buffered writes until commit or abort)
     pub participants: HashSet<Address>,
+    /// What the participants reported in their replies: the clocks of what
+    /// they read and of the vars they overwrote. Joined into the one clock
+    /// every write of the transaction is stamped with
+    pub(crate) participant_history: VClock,
+    /// The vars the participants wrote, from the same replies
+    pub(crate) participant_writes: HashSet<(Symbol, Symbol)>,
+    /// Composed actions already executed under this transaction, keyed by
+    /// their position in this transaction's dispatch order
+    ///
+    /// A participant action that parks is re-run from its first statement, so
+    /// a composed action it completed is reached again. It must not be sent
+    /// again: the other node already ran it under this id and holds its writes
+    /// buffered, where this node cannot roll them back
+    ///
+    /// Scaffolding: once a parked action is suspended and resumed rather than
+    /// re-run (#213), this and `composed_seq` go away
+    pub composed_done: HashMap<u64, ComposedCall>,
+    /// Position the next composed action dispatched under this transaction
+    /// takes. A park rewinds it, so a replayed dispatch lands on the position
+    /// the first attempt recorded
+    pub composed_seq: u64,
+}
+
+/// A composed action that completed under a transaction: where it was sent,
+/// and what was sent, so a diverging replay is detected rather than suppressed
+#[derive(Debug, Clone)]
+pub struct ComposedCall {
+    pub target: ServiceNetId,
+    /// Hash of the encoded statements and environment the dispatch shipped
+    pub fingerprint: u64,
 }
 
 impl Transaction {
@@ -274,6 +328,10 @@ impl Transaction {
             read_cache: HashMap::new(),
             written: HashMap::new(),
             participants: HashSet::new(),
+            participant_history: VClock::new(),
+            participant_writes: HashSet::new(),
+            composed_done: HashMap::new(),
+            composed_seq: 0,
         }
     }
 }

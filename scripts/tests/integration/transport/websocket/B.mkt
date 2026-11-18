@@ -1,0 +1,5 @@
+service B {
+    var stock = 100;
+    pub def get_stock = stock;
+    pub def take = action { stock = stock - 1; };
+}

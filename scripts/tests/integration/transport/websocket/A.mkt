@@ -1,0 +1,6 @@
+import B
+
+service A {
+    pub def remote_stock = B.get_stock;
+    pub def buy = action { do B.take; };
+}

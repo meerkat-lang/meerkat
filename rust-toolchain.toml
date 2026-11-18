@@ -1,0 +1,8 @@
+# The Rust version CI, the pre-commit hooks and local builds all use.
+# Renovate proposes version bumps; review them in separate PRs.
+# See "Rust Toolchain" in AGENTS.md for upgrade checks.
+[toolchain]
+channel = "1.100.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]

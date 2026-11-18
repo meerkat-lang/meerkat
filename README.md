@@ -15,12 +15,11 @@ Core libraries for the Meerkat runtime:
 
 - **net** - Network layer with libp2p and circuit relay support for peer-to-peer communication
 
-### Building and Testing
+## Building and Testing
 
-We use [`pre-commit`](https://pre-commit.com/) to ensure code quality.
-
-1. **Install pre-commit:** Run `sudo apt install pre-commit` or `pip install pre-commit` or `brew install pre-commit` (see [installation guide](https://pre-commit.com/#install)).
-2. **Set up hooks:** Run `pre-commit install` in the repository root before submitting a pull request.
+The Rust version is pinned in `rust-toolchain.toml`. With [rustup](https://rustup.rs),
+the first `cargo` command in the repository installs that version, along with the
+WASM target.
 
 ```bash
 # Build all packages
@@ -28,9 +27,6 @@ cargo build
 
 # Run all tests
 cargo test
-
-# Install the WASM target (one-time setup)
-rustup target add wasm32-unknown-unknown
 
 # Test WASM compatibility
 cargo check --locked -p meerkat-lib --target wasm32-unknown-unknown --all-features
@@ -53,6 +49,15 @@ cargo run -- -f meerkat/tests/test_client.mkt --watch -i <Service URL>   # (in t
 cargo run -- -f meerkat/tests/test_client.mkt -i <Service URL>           # (in terminal 3): modifies a var on s1, triggers an update to the test_client in terminal 2
 
 ```
+
+## Contributing
+
+We use [`pre-commit`](https://pre-commit.com/) to ensure code quality.
+
+1. **Install pre-commit:** Run `sudo apt install pre-commit` or `pip install pre-commit` or `brew install pre-commit` (see [installation guide](https://pre-commit.com/#install)).
+2. **Set up hooks:** Run `pre-commit install` in the repository root before submitting a pull request.
+
+Note that pre-commit runs `cargo fmt`; a common issue is not running this before opening a PR.
 
 ## License
 

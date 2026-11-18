@@ -1,0 +1,12 @@
+import ryow_mid
+import ryow_c
+
+service nested_cli {
+    pub def w = ryow_c.gc * 2;
+}
+
+@test(nested_cli) {
+    assert(w == 2);
+    do ryow_mid.bump_mid;
+    assert(w == 22);
+}

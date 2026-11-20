@@ -1454,21 +1454,6 @@ impl Manager {
         Ok((value, clock, sources))
     }
 
-    /// Owning service of a table declared in `unified_ast`.
-    pub(crate) fn service_for_table(&self, table_name: Symbol) -> Option<Symbol> {
-        for stmt in &self.unified_ast {
-            if let Stmt::Service { name, decls } = stmt {
-                if decls
-                    .iter()
-                    .any(|d| matches!(d, Decl::TableDecl { name: t, .. } if *t == table_name))
-                {
-                    return Some(*name);
-                }
-            }
-        }
-        None
-    }
-
     /// Column names of a table on `service_name`, in schema order.
     pub(crate) fn table_field_names(
         &self,
@@ -1633,18 +1618,19 @@ impl Manager {
         row: Value,
         mut txn: Option<&mut Transaction>,
     ) -> Result<(), EvalError> {
-        if txn.is_some() {
+        if let Some(t) = txn.as_mut() {
             let key = (self.service_net_id_for_name(service_name), table_name);
             enum LockAction {
                 Acquire,
                 Upgrade,
             }
             let (txn_id, kind, staged) = {
-                let t = txn.as_deref().unwrap();
                 // Reject a missing or non-list target before locking. The
                 // write lock would otherwise create the variable.
-                let staged = if let Some(existing) =
-                    t.written.get(&key).or_else(|| t.read_cache.get(&key))
+                let staged = if let Some(existing) = t
+                    .written
+                    .get(&key)
+                    .or_else(|| t.read_cache.get(&key).map(|(value, _, _)| value))
                 {
                     if !matches!(existing, Value::List { .. }) {
                         return Err(EvalError::TypeError(
@@ -1676,7 +1662,6 @@ impl Manager {
                     self.acquire_write_lock(service_name, table_name, &txn_id)?
                 }
             }
-            let t = txn.as_deref_mut().unwrap();
             t.locked.insert(key.clone());
 
             if t.written.contains_key(&key) {
@@ -1688,33 +1673,35 @@ impl Manager {
                 if let Some(Value::List { vals }) = t.written.get_mut(&key) {
                     vals.push(row.clone());
                 }
-                if let Some(Value::List { vals }) = t.read_cache.get_mut(&key) {
+                if let Some((Value::List { vals }, _, _)) = t.read_cache.get_mut(&key) {
                     vals.push(row);
                 } else {
                     let updated = t.written.get(&key).unwrap().clone();
-                    t.read_cache.insert(key, updated);
+                    t.read_cache.insert(key, (updated, None, None));
                 }
                 return Ok(());
             }
 
             let taken_from_cache = t.read_cache.contains_key(&key);
-            let mut table = if taken_from_cache {
-                t.read_cache.remove(&key).unwrap()
+            let (mut table, clock, sources) = if taken_from_cache {
+                let (value, clock, sources) = t.read_cache.remove(&key).unwrap();
+                (value, clock, sources)
             } else {
-                staged.unwrap()
+                (staged.unwrap(), None, None)
             };
             match &mut table {
                 Value::List { vals } => vals.push(row),
                 _ => {
                     if taken_from_cache {
-                        t.read_cache.insert(key, table);
+                        t.read_cache.insert(key, (table, clock, sources));
                     }
                     return Err(EvalError::TypeError(
                         "insert target is not a table".to_string(),
                     ));
                 }
             }
-            t.read_cache.insert(key.clone(), table.clone());
+            t.read_cache
+                .insert(key.clone(), (table.clone(), clock, sources));
             t.written.insert(key, table);
             return Ok(());
         }

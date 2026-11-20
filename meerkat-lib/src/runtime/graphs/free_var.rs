@@ -1,6 +1,8 @@
 //! Free variable extraction
 
-use crate::ast::{ActionStmt, Expr, Stmt};
+#[cfg(test)]
+use crate::ast::Stmt;
+use crate::ast::{ActionStmt, Expr};
 use crate::runtime::interner::Symbol;
 use std::collections::HashSet;
 
@@ -133,6 +135,7 @@ fn collect_free_vars_action_stmt(
 /// `MemberAccess` uses the same syntax for `s1.y` (a service member) and
 /// `row.done` (a record field). Only the former is a cross-service dependency;
 /// the latter is distinguished by whether the left ident is a known service.
+#[cfg(test)]
 pub(super) fn service_names(program: &[Stmt]) -> HashSet<Symbol> {
     program
         .iter()

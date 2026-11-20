@@ -314,7 +314,46 @@ impl<'a> Effects<'a> {
             &Expr::MemberAccess {
                 service_name,
                 member_name,
+            }
+            | &Expr::ServiceAccess {
+                service: service_name,
+                member: member_name,
             } => self.read((service_name, member_name), reads)?,
+            // A field read depends on the record. A row variable is a local.
+            Expr::FieldAccess { var, .. } => {
+                match locals.iter().rev().find(|(local, _)| local == var) {
+                    Some((_, functions)) => functions.clone(),
+                    None => self.read((service, *var), reads)?,
+                }
+            }
+            Expr::Map {
+                var,
+                table_name,
+                where_clause,
+                body,
+            } => {
+                if !locals.iter().any(|(local, _)| local == table_name) {
+                    reads.direct.insert((service, *table_name));
+                }
+                let mut row_locals = locals.to_vec();
+                row_locals.push((*var, Functions::new()));
+                self.visit(where_clause, service, &row_locals, reads)?;
+                self.visit(body, service, &row_locals, reads)?;
+                Functions::new()
+            }
+            Expr::Fold {
+                table_name,
+                operation,
+                identity,
+                ..
+            } => {
+                if !locals.iter().any(|(local, _)| local == table_name) {
+                    reads.direct.insert((service, *table_name));
+                }
+                self.visit(operation, service, locals, reads)?;
+                self.visit(identity, service, locals, reads)?;
+                Functions::new()
+            }
             Expr::Func { params, body, .. } => {
                 // As in `eval`, a closure captures the locals free in its body,
                 // except one named like a member that already exists.

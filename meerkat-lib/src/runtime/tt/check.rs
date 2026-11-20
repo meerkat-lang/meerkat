@@ -108,14 +108,14 @@ fn table_list_type(fields: &[Field]) -> Result<Type, Error> {
 /// A `fold` operation is either `(acc, column) -> acc` or `acc -> column -> acc`.
 fn fold_operation_matches(op: &Type, acc: &Type, col: &Type) -> bool {
     match op {
-        Type::Func(param, ret, _) if ret.as_ref() == acc => match param.as_ref() {
+        Type::Func(param, ret) if ret.as_ref() == acc => match param.as_ref() {
             Type::Tuple(ts) => ts.len() == 2 && &ts[0] == acc && &ts[1] == col,
             _ => false,
         },
-        Type::Func(param, ret, _) if param.as_ref() == acc => {
+        Type::Func(param, ret) if param.as_ref() == acc => {
             matches!(
                 ret.as_ref(),
-                Type::Func(inner_param, inner_ret, _)
+                Type::Func(inner_param, inner_ret)
                     if inner_param.as_ref() == col && inner_ret.as_ref() == acc
             )
         }
@@ -471,7 +471,6 @@ impl<'a, 'b> Context<'a, 'b> {
                 }
                 Decl::TableDecl { name, .. } => {
                     self.type_of_member(service_name, *name)?;
-                    self.initialized.insert(*name);
                 }
             }
         }
@@ -949,7 +948,6 @@ impl<'a, 'b> Context<'a, 'b> {
                         expected: Box::new(Type::Func(
                             Box::new(Type::Tuple(params)),
                             Box::new(acc_ty),
-                            std::collections::HashSet::new(),
                         )),
                         found: Box::new(op_ty),
                     });
@@ -1078,7 +1076,7 @@ impl<'a, 'b> Context<'a, 'b> {
             Value::Record { fields } => {
                 let mut tys = Vec::new();
                 for (name, v) in fields {
-                    tys.push((*name, self.infer_value(v, type_depth + 1)?));
+                    tys.push((*name, Self::infer_value(v, type_depth + 1)?));
                 }
                 let rec = RecordType::new(tys).map_err(|_| Error::CannotInferType)?;
                 Ok(Type::Record(rec))
@@ -1122,7 +1120,6 @@ impl<'a, 'b> Context<'a, 'b> {
         }
     }
 }
-
 
 /// Perform static type checking on a program statement list
 ///

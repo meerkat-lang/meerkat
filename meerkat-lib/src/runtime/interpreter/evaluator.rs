@@ -338,18 +338,7 @@ pub(crate) async fn eval_with_inputs(
             record_field(&recv, field)
         }
         &Expr::ServiceAccess { service, member } => {
-            if let Some(v) = ctx
-                .manager
-                .reactive_cache
-                .as_ref()
-                .and_then(|c| c.get(&(service, member)))
-                .cloned()
-            {
-                return Ok(v);
-            }
-            ctx.manager
-                .lookup(member, service, ctx.txn.as_deref_mut())
-                .await
+            lookup_input((service, member), ctx, inputs).await
         }
         &Expr::MemberAccess {
             service_name,

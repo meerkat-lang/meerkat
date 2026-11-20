@@ -175,7 +175,11 @@ impl Resolver {
         })
     }
 
-    fn resolve_table(&self, table_name: Symbol, env: &Env<'_, Binding>) -> Result<Vec<Field>, Error> {
+    fn resolve_table(
+        &self,
+        table_name: Symbol,
+        env: &Env<'_, Binding>,
+    ) -> Result<Vec<Field>, Error> {
         let missing = Error::UnknownIdentifier {
             name: table_name,
             expected: ExpectedSort::Table,
@@ -1057,7 +1061,7 @@ mod tests {
         };
 
         // update s { var x = 5; def y = x; }
-        let mut update_stmt = Stmt::Update {
+        let update_stmt = Stmt::Update {
             service_name: s,
             decls: vec![
                 Decl::VarDecl {
@@ -1097,7 +1101,7 @@ mod tests {
         };
 
         // update s { def y = x; var x = 5; } -- x is new, so y cannot forward ref x
-        let mut update_stmt = Stmt::Update {
+        let update_stmt = Stmt::Update {
             service_name: s,
             decls: vec![
                 Decl::DefDecl {
@@ -1151,7 +1155,7 @@ mod tests {
         };
 
         // Representing `@test(s) { x; }`
-        let mut test_stmt = Stmt::Test {
+        let test_stmt = Stmt::Test {
             service_name: s,
             stmts: vec![ActionStmt::Expr(Expr::Variable { name: x })],
         };
@@ -1172,7 +1176,7 @@ mod tests {
         let x = interner.insert("x");
 
         // Representing `@test(s) { x; }`
-        let mut test_stmt = Stmt::Test {
+        let test_stmt = Stmt::Test {
             service_name: s,
             stmts: vec![ActionStmt::Expr(Expr::Variable { name: x })],
         };
@@ -1209,7 +1213,7 @@ mod tests {
         // Representing:
         //   service s { var x = 0; }
         //   @test(s) { x; }
-        let mut service_stmt = Stmt::Service {
+        let service_stmt = Stmt::Service {
             name: s,
             decls: vec![Decl::VarDecl {
                 name: x,
@@ -1219,7 +1223,7 @@ mod tests {
                 },
             }],
         };
-        let mut test_stmt = Stmt::Test {
+        let test_stmt = Stmt::Test {
             service_name: s,
             stmts: vec![ActionStmt::Expr(Expr::Variable { name: x })],
         };
@@ -1241,7 +1245,7 @@ mod tests {
         let x = interner.insert("x");
 
         // Representing `@test(s) { x; }`
-        let mut test_stmt = Stmt::Test {
+        let test_stmt = Stmt::Test {
             service_name: s,
             stmts: vec![ActionStmt::Expr(Expr::Variable { name: x })],
         };
@@ -1575,7 +1579,11 @@ mod tests {
         }
     }
 
-    fn table(name: Symbol, columns: &[(&str, crate::runtime::ast::TableType)], interner: &mut Interner) -> Decl {
+    fn table(
+        name: Symbol,
+        columns: &[(&str, crate::runtime::ast::TableType)],
+        interner: &mut Interner,
+    ) -> Decl {
         Decl::TableDecl {
             name,
             fields: columns
@@ -1940,11 +1948,15 @@ mod tests {
         }];
         let mut program = program;
         resolve(&mut program).unwrap();
-        let graphs = crate::runtime::graphs::analysis::compute_dependencies(&program, None);
-        assert!(graphs[0].reactive_graph.contains_edge(config, xs));
-        let Stmt::Service { decls, .. } = &program[0] else {
+        let mut effects = crate::runtime::graphs::effects::Effects::new(
+            &program,
+            std::collections::HashMap::new(),
+        );
+        let Stmt::Service { name, decls, .. } = &program[0] else {
             panic!("service");
         };
+        let graphs = effects.graphs(*name, decls);
+        assert!(graphs.reactive_graph.contains_edge(config, xs));
         let Decl::DefDecl { val, .. } = &decls[2] else {
             panic!("xs");
         };
@@ -1955,6 +1967,6 @@ mod tests {
             panic!("comparison");
         };
         assert!(matches!(expr2.as_ref(), Expr::FieldAccess { .. }));
-        assert!(graphs[0].cross_deps.get(&xs).is_none());
+        assert!(!graphs.cross_deps.contains_key(&xs));
     }
 }

@@ -11,9 +11,9 @@ use meerkat_lib::runtime::interner::Symbol;
 #[cfg(test)]
 use meerkat_lib::runtime::parser;
 use meerkat_lib::runtime::{Manager, Node};
-use tokio::sync::mpsc::{self, UnboundedReceiver};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
+use tokio::sync::mpsc::{self, UnboundedReceiver};
 
 #[cfg(debug_assertions)]
 use meerkat_lib::net::types::LockGroup;
@@ -180,16 +180,14 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
             },
         )
         .target({
-            let log_with_external_printer = !args.server
-    && !args.check_only
-    && (args.interactive || args.input_file.is_none());
+            let log_with_external_printer =
+                !args.server && !args.check_only && (args.interactive || args.input_file.is_none());
             if log_with_external_printer {
-                env_logger::Target::Pipe(Box::new(repl::TokioChannelWriter {tx}))
+                env_logger::Target::Pipe(Box::new(repl::TokioChannelWriter { tx }))
             } else {
                 env_logger::Target::Stderr
             }
-        }
-        )
+        })
         .init();
 
     let mut remote_url_map = remote_url_map(&args.import_urls);
@@ -300,7 +298,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                     args.local,
                     args.watch,
                     args.interactive,
-                    rx
+                    rx,
                 )
                 .await
             }
@@ -600,7 +598,7 @@ async fn run_client(
     local: bool,
     watch: bool,
     interactive: bool,
-    log_rx: UnboundedReceiver<Vec<u8>>
+    log_rx: UnboundedReceiver<Vec<u8>>,
 ) -> Result<(), Box<dyn Error>> {
     let mut manager = Manager::new(node.interner);
     manager.local = local;

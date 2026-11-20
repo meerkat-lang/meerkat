@@ -8,13 +8,13 @@ use meerkat_lib::runtime::Manager;
 use directories::ProjectDirs;
 use rustyline::error::ReadlineError;
 use rustyline::{DefaultEditor, ExternalPrinter};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use std::io::{self, IsTerminal, Write};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 const PROMPT: &str = "meerkat> ";
 const PROMPT_CONT: &str = "       > ";
 
-/// A writer which sends all bytes it recieves over a channel
+/// A writer which sends all bytes it receives over a channel
 pub struct TokioChannelWriter {
     pub tx: UnboundedSender<Vec<u8>>,
 }
@@ -22,12 +22,12 @@ pub struct TokioChannelWriter {
 impl Write for TokioChannelWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let line = buf.into();
-        
+
         // UnboundedSender::send is synchronous and non-blocking
         self.tx
             .send(line)
             .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
-            
+
         Ok(buf.len())
     }
 
@@ -111,8 +111,7 @@ pub async fn run_repl(
     mut manager: Manager,
     remote_url_map: std::collections::HashMap<String, String>,
     _watch: bool,
-    mut log_rx: UnboundedReceiver<Vec<u8>>
-    
+    mut log_rx: UnboundedReceiver<Vec<u8>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut reader = DefaultEditor::new()?;
     use std::path::PathBuf;
@@ -171,12 +170,11 @@ pub async fn run_repl(
     // (e.g. piped input), which must not break plain `--interactive` or a
     // `--watch` session running non-interactively. Fall back to a plain
     // `println!` (via `None`) rather than propagating that error.
-    let mut printer: Option<Box<dyn ExternalPrinter + Send>> = 
-        reader
-            .create_external_printer()
-            .ok()
-            .map(|p| Box::new(p) as Box<dyn ExternalPrinter + Send>);
-    
+    let mut printer: Option<Box<dyn ExternalPrinter + Send>> = reader
+        .create_external_printer()
+        .ok()
+        .map(|p| Box::new(p) as Box<dyn ExternalPrinter + Send>);
+
     let mut last_keepalive = tokio::time::Instant::now();
     let mut watch_tick = tokio::time::interval(std::time::Duration::from_millis(10));
     let mut read_fut = spawn_next_readline(reader, continuation);

@@ -340,6 +340,7 @@ pub(crate) async fn eval_with_inputs(
         &Expr::ServiceAccess { service, member } => {
             lookup_input((service, member), ctx, inputs).await
         }
+        // Unresolved `x.f`. Remains only for the update and REPL paths.
         &Expr::MemberAccess {
             service_name,
             member_name,

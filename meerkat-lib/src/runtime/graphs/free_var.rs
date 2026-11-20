@@ -164,6 +164,8 @@ pub(super) fn service_names(program: &[Stmt]) -> HashSet<Symbol> {
 pub fn cross_service_deps(expr: &Expr, services: &HashSet<Symbol>) -> HashSet<(Symbol, Symbol)> {
     match expr {
         Expr::Literal { .. } | Expr::Variable { .. } | Expr::Table { .. } => HashSet::new(),
+        // Unresolved `x.f`. This list of service names remains only for the
+        // update and REPL paths.
         Expr::MemberAccess {
             service_name,
             member_name,

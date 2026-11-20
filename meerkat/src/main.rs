@@ -13,6 +13,7 @@ use meerkat_lib::runtime::parser;
 use meerkat_lib::runtime::{Manager, Node};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
+use tokio::sync::mpsc::{self, UnboundedReceiver};
 
 #[cfg(debug_assertions)]
 use meerkat_lib::net::types::LockGroup;
@@ -114,10 +115,14 @@ struct Args {
     #[arg(long = "ast", default_value_t = false)]
     ast: bool,
 
-    /// Watch mode: subscribe to cross-service dependencies and print change
-    /// notifications asynchronously as they arrive (issue #24)
+    /// Watch mode: log incoming network updates and changed local definitions
     #[arg(long = "watch", default_value_t = false)]
     watch: bool,
+
+    /// Interactive mode: enter a repl environment after loading the services
+    /// and establishing the network connections
+    #[arg(long = "interactive", default_value_t = false)]
+    interactive: bool,
 
     /// Run lock group cascade test client (debug builds only).
     /// Accepts a test case name; requires -i flags to resolve
@@ -156,13 +161,33 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
         return run_lock_test_client(test_case, &args.import_urls).await;
     }
 
+    let (tx, rx) = mpsc::unbounded_channel();
+
     let log_level = if args.verbose {
         log::LevelFilter::Info
     } else {
         log::LevelFilter::Warn
     };
+
     env_logger::Builder::from_default_env()
         .filter_level(log_level)
+        .filter_module(
+            "WATCH",
+            if args.watch {
+                log::LevelFilter::Warn
+            } else {
+                log::LevelFilter::Off
+            },
+        )
+        .target({
+            let log_with_external_printer =
+                !args.server && !args.check_only && (args.interactive || args.input_file.is_none());
+            if log_with_external_printer {
+                env_logger::Target::Pipe(Box::new(repl::TokioChannelWriter { tx }))
+            } else {
+                env_logger::Target::Stderr
+            }
+        })
         .init();
 
     let mut remote_url_map = remote_url_map(&args.import_urls);
@@ -266,7 +291,16 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                 )
                 .await
             } else {
-                run_client(node, prog, remote_url_map, args.local, args.watch).await
+                run_client(
+                    node,
+                    prog,
+                    remote_url_map,
+                    args.local,
+                    args.watch,
+                    args.interactive,
+                    rx,
+                )
+                .await
             }
         }
         None => {
@@ -277,7 +311,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
             }
             let mut manager = node.start();
             manager.local = args.local;
-            repl::run_repl(manager, remote_url_map).await
+            repl::run_repl(manager, remote_url_map, args.watch, rx).await
         }
     }
 }
@@ -563,6 +597,8 @@ async fn run_client(
     remote_url_map: std::collections::HashMap<String, String>,
     local: bool,
     watch: bool,
+    interactive: bool,
+    log_rx: UnboundedReceiver<Vec<u8>>,
 ) -> Result<(), Box<dyn Error>> {
     let mut manager = Manager::new(node.interner);
     manager.local = local;
@@ -575,7 +611,7 @@ async fn run_client(
     // (watch needs the network to receive change notifications).
     let mut net: Option<NetworkActor> = None;
     let mut local_full_addr: Option<String> = None;
-    if watch || !remote_url_map.is_empty() {
+    if watch || interactive || !remote_url_map.is_empty() {
         let mut n = NetworkActor::new(NodeType::Server)
             .await
             .map_err(|e| format!("Network error: {}", e))?;
@@ -648,73 +684,80 @@ async fn run_client(
         }
     }
 
+    if interactive {
+        return crate::repl::run_repl(manager, remote_url_map, watch, log_rx).await;
+    }
     if watch {
         println!("Watching for changes, press Ctrl+C to stop...");
         let mut last_keepalive = tokio::time::Instant::now();
         loop {
-            if last_keepalive.elapsed() >= meerkat_lib::runtime::limits::KEEPALIVE_INTERVAL {
-                manager.keepalive_waiters().await;
-                last_keepalive = tokio::time::Instant::now();
-            }
-            manager.complete_code_updates().await;
-            manager.wake_freed().await;
-            let msg = manager.try_recv_event().and_then(|ev| match ev {
-                NetworkEvent::MessageReceived { msg, .. } => Some(msg),
-                _ => None,
-            });
-            let msg = match msg {
-                Some(msg) => manager.serve_request(msg).await,
-                None => None,
-            };
-            if let Some(MeerkatMessage::Update {
-                listener_service,
-                listener_def,
-                source_service,
-                member,
-                value,
-                clock,
-                sources,
-            }) = msg
-            {
-                if let Ok(parsed) = codec::decode_value(value.clone(), &mut manager.interner) {
-                    println!("[update] {}.{} = {:?}", source_service, member, parsed);
-                }
-                let lid = ServiceNetId(listener_service);
-                // #24: validate + intern wire names through codec; skip on bad
-                // input. The clock's dimension names are interned here too, so
-                // a bad one drops the whole message.
-                let (def_sym, source_sym, member_sym, vclock, sources) = match codec::decode_update(
-                    &listener_def,
-                    &source_service,
-                    &member,
-                    &mut manager.interner,
-                    clock,
-                    sources,
-                ) {
-                    Ok(syms) => syms,
-                    Err(_) => continue,
-                };
-                manager
-                    .handle_update(
-                        lid.clone(),
-                        def_sym,
-                        (source_sym, member_sym),
-                        value,
-                        vclock,
-                        sources,
-                    )
-                    .await;
-                if let Some((_, svc)) = manager.services.iter().find(|(_, s)| s.id == lid) {
-                    if let Some(vs) = svc.vars.get(&def_sym) {
-                        println!("          -> {} = {:?}", listener_def, vs.value);
-                    }
-                }
-            }
+            poll_and_log_updates(&mut manager, &mut last_keepalive).await;
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         }
     }
 
     Ok(())
+}
+
+/// Poll one pending network event and log incoming updates through `WATCH`.
+/// Returns whether an update was decoded and passed to the manager.
+async fn poll_and_log_updates(
+    manager: &mut Manager,
+    last_keepalive: &mut tokio::time::Instant,
+) -> bool {
+    if last_keepalive.elapsed() >= meerkat_lib::runtime::limits::KEEPALIVE_INTERVAL {
+        manager.keepalive_waiters().await;
+        *last_keepalive = tokio::time::Instant::now();
+    }
+    manager.complete_code_updates().await;
+    manager.wake_freed().await;
+    let msg = manager.try_recv_event().and_then(|ev| match ev {
+        NetworkEvent::MessageReceived { msg, .. } => Some(msg),
+        _ => None,
+    });
+    let msg = match msg {
+        Some(msg) => manager.serve_request(msg).await,
+        None => None,
+    };
+    if let Some(MeerkatMessage::Update {
+        listener_service,
+        listener_def,
+        source_service,
+        member,
+        value,
+        clock,
+        sources,
+    }) = msg
+    {
+        if let Ok(parsed) = codec::decode_value(value.clone(), &mut manager.interner) {
+            log::warn!(target: "WATCH", "[update] {}.{} = {:?}", source_service, member, parsed);
+        }
+        let lid = ServiceNetId(listener_service);
+        // Validate wire names and clock dimensions before applying the update.
+        let (def_sym, source_sym, member_sym, vclock, sources) = match codec::decode_update(
+            &listener_def,
+            &source_service,
+            &member,
+            &mut manager.interner,
+            clock,
+            sources,
+        ) {
+            Ok(syms) => syms,
+            Err(_) => return false,
+        };
+        manager
+            .handle_update(
+                lid.clone(),
+                def_sym,
+                (source_sym, member_sym),
+                value,
+                vclock,
+                sources,
+            )
+            .await;
+        return true;
+    }
+    false
 }
 
 /// Lock group cascade integration test client (debug builds only).

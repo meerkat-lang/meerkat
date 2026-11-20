@@ -8,10 +8,33 @@ use meerkat_lib::runtime::Manager;
 use directories::ProjectDirs;
 use rustyline::error::ReadlineError;
 use rustyline::{DefaultEditor, ExternalPrinter};
-use std::io::{self, IsTerminal};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use std::io::{self, IsTerminal, Write};
 
 const PROMPT: &str = "meerkat> ";
 const PROMPT_CONT: &str = "       > ";
+
+/// A writer which sends all bytes it recieves over a channel
+pub struct TokioChannelWriter {
+    pub tx: UnboundedSender<Vec<u8>>,
+}
+
+impl Write for TokioChannelWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let line = buf.into();
+        
+        // UnboundedSender::send is synchronous and non-blocking
+        self.tx
+            .send(line)
+            .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
+            
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 /// A registered watch represented by `Watch`
 ///
@@ -87,7 +110,9 @@ fn spawn_next_readline(
 pub async fn run_repl(
     mut manager: Manager,
     remote_url_map: std::collections::HashMap<String, String>,
-    watch: bool,
+    _watch: bool,
+    mut log_rx: UnboundedReceiver<Vec<u8>>
+    
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut reader = DefaultEditor::new()?;
     use std::path::PathBuf;
@@ -146,14 +171,12 @@ pub async fn run_repl(
     // (e.g. piped input), which must not break plain `--interactive` or a
     // `--watch` session running non-interactively. Fall back to a plain
     // `println!` (via `None`) rather than propagating that error.
-    let mut printer: Option<Box<dyn ExternalPrinter + Send>> = if watch {
+    let mut printer: Option<Box<dyn ExternalPrinter + Send>> = 
         reader
             .create_external_printer()
             .ok()
-            .map(|p| Box::new(p) as Box<dyn ExternalPrinter + Send>)
-    } else {
-        None
-    };
+            .map(|p| Box::new(p) as Box<dyn ExternalPrinter + Send>);
+    
     let mut last_keepalive = tokio::time::Instant::now();
     let mut watch_tick = tokio::time::interval(std::time::Duration::from_millis(10));
     let mut read_fut = spawn_next_readline(reader, continuation);
@@ -231,14 +254,22 @@ pub async fn run_repl(
 
                 read_fut = spawn_next_readline(reader, continuation);
             }
-            _ = watch_tick.tick(), if watch => {
+            _ = watch_tick.tick() => {
                 let mut print = |line| match printer.as_mut() {
                     Some(p) => {
                         let _ = p.print(line);
                     }
                     None => println!("{}", line),
                 };
-                if crate::poll_and_log_updates(&mut manager, &mut last_keepalive).await {
+
+                let any_updates =
+                    crate::poll_and_log_updates(&mut manager, &mut last_keepalive).await;
+
+                while let Ok(v) = log_rx.try_recv() {
+                    print(String::from_utf8_lossy(&v).to_string());
+                }
+
+                if any_updates {
                     check_watches(&mut watches, &mut manager, &repl_env, &mut print).await;
                 }
             }

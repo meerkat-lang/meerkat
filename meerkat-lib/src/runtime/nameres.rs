@@ -5,13 +5,9 @@
 //! When called with a unified AST (local + all imported service source),
 //! cross-service member accesses and @test blocks are fully resolved.
 //!
-//! The currently skipped operations are listed below
-//! - `TableDecl` declarations
-//! - `Insert` statements
-//! - `Select` expressions
-//! - `Fold` expressions
+//! `Select` expressions are still skipped (no `select` in demo-3).
 
-use crate::runtime::ast::{ActionStmt, Decl, Expr, Stmt, Value};
+use crate::runtime::ast::{ActionStmt, Decl, Expr, Field, Stmt, Value};
 use crate::runtime::interner::Symbol;
 use crate::runtime::limits::MAX_SCOPE_DEPTH;
 use crate::runtime::Env;
@@ -90,11 +86,28 @@ impl std::error::Error for Error {}
 
 /// Represents the type of binding stored in the name resolution environment
 #[derive(Debug, Clone)]
-pub enum Binding<'a> {
-    /// A standard, immediately evaluated value
+pub enum Binding {
+    /// A local value: `let`, `def`, `var`, or a parameter
     Value,
-    #[doc(hidden)]
-    _Marker(std::marker::PhantomData<&'a ()>),
+    /// A service or import name
+    Service,
+    /// A `map` row, with the table's columns
+    Row(Vec<Field>),
+}
+
+/// One declaration recorded for member checks. Tables keep their columns.
+#[derive(Clone)]
+struct ServiceDecl {
+    name: Symbol,
+    table_fields: Option<Vec<Field>>,
+}
+
+fn bind_member(env: &mut Env<'_, Binding>, decl: &ServiceDecl) {
+    if let Some(fields) = &decl.table_fields {
+        env.bind(decl.name, Binding::Row(fields.clone()));
+    } else {
+        env.bind(decl.name, Binding::Value);
+    }
 }
 
 /// The stateful struct that drives static name resolution traversal
@@ -103,18 +116,37 @@ pub enum Binding<'a> {
 /// It delegates execution-order dependency checking to a separate
 /// static analysis pass, ensuring that lexical lookup rules are
 /// enforced cleanly without rigid ordering constraints.
-pub struct Resolver<'a> {
-    local_services: HashMap<Symbol, Vec<&'a Decl>>,
+pub struct Resolver {
+    local_services: HashMap<Symbol, Vec<ServiceDecl>>,
     current_context: Option<Symbol>,
+    /// Set while resolving a function or action body. A table used there may
+    /// be declared later in the service; an eager use may not.
+    deferred: bool,
 }
 
-impl<'a> Default for Resolver<'a> {
+fn owned_decls(decls: &[Decl]) -> Vec<ServiceDecl> {
+    decls
+        .iter()
+        .map(|decl| match decl {
+            Decl::VarDecl { name, .. } | Decl::DefDecl { name, .. } => ServiceDecl {
+                name: *name,
+                table_fields: None,
+            },
+            Decl::TableDecl { name, fields } => ServiceDecl {
+                name: *name,
+                table_fields: Some(fields.clone()),
+            },
+        })
+        .collect()
+}
+
+impl Default for Resolver {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<'a> Resolver<'a> {
+impl Resolver {
     /// Creates a new resolver instance
     ///
     /// Returns:
@@ -123,35 +155,74 @@ impl<'a> Resolver<'a> {
         let resolver = Self {
             local_services: HashMap::new(),
             current_context: None,
+            deferred: false,
         };
         debug_assert!(resolver.current_context.is_none());
         resolver
+    }
+
+    /// Columns of a table declared on the current service, in any order.
+    /// Eager references use the environment instead; this is only the
+    /// forward-reference fallback inside a function or action.
+    fn declared_table(&self, table_name: Symbol) -> Option<Vec<Field>> {
+        let svc = self.current_context?;
+        self.local_services.get(&svc)?.iter().find_map(|decl| {
+            if decl.name == table_name {
+                decl.table_fields.clone()
+            } else {
+                None
+            }
+        })
+    }
+
+    fn resolve_table(
+        &self,
+        table_name: Symbol,
+        env: &Env<'_, Binding>,
+    ) -> Result<Vec<Field>, Error> {
+        let missing = Error::UnknownIdentifier {
+            name: table_name,
+            expected: ExpectedSort::Table,
+            context_name: self.current_context,
+        };
+        match env.find(table_name) {
+            Some(Binding::Row(fields)) => Ok(fields.clone()),
+            Some(_) => Err(missing),
+            None if self.deferred => self.declared_table(table_name).ok_or(missing),
+            None => Err(missing),
+        }
+    }
+
+    fn declares(&self, service: Symbol, name: Symbol) -> bool {
+        self.local_services
+            .get(&service)
+            .is_some_and(|decls| decls.iter().any(|decl| decl.name == name))
     }
 
     /// Resolves name bindings for a program represented as a slice
     /// of `Stmt`s
     ///
     /// Args:
-    ///     `stmts` (`&'a [Stmt]`): The statements of the program
-    ///     `env` (`&mut Env<'a, Binding<'a>>`): The current environment
+    ///     `stmts` (`&mut [Stmt]`): The statements of the program
+    ///     `env` (`&mut Env<Binding>`): The current environment
     ///
     /// Returns:
     ///     `Result<(), Error>`: Ok if resolution succeeds, or `Error`
     pub fn resolve_program(
         &mut self,
-        stmts: &'a [Stmt],
-        env: &mut Env<'a, Binding<'a>>,
+        stmts: &mut [Stmt],
+        env: &mut Env<'_, Binding>,
     ) -> Result<(), Error> {
         // Pass 1: Bind top-level services and imports, and record
         // local service declarations
-        for stmt in stmts {
+        for stmt in stmts.iter() {
             match stmt {
                 Stmt::Service { name, decls } => {
-                    env.bind(*name, Binding::Value);
-                    self.local_services.insert(*name, decls.iter().collect());
+                    env.bind(*name, Binding::Service);
+                    self.local_services.insert(*name, owned_decls(decls));
                 }
                 Stmt::Import { service_name, .. } => {
-                    env.bind(*service_name, Binding::Value);
+                    env.bind(*service_name, Binding::Service);
                 }
                 Stmt::ActionStmt(_)
                 | Stmt::Atomic { .. }
@@ -162,8 +233,8 @@ impl<'a> Resolver<'a> {
             }
         }
 
-        // Pass 2: Resolve all statements sequentially
-        for stmt in stmts {
+        // Pass 2: Resolve all statements sequentially, rewriting `x.f`
+        for stmt in stmts.iter_mut() {
             self.resolve_stmt(stmt, env)?;
         }
 
@@ -173,18 +244,20 @@ impl<'a> Resolver<'a> {
     /// Resolves name bindings in a single statement
     ///
     /// Args:
-    ///     `stmt` (`&'a Stmt`): The statement to resolve
-    ///     `env` (`&mut Env<'b, Binding<'a>>`): The environment
+    ///     `stmt` (`&mut Stmt`): The statement to resolve
+    ///     `env` (`&mut Env<Binding>`): The environment
     ///
     /// Returns:
     ///     `Result<(), Error>`: Ok if resolution succeeds, or `Error`
-    fn resolve_stmt<'b>(
-        &mut self,
-        stmt: &'a Stmt,
-        env: &mut Env<'b, Binding<'a>>,
-    ) -> Result<(), Error> {
+    fn resolve_stmt(&mut self, stmt: &mut Stmt, env: &mut Env<'_, Binding>) -> Result<(), Error> {
         match stmt {
-            Stmt::ActionStmt(action) => self.resolve_action_stmt(action, env, 0),
+            Stmt::ActionStmt(action) => {
+                let prev = self.deferred;
+                self.deferred = true;
+                let res = self.resolve_action_stmt(action, env, 0);
+                self.deferred = prev;
+                res
+            }
             Stmt::Atomic { updates } => {
                 for u in updates {
                     self.resolve_stmt(u, env)?;
@@ -202,20 +275,50 @@ impl<'a> Resolver<'a> {
                         context_name: self.current_context,
                     });
                 }
+                let service_name = *service_name;
                 let prev_context = self.current_context;
-                self.current_context = Some(*service_name);
-                for decl in decls {
+                self.current_context = Some(service_name);
+                let prior = self
+                    .local_services
+                    .get(&service_name)
+                    .cloned()
+                    .unwrap_or_default();
+                let new_tables: Vec<ServiceDecl> = decls
+                    .iter()
+                    .filter_map(|decl| match decl {
+                        Decl::TableDecl { name, fields } => Some(ServiceDecl {
+                            name: *name,
+                            table_fields: Some(fields.clone()),
+                        }),
+                        _ => None,
+                    })
+                    .collect();
+                if let Some(svc_decls) = self.local_services.get_mut(&service_name) {
+                    svc_decls.extend(new_tables);
+                }
+                let mut update_env = Env::new(Some(env));
+                for decl in &prior {
+                    bind_member(&mut update_env, decl);
+                }
+                for decl in decls.iter_mut() {
                     match decl {
-                        Decl::VarDecl { val, .. } | Decl::DefDecl { val, .. } => {
-                            if let Err(e) = self.resolve_expr(val, env, 0) {
+                        Decl::VarDecl { name, val, .. } | Decl::DefDecl { name, val, .. } => {
+                            if let Err(e) = self.resolve_expr(val, &update_env, 0) {
                                 self.current_context = prev_context;
                                 return Err(e);
                             }
+                            let name = *name;
+                            update_env.bind(name, Binding::Value);
+                            if let Some(svc_decls) = self.local_services.get_mut(&service_name) {
+                                svc_decls.push(ServiceDecl {
+                                    name,
+                                    table_fields: None,
+                                });
+                            }
                         }
-                        Decl::TableDecl { .. } => {}
-                    }
-                    if let Some(svc_decls) = self.local_services.get_mut(service_name) {
-                        svc_decls.push(decl);
+                        Decl::TableDecl { name, fields } => {
+                            update_env.bind(*name, Binding::Row(fields.clone()));
+                        }
                     }
                 }
                 self.current_context = prev_context;
@@ -226,11 +329,11 @@ impl<'a> Resolver<'a> {
                 path: _,
                 service_name,
             } => {
-                env.bind(*service_name, Binding::Value);
+                env.bind(*service_name, Binding::Service);
                 Ok(())
             }
             Stmt::Service { name, decls } => {
-                env.bind(*name, Binding::Value);
+                env.bind(*name, Binding::Service);
                 let mut service_env = Env::new(Some(env));
                 let prev_context = self.current_context;
                 self.current_context = Some(*name);
@@ -252,8 +355,8 @@ impl<'a> Resolver<'a> {
                 let prev_context = self.current_context;
                 self.current_context = Some(*service_name);
                 let mut test_env = Env::new(Some(env));
-                let decls = match self.local_services.get(service_name) {
-                    Some(decls) => decls,
+                let members = match self.local_services.get(service_name) {
+                    Some(decls) => decls.clone(),
                     None => {
                         self.current_context = prev_context;
                         return Err(Error::UnknownIdentifier {
@@ -263,14 +366,8 @@ impl<'a> Resolver<'a> {
                         });
                     }
                 };
-                for decl in decls {
-                    match decl {
-                        Decl::VarDecl { name: mem, .. }
-                        | Decl::DefDecl { name: mem, .. }
-                        | Decl::TableDecl { name: mem, .. } => {
-                            test_env.bind(*mem, Binding::Value);
-                        }
-                    }
+                for decl in &members {
+                    bind_member(&mut test_env, decl);
                 }
                 let res = self.resolve_action_stmts(stmts, &mut test_env, 0);
                 self.current_context = prev_context;
@@ -282,18 +379,18 @@ impl<'a> Resolver<'a> {
 
     /// Resolves service-level declarations sequentially
     ///
-    /// Note that `TableDecl` is registered but its schema is not verified
-    ///
+    /// A table is bound, with its columns, when its declaration is reached.
+    /// `map`, `fold`, and `insert` look that binding up in the environment.
     /// Args:
-    ///     `decls` (`&'a [Decl]`): The declarations in the service
-    ///     `env` (`&mut Env<'b, Binding<'a>>`): The environment
+    ///     `decls` (`&mut [Decl]`): The declarations in the service
+    ///     `env` (`&mut Env<Binding>`): The environment
     ///
     /// Returns:
     ///     `Result<(), Error>`: `Ok` if resolution succeeds, or `Error`
-    fn resolve_service<'b>(
+    fn resolve_service(
         &mut self,
-        decls: &'a [Decl],
-        env: &mut Env<'b, Binding<'a>>,
+        decls: &mut [Decl],
+        env: &mut Env<'_, Binding>,
     ) -> Result<(), Error> {
         for decl in decls {
             match decl {
@@ -310,12 +407,8 @@ impl<'a> Resolver<'a> {
                     self.resolve_expr(val, env, 0)?;
                     env.bind(*name, Binding::Value);
                 }
-                Decl::TableDecl { name, fields: _ } => {
-                    println!(
-                        "warning: nameres: ignoring 'table' schema \
-                         checks as not yet implemented"
-                    );
-                    env.bind(*name, Binding::Value);
+                Decl::TableDecl { name, fields } => {
+                    env.bind(*name, Binding::Row(fields.clone()));
                 }
             }
         }
@@ -325,15 +418,15 @@ impl<'a> Resolver<'a> {
     /// Resolves a list of action statements sequentially
     ///
     /// Args:
-    ///     `stmts` (`&'a [ActionStmt]`): The action statements to resolve
-    ///     `env` (`&mut Env<'b, Binding<'a>>`): The current environment
+    ///     `stmts` (`&mut [ActionStmt]`): The action statements to resolve
+    ///     `env` (`&mut Env<Binding>`): The current environment
     ///
     /// Returns:
     ///     `Result<(), Error>`: Ok if resolution succeeds, or `Error`
-    fn resolve_action_stmts<'b>(
+    fn resolve_action_stmts(
         &mut self,
-        stmts: &'a [ActionStmt],
-        env: &mut Env<'b, Binding<'a>>,
+        stmts: &mut [ActionStmt],
+        env: &mut Env<'_, Binding>,
         depth: usize,
     ) -> Result<(), Error> {
         for stmt in stmts {
@@ -350,10 +443,10 @@ impl<'a> Resolver<'a> {
     ///
     /// Returns:
     ///     `Result<(), Error>`: Ok if resolution succeeds, or `Error`
-    fn resolve_action_stmt<'b>(
+    fn resolve_action_stmt(
         &mut self,
-        stmt: &'a ActionStmt,
-        env: &mut Env<'b, Binding<'a>>,
+        stmt: &mut ActionStmt,
+        env: &mut Env<'_, Binding>,
         depth: usize,
     ) -> Result<(), Error> {
         if depth >= MAX_SCOPE_DEPTH {
@@ -372,14 +465,7 @@ impl<'a> Resolver<'a> {
                 if env.find(*name).is_none() {
                     let is_local_member = self
                         .current_context
-                        .and_then(|ctx| self.local_services.get(&ctx))
-                        .is_some_and(|decls| {
-                            decls.iter().any(|decl| match decl {
-                                Decl::VarDecl { name: mem, .. }
-                                | Decl::DefDecl { name: mem, .. }
-                                | Decl::TableDecl { name: mem, .. } => mem == name,
-                            })
-                        });
+                        .is_some_and(|ctx| self.declares(ctx, *name));
 
                     if !is_local_member {
                         return Err(Error::UnknownIdentifier {
@@ -391,15 +477,9 @@ impl<'a> Resolver<'a> {
                 }
                 self.resolve_expr(expr, env, depth + 1)
             }
-            ActionStmt::Insert {
-                row: _,
-                table_name: _,
-            } => {
-                println!(
-                    "warning: nameres: ignoring 'insert' checks \
-                     as not yet implemented"
-                );
-                Ok(())
+            ActionStmt::Insert { row, table_name } => {
+                self.resolve_table(*table_name, env)?;
+                self.resolve_expr(row, env, depth + 1)
             }
             ActionStmt::For {
                 var,
@@ -417,24 +497,37 @@ impl<'a> Resolver<'a> {
     /// Resolves variable names within an expression
     ///
     /// Args:
-    ///     `expr` (`&'a Expr`): The expression to resolve
-    ///     `env` (`&Env<'b, Binding<'a>>`): The environment
+    ///     `expr` (`&mut Expr`): The expression to resolve
+    ///     `env` (`&Env<Binding>`): The environment
     ///
     /// Returns:
     ///     `Result<(), Error>`: Ok if resolution succeeds, or `Error`
-    fn resolve_expr<'b>(
+    fn resolve_expr(
         &mut self,
-        expr: &'a Expr,
-        env: &Env<'b, Binding<'a>>,
+        expr: &mut Expr,
+        env: &Env<'_, Binding>,
         depth: usize,
     ) -> Result<(), Error> {
         if depth >= MAX_SCOPE_DEPTH {
             return Err(Error::DepthLimit);
         }
+        let pending = if let Expr::MemberAccess {
+            service_name,
+            member_name,
+        } = &*expr
+        {
+            Some((*service_name, *member_name))
+        } else {
+            None
+        };
+        if let Some((receiver, member)) = pending {
+            *expr = self.classify_access(receiver, member, env)?;
+            return Ok(());
+        }
         match expr {
             Expr::Literal { val } => self.resolve_value(val, env, depth + 1),
             Expr::Html(template) => {
-                for e in template.embedded_exprs() {
+                for e in template.embedded_exprs_mut() {
                     self.resolve_expr(e, env, depth + 1)?;
                 }
                 Ok(())
@@ -443,14 +536,7 @@ impl<'a> Resolver<'a> {
                 if env.find(*name).is_none() {
                     let is_local_member = self
                         .current_context
-                        .and_then(|ctx| self.local_services.get(&ctx))
-                        .is_some_and(|decls| {
-                            decls.iter().any(|decl| match decl {
-                                Decl::VarDecl { name: mem, .. }
-                                | Decl::DefDecl { name: mem, .. }
-                                | Decl::TableDecl { name: mem, .. } => mem == name,
-                            })
-                        });
+                        .is_some_and(|ctx| self.declares(ctx, *name));
 
                     if is_local_member {
                         return Ok(());
@@ -470,20 +556,20 @@ impl<'a> Resolver<'a> {
                 }
                 Ok(())
             }
-            Expr::KeyVal { name: _, value } => self.resolve_expr(value.as_ref(), env, depth + 1),
-            Expr::Unop { op: _, expr } => self.resolve_expr(expr.as_ref(), env, depth + 1),
+            Expr::KeyVal { name: _, value } => self.resolve_expr(value.as_mut(), env, depth + 1),
+            Expr::Unop { op: _, expr } => self.resolve_expr(expr.as_mut(), env, depth + 1),
             Expr::Binop {
                 op: _,
                 expr1,
                 expr2,
             } => {
-                self.resolve_expr(expr1.as_ref(), env, depth + 1)?;
-                self.resolve_expr(expr2.as_ref(), env, depth + 1)
+                self.resolve_expr(expr1.as_mut(), env, depth + 1)?;
+                self.resolve_expr(expr2.as_mut(), env, depth + 1)
             }
             Expr::If { cond, expr1, expr2 } => {
-                self.resolve_expr(cond.as_ref(), env, depth + 1)?;
-                self.resolve_expr(expr1.as_ref(), env, depth + 1)?;
-                self.resolve_expr(expr2.as_ref(), env, depth + 1)
+                self.resolve_expr(cond.as_mut(), env, depth + 1)?;
+                self.resolve_expr(expr1.as_mut(), env, depth + 1)?;
+                self.resolve_expr(expr2.as_mut(), env, depth + 1)
             }
             Expr::Func {
                 params,
@@ -494,11 +580,15 @@ impl<'a> Resolver<'a> {
                 for param in params {
                     inner_env.bind(param.name, Binding::Value);
                 }
-                self.resolve_expr(body.as_ref(), &inner_env, depth + 1)?;
+                let prev = self.deferred;
+                self.deferred = true;
+                let res = self.resolve_expr(body.as_mut(), &inner_env, depth + 1);
+                self.deferred = prev;
+                res?;
                 Ok(())
             }
             Expr::Call { func, args } => {
-                self.resolve_expr(func.as_ref(), env, depth + 1)?;
+                self.resolve_expr(func.as_mut(), env, depth + 1)?;
                 for arg in args {
                     self.resolve_expr(arg, env, depth + 1)?;
                 }
@@ -506,35 +596,17 @@ impl<'a> Resolver<'a> {
             }
             Expr::Action(stmts) => {
                 let mut action_env = Env::new(Some(env));
-                self.resolve_action_stmts(stmts, &mut action_env, depth + 1)?;
+                let prev = self.deferred;
+                self.deferred = true;
+                let res = self.resolve_action_stmts(stmts, &mut action_env, depth + 1);
+                self.deferred = prev;
+                res?;
                 Ok(())
             }
-            Expr::MemberAccess {
-                service_name,
-                member_name,
-            } => {
-                if let Some(decls) = self.local_services.get(service_name) {
-                    let has_member = decls.iter().any(|decl| match decl {
-                        Decl::VarDecl { name: mem, .. }
-                        | Decl::DefDecl { name: mem, .. }
-                        | Decl::TableDecl { name: mem, .. } => mem == member_name,
-                    });
-                    if !has_member {
-                        return Err(Error::UnknownIdentifier {
-                            name: *member_name,
-                            expected: ExpectedSort::Variable,
-                            context_name: Some(*service_name),
-                        });
-                    }
-                } else if env.find(*service_name).is_none() {
-                    return Err(Error::UnknownIdentifier {
-                        name: *service_name,
-                        expected: ExpectedSort::Service,
-                        context_name: self.current_context,
-                    });
-                }
-                Ok(())
+            Expr::MemberAccess { .. } => {
+                unreachable!("member access is rewritten before this match")
             }
+            Expr::FieldAccess { .. } | Expr::ServiceAccess { .. } => Ok(()),
             Expr::Select {
                 table_name: _,
                 column_names: _,
@@ -553,16 +625,34 @@ impl<'a> Resolver<'a> {
                 Ok(())
             }
             Expr::Fold {
-                table_name: _,
-                column_name: _,
-                operation: _,
-                identity: _,
+                table_name,
+                column_name,
+                operation,
+                identity,
             } => {
-                println!(
-                    "warning: nameres: ignoring 'fold' checks \
-                     as not yet implemented"
-                );
-                Ok(())
+                let fields = self.resolve_table(*table_name, env)?;
+                if !fields.iter().any(|f| f.name == *column_name) {
+                    return Err(Error::UnknownIdentifier {
+                        name: *column_name,
+                        expected: ExpectedSort::Variable,
+                        context_name: Some(*table_name),
+                    });
+                }
+                self.resolve_expr(operation, env, depth + 1)?;
+                self.resolve_expr(identity, env, depth + 1)
+            }
+            Expr::Map {
+                var,
+                table_name,
+                where_clause,
+                body,
+            } => {
+                let fields = self.resolve_table(*table_name, env)?;
+                let var = *var;
+                let mut row_env = Env::new(Some(env));
+                row_env.bind(var, Binding::Row(fields));
+                self.resolve_expr(where_clause, &row_env, depth + 1)?;
+                self.resolve_expr(body, &row_env, depth + 1)
             }
             Expr::List(exprs) => {
                 for expr in exprs {
@@ -571,8 +661,8 @@ impl<'a> Resolver<'a> {
                 Ok(())
             }
             Expr::Range { start, end } => {
-                self.resolve_expr(start.as_ref(), env, depth + 1)?;
-                self.resolve_expr(end.as_ref(), env, depth + 1)
+                self.resolve_expr(start.as_mut(), env, depth + 1)?;
+                self.resolve_expr(end.as_mut(), env, depth + 1)
             }
         }
     }
@@ -585,10 +675,56 @@ impl<'a> Resolver<'a> {
     ///
     /// Returns:
     ///     `Result<(), Error>`: Ok if resolution succeeds, or `Error`
-    fn resolve_value<'b>(
+    fn classify_access(
+        &self,
+        receiver: Symbol,
+        member: Symbol,
+        env: &Env<'_, Binding>,
+    ) -> Result<Expr, Error> {
+        match env.find(receiver) {
+            Some(Binding::Row(fields)) => {
+                if !fields.iter().any(|field| field.name == member) {
+                    return Err(Error::UnknownIdentifier {
+                        name: member,
+                        expected: ExpectedSort::Variable,
+                        context_name: Some(receiver),
+                    });
+                }
+                Ok(Expr::FieldAccess {
+                    var: receiver,
+                    field: member,
+                })
+            }
+            Some(Binding::Value) => Ok(Expr::FieldAccess {
+                var: receiver,
+                field: member,
+            }),
+            Some(Binding::Service) => self.service_access(receiver, member),
+            None => Err(Error::UnknownIdentifier {
+                name: receiver,
+                expected: ExpectedSort::Service,
+                context_name: self.current_context,
+            }),
+        }
+    }
+
+    fn service_access(&self, service: Symbol, member: Symbol) -> Result<Expr, Error> {
+        if let Some(decls) = self.local_services.get(&service) {
+            if !decls.iter().any(|decl| decl.name == member) {
+                return Err(Error::UnknownIdentifier {
+                    name: member,
+                    expected: ExpectedSort::Variable,
+                    context_name: Some(service),
+                });
+            }
+        }
+        Ok(Expr::ServiceAccess { service, member })
+    }
+
+    fn resolve_value(
         &mut self,
-        val: &'a Value,
-        env: &Env<'b, Binding<'a>>,
+        val: &mut Value,
+        env: &Env<'_, Binding>,
         depth: usize,
     ) -> Result<(), Error> {
         if depth >= MAX_SCOPE_DEPTH {
@@ -610,7 +746,11 @@ impl<'a> Resolver<'a> {
                 for param in params {
                     inner_env.bind(param.name, Binding::Value);
                 }
-                self.resolve_expr(body.as_ref(), &inner_env, depth + 1)?;
+                let prev = self.deferred;
+                self.deferred = true;
+                let res = self.resolve_expr(body.as_mut(), &inner_env, depth + 1);
+                self.deferred = prev;
+                res?;
                 Ok(())
             }
             Value::ActionClosure {
@@ -619,11 +759,21 @@ impl<'a> Resolver<'a> {
                 service_net_id: _,
             } => {
                 let mut action_env = Env::new(Some(env));
-                self.resolve_action_stmts(stmts, &mut action_env, depth + 1)?;
+                let prev = self.deferred;
+                self.deferred = true;
+                let res = self.resolve_action_stmts(stmts, &mut action_env, depth + 1);
+                self.deferred = prev;
+                res?;
                 Ok(())
             }
             Value::List { vals } => {
                 for val in vals {
+                    self.resolve_value(val, env, depth + 1)?;
+                }
+                Ok(())
+            }
+            Value::Record { fields } => {
+                for (_, val) in fields {
                     self.resolve_value(val, env, depth + 1)?;
                 }
                 Ok(())
@@ -640,7 +790,7 @@ impl<'a> Resolver<'a> {
 ///
 /// Returns:
 ///     `Result<(), Error>`: Ok if all symbols are bound correctly
-pub fn resolve(stmts: &[Stmt]) -> Result<(), Error> {
+pub fn resolve(stmts: &mut [Stmt]) -> Result<(), Error> {
     let mut resolver = Resolver::new();
     let mut root_env = Env::new(None);
     resolver.resolve_program(stmts, &mut root_env)
@@ -683,8 +833,8 @@ mod tests {
 
         let mut env = Env::new(None);
         let mut resolver = Resolver::new();
-        let program = vec![stmt];
-        let res = resolver.resolve_program(&program, &mut env);
+        let mut program = vec![stmt];
+        let res = resolver.resolve_program(&mut program, &mut env);
         assert!(res.is_ok());
     }
 
@@ -735,8 +885,8 @@ mod tests {
 
         let mut env = Env::new(None);
         let mut resolver = Resolver::new();
-        let program = vec![stmt];
-        assert!(resolver.resolve_program(&program, &mut env).is_ok());
+        let mut program = vec![stmt];
+        assert!(resolver.resolve_program(&mut program, &mut env).is_ok());
 
         // Test sequential failure (no service variable x exists)
         // action { do x; let x = 10; }
@@ -766,8 +916,8 @@ mod tests {
 
         let mut bad_env = Env::new(None);
         let mut bad_resolver = Resolver::new();
-        let program_bad = vec![bad_stmt];
-        let res = bad_resolver.resolve_program(&program_bad, &mut bad_env);
+        let mut program_bad = vec![bad_stmt];
+        let res = bad_resolver.resolve_program(&mut program_bad, &mut bad_env);
         assert_eq!(
             res,
             Err(Error::UnknownIdentifier {
@@ -815,8 +965,8 @@ mod tests {
 
         let mut env = Env::new(None);
         let mut resolver = Resolver::new();
-        let program = vec![stmt];
-        let res = resolver.resolve_program(&program, &mut env);
+        let mut program = vec![stmt];
+        let res = resolver.resolve_program(&mut program, &mut env);
         assert_eq!(
             res,
             Err(Error::UnknownIdentifier {
@@ -858,8 +1008,8 @@ mod tests {
         };
         let mut env = Env::new(None);
         let mut resolver = Resolver::new();
-        let program = vec![stmt];
-        assert!(resolver.resolve_program(&program, &mut env).is_ok());
+        let mut program = vec![stmt];
+        assert!(resolver.resolve_program(&mut program, &mut env).is_ok());
 
         // Verify parameter escaping triggers error:
         // fn a => (fn b => b) + b
@@ -885,8 +1035,8 @@ mod tests {
         };
         let mut env_escaped = Env::new(None);
         let mut resolver_escaped = Resolver::new();
-        let program_escaped = vec![escaped_stmt];
-        let res = resolver_escaped.resolve_program(&program_escaped, &mut env_escaped);
+        let mut program_escaped = vec![escaped_stmt];
+        let res = resolver_escaped.resolve_program(&mut program_escaped, &mut env_escaped);
         assert_eq!(
             res,
             Err(Error::UnknownIdentifier {
@@ -932,8 +1082,8 @@ mod tests {
 
         let mut env = Env::new(None);
         let mut resolver = Resolver::new();
-        let program = vec![s_stmt, update_stmt];
-        let res = resolver.resolve_program(&program, &mut env);
+        let mut program = vec![s_stmt, update_stmt];
+        let res = resolver.resolve_program(&mut program, &mut env);
         assert_eq!(res, Ok(()));
     }
 
@@ -972,8 +1122,8 @@ mod tests {
 
         let mut env = Env::new(None);
         let mut resolver = Resolver::new();
-        let program = vec![s_stmt, update_stmt];
-        let res = resolver.resolve_program(&program, &mut env);
+        let mut program = vec![s_stmt, update_stmt];
+        let res = resolver.resolve_program(&mut program, &mut env);
         assert_eq!(
             res,
             Err(Error::UnknownIdentifier {
@@ -1012,9 +1162,9 @@ mod tests {
 
         let mut env = Env::new(None);
         let mut resolver = Resolver::new();
-        let program = vec![s_stmt, test_stmt];
+        let mut program = vec![s_stmt, test_stmt];
 
-        assert!(resolver.resolve_program(&program, &mut env).is_ok());
+        assert!(resolver.resolve_program(&mut program, &mut env).is_ok());
     }
 
     /// Verify `@test` blocks can resolve services that
@@ -1045,9 +1195,9 @@ mod tests {
 
         let mut env = Env::new(None);
         let mut resolver = Resolver::new();
-        let program = vec![test_stmt, s_stmt];
+        let mut program = vec![test_stmt, s_stmt];
 
-        assert!(resolver.resolve_program(&program, &mut env).is_ok());
+        assert!(resolver.resolve_program(&mut program, &mut env).is_ok());
     }
 
     /// Verify testing an imported service resolves when its
@@ -1080,9 +1230,9 @@ mod tests {
 
         let mut env = Env::new(None);
         let mut resolver = Resolver::new();
-        let program = vec![service_stmt, test_stmt];
+        let mut program = vec![service_stmt, test_stmt];
 
-        let result = resolver.resolve_program(&program, &mut env);
+        let result = resolver.resolve_program(&mut program, &mut env);
         assert!(result.is_ok());
     }
 
@@ -1102,9 +1252,9 @@ mod tests {
 
         let mut env = Env::new(None);
         let mut resolver = Resolver::new();
-        let program = vec![test_stmt];
+        let mut program = vec![test_stmt];
 
-        let result = resolver.resolve_program(&program, &mut env);
+        let result = resolver.resolve_program(&mut program, &mut env);
         assert!(result.is_err());
         match result.unwrap_err() {
             Error::UnknownIdentifier {
@@ -1147,7 +1297,7 @@ mod tests {
         env.bind(x, Binding::Value);
 
         let mut resolver = Resolver::new();
-        let res = resolver.resolve_expr(&deep_expr, &env, 0);
+        let res = resolver.resolve_expr(&mut deep_expr, &env, 0);
         assert_eq!(res, Err(Error::DepthLimit))
     }
 
@@ -1177,7 +1327,7 @@ mod tests {
         env.bind(v, Binding::Value);
 
         let mut resolver = Resolver::new();
-        let res = resolver.resolve_action_stmt(&deep_stmt, &mut env, 0);
+        let res = resolver.resolve_action_stmt(&mut deep_stmt, &mut env, 0);
         assert_eq!(res, Err(Error::DepthLimit))
     }
 
@@ -1191,7 +1341,7 @@ mod tests {
         let unbound = interner.insert("unbound");
         let y = interner.insert("y");
 
-        let service_stmt = Stmt::Service {
+        let mut service_stmt = Stmt::Service {
             name: s,
             decls: vec![Decl::VarDecl {
                 name: x,
@@ -1202,7 +1352,7 @@ mod tests {
             }],
         };
 
-        let update_stmt = Stmt::Update {
+        let mut update_stmt = Stmt::Update {
             service_name: s,
             decls: vec![Decl::VarDecl {
                 name: x,
@@ -1215,19 +1365,19 @@ mod tests {
         let mut resolver = Resolver::new();
 
         // Register service definition first
-        let reg_res = resolver.resolve_stmt(&service_stmt, &mut env);
+        let reg_res = resolver.resolve_stmt(&mut service_stmt, &mut env);
         assert!(reg_res.is_ok());
 
         // Resolve update with invalid initializer
-        let update_res = resolver.resolve_stmt(&update_stmt, &mut env);
+        let update_res = resolver.resolve_stmt(&mut update_stmt, &mut env);
         assert!(update_res.is_err());
         assert_eq!(resolver.current_context, None);
 
         // Verify reusable resolver does not leak stale context_name
-        let watch_stmt = Stmt::Watch {
+        let mut watch_stmt = Stmt::Watch {
             expr: Expr::Variable { name: y },
         };
-        let second_res = resolver.resolve_stmt(&watch_stmt, &mut env);
+        let second_res = resolver.resolve_stmt(&mut watch_stmt, &mut env);
         assert!(second_res.is_err());
         match second_res.unwrap_err() {
             Error::UnknownIdentifier { context_name, .. } => {
@@ -1247,7 +1397,7 @@ mod tests {
         let unbound = interner.insert("unbound");
         let y = interner.insert("y");
 
-        let service_stmt = Stmt::Service {
+        let mut service_stmt = Stmt::Service {
             name: s,
             decls: vec![Decl::VarDecl {
                 name: x,
@@ -1258,7 +1408,7 @@ mod tests {
             }],
         };
 
-        let test_stmt = Stmt::Test {
+        let mut test_stmt = Stmt::Test {
             service_name: s,
             stmts: vec![ActionStmt::Expr(Expr::Variable { name: unbound })],
         };
@@ -1267,19 +1417,19 @@ mod tests {
         let mut resolver = Resolver::new();
 
         // Register service definition first
-        let reg_res = resolver.resolve_stmt(&service_stmt, &mut env);
+        let reg_res = resolver.resolve_stmt(&mut service_stmt, &mut env);
         assert!(reg_res.is_ok());
 
         // Resolve test block containing an invalid statement
-        let test_res = resolver.resolve_stmt(&test_stmt, &mut env);
+        let test_res = resolver.resolve_stmt(&mut test_stmt, &mut env);
         assert!(test_res.is_err());
         assert_eq!(resolver.current_context, None);
 
         // Verify reusable resolver does not leak stale context_name
-        let watch_stmt = Stmt::Watch {
+        let mut watch_stmt = Stmt::Watch {
             expr: Expr::Variable { name: y },
         };
-        let second_res = resolver.resolve_stmt(&watch_stmt, &mut env);
+        let second_res = resolver.resolve_stmt(&mut watch_stmt, &mut env);
         assert!(second_res.is_err());
         match second_res.unwrap_err() {
             Error::UnknownIdentifier { context_name, .. } => {
@@ -1287,5 +1437,536 @@ mod tests {
             }
             _ => panic!("Expected UnknownIdentifier error"),
         }
+    }
+
+    #[test]
+    fn test_map_fold_insert_resolve_against_table() {
+        use crate::runtime::ast::{Field, TableType};
+
+        let mut interner = Interner::new();
+        let board = interner.insert("board");
+        let tasks = interner.insert("tasks");
+        let id = interner.insert("id");
+        let done = interner.insert("done");
+        let m = interner.insert("m");
+        let open = interner.insert("open");
+        let total = interner.insert("total");
+
+        let table = Decl::TableDecl {
+            name: tasks,
+            fields: vec![
+                Field {
+                    name: id,
+                    ty: TableType::Int,
+                },
+                Field {
+                    name: done,
+                    ty: TableType::Bool,
+                },
+            ],
+        };
+        let map_def = Decl::DefDecl {
+            name: open,
+            ty: None,
+            val: Expr::Map {
+                var: m,
+                table_name: tasks,
+                where_clause: Box::new(Expr::Unop {
+                    op: crate::runtime::ast::UnOp::Not,
+                    expr: Box::new(Expr::MemberAccess {
+                        service_name: m,
+                        member_name: done,
+                    }),
+                }),
+                body: Box::new(Expr::Tuple {
+                    val: vec![Expr::KeyVal {
+                        name: id,
+                        value: Box::new(Expr::MemberAccess {
+                            service_name: m,
+                            member_name: id,
+                        }),
+                    }],
+                }),
+            },
+            is_pub: true,
+        };
+        let fold_def = Decl::DefDecl {
+            name: total,
+            ty: None,
+            val: Expr::Fold {
+                table_name: tasks,
+                column_name: id,
+                operation: Box::new(Expr::Literal {
+                    val: Value::Int { val: 0 },
+                }),
+                identity: Box::new(Expr::Literal {
+                    val: Value::Int { val: 0 },
+                }),
+            },
+            is_pub: true,
+        };
+
+        let mut stmt = Stmt::Service {
+            name: board,
+            decls: vec![table, map_def, fold_def],
+        };
+        assert!(resolve(std::slice::from_mut(&mut stmt)).is_ok());
+
+        let insert = Stmt::Test {
+            service_name: board,
+            stmts: vec![ActionStmt::Insert {
+                table_name: tasks,
+                row: Expr::Tuple {
+                    val: vec![
+                        Expr::Literal {
+                            val: Value::Int { val: 1 },
+                        },
+                        Expr::Literal {
+                            val: Value::Bool { val: false },
+                        },
+                    ],
+                },
+            }],
+        };
+        let mut program = vec![stmt, insert];
+        assert!(resolve(&mut program).is_ok());
+    }
+
+    #[test]
+    fn test_map_unknown_column_fails() {
+        use crate::runtime::ast::{Field, TableType};
+
+        let mut interner = Interner::new();
+        let board = interner.insert("board");
+        let tasks = interner.insert("tasks");
+        let id = interner.insert("id");
+        let m = interner.insert("m");
+        let missing = interner.insert("missing");
+        let open = interner.insert("open");
+
+        let table = Decl::TableDecl {
+            name: tasks,
+            fields: vec![Field {
+                name: id,
+                ty: TableType::Int,
+            }],
+        };
+        let map_def = Decl::DefDecl {
+            name: open,
+            ty: None,
+            val: Expr::Map {
+                var: m,
+                table_name: tasks,
+                where_clause: Box::new(Expr::Literal {
+                    val: Value::Bool { val: true },
+                }),
+                body: Box::new(Expr::MemberAccess {
+                    service_name: m,
+                    member_name: missing,
+                }),
+            },
+            is_pub: true,
+        };
+        let stmt = Stmt::Service {
+            name: board,
+            decls: vec![table, map_def],
+        };
+        let mut program = vec![stmt];
+        let err = resolve(&mut program).unwrap_err();
+        match err {
+            Error::UnknownIdentifier { name, .. } => assert_eq!(name, missing),
+            other => panic!("expected UnknownIdentifier, got {:?}", other),
+        }
+    }
+
+    fn table(
+        name: Symbol,
+        columns: &[(&str, crate::runtime::ast::TableType)],
+        interner: &mut Interner,
+    ) -> Decl {
+        Decl::TableDecl {
+            name,
+            fields: columns
+                .iter()
+                .map(|(col, ty)| crate::runtime::ast::Field {
+                    name: interner.insert(col),
+                    ty: ty.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    fn int_lit(val: i32) -> Expr {
+        Expr::Literal {
+            val: Value::Int { val },
+        }
+    }
+
+    /// A local record hides a service of the same name, so `board.n` is a field.
+    #[test]
+    fn test_local_binding_shadows_service() {
+        let mut interner = Interner::new();
+        let board = interner.insert("board");
+        let user = interner.insert("user");
+        let n = interner.insert("n");
+        let id = interner.insert("id");
+        let program = vec![
+            Stmt::Service {
+                name: board,
+                decls: vec![Decl::DefDecl {
+                    name: n,
+                    ty: None,
+                    is_pub: true,
+                    val: int_lit(1),
+                }],
+            },
+            Stmt::Service {
+                name: user,
+                decls: vec![
+                    Decl::DefDecl {
+                        name: interner.insert("y"),
+                        ty: None,
+                        is_pub: true,
+                        val: Expr::MemberAccess {
+                            service_name: board,
+                            member_name: n,
+                        },
+                    },
+                    Decl::DefDecl {
+                        name: board,
+                        ty: None,
+                        is_pub: true,
+                        val: Expr::Tuple {
+                            val: vec![Expr::KeyVal {
+                                name: id,
+                                value: Box::new(int_lit(1)),
+                            }],
+                        },
+                    },
+                    Decl::DefDecl {
+                        name: interner.insert("x"),
+                        ty: None,
+                        is_pub: true,
+                        val: Expr::MemberAccess {
+                            service_name: board,
+                            member_name: n,
+                        },
+                    },
+                ],
+            },
+        ];
+        let mut program = program;
+        resolve(&mut program).unwrap();
+        let Stmt::Service { decls, .. } = &program[1] else {
+            panic!("user service");
+        };
+        assert!(matches!(
+            decls[0],
+            Decl::DefDecl {
+                val: Expr::ServiceAccess { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            decls[2],
+            Decl::DefDecl {
+                val: Expr::FieldAccess { .. },
+                ..
+            }
+        ));
+        let mut types = Env::new(None);
+        assert!(matches!(
+            crate::runtime::tt::check(&program, &mut types),
+            Err(crate::runtime::tt::Error::UnboundVariable(_))
+        ));
+    }
+
+    /// An outer map row stays in scope, and a `let` can hide the row.
+    #[test]
+    fn test_row_scope_follows_the_environment() {
+        use crate::runtime::ast::{BinOp, TableType};
+
+        let mut interner = Interner::new();
+        let s = interner.insert("s");
+        let t1 = interner.insert("t1");
+        let t2 = interner.insert("t2");
+        let a = interner.insert("a");
+        let b = interner.insert("b");
+        let x = interner.insert("x");
+        let bogus = interner.insert("bogus");
+        let m = interner.insert("m");
+        let tasks = interner.insert("tasks");
+        let other = interner.insert("other");
+
+        let nested = Stmt::Service {
+            name: s,
+            decls: vec![
+                table(t1, &[("x", TableType::Int)], &mut interner),
+                table(t2, &[("x", TableType::Int)], &mut interner),
+                Decl::DefDecl {
+                    name: interner.insert("bad"),
+                    ty: None,
+                    is_pub: false,
+                    val: Expr::Map {
+                        var: a,
+                        table_name: t1,
+                        where_clause: Box::new(Expr::Literal {
+                            val: Value::Bool { val: true },
+                        }),
+                        body: Box::new(Expr::Map {
+                            var: b,
+                            table_name: t2,
+                            where_clause: Box::new(Expr::Binop {
+                                op: BinOp::Eq,
+                                expr1: Box::new(Expr::MemberAccess {
+                                    service_name: a,
+                                    member_name: bogus,
+                                }),
+                                expr2: Box::new(Expr::MemberAccess {
+                                    service_name: b,
+                                    member_name: x,
+                                }),
+                            }),
+                            body: Box::new(Expr::MemberAccess {
+                                service_name: b,
+                                member_name: x,
+                            }),
+                        }),
+                    },
+                },
+            ],
+        };
+        let mut nested = vec![nested];
+        let err = resolve(&mut nested).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::UnknownIdentifier { name, .. } if name == bogus
+        ));
+
+        let shadowed = Stmt::Service {
+            name: s,
+            decls: vec![
+                table(tasks, &[("x", TableType::Int)], &mut interner),
+                Decl::DefDecl {
+                    name: interner.insert("ok"),
+                    ty: None,
+                    is_pub: false,
+                    val: Expr::Map {
+                        var: m,
+                        table_name: tasks,
+                        where_clause: Box::new(Expr::Literal {
+                            val: Value::Bool { val: true },
+                        }),
+                        body: Box::new(Expr::Action(vec![
+                            ActionStmt::Let {
+                                name: m,
+                                ty: None,
+                                expr: Expr::Tuple {
+                                    val: vec![Expr::KeyVal {
+                                        name: other,
+                                        value: Box::new(int_lit(1)),
+                                    }],
+                                },
+                            },
+                            ActionStmt::Expr(Expr::MemberAccess {
+                                service_name: m,
+                                member_name: other,
+                            }),
+                        ])),
+                    },
+                },
+            ],
+        };
+        let mut shadowed = vec![shadowed];
+        resolve(&mut shadowed).unwrap();
+        let Stmt::Service { decls, .. } = &shadowed[0] else {
+            panic!("service");
+        };
+        let Decl::DefDecl {
+            val: Expr::Map { body, .. },
+            ..
+        } = &decls[1]
+        else {
+            panic!("map");
+        };
+        let Expr::Action(stmts) = body.as_ref() else {
+            panic!("action");
+        };
+        assert!(matches!(
+            stmts[1],
+            ActionStmt::Expr(Expr::FieldAccess { .. })
+        ));
+    }
+
+    /// A table is visible from its declaration on, except inside a function.
+    #[test]
+    fn test_table_binding_is_lexical() {
+        use crate::runtime::ast::TableType;
+
+        let mut interner = Interner::new();
+        let s = interner.insert("s");
+        let tasks = interner.insert("tasks");
+        let m = interner.insert("m");
+
+        let map_tasks = |interner: &mut Interner| Expr::Map {
+            var: m,
+            table_name: tasks,
+            where_clause: Box::new(Expr::Literal {
+                val: Value::Bool { val: true },
+            }),
+            body: Box::new(Expr::MemberAccess {
+                service_name: m,
+                member_name: interner.insert("id"),
+            }),
+        };
+
+        let early = Stmt::Service {
+            name: s,
+            decls: vec![
+                Decl::DefDecl {
+                    name: interner.insert("open"),
+                    ty: None,
+                    is_pub: false,
+                    val: map_tasks(&mut interner),
+                },
+                table(tasks, &[("id", TableType::Int)], &mut interner),
+            ],
+        };
+        let mut early = vec![early];
+        let err = resolve(&mut early).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::UnknownIdentifier {
+                name,
+                expected: ExpectedSort::Table,
+                ..
+            } if name == tasks
+        ));
+
+        let deferred = Stmt::Service {
+            name: s,
+            decls: vec![
+                Decl::DefDecl {
+                    name: interner.insert("f"),
+                    ty: None,
+                    is_pub: false,
+                    val: Expr::Func {
+                        params: vec![],
+                        body: Box::new(map_tasks(&mut interner)),
+                        return_ty: None,
+                    },
+                },
+                table(tasks, &[("id", TableType::Int)], &mut interner),
+            ],
+        };
+        let mut deferred = vec![deferred];
+        assert!(resolve(&mut deferred).is_ok());
+
+        let hidden = Stmt::Service {
+            name: s,
+            decls: vec![
+                table(tasks, &[("id", TableType::Int)], &mut interner),
+                Decl::DefDecl {
+                    name: interner.insert("act"),
+                    ty: None,
+                    is_pub: false,
+                    val: Expr::Action(vec![
+                        ActionStmt::Let {
+                            name: tasks,
+                            ty: None,
+                            expr: int_lit(1),
+                        },
+                        ActionStmt::Expr(map_tasks(&mut interner)),
+                    ]),
+                },
+            ],
+        };
+        let mut hidden = vec![hidden];
+        let err = resolve(&mut hidden).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::UnknownIdentifier {
+                name,
+                expected: ExpectedSort::Table,
+                ..
+            } if name == tasks
+        ));
+    }
+
+    /// A field receiver is a dependency of the definition that uses it.
+    #[test]
+    fn test_field_receiver_is_a_dependency() {
+        use crate::runtime::ast::{BinOp, TableType};
+
+        let mut interner = Interner::new();
+        let board = interner.insert("board");
+        let tasks = interner.insert("tasks");
+        let minutes = interner.insert("minutes");
+        let config = interner.insert("config");
+        let limit = interner.insert("limit");
+        let m = interner.insert("m");
+        let xs = interner.insert("xs");
+        let program = vec![Stmt::Service {
+            name: board,
+            decls: vec![
+                table(tasks, &[("minutes", TableType::Int)], &mut interner),
+                Decl::VarDecl {
+                    name: config,
+                    ty: None,
+                    val: Expr::Tuple {
+                        val: vec![Expr::KeyVal {
+                            name: limit,
+                            value: Box::new(int_lit(10)),
+                        }],
+                    },
+                },
+                Decl::DefDecl {
+                    name: xs,
+                    ty: None,
+                    is_pub: true,
+                    val: Expr::Map {
+                        var: m,
+                        table_name: tasks,
+                        where_clause: Box::new(Expr::Binop {
+                            op: BinOp::Gt,
+                            expr1: Box::new(Expr::MemberAccess {
+                                service_name: m,
+                                member_name: minutes,
+                            }),
+                            expr2: Box::new(Expr::MemberAccess {
+                                service_name: config,
+                                member_name: limit,
+                            }),
+                        }),
+                        body: Box::new(Expr::MemberAccess {
+                            service_name: m,
+                            member_name: minutes,
+                        }),
+                    },
+                },
+            ],
+        }];
+        let mut program = program;
+        resolve(&mut program).unwrap();
+        let mut effects = crate::runtime::graphs::effects::Effects::new(
+            &program,
+            std::collections::HashMap::new(),
+        );
+        let Stmt::Service { name, decls, .. } = &program[0] else {
+            panic!("service");
+        };
+        let graphs = effects.graphs(*name, decls);
+        assert!(graphs.reactive_graph.contains_edge(config, xs));
+        let Decl::DefDecl { val, .. } = &decls[2] else {
+            panic!("xs");
+        };
+        let Expr::Map { where_clause, .. } = val else {
+            panic!("map");
+        };
+        let Expr::Binop { expr2, .. } = where_clause.as_ref() else {
+            panic!("comparison");
+        };
+        assert!(matches!(expr2.as_ref(), Expr::FieldAccess { .. }));
+        assert!(!graphs.cross_deps.contains_key(&xs));
     }
 }

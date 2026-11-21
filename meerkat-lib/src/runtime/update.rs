@@ -205,7 +205,7 @@ impl Transaction {
             }
         }
 
-        if let Err(e) = crate::runtime::node::check_program(&self.ast) {
+        if let Err(e) = crate::runtime::node::check_program(&mut self.ast) {
             return Err(EvalError::RuntimeError(format!(
                 "Static check failed on update: {}",
                 e.message(&manager.interner)
@@ -533,6 +533,7 @@ pub fn format_expr(expr: &Expr, interner: &Interner) -> String {
             Value::Closure { .. }
             | Value::ActionClosure { .. }
             | Value::List { .. }
+            | Value::Record { .. }
             | Value::Range { .. } => val.to_string(),
         },
         Expr::Html(_) => "<html>".to_string(),
@@ -594,6 +595,14 @@ pub fn format_expr(expr: &Expr, interner: &Interner) -> String {
         Expr::MemberAccess {
             service_name,
             member_name,
+        }
+        | Expr::FieldAccess {
+            var: service_name,
+            field: member_name,
+        }
+        | Expr::ServiceAccess {
+            service: service_name,
+            member: member_name,
         } => format!(
             "{}.{}",
             interner.get(*service_name),
@@ -614,7 +623,30 @@ pub fn format_expr(expr: &Expr, interner: &Interner) -> String {
                 .collect();
             format!("[{}]", records_str.join(", "))
         }
-        Expr::Fold { .. } => "fold".to_string(),
+        Expr::Fold {
+            table_name,
+            column_name,
+            operation,
+            identity,
+        } => format!(
+            "fold({}.{}, {}, {})",
+            interner.get(*table_name),
+            interner.get(*column_name),
+            format_expr(operation, interner),
+            format_expr(identity, interner)
+        ),
+        Expr::Map {
+            var,
+            table_name,
+            where_clause,
+            body,
+        } => format!(
+            "map ({} in {} where {}) ({})",
+            interner.get(*var),
+            interner.get(*table_name),
+            format_expr(where_clause, interner),
+            format_expr(body, interner)
+        ),
         Expr::List(exprs) => {
             let elems: Vec<String> = exprs.iter().map(|e| format_expr(e, interner)).collect();
             format!("[{}]", elems.join(", "))
@@ -789,5 +821,98 @@ mod tests {
         let service = manager.services.get(&s1_sym).unwrap();
         let var_state = service.vars.get(&x_sym).unwrap();
         assert!(matches!(var_state.lock, VarLock::Unlocked));
+    }
+
+    /// Formatting a `map` or `fold` must produce source that parses back
+    /// to the same expression. Remote updates send this text through
+    /// `format_update_source`.
+    #[test]
+    fn test_format_map_and_fold_round_trip() {
+        use crate::runtime::ast::BinOp;
+
+        let mut interner = Interner::new();
+        let board = interner.insert("board");
+        let open = interner.insert("open");
+        let total = interner.insert("total");
+        let m = interner.insert("m");
+        let tasks = interner.insert("tasks");
+        let minutes = interner.insert("minutes");
+        let add = interner.insert("add");
+
+        let map_expr = Expr::Map {
+            var: m,
+            table_name: tasks,
+            where_clause: Box::new(Expr::Binop {
+                op: BinOp::Gt,
+                expr1: Box::new(Expr::MemberAccess {
+                    service_name: m,
+                    member_name: minutes,
+                }),
+                expr2: Box::new(Expr::Literal {
+                    val: Value::Int { val: 10 },
+                }),
+            }),
+            body: Box::new(Expr::Binop {
+                op: BinOp::Add,
+                expr1: Box::new(Expr::MemberAccess {
+                    service_name: m,
+                    member_name: minutes,
+                }),
+                expr2: Box::new(Expr::Literal {
+                    val: Value::Int { val: 1 },
+                }),
+            }),
+        };
+        let fold_expr = Expr::Fold {
+            table_name: tasks,
+            column_name: minutes,
+            operation: Box::new(Expr::Variable { name: add }),
+            identity: Box::new(Expr::Literal {
+                val: Value::Int { val: 0 },
+            }),
+        };
+        let decls = vec![
+            Decl::DefDecl {
+                name: open,
+                ty: None,
+                val: map_expr.clone(),
+                is_pub: true,
+            },
+            Decl::DefDecl {
+                name: total,
+                ty: None,
+                val: fold_expr.clone(),
+                is_pub: false,
+            },
+        ];
+
+        let src = format_update_source(board, &decls, &interner);
+        let stmts = crate::runtime::parser::parse_string(&src, &mut interner)
+            .unwrap_or_else(|e| panic!("reparse failed: {e}\nsource:\n{src}"));
+        let Stmt::Update {
+            service_name,
+            decls: parsed,
+        } = &stmts[0]
+        else {
+            panic!("expected update, got {stmts:?}");
+        };
+        assert_eq!(*service_name, board);
+        assert_eq!(
+            parsed,
+            &vec![
+                Decl::DefDecl {
+                    name: open,
+                    ty: None,
+                    val: map_expr,
+                    is_pub: true,
+                },
+                Decl::DefDecl {
+                    name: total,
+                    ty: None,
+                    val: fold_expr,
+                    is_pub: false,
+                },
+            ]
+        );
     }
 }

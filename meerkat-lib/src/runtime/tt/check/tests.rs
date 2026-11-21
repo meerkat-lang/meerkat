@@ -562,7 +562,7 @@ fn test_html_expression() {
     assert!(res.is_ok())
 }
 
-/// Verify select table and fold placeholders type check
+/// Verify select and table placeholders type check
 #[test]
 fn test_placeholder_expressions() {
     let mut classes = Env::new(None);
@@ -590,14 +590,90 @@ fn test_placeholder_expressions() {
                     records: vec![],
                 },
             },
-            Decl::VarDecl {
-                name: interner.insert("fld"),
-                ty: Some(Type::Unit),
+        ],
+    }];
+    let res = check(&program, &mut classes);
+    assert!(res.is_ok())
+}
+
+/// A `map` has the type of its body, and a `fold` must match the accumulator.
+#[test]
+fn test_map_and_fold_use_row_types() {
+    let mut classes = Env::new(None);
+    let mut interner = Interner::new();
+    let name_s = interner.insert("s");
+    let tasks = interner.insert("tasks");
+    let minutes = interner.insert("minutes");
+    let id = interner.insert("id");
+    let m = interner.insert("m");
+    let acc = interner.insert("acc");
+    let item = interner.insert("item");
+    let open = interner.insert("open");
+
+    let add = Expr::Binop {
+        op: BinOp::Add,
+        expr1: Box::new(Expr::Variable { name: acc }),
+        expr2: Box::new(Expr::Variable { name: item }),
+    };
+    let program = vec![Stmt::Service {
+        name: name_s,
+        decls: vec![
+            Decl::TableDecl {
+                name: tasks,
+                fields: vec![
+                    Field {
+                        name: id,
+                        ty: TableType::Int,
+                    },
+                    Field {
+                        name: minutes,
+                        ty: TableType::Int,
+                    },
+                ],
+            },
+            Decl::DefDecl {
+                name: open,
+                ty: None,
+                is_pub: false,
+                val: Expr::Map {
+                    var: m,
+                    table_name: tasks,
+                    where_clause: Box::new(Expr::Binop {
+                        op: BinOp::Gt,
+                        expr1: Box::new(Expr::MemberAccess {
+                            service_name: m,
+                            member_name: minutes,
+                        }),
+                        expr2: Box::new(Expr::Literal {
+                            val: Value::Int { val: 0 },
+                        }),
+                    }),
+                    body: Box::new(Expr::MemberAccess {
+                        service_name: m,
+                        member_name: id,
+                    }),
+                },
+            },
+            Decl::DefDecl {
+                name: interner.insert("total"),
+                ty: None,
+                is_pub: false,
                 val: Expr::Fold {
-                    table_name: interner.insert("t"),
-                    column_name: interner.insert("c"),
-                    operation: Box::new(Expr::Literal {
-                        val: Value::Int { val: 0 },
+                    table_name: tasks,
+                    column_name: minutes,
+                    operation: Box::new(Expr::Func {
+                        params: vec![
+                            Param {
+                                name: acc,
+                                ty: Some(Type::Int),
+                            },
+                            Param {
+                                name: item,
+                                ty: Some(Type::Int),
+                            },
+                        ],
+                        body: Box::new(add),
+                        return_ty: None,
                     }),
                     identity: Box::new(Expr::Literal {
                         val: Value::Int { val: 0 },
@@ -606,8 +682,94 @@ fn test_placeholder_expressions() {
             },
         ],
     }];
-    let res = check(&program, &mut classes);
-    assert!(res.is_ok())
+    assert!(check(&program, &mut classes).is_ok());
+    let open_ty = classes
+        .find(name_s)
+        .unwrap()
+        .fields()
+        .find(open)
+        .unwrap()
+        .clone();
+    assert_eq!(open_ty, Type::List(Box::new(Type::Int)));
+
+    let bad_where = vec![Stmt::Service {
+        name: name_s,
+        decls: vec![
+            Decl::TableDecl {
+                name: tasks,
+                fields: vec![Field {
+                    name: minutes,
+                    ty: TableType::Int,
+                }],
+            },
+            Decl::DefDecl {
+                name: open,
+                ty: None,
+                is_pub: false,
+                val: Expr::Map {
+                    var: m,
+                    table_name: tasks,
+                    where_clause: Box::new(Expr::MemberAccess {
+                        service_name: m,
+                        member_name: minutes,
+                    }),
+                    body: Box::new(Expr::MemberAccess {
+                        service_name: m,
+                        member_name: minutes,
+                    }),
+                },
+            },
+        ],
+    }];
+    let mut classes = Env::new(None);
+    assert!(matches!(
+        check(&bad_where, &mut classes),
+        Err(Error::TypeMismatch { .. })
+    ));
+
+    let bad_fold = vec![Stmt::Service {
+        name: name_s,
+        decls: vec![
+            Decl::TableDecl {
+                name: tasks,
+                fields: vec![Field {
+                    name: minutes,
+                    ty: TableType::Int,
+                }],
+            },
+            Decl::DefDecl {
+                name: interner.insert("total"),
+                ty: None,
+                is_pub: false,
+                val: Expr::Fold {
+                    table_name: tasks,
+                    column_name: minutes,
+                    operation: Box::new(Expr::Func {
+                        params: vec![
+                            Param {
+                                name: acc,
+                                ty: Some(Type::String),
+                            },
+                            Param {
+                                name: item,
+                                ty: Some(Type::Int),
+                            },
+                        ],
+                        body: Box::new(Expr::Variable { name: acc }),
+                        return_ty: None,
+                    }),
+                    identity: Box::new(Expr::Literal {
+                        val: Value::Int { val: 0 },
+                    }),
+                },
+            },
+        ],
+    }];
+    let mut classes = Env::new(None);
+    assert!(matches!(
+        check(&bad_fold, &mut classes),
+        Err(Error::TypeMismatch { .. })
+    ));
 }
 
 /// Verify that invalid function parameters trigger errors

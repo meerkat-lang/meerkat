@@ -29,7 +29,7 @@ use crate::runtime::{nameres, tt, Env, Manager};
 /// order: names resolve, types check, the dependency graph is complete and
 /// acyclic. The typing environment of the checked program is the result
 pub(crate) fn check_program(
-    ast: &[Stmt],
+    ast: &mut [Stmt],
 ) -> std::result::Result<Env<'static, ServiceType>, StaticError> {
     nameres::resolve(ast).map_err(StaticError::Names)?;
     let mut types = Env::new(None);
@@ -118,6 +118,37 @@ impl StaticError {
     }
 }
 
+/// Local program for a file that has `update` or `atomic` statements.
+///
+/// `final_ast` holds the resolved services and tests and no update statements.
+/// Tests that belong to the import prefix come first; `imported_tests` skips them.
+fn with_resolved_services_and_tests(
+    local: &[Stmt],
+    final_ast: &[Stmt],
+    imported_tests: usize,
+) -> Vec<Stmt> {
+    let mut services = HashMap::new();
+    let mut tests = Vec::new();
+    for stmt in final_ast {
+        match stmt {
+            Stmt::Service { name, .. } => {
+                services.insert(*name, stmt.clone());
+            }
+            Stmt::Test { .. } => tests.push(stmt.clone()),
+            _ => {}
+        }
+    }
+    let mut tests = tests.into_iter().skip(imported_tests);
+    local
+        .iter()
+        .map(|stmt| match stmt {
+            Stmt::Service { name, .. } => services.get(name).expect("resolved service").clone(),
+            Stmt::Test { .. } => tests.next().expect("resolved test"),
+            _ => stmt.clone(),
+        })
+        .collect()
+}
+
 /// Root manager for executing a Meerkat node
 pub struct Node {
     /// Local services registered on this node
@@ -126,6 +157,11 @@ pub struct Node {
     pub imported_services: Env<'static, ServiceType>,
     /// Unified program statements AST
     pub unified_ast: Vec<Stmt>,
+    /// Leading import statements in `unified_ast`. The tail is the local program.
+    imported_len: usize,
+    /// Local program to run when the file has `update` or `atomic`.
+    /// `None` means that program is the tail of `unified_ast`.
+    resolved_local: Option<Vec<Stmt>>,
     /// Statements of the imports read from local disk, in dependency order.
     /// Startup runs them before the program's own; a network-fetched module
     /// is its peer's program, so it is left out. See `Imports::finalize`.
@@ -148,6 +184,8 @@ impl Node {
             local_services: Env::new(None),
             imported_services: Env::new(None),
             unified_ast: Vec::new(),
+            imported_len: 0,
+            resolved_local: None,
             local_imports: Vec::new(),
             discovered_remote_services: HashMap::new(),
             interner: Interner::new(),
@@ -440,8 +478,23 @@ impl Node {
     /// themselves. Both entry points that build a unified AST go through here,
     /// so neither can drift back to appending imports last.
     fn set_unified_ast(&mut self, local_prog: &[Stmt], imported_ast: Vec<Stmt>) {
+        self.imported_len = imported_ast.len();
         self.unified_ast = imported_ast;
         self.unified_ast.extend_from_slice(local_prog);
+    }
+
+    /// The local program a loaded file runs.
+    ///
+    /// This stays separate from `unified_ast`: it is what marks a service as
+    /// locally declared. With no `update` or `atomic`, it is the tail of
+    /// `unified_ast` after `static_checks`. With them, that tail no longer
+    /// lines up, so this is the resolved services and tests and the update
+    /// statements as parsed.
+    pub fn resolved_local_program(&self) -> Vec<Stmt> {
+        match &self.resolved_local {
+            Some(prog) => prog.clone(),
+            None => self.unified_ast[self.imported_len..].to_vec(),
+        }
     }
 
     /// Orchestrates the network boot sequence and resolves imports
@@ -485,7 +538,7 @@ impl Node {
 
         self.static_checks()?;
 
-        Ok((opt_net, buffered_events, local_prog))
+        Ok((opt_net, buffered_events, self.resolved_local_program()))
     }
 
     /// Resolve local disk and remote P2P dependencies into unified AST
@@ -638,6 +691,7 @@ impl Node {
     /// Errors:
     ///   `Error`: If name resolution or type checking fails
     pub fn static_checks(&mut self) -> Result<()> {
+        self.resolved_local = None;
         let mut service_ast: Vec<Stmt> = Vec::new();
         let mut top_level_stmts: Vec<Stmt> = Vec::new();
         let mut update_batches: Vec<Vec<Stmt>> = Vec::new();
@@ -663,12 +717,12 @@ impl Node {
 
         if update_batches.is_empty() {
             self.local_services =
-                check_program(&self.unified_ast).map_err(|e| self.format_static_error(e))?;
+                check_program(&mut self.unified_ast).map_err(|e| self.format_static_error(e))?;
             return Ok(());
         }
 
         // Initial validation of base service declarations
-        check_program(&service_ast).map_err(|e| self.format_static_error(e))?;
+        check_program(&mut service_ast).map_err(|e| self.format_static_error(e))?;
 
         let last_batch = update_batches.pop().unwrap();
 
@@ -681,7 +735,7 @@ impl Node {
                 ))
             })?;
 
-            check_program(&service_ast).map_err(|e| self.format_static_error(e))?;
+            check_program(&mut service_ast).map_err(|e| self.format_static_error(e))?;
         }
 
         // Process final atomic transaction batch
@@ -695,9 +749,21 @@ impl Node {
         let mut final_ast = service_ast;
         final_ast.extend(top_level_stmts);
 
-        self.local_services = check_program(&final_ast).map_err(|e| self.format_static_error(e))?;
+        self.local_services =
+            check_program(&mut final_ast).map_err(|e| self.format_static_error(e))?;
         // Validate future updates without installing their declarations.
         // The runtime transaction installs each update only after evaluation.
+        // Take the resolved Service and Test statements from `final_ast` and
+        // leave the update statements as they are.
+        let imported_tests = self.unified_ast[..self.imported_len]
+            .iter()
+            .filter(|stmt| matches!(stmt, Stmt::Test { .. }))
+            .count();
+        self.resolved_local = Some(with_resolved_services_and_tests(
+            &self.unified_ast[self.imported_len..],
+            &final_ast,
+            imported_tests,
+        ));
 
         Ok(())
     }
@@ -742,6 +808,7 @@ impl Node {
 
     pub fn run_static_checks(&mut self, program: &[Stmt]) -> Result<()> {
         self.unified_ast = program.to_vec();
+        self.imported_len = 0;
         // `program` resolves no imports, so none from an earlier resolution
         // may run with it.
         self.local_imports.clear();
@@ -1550,5 +1617,79 @@ mod tests {
         let program = vec![service_stmt, update1, update2, action_stmt];
         let res = node.run_static_checks(&program);
         assert!(res.is_ok());
+    }
+
+    async fn run_loaded_file(src: &str) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "meerkat_file_load_{}_{}",
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("prog.mkt");
+        std::fs::write(&path, src).unwrap();
+
+        let mut node = Node::new();
+        let (_net, _events, prog) = node
+            .on_node_startup(path.to_str().unwrap(), HashMap::new(), None)
+            .await
+            .expect("loaded file");
+        let tests: Vec<_> = prog
+            .iter()
+            .filter_map(|stmt| match stmt {
+                Stmt::Test {
+                    service_name,
+                    stmts,
+                } => Some((*service_name, stmts.clone())),
+                _ => None,
+            })
+            .collect();
+        let mut manager = node
+            .on_manager_startup(true, None, HashMap::new(), &prog)
+            .await
+            .expect("startup");
+        for (service, stmts) in tests {
+            manager
+                .execute_test_block(service, &stmts)
+                .await
+                .expect("test block");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A row field read inside an action, loaded from a file.
+    #[tokio::test]
+    async fn loaded_file_reads_a_row_field_inside_an_action() {
+        run_loaded_file(
+            "service s {
+                table tasks { id: int, minutes: int, };
+                var total = 0;
+                pub def acts = map (m in tasks where true) action { total = total + m.minutes; };
+            }
+            @test(s) {
+                insert {1, 20} into tasks
+                for a in acts { do a; }
+                assert(total == 20);
+            }",
+        )
+        .await;
+    }
+
+    /// A captured record field read inside an action, loaded from a file.
+    #[tokio::test]
+    async fn loaded_file_reads_a_captured_record_field() {
+        run_loaded_file(
+            "service s {
+                var total = 0;
+                var r = {a: 1, b: 2};
+                pub def act = action { total = total + r.a; };
+            }
+            @test(s) { do act; assert(total == 1); }",
+        )
+        .await;
     }
 }

@@ -127,6 +127,9 @@ pub enum Value {
     List {
         vals: Vec<Value>,
     },
+    Record {
+        fields: Vec<(Symbol, Value)>,
+    },
     Range {
         start: i32,
         end: i32,
@@ -210,6 +213,16 @@ pub enum Expr {
         service_name: Symbol,
         member_name: Symbol,
     },
+    /// Record field. Name resolution rewrites `x.f` into this when `x` is a local.
+    FieldAccess {
+        var: Symbol,
+        field: Symbol,
+    },
+    /// Service member. Name resolution rewrites `x.f` into this when `x` is a service.
+    ServiceAccess {
+        service: Symbol,
+        member: Symbol,
+    },
     Select {
         table_name: Symbol,
         column_names: Vec<Symbol>,
@@ -232,6 +245,12 @@ pub enum Expr {
         operation: Box<Expr>,
         identity: Box<Expr>,
     },
+    Map {
+        var: Symbol,
+        table_name: Symbol,
+        where_clause: Box<Expr>,
+        body: Box<Expr>,
+    },
     List(Vec<Expr>),
     Range {
         start: Box<Expr>,
@@ -244,7 +263,11 @@ impl Expr {
     /// forms their own meaning recurses over these for all the others
     pub fn children(&self) -> Vec<&Expr> {
         match self {
-            Expr::Literal { .. } | Expr::Variable { .. } | Expr::MemberAccess { .. } => Vec::new(),
+            Expr::Literal { .. }
+            | Expr::Variable { .. }
+            | Expr::MemberAccess { .. }
+            | Expr::FieldAccess { .. }
+            | Expr::ServiceAccess { .. } => Vec::new(),
             Expr::KeyVal { value, .. } => vec![value],
             Expr::Unop { expr, .. } => vec![expr],
             Expr::Binop { expr1, expr2, .. }
@@ -266,6 +289,9 @@ impl Expr {
             Expr::Html(template) => template.embedded_exprs().collect(),
             Expr::Action(stmts) => stmts.iter().flat_map(ActionStmt::exprs).collect(),
             Expr::Select { where_clause, .. } => vec![where_clause],
+            Expr::Map {
+                where_clause, body, ..
+            } => vec![where_clause, body],
         }
     }
 }
@@ -322,6 +348,37 @@ impl Decl {
 pub struct Field {
     pub name: Symbol,
     pub ty: TableType,
+}
+
+/// Schema of `table_name` if it is declared in `decls`.
+pub fn table_decl_fields<'a, I>(decls: I, table_name: Symbol) -> Option<&'a [Field]>
+where
+    I: IntoIterator<Item = &'a Decl>,
+{
+    for d in decls {
+        if let Decl::TableDecl { name, fields } = d {
+            if *name == table_name {
+                return Some(fields.as_slice());
+            }
+        }
+    }
+    None
+}
+
+/// Schema of `table_name` on `service_name` in `program`.
+pub fn table_decl_in_service(
+    program: &[Stmt],
+    service_name: Symbol,
+    table_name: Symbol,
+) -> Option<&[Field]> {
+    for stmt in program {
+        if let Stmt::Service { name, decls } = stmt {
+            if *name == service_name {
+                return table_decl_fields(decls, table_name);
+            }
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -419,6 +476,16 @@ impl Display for Value {
                 }
                 write!(f, "]")
             }
+            Value::Record { fields } => {
+                write!(f, "{{")?;
+                for (i, (name, val)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{:?}: {}", name, val)?;
+                }
+                write!(f, "}}")
+            }
             Value::Range { start, end } => write!(f, "{}..{}", start, end),
         }
     }
@@ -481,6 +548,14 @@ impl Display for Expr {
             Expr::MemberAccess {
                 service_name,
                 member_name,
+            }
+            | Expr::FieldAccess {
+                var: service_name,
+                field: member_name,
+            }
+            | Expr::ServiceAccess {
+                service: service_name,
+                member: member_name,
             } => write!(f, "{:?}.{:?}", service_name, member_name),
             Expr::Select { where_clause, .. } => write!(f, "{}", where_clause),
             Expr::Table { records, .. } => {
@@ -508,6 +583,7 @@ impl Display for Expr {
                 write!(f, "]")
             }
             Expr::Fold { .. } => write!(f, "fold"),
+            Expr::Map { .. } => write!(f, "map"),
             Expr::List(exprs) => {
                 write!(f, "[")?;
                 for (i, expr) in exprs.iter().enumerate() {

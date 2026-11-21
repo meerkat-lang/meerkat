@@ -33,6 +33,7 @@ extern {
         "where" => Token::WHERE_KW,
         "into" => Token::INTO_KW,
         "fold" => Token::FOLD_KW,
+        "map" => Token::MAP_KW,
         "action" => Token::ACTION_KW,
         "fn" => Token::FN_KW,
         "then" => Token::THEN_KW,
@@ -391,6 +392,13 @@ pub Expr: Expr = {
         column_name: cn,
         operation: Box::new(op),
         identity: Box::new(id)
+    },
+    "map" "(" <v:Ident> "in" <t:Ident> "where" <cond:Expr> ")" <body:Expr> =>
+    Expr::Map {
+        var: v,
+        table_name: t,
+        where_clause: Box::new(cond),
+        body: Box::new(body),
     }
 }
 

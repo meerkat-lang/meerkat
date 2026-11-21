@@ -101,6 +101,9 @@ pub enum NetValue {
     List {
         vals: Vec<NetValue>,
     },
+    Record {
+        fields: Vec<(String, NetValue)>,
+    },
     Range {
         start: i32,
         end: i32,
@@ -166,10 +169,24 @@ pub enum NetExpr {
         operation: Box<NetExpr>,
         identity: Box<NetExpr>,
     },
+    Map {
+        var: String,
+        table_name: String,
+        where_clause: Box<NetExpr>,
+        body: Box<NetExpr>,
+    },
     List(Vec<NetExpr>),
     Range {
         start: Box<NetExpr>,
         end: Box<NetExpr>,
+    },
+    FieldAccess {
+        var: String,
+        field: String,
+    },
+    ServiceAccess {
+        service: String,
+        member: String,
     },
 }
 

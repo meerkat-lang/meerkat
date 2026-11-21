@@ -537,6 +537,7 @@ fn encode_type_internal(ty: &Type, depth: usize) -> Result<NetType> {
         Type::UnresolvedService(_) => Err(Error::Message(
             "Cannot serialize unresolved service type".to_string(),
         )),
+        Type::Record(_) => Err(Error::Message("Cannot serialize record type".to_string())),
     }
 }
 
@@ -798,6 +799,15 @@ pub fn encode_value(val: &Value, interner: &Interner) -> Result<NetValue> {
             }
             Ok(NetValue::List { vals: encoded })
         }
+        Value::Record { fields } => {
+            let mut encoded = Vec::new();
+            for (k, v) in fields {
+                let k_str = interner.get(*k);
+                validate_identifier(k_str)?;
+                encoded.push((k_str.to_string(), encode_value(v, interner)?));
+            }
+            Ok(NetValue::Record { fields: encoded })
+        }
         Value::Range { start, end } => Ok(NetValue::Range {
             start: *start,
             end: *end,
@@ -910,6 +920,14 @@ pub fn decode_value(val: NetValue, interner: &mut Interner) -> Result<Value> {
             }
             Ok(Value::List { vals: decoded })
         }
+        NetValue::Record { fields } => {
+            let mut decoded = Vec::new();
+            for (k, v) in fields {
+                validate_identifier(&k)?;
+                decoded.push((interner.insert(&k), decode_value(v, interner)?));
+            }
+            Ok(Value::Record { fields: decoded })
+        }
         NetValue::Range { start, end } => Ok(Value::Range { start, end }),
     }
 }
@@ -1016,6 +1034,26 @@ pub fn encode_expr(expr: &Expr, interner: &Interner) -> Result<NetExpr> {
                 member_name: member_str.to_string(),
             })
         }
+        Expr::FieldAccess { var, field } => {
+            let var_str = interner.get(*var);
+            let field_str = interner.get(*field);
+            validate_identifier(var_str)?;
+            validate_identifier(field_str)?;
+            Ok(NetExpr::FieldAccess {
+                var: var_str.to_string(),
+                field: field_str.to_string(),
+            })
+        }
+        Expr::ServiceAccess { service, member } => {
+            let service_str = interner.get(*service);
+            let member_str = interner.get(*member);
+            validate_identifier(service_str)?;
+            validate_identifier(member_str)?;
+            Ok(NetExpr::ServiceAccess {
+                service: service_str.to_string(),
+                member: member_str.to_string(),
+            })
+        }
         Expr::Select {
             table_name,
             column_names,
@@ -1064,6 +1102,23 @@ pub fn encode_expr(expr: &Expr, interner: &Interner) -> Result<NetExpr> {
                 column_name: column_str.to_string(),
                 operation: Box::new(encode_expr(operation, interner)?),
                 identity: Box::new(encode_expr(identity, interner)?),
+            })
+        }
+        Expr::Map {
+            var,
+            table_name,
+            where_clause,
+            body,
+        } => {
+            let var_str = interner.get(*var);
+            let table_str = interner.get(*table_name);
+            validate_identifier(var_str)?;
+            validate_identifier(table_str)?;
+            Ok(NetExpr::Map {
+                var: var_str.to_string(),
+                table_name: table_str.to_string(),
+                where_clause: Box::new(encode_expr(where_clause, interner)?),
+                body: Box::new(encode_expr(body, interner)?),
             })
         }
         Expr::List(exprs) => {
@@ -1221,6 +1276,21 @@ pub fn decode_expr(expr: NetExpr, interner: &mut Interner) -> Result<Expr> {
                 identity: Box::new(decode_expr(*identity, interner)?),
             })
         }
+        NetExpr::Map {
+            var,
+            table_name,
+            where_clause,
+            body,
+        } => {
+            validate_identifier(&var)?;
+            validate_identifier(&table_name)?;
+            Ok(Expr::Map {
+                var: interner.insert(&var),
+                table_name: interner.insert(&table_name),
+                where_clause: Box::new(decode_expr(*where_clause, interner)?),
+                body: Box::new(decode_expr(*body, interner)?),
+            })
+        }
         NetExpr::List(exprs) => {
             let mut decoded = Vec::new();
             for e in exprs {
@@ -1232,6 +1302,22 @@ pub fn decode_expr(expr: NetExpr, interner: &mut Interner) -> Result<Expr> {
             start: Box::new(decode_expr(*start, interner)?),
             end: Box::new(decode_expr(*end, interner)?),
         }),
+        NetExpr::FieldAccess { var, field } => {
+            validate_identifier(&var)?;
+            validate_identifier(&field)?;
+            Ok(Expr::FieldAccess {
+                var: interner.insert(&var),
+                field: interner.insert(&field),
+            })
+        }
+        NetExpr::ServiceAccess { service, member } => {
+            validate_identifier(&service)?;
+            validate_identifier(&member)?;
+            Ok(Expr::ServiceAccess {
+                service: interner.insert(&service),
+                member: interner.insert(&member),
+            })
+        }
     }
 }
 
@@ -1799,6 +1885,24 @@ mod tests {
             }),
         };
         run_expr_test(&fold_expr, &interner);
+
+        // 4. Map
+        let mut interner = Interner::new();
+        let var = interner.insert("m");
+        let table_name = interner.insert("tbl");
+        let col = interner.insert("col");
+        let map_expr = Expr::Map {
+            var,
+            table_name,
+            where_clause: Box::new(Expr::Literal {
+                val: Value::Bool { val: true },
+            }),
+            body: Box::new(Expr::MemberAccess {
+                service_name: var,
+                member_name: col,
+            }),
+        };
+        run_expr_test(&map_expr, &interner);
     }
 
     /// Verify round-trip encoding and decoding for Expr,

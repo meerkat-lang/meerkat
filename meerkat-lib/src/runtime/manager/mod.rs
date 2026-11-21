@@ -1,4 +1,4 @@
-use super::ast::{ActionStmt, Decl, Expr, Stmt, Value};
+use super::ast::{table_decl_in_service, ActionStmt, Decl, Expr, Stmt, Value};
 use super::graphs::{
     analysis::service_declarations,
     effects::{self, Effects},
@@ -1133,8 +1133,15 @@ impl Manager {
                     Decl::VarDecl { name, val, .. } | Decl::DefDecl { name, val, .. } => {
                         (name, val)
                     }
-                    Decl::TableDecl { .. } => {
-                        return Err(EvalError::NotImplemented);
+                    Decl::TableDecl { name, .. } => {
+                        let value = Value::List { vals: vec![] };
+                        env.push((name, value.clone()));
+                        if let Some(service) = self.services.get_mut(&svc_name) {
+                            let mut table_value = VarState::new(value);
+                            table_value.latest_write_txn = Some(txn.id.clone());
+                            service.vars.insert(name, table_value);
+                        }
+                        continue;
                     }
                 };
                 // Defs resolve service members through their transactional snapshots;
@@ -1447,6 +1454,16 @@ impl Manager {
         Ok((value, clock, sources))
     }
 
+    /// Column names of a table on `service_name`, in schema order.
+    pub(crate) fn table_field_names(
+        &self,
+        service_name: Symbol,
+        table_name: Symbol,
+    ) -> Option<Vec<Symbol>> {
+        table_decl_in_service(&self.unified_ast, service_name, table_name)
+            .map(|fields| fields.iter().map(|f| f.name).collect())
+    }
+
     /// Assign a value to a service variable
     ///
     /// In a transaction, this acquires a write lock (or upgrades an existing read lock)
@@ -1587,6 +1604,151 @@ impl Manager {
         let mut write_set = txn.participant_writes.clone();
         write_set.extend(local_writes);
         (v_base, write_set)
+    }
+
+    /// Append one row to a table without copying the rows already stored.
+    ///
+    /// Outside a transaction the live list is extended in place. Inside a
+    /// transaction the buffered list is extended in place; the live table is
+    /// copied only when that buffer does not exist yet.
+    pub(crate) async fn append_table_row(
+        &mut self,
+        service_name: Symbol,
+        table_name: Symbol,
+        row: Value,
+        mut txn: Option<&mut Transaction>,
+    ) -> Result<(), EvalError> {
+        if let Some(t) = txn.as_mut() {
+            let key = (self.service_net_id_for_name(service_name), table_name);
+            enum LockAction {
+                Acquire,
+                Upgrade,
+            }
+            let (txn_id, kind, staged) = {
+                // Reject a missing or non-list target before locking. The
+                // write lock would otherwise create the variable.
+                let staged = if let Some(existing) = t
+                    .written
+                    .get(&key)
+                    .or_else(|| t.read_cache.get(&key).map(|(value, _, _)| value))
+                {
+                    if !matches!(existing, Value::List { .. }) {
+                        return Err(EvalError::TypeError(
+                            "insert target is not a table".to_string(),
+                        ));
+                    }
+                    None
+                } else {
+                    let current = self.current_table(service_name, table_name)?;
+                    if !matches!(current, Value::List { .. }) {
+                        return Err(EvalError::TypeError(
+                            "insert target is not a table".to_string(),
+                        ));
+                    }
+                    Some(current)
+                };
+                let kind = if t.locked.contains(&key) {
+                    LockAction::Upgrade
+                } else {
+                    LockAction::Acquire
+                };
+                (t.id.clone(), kind, staged)
+            };
+            match kind {
+                LockAction::Upgrade => {
+                    self.upgrade_to_write_lock(service_name, table_name, &txn_id)?
+                }
+                LockAction::Acquire => {
+                    self.acquire_write_lock(service_name, table_name, &txn_id)?
+                }
+            }
+            t.locked.insert(key.clone());
+
+            if t.written.contains_key(&key) {
+                if !matches!(t.written.get(&key), Some(Value::List { .. })) {
+                    return Err(EvalError::TypeError(
+                        "insert target is not a table".to_string(),
+                    ));
+                }
+                if let Some(Value::List { vals }) = t.written.get_mut(&key) {
+                    vals.push(row.clone());
+                }
+                if let Some((Value::List { vals }, _, _)) = t.read_cache.get_mut(&key) {
+                    vals.push(row);
+                } else {
+                    let updated = t.written.get(&key).unwrap().clone();
+                    t.read_cache.insert(key, (updated, None, None));
+                }
+                return Ok(());
+            }
+
+            let taken_from_cache = t.read_cache.contains_key(&key);
+            let (mut table, clock, sources) = if taken_from_cache {
+                let (value, clock, sources) = t.read_cache.remove(&key).unwrap();
+                (value, clock, sources)
+            } else {
+                (staged.unwrap(), None, None)
+            };
+            match &mut table {
+                Value::List { vals } => vals.push(row),
+                _ => {
+                    if taken_from_cache {
+                        t.read_cache.insert(key, (table, clock, sources));
+                    }
+                    return Err(EvalError::TypeError(
+                        "insert target is not a table".to_string(),
+                    ));
+                }
+            }
+            t.read_cache
+                .insert(key.clone(), (table.clone(), clock, sources));
+            t.written.insert(key, table);
+            return Ok(());
+        }
+
+        {
+            let service = self.services.get_mut(&service_name).ok_or_else(|| {
+                EvalError::ServiceNotFound(format!(
+                    "Service '{}' not found",
+                    self.interner.get(service_name)
+                ))
+            })?;
+            let var_state = service.vars.get_mut(&table_name).ok_or_else(|| {
+                EvalError::VarNotFound(format!(
+                    "Variable '{}' not found in service '{}'",
+                    self.interner.get(table_name),
+                    self.interner.get(service_name)
+                ))
+            })?;
+            match &mut var_state.value {
+                Value::List { vals } => vals.push(row),
+                _ => {
+                    return Err(EvalError::TypeError(
+                        "insert target is not a table".to_string(),
+                    ))
+                }
+            }
+        }
+        self.propagate(service_name, table_name).await;
+        Ok(())
+    }
+
+    /// Clone of a local variable, or the same not-found errors as `lookup`.
+    fn current_table(&self, service_name: Symbol, table_name: Symbol) -> Result<Value, EvalError> {
+        let service = self.services.get(&service_name).ok_or_else(|| {
+            EvalError::ServiceNotFound(format!(
+                "Service '{}' not found",
+                self.interner.get(service_name)
+            ))
+        })?;
+        let var_state = service.vars.get(&table_name).ok_or_else(|| {
+            EvalError::VarNotFound(format!(
+                "Variable '{}' not found in service '{}'",
+                self.interner.get(table_name),
+                self.interner.get(service_name)
+            ))
+        })?;
+        Ok(var_state.value.clone())
     }
 
     pub(crate) async fn propagate(&mut self, service_name: Symbol, changed_var: Symbol) {
@@ -4412,6 +4574,10 @@ impl Manager {
                 if visited.insert((svc_sym, mem_sym)) {
                     if let Some(service) = self.services.get(&svc_sym) {
                         for (owner, input) in service.graphs.inputs(svc_sym, mem_sym) {
+                            // `cross_deps` also records vars. Only defs are followed.
+                            if owner != svc_sym && !service.defs.contains_key(&mem_sym) {
+                                continue;
+                            }
                             if self.remote_services.contains_key(&owner) {
                                 // Track remote dependencies for a
                                 // remote service to request them
@@ -4641,8 +4807,40 @@ impl Default for Manager {
 mod tests {
     use super::*;
     use crate::ast::{Decl, Expr, Value};
+    use crate::runtime::graphs::free_var::cross_service_deps;
     use crate::runtime::interpreter::execute;
     use crate::runtime::{parser::parse_string, update::Transaction as CodeUpdate, Node};
+
+    // #24: cross_service_deps pulls out exactly the (service, member) symbols
+    // referenced via MemberAccess, and nothing for a purely local expression.
+    #[test]
+    fn test_cross_service_deps_extraction() {
+        let tc = TestContext::new();
+        // z = s1.y + 2  ->  {(s1, y)}
+        let z_expr = Expr::Binop {
+            op: crate::ast::BinOp::Add,
+            expr1: Box::new(Expr::MemberAccess {
+                service_name: tc.s1,
+                member_name: tc.y,
+            }),
+            expr2: Box::new(Expr::Literal {
+                val: Value::Int { val: 2 },
+            }),
+        };
+        assert_eq!(
+            cross_service_deps(&z_expr, &std::collections::HashSet::from([tc.s1])),
+            std::collections::HashSet::from([(tc.s1, tc.y)])
+        );
+        // y = x + 1  ->  {} (no cross-service references)
+        let y_expr = Expr::Binop {
+            op: crate::ast::BinOp::Add,
+            expr1: Box::new(Expr::Variable { name: tc.x }),
+            expr2: Box::new(Expr::Literal {
+                val: Value::Int { val: 1 },
+            }),
+        };
+        assert!(cross_service_deps(&y_expr, &std::collections::HashSet::from([tc.s1])).is_empty());
+    }
 
     // #24: a def in s2 that reads s1.y updates eagerly when s1.x changes,
     // driven by the listener cascade rather than a lazy re-lookup.
@@ -4963,6 +5161,87 @@ mod tests {
         tc.manager.create_service(tc.foo, decls).await.unwrap();
         let result = tc.manager.lookup(tc.f, tc.foo, None).await.unwrap();
         assert_eq!(result, Value::Int { val: 5 });
+    }
+
+    #[tokio::test]
+    async fn test_insert_recomputes_fold() {
+        use crate::ast::{ActionStmt, Field, TableType};
+        use crate::runtime::tt::Param;
+
+        let mut tc = TestContext::new();
+        let tasks = tc.manager.interner.insert("tasks");
+        let minutes = tc.manager.interner.insert("minutes");
+        let acc = tc.manager.interner.insert("acc");
+        let item = tc.manager.interner.insert("item");
+        let total = tc.manager.interner.insert("total");
+        let decls = vec![
+            Decl::TableDecl {
+                name: tasks,
+                fields: vec![Field {
+                    name: minutes,
+                    ty: TableType::Int,
+                }],
+            },
+            Decl::DefDecl {
+                name: total,
+                ty: None,
+                val: Expr::Fold {
+                    table_name: tasks,
+                    column_name: minutes,
+                    operation: Box::new(Expr::Func {
+                        params: vec![
+                            Param {
+                                name: acc,
+                                ty: Some(crate::runtime::tt::Type::Int),
+                            },
+                            Param {
+                                name: item,
+                                ty: Some(crate::runtime::tt::Type::Int),
+                            },
+                        ],
+                        body: Box::new(Expr::Binop {
+                            op: crate::ast::BinOp::Add,
+                            expr1: Box::new(Expr::Variable { name: acc }),
+                            expr2: Box::new(Expr::Variable { name: item }),
+                        }),
+                        return_ty: None,
+                    }),
+                    identity: Box::new(Expr::Literal {
+                        val: Value::Int { val: 0 },
+                    }),
+                },
+                is_pub: true,
+            },
+        ];
+        tc.manager.create_service(tc.foo, decls).await.unwrap();
+        assert_eq!(
+            tc.manager.lookup(total, tc.foo, None).await.unwrap(),
+            Value::Int { val: 0 }
+        );
+        tc.manager
+            .execute_test_block(
+                tc.foo,
+                &[
+                    ActionStmt::Insert {
+                        table_name: tasks,
+                        row: Expr::Literal {
+                            val: Value::Int { val: 10 },
+                        },
+                    },
+                    ActionStmt::Insert {
+                        table_name: tasks,
+                        row: Expr::Literal {
+                            val: Value::Int { val: 33 },
+                        },
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tc.manager.lookup(total, tc.foo, None).await.unwrap(),
+            Value::Int { val: 43 }
+        );
     }
 
     /// Recomputing a def must leave the inputs of an evaluation already in

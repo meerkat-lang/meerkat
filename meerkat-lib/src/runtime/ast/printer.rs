@@ -327,6 +327,24 @@ impl<'a> AstPrinter<'a> {
                     self.format_symbol(member_name)
                 );
             }
+            Expr::FieldAccess { var, field } => {
+                let var = *var;
+                let field = *field;
+                println!(
+                    "FieldAccess: {{ var: {}, field: {} }}",
+                    self.format_symbol(var),
+                    self.format_symbol(field)
+                );
+            }
+            Expr::ServiceAccess { service, member } => {
+                let service = *service;
+                let member = *member;
+                println!(
+                    "ServiceAccess: {{ service: {}, member: {} }}",
+                    self.format_symbol(service),
+                    self.format_symbol(member)
+                );
+            }
             Expr::Select {
                 table_name,
                 column_names,
@@ -368,6 +386,20 @@ impl<'a> AstPrinter<'a> {
                 );
                 self.print_expr(operation, indent + 1);
                 self.print_expr(identity, indent + 1);
+            }
+            Expr::Map {
+                var,
+                table_name,
+                where_clause,
+                body,
+            } => {
+                println!(
+                    "Map: {{ var: {}, table_name: {} }}",
+                    self.format_symbol(*var),
+                    self.format_symbol(*table_name)
+                );
+                self.print_expr(where_clause, indent + 1);
+                self.print_expr(body, indent + 1);
             }
             Expr::List(exprs) => {
                 println!("List:");
@@ -444,6 +476,14 @@ impl<'a> AstPrinter<'a> {
                 println!("List:");
                 for val in vals {
                     self.print_value(val, indent + 1);
+                }
+            }
+            Value::Record { fields } => {
+                println!("Record:");
+                for (name, val) in fields {
+                    self.print_indent(indent + 1);
+                    println!("{}", self.format_symbol(*name));
+                    self.print_value(val, indent + 2);
                 }
             }
             Value::Range { start, end } => {

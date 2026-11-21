@@ -44,9 +44,9 @@
 //! - Recursion depth limit: Enforces `limits::MAX_SCOPE_DEPTH`
 //! - Type structure depth limit: Enforces `limits::MAX_TYPE_DEPTH`
 
-use crate::runtime::ast::{ActionStmt, BinOp, Decl, Expr, Stmt, UnOp, Value};
+use crate::runtime::ast::{ActionStmt, BinOp, Decl, Expr, Field, Stmt, TableType, UnOp, Value};
 use crate::runtime::interner::Symbol;
-use crate::runtime::tt::types::{Param, ServiceType, TupleType, Type};
+use crate::runtime::tt::types::{Param, RecordType, ServiceType, TupleType, Type};
 use crate::runtime::Env;
 use std::collections::HashSet;
 
@@ -73,12 +73,53 @@ fn check_type(ty: &Type, depth: usize) -> Result<(), Error> {
             }
             Ok(())
         }
+        Type::Record(fields) => {
+            for (_, t) in fields.fields() {
+                check_type(t, depth + 1)?;
+            }
+            Ok(())
+        }
         Type::Func(t1, t2) => {
             check_type(t1, depth + 1)?;
             check_type(t2, depth + 1)?;
             Ok(())
         }
         Type::List(inner) => check_type(inner, depth + 1),
+    }
+}
+
+fn table_field_type(ty: &TableType) -> Type {
+    match ty {
+        TableType::Int => Type::Int,
+        TableType::String => Type::String,
+        TableType::Bool => Type::Bool,
+    }
+}
+
+fn table_list_type(fields: &[Field]) -> Result<Type, Error> {
+    let cols = fields
+        .iter()
+        .map(|f| (f.name, table_field_type(&f.ty)))
+        .collect();
+    let row_ty = Type::Record(RecordType::new(cols).map_err(|_| Error::CannotInferType)?);
+    Ok(Type::List(Box::new(row_ty)))
+}
+
+/// A `fold` operation is either `(acc, column) -> acc` or `acc -> column -> acc`.
+fn fold_operation_matches(op: &Type, acc: &Type, col: &Type) -> bool {
+    match op {
+        Type::Func(param, ret) if ret.as_ref() == acc => match param.as_ref() {
+            Type::Tuple(ts) => ts.len() == 2 && &ts[0] == acc && &ts[1] == col,
+            _ => false,
+        },
+        Type::Func(param, ret) if param.as_ref() == acc => {
+            matches!(
+                ret.as_ref(),
+                Type::Func(inner_param, inner_ret)
+                    if inner_param.as_ref() == col && inner_ret.as_ref() == acc
+            )
+        }
+        _ => false,
     }
 }
 
@@ -375,7 +416,7 @@ impl<'a, 'b> Context<'a, 'b> {
                     self.infer(val, &mut env, 1)?
                 }
             }
-            Decl::TableDecl { .. } => Type::Unit,
+            Decl::TableDecl { fields, .. } => table_list_type(fields)?,
         };
 
         if let Some(mut st) = self.local_services.remove(service_name) {
@@ -384,6 +425,34 @@ impl<'a, 'b> Context<'a, 'b> {
         }
 
         Ok(ty)
+    }
+
+    /// Row type of a table named in the local environment or the current service.
+    fn row_type(&mut self, table_name: Symbol, env: &Env<'_, Type>) -> Result<RecordType, Error> {
+        let table_ty = if let Some(ty) = env.find(table_name) {
+            ty.clone()
+        } else if let Some(svc) = self.current_service {
+            self.type_of_member(svc, table_name)?
+        } else {
+            return Err(Error::UnboundVariable(table_name));
+        };
+        match table_ty {
+            Type::List(inner) => match *inner {
+                Type::Record(rec) => Ok(rec),
+                other => Err(Error::TypeMismatch {
+                    expected: Box::new(Type::List(Box::new(Type::Record(
+                        RecordType::new(Vec::new()).unwrap(),
+                    )))),
+                    found: Box::new(Type::List(Box::new(other))),
+                }),
+            },
+            other => Err(Error::TypeMismatch {
+                expected: Box::new(Type::List(Box::new(Type::Record(
+                    RecordType::new(Vec::new()).unwrap(),
+                )))),
+                found: Box::new(other),
+            }),
+        }
     }
 
     /// Type check all declarations within a service
@@ -400,13 +469,8 @@ impl<'a, 'b> Context<'a, 'b> {
                 Decl::VarDecl { name, .. } | Decl::DefDecl { name, .. } => {
                     self.type_of_member(service_name, *name)?;
                 }
-                Decl::TableDecl { .. } => {
-                    // TODO(Issue #156): Implement Table type schema
-                    // validation (deferred per Issue #34)
-                    println!(
-                        "warning: tt/check: ignoring 'table' \
-                         schema checks as not yet implemented"
-                    );
+                Decl::TableDecl { name, .. } => {
+                    self.type_of_member(service_name, *name)?;
                 }
             }
         }
@@ -490,12 +554,6 @@ impl<'a, 'b> Context<'a, 'b> {
                 Ok(())
             }
             ActionStmt::Insert { row, .. } => {
-                // TODO(Issue #156): Validate inserted row against
-                // table schema (deferred per Issue #34)
-                println!(
-                    "warning: tt/check: ignoring 'insert' \
-                     checks as not yet implemented"
-                );
                 self.infer(row, env, 1)?;
                 Ok(())
             }
@@ -704,6 +762,7 @@ impl<'a, 'b> Context<'a, 'b> {
                 | Value::String { .. }
                 | Value::Html(..)
                 | Value::List { .. }
+                | Value::Record { .. }
                 | Value::Range { .. } => Self::infer_value(val, type_depth),
             },
             Expr::Html(_) => Ok(Type::String),
@@ -717,7 +776,17 @@ impl<'a, 'b> Context<'a, 'b> {
                 }
             }
             Expr::Tuple { val } => {
-                if val.is_empty() {
+                if !val.is_empty() && val.iter().all(|e| matches!(e, Expr::KeyVal { .. })) {
+                    let mut fields = Vec::new();
+                    for e in val {
+                        let Expr::KeyVal { name, value } = e else {
+                            unreachable!()
+                        };
+                        fields.push((*name, self.infer(value, env, type_depth + 1)?));
+                    }
+                    let rec = RecordType::new(fields).map_err(|_| Error::CannotInferType)?;
+                    Ok(Type::Record(rec))
+                } else if val.is_empty() {
                     Ok(Type::Unit)
                 } else if val.len() < 2 {
                     Err(Error::InvalidTupleArity)
@@ -814,13 +883,90 @@ impl<'a, 'b> Context<'a, 'b> {
                 }
                 Ok(Type::Unit)
             }
+            Expr::FieldAccess { var, field } => {
+                let recv = if let Some(ty) = env.find(*var) {
+                    ty.clone()
+                } else if let Some(svc) = self.current_service {
+                    self.type_of_member(svc, *var)?
+                } else {
+                    return Err(Error::UnboundVariable(*var));
+                };
+                match recv {
+                    Type::Record(rec) => rec
+                        .field_type(*field)
+                        .cloned()
+                        .ok_or(Error::UnboundVariable(*field)),
+                    other => Err(Error::TypeMismatch {
+                        expected: Box::new(Type::Record(RecordType::new(Vec::new()).unwrap())),
+                        found: Box::new(other),
+                    }),
+                }
+            }
+            Expr::ServiceAccess { service, member } => self.type_of_member(*service, *member),
             Expr::MemberAccess {
                 service_name,
                 member_name,
-            } => self.type_of_member(*service_name, *member_name),
+            } => {
+                let recv = if let Some(ty) = env.find(*service_name) {
+                    Some(ty.clone())
+                } else if let Some(svc) = self.current_service {
+                    match self.type_of_member(svc, *service_name) {
+                        Ok(ty) => Some(ty),
+                        Err(Error::UnboundVariable(_)) => None,
+                        Err(e) => return Err(e),
+                    }
+                } else {
+                    None
+                };
+                if let Some(Type::Record(rec)) = recv {
+                    rec.field_type(*member_name)
+                        .cloned()
+                        .ok_or(Error::UnboundVariable(*member_name))
+                } else {
+                    self.type_of_member(*service_name, *member_name)
+                }
+            }
             Expr::Select { .. } => Ok(Type::List(Box::new(Type::Unit))),
             Expr::Table { .. } => Ok(Type::Unit),
-            Expr::Fold { .. } => Ok(Type::Unit),
+            Expr::Fold {
+                table_name,
+                column_name,
+                operation,
+                identity,
+            } => {
+                let row = self.row_type(*table_name, env)?;
+                let col_ty = row
+                    .field_type(*column_name)
+                    .cloned()
+                    .ok_or(Error::UnboundVariable(*column_name))?;
+                let acc_ty = self.infer(identity, env, type_depth + 1)?;
+                let op_ty = self.infer(operation, env, type_depth + 1)?;
+                if !fold_operation_matches(&op_ty, &acc_ty, &col_ty) {
+                    let params = TupleType::new(vec![acc_ty.clone(), col_ty])
+                        .map_err(|_| Error::InvalidTupleArity)?;
+                    return Err(Error::TypeMismatch {
+                        expected: Box::new(Type::Func(
+                            Box::new(Type::Tuple(params)),
+                            Box::new(acc_ty),
+                        )),
+                        found: Box::new(op_ty),
+                    });
+                }
+                Ok(acc_ty)
+            }
+            Expr::Map {
+                var,
+                table_name,
+                where_clause,
+                body,
+            } => {
+                let row = self.row_type(*table_name, env)?;
+                let mut row_env = Env::new(Some(env));
+                row_env.bind(*var, Type::Record(row));
+                self.check_expr(where_clause, &Type::Bool, &mut row_env)?;
+                let body_ty = self.infer(body, &mut row_env, type_depth + 1)?;
+                Ok(Type::List(Box::new(body_ty)))
+            }
             Expr::List(elems) => {
                 if elems.is_empty() {
                     Err(Error::CannotInferType)
@@ -926,6 +1072,14 @@ impl<'a, 'b> Context<'a, 'b> {
                     }
                     Ok(Type::List(Box::new(inner)))
                 }
+            }
+            Value::Record { fields } => {
+                let mut tys = Vec::new();
+                for (name, v) in fields {
+                    tys.push((*name, Self::infer_value(v, type_depth + 1)?));
+                }
+                let rec = RecordType::new(tys).map_err(|_| Error::CannotInferType)?;
+                Ok(Type::Record(rec))
             }
             Value::Range { .. } => Ok(Type::List(Box::new(Type::Int))),
             Value::ActionClosure { .. } => Ok(Type::Unit),

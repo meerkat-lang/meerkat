@@ -230,6 +230,10 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
             .static_checks()
             .map_err(|e| format!("Static check error: {}", e))?;
 
+            // `prog` stays the local program, which marks a service as locally
+            // declared. This is that program after name resolution.
+            let prog = node.resolved_local_program();
+
             // `run_server` and `run_client` build their `Manager` directly
             // rather than through `Node::on_manager_startup`, so they need
             // the peers discovered during resolution merged in here.

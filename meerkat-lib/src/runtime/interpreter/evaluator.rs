@@ -185,6 +185,9 @@ pub(crate) async fn eval_with_inputs(
                     (Value::List { vals: v1 }, Value::List { vals: v2 }) => {
                         return Ok(Value::Bool { val: v1 == v2 });
                     }
+                    (Value::Record { .. }, Value::Record { .. }) => {
+                        return Ok(Value::Bool { val: val1 == val2 });
+                    }
                     (Value::Range { start: s1, end: e1 }, Value::Range { start: s2, end: e2 }) => {
                         return Ok(Value::Bool {
                             val: s1 == s2 && e1 == e2,
@@ -330,15 +333,45 @@ pub(crate) async fn eval_with_inputs(
             })
         }
 
+        &Expr::FieldAccess { var, field } => {
+            let recv = lookup_name(var, env, ctx).await?;
+            record_field(&recv, field)
+        }
+        &Expr::ServiceAccess { service, member } => {
+            lookup_input((service, member), ctx, inputs).await
+        }
+        // Unresolved `x.f`. Remains only for the update and REPL paths.
         &Expr::MemberAccess {
             service_name,
             member_name,
-        } => lookup_input((service_name, member_name), ctx, inputs).await,
-        Expr::Tuple { .. }
-        | Expr::KeyVal { .. }
-        | Expr::Select { .. }
-        | Expr::Table { .. }
-        | Expr::Fold { .. } => Err(EvalError::NotImplemented),
+        } => {
+            for (var_name, var_val) in env.iter().rev() {
+                if *var_name == service_name {
+                    return record_field(var_val, member_name);
+                }
+            }
+            lookup_input((service_name, member_name), ctx, inputs).await
+        }
+        Expr::Tuple { val } => eval_tuple(val, env, ctx).await,
+        Expr::KeyVal { name, value } => {
+            let v = eval_with_inputs(value, env, ctx, inputs).await?;
+            Ok(Value::Record {
+                fields: vec![(*name, v)],
+            })
+        }
+        Expr::Select { .. } | Expr::Table { .. } => Err(EvalError::NotImplemented),
+        Expr::Fold {
+            table_name,
+            column_name,
+            operation,
+            identity,
+        } => eval_fold(*table_name, *column_name, operation, identity, env, ctx).await,
+        Expr::Map {
+            var,
+            table_name,
+            where_clause,
+            body,
+        } => eval_map(*var, *table_name, where_clause, body, env, ctx).await,
         Expr::List(exprs) => {
             let mut vals = Vec::new();
             for expr in exprs {
@@ -359,6 +392,166 @@ pub(crate) async fn eval_with_inputs(
             }
         }
     }
+}
+
+fn record_field(val: &Value, field: Symbol) -> Result<Value, EvalError> {
+    match val {
+        Value::Record { fields } => fields
+            .iter()
+            .find(|(k, _)| *k == field)
+            .map(|(_, v)| v.clone())
+            .ok_or_else(|| EvalError::TypeError("unknown record field".to_string())),
+        _ => Err(EvalError::TypeError(
+            "member access on a non-record value".to_string(),
+        )),
+    }
+}
+
+async fn eval_tuple(
+    elems: &[Expr],
+    env: &[(Symbol, Value)],
+    ctx: &mut EvalContext<'_>,
+) -> Result<Value, EvalError> {
+    let all_keyvals = elems.iter().all(|e| matches!(e, Expr::KeyVal { .. }));
+    if all_keyvals && !elems.is_empty() {
+        let mut fields = Vec::new();
+        for e in elems {
+            let Expr::KeyVal { name, value } = e else {
+                unreachable!();
+            };
+            fields.push((*name, eval(value, env, ctx).await?));
+        }
+        return Ok(Value::Record { fields });
+    }
+    let mut vals = Vec::new();
+    for e in elems {
+        vals.push(eval(e, env, ctx).await?);
+    }
+    Ok(Value::List { vals })
+}
+
+async fn lookup_name(
+    name: Symbol,
+    env: &[(Symbol, Value)],
+    ctx: &mut EvalContext<'_>,
+) -> Result<Value, EvalError> {
+    for (var_name, var_val) in env.iter().rev() {
+        if *var_name == name {
+            return Ok(var_val.clone());
+        }
+    }
+    ctx.manager
+        .lookup(name, ctx.service_name, ctx.txn.as_deref_mut())
+        .await
+}
+
+async fn call_closure(
+    func: &Value,
+    args: Vec<Value>,
+    ctx: &mut EvalContext<'_>,
+) -> Result<Value, EvalError> {
+    let Value::Closure {
+        params,
+        body,
+        env: closure_env,
+        service_name: closure_svc,
+        ..
+    } = func
+    else {
+        return Err(EvalError::TypeError(
+            "Attempting to call a non-function value".to_string(),
+        ));
+    };
+    // Extend a copy of the captured environment. The body stays borrowed.
+    let mut call_env = closure_env.clone();
+    for (param, arg_val) in params.iter().zip(args) {
+        call_env.push((param.name, arg_val));
+    }
+    eval(
+        body,
+        &call_env,
+        &mut EvalContext {
+            manager: ctx.manager,
+            service_name: *closure_svc,
+            txn: ctx.txn.as_deref_mut(),
+        },
+    )
+    .await
+}
+
+async fn eval_fold(
+    table_name: Symbol,
+    column_name: Symbol,
+    operation: &Expr,
+    identity: &Expr,
+    env: &[(Symbol, Value)],
+    ctx: &mut EvalContext<'_>,
+) -> Result<Value, EvalError> {
+    let table = lookup_name(table_name, env, ctx).await?;
+    let rows = match table {
+        Value::List { vals } => vals,
+        _ => {
+            return Err(EvalError::TypeError(
+                "fold expects a table (list of rows)".to_string(),
+            ))
+        }
+    };
+    let op = eval(operation, env, ctx).await?;
+    let mut acc = eval(identity, env, ctx).await?;
+    for row in rows {
+        let item = record_field(&row, column_name)?;
+        acc = match &op {
+            Value::Closure { params, .. } if params.len() == 2 => {
+                call_closure(&op, vec![acc, item], ctx).await?
+            }
+            Value::Closure { params, .. } if params.len() == 1 => {
+                let inner = call_closure(&op, vec![acc], ctx).await?;
+                call_closure(&inner, vec![item], ctx).await?
+            }
+            _ => {
+                return Err(EvalError::TypeError(
+                    "fold operation must be a function".to_string(),
+                ))
+            }
+        };
+    }
+    Ok(acc)
+}
+
+async fn eval_map(
+    var: Symbol,
+    table_name: Symbol,
+    where_clause: &Expr,
+    body: &Expr,
+    env: &[(Symbol, Value)],
+    ctx: &mut EvalContext<'_>,
+) -> Result<Value, EvalError> {
+    let table = lookup_name(table_name, env, ctx).await?;
+    let rows = match table {
+        Value::List { vals } => vals,
+        _ => {
+            return Err(EvalError::TypeError(
+                "map expects a table (list of rows)".to_string(),
+            ))
+        }
+    };
+    let mut out = Vec::new();
+    let mut row_env = env.to_vec();
+    row_env.push((var, Value::Int { val: 0 }));
+    let row_idx = row_env.len() - 1;
+    for row in rows {
+        row_env[row_idx] = (var, row);
+        match eval(where_clause, &row_env, ctx).await? {
+            Value::Bool { val: true } => out.push(eval(body, &row_env, ctx).await?),
+            Value::Bool { val: false } => {}
+            _ => {
+                return Err(EvalError::TypeError(
+                    "map where clause must be boolean".to_string(),
+                ))
+            }
+        }
+    }
+    Ok(Value::List { vals: out })
 }
 
 /// Unit tests for the evaluator
@@ -646,6 +839,147 @@ mod tests {
         };
         let eq_val_2 = eval(&eq_expr_2, &[], &mut ctx).await.unwrap();
         assert_eq!(eq_val_2, Value::Bool { val: true });
+    }
+
+    /// Two records compare by the same equality lists already use for their
+    /// elements, so a record and a list of that record agree.
+    #[tokio::test]
+    async fn test_record_equality_matches_list_equality() {
+        let mut manager = Manager::new(Interner::new());
+        let id = manager.interner.insert("id");
+        let x = manager.interner.insert("x");
+        let mut ctx = EvalContext {
+            manager: &mut manager,
+            service_name: Symbol::empty(),
+            txn: None,
+        };
+
+        let record = |n: i32| Expr::Tuple {
+            val: vec![
+                Expr::KeyVal {
+                    name: id,
+                    value: Box::new(Expr::Literal {
+                        val: Value::Int { val: 1 },
+                    }),
+                },
+                Expr::KeyVal {
+                    name: x,
+                    value: Box::new(Expr::Literal {
+                        val: Value::Int { val: n },
+                    }),
+                },
+            ],
+        };
+        let eq = |left: Expr, right: Expr| Expr::Binop {
+            op: BinOp::Eq,
+            expr1: Box::new(left),
+            expr2: Box::new(right),
+        };
+
+        let same = eval(&eq(record(2), record(2)), &[], &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(same, Value::Bool { val: true });
+
+        let different = eval(&eq(record(2), record(3)), &[], &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(different, Value::Bool { val: false });
+
+        let nested = eval(
+            &eq(Expr::List(vec![record(2)]), Expr::List(vec![record(2)])),
+            &[],
+            &mut ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(nested, Value::Bool { val: true });
+    }
+
+    /// Fold applies one borrowed closure to every row. A captured binding
+    /// is still visible, and a one-parameter function is applied twice.
+    #[tokio::test]
+    async fn test_fold_applies_closure_per_row() {
+        let mut manager = Manager::new(Interner::new());
+        let tasks = manager.interner.insert("tasks");
+        let minutes = manager.interner.insert("minutes");
+        let acc = manager.interner.insert("acc");
+        let item = manager.interner.insert("item");
+        let extra = manager.interner.insert("extra");
+        let mut ctx = EvalContext {
+            manager: &mut manager,
+            service_name: Symbol::empty(),
+            txn: None,
+        };
+        let row = |n: i32| Value::Record {
+            fields: vec![(minutes, Value::Int { val: n })],
+        };
+        let env = vec![
+            (
+                tasks,
+                Value::List {
+                    vals: vec![row(1), row(2)],
+                },
+            ),
+            (extra, Value::Int { val: 10 }),
+        ];
+        let add_all = Expr::Binop {
+            op: BinOp::Add,
+            expr1: Box::new(Expr::Binop {
+                op: BinOp::Add,
+                expr1: Box::new(Expr::Variable { name: acc }),
+                expr2: Box::new(Expr::Variable { name: item }),
+            }),
+            expr2: Box::new(Expr::Variable { name: extra }),
+        };
+        let two_param = Expr::Fold {
+            table_name: tasks,
+            column_name: minutes,
+            operation: Box::new(Expr::Func {
+                params: vec![
+                    Param {
+                        name: acc,
+                        ty: None,
+                    },
+                    Param {
+                        name: item,
+                        ty: None,
+                    },
+                ],
+                body: Box::new(add_all.clone()),
+                return_ty: None,
+            }),
+            identity: Box::new(Expr::Literal {
+                val: Value::Int { val: 0 },
+            }),
+        };
+        let result = eval(&two_param, &env, &mut ctx).await.unwrap();
+        assert_eq!(result, Value::Int { val: 23 });
+
+        let curried = Expr::Fold {
+            table_name: tasks,
+            column_name: minutes,
+            operation: Box::new(Expr::Func {
+                params: vec![Param {
+                    name: acc,
+                    ty: None,
+                }],
+                body: Box::new(Expr::Func {
+                    params: vec![Param {
+                        name: item,
+                        ty: None,
+                    }],
+                    body: Box::new(add_all),
+                    return_ty: None,
+                }),
+                return_ty: None,
+            }),
+            identity: Box::new(Expr::Literal {
+                val: Value::Int { val: 0 },
+            }),
+        };
+        let result = eval(&curried, &env, &mut ctx).await.unwrap();
+        assert_eq!(result, Value::Int { val: 23 });
     }
 
     /// #39: an html template evaluates to a Value::Html whose rendered markup

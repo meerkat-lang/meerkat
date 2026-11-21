@@ -5,6 +5,7 @@
 
 use crate::runtime::interner::Symbol;
 use crate::runtime::Env;
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 
 /// Represents a type in the Meerkat language
@@ -18,6 +19,7 @@ pub enum Type {
     Bool,
     Unit,
     Tuple(TupleType),
+    Record(RecordType),
     Func(Box<Type>, Box<Type>),
     List(Box<Type>),
     UnresolvedService(Symbol),
@@ -167,6 +169,48 @@ impl Hash for ServiceType {
     }
 }
 
+/// A record type: named fields, in source order.
+///
+/// One field is allowed, so a one-column table is still a record.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RecordType(Vec<(Symbol, Type)>);
+
+impl RecordType {
+    /// Create a record type. Duplicate field names are rejected.
+    pub fn new(fields: Vec<(Symbol, Type)>) -> Result<Self, &'static str> {
+        let mut seen = HashSet::new();
+        for (name, _) in &fields {
+            if !seen.insert(*name) {
+                return Err("duplicate record field");
+            }
+        }
+        Ok(Self(fields))
+    }
+
+    /// Field names and types in source order.
+    pub fn fields(&self) -> &[(Symbol, Type)] {
+        &self.0
+    }
+
+    /// The type of `name`, if this record has that field.
+    pub fn field_type(&self, name: Symbol) -> Option<&Type> {
+        self.0.iter().find(|(n, _)| *n == name).map(|(_, ty)| ty)
+    }
+}
+
+impl std::fmt::Display for RecordType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{{")?;
+        for (i, (name, ty)) in self.0.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{:?}: {}", name, ty)?;
+        }
+        write!(f, "}}")
+    }
+}
+
 /// A tuple type wrapping a list of types of arity 2 or greater
 ///
 /// This structure enforces the canonical representation invariant
@@ -250,6 +294,7 @@ impl std::fmt::Display for Type {
             Type::Bool => write!(f, "bool"),
             Type::Unit => write!(f, "unit"),
             Type::Tuple(ts) => write!(f, "{}", ts),
+            Type::Record(fields) => write!(f, "{}", fields),
             Type::Func(t1, t2) => {
                 // Determine if the left-hand side is a function type
                 // to preserve right-associativity during formatting
@@ -261,6 +306,7 @@ impl std::fmt::Display for Type {
                     Type::Int
                     | Type::String
                     | Type::Bool
+                    | Type::Record(_)
                     | Type::Tuple(_)
                     | Type::List(_)
                     | Type::UnresolvedService(_) => {

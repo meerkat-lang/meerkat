@@ -45,5 +45,5 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 # 0.3, not 0.4: gloo-timers 0.4 needs js-sys >= 0.3.91, but libp2p-swarm 0.48.0
 # pins wasm-bindgen-futures =0.4.58, which pins js-sys 0.3.85. Go back to 0.4
 # once libp2p-swarm relaxes that pin.
-gloo-timers = { version = "0.3", features = ["futures"] }
+gloo-timers = { version = "0.4", features = ["futures"] }
 send_wrapper = { version = "0.6", features = ["futures"] }

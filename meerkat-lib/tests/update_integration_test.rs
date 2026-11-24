@@ -17,10 +17,19 @@ use meerkat_lib::runtime::{
     parser::parse_string,
     txn::{Transaction as LockTxn, TxnId, VarLock},
     update::Transaction,
-    Interner, Manager, Node,
+    Interner, Manager, Node, Symbol,
 };
 use std::collections::HashMap;
 use std::time::Duration;
+
+fn set_int(name: Symbol, n: i32) -> ActionStmt {
+    ActionStmt::Assign {
+        name,
+        expr: Expr::Literal {
+            val: Value::Int { val: n },
+        },
+    }
+}
 
 /// Helper function to create an initialized test `Manager` instance
 ///
@@ -627,7 +636,7 @@ async fn test_update_listener_rewiring_propagation() {
 
     // Assign x = 20 to trigger reactive propagation over newly re-wired listener
     manager
-        .assign(s1_sym, x_sym, Value::Int { val: 20 }, None)
+        .execute_action(s1_sym, &[set_int(x_sym, 20)])
         .await
         .unwrap();
 
@@ -679,7 +688,7 @@ async fn test_update_cross_service_listener_rewiring() {
 
     // Assign s1.x = 5 to trigger propagation across services
     manager
-        .assign(s1_sym, x_sym, Value::Int { val: 5 }, None)
+        .execute_action(s1_sym, &[set_int(x_sym, 5)])
         .await
         .unwrap();
 
@@ -735,7 +744,7 @@ async fn test_update_adds_new_cross_service_listener_edge() {
 
     // Assign s1.x = 200 to verify the newly wired cross-service listener triggers
     manager
-        .assign(s1_sym, x_sym, Value::Int { val: 200 }, None)
+        .execute_action(s1_sym, &[set_int(x_sym, 200)])
         .await
         .unwrap();
 
@@ -797,11 +806,11 @@ async fn test_update_def_to_var_unwires_same_service_listener() {
     let d_sym = manager.interner.insert("d");
 
     manager
-        .assign(s1_sym, d_sym, Value::Int { val: 50 }, None)
+        .execute_action(s1_sym, &[set_int(d_sym, 50)])
         .await
         .unwrap();
     manager
-        .assign(s1_sym, x_sym, Value::Int { val: 11 }, None)
+        .execute_action(s1_sym, &[set_int(x_sym, 11)])
         .await
         .unwrap();
 
@@ -841,11 +850,11 @@ async fn test_update_def_to_var_unwires_cross_service_listener() {
     let d_sym = manager.interner.insert("d");
 
     manager
-        .assign(a_sym, d_sym, Value::Int { val: 50 }, None)
+        .execute_action(a_sym, &[set_int(d_sym, 50)])
         .await
         .unwrap();
     manager
-        .assign(b_sym, m_sym, Value::Int { val: 11 }, None)
+        .execute_action(b_sym, &[set_int(m_sym, 11)])
         .await
         .unwrap();
 
@@ -897,7 +906,7 @@ async fn test_update_def_to_var_ignores_update_from_stale_subscription() {
     );
 
     manager
-        .assign(a_sym, d_sym, Value::Int { val: 50 }, None)
+        .execute_action(a_sym, &[set_int(d_sym, 50)])
         .await
         .unwrap();
     let a_id = manager.services[&a_sym].id.clone();

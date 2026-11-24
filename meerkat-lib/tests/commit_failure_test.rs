@@ -6,19 +6,20 @@
 //! dropped the originator returns `Ok`, and the CLI prints `@test ... passed`
 //! for a transaction only part of which is committed.
 //!
-//! Both tests stand in for the participant with a bare network peer that
+//! These tests stand in for the participant with a bare network peer that
 //! refuses every `Commit`, so the outcome is chosen by the test rather than
 //! being timing-dependent.
 
 use meerkat_lib::net::ast::NetValue;
+use meerkat_lib::net::types::ClockEntry;
 use meerkat_lib::net::{
     Address, MeerkatMessage, NetworkActor, NetworkCommand, NetworkEvent, NetworkReply, NodeType,
     ServiceNetId,
 };
-use meerkat_lib::runtime::ast::{ActionStmt, Expr, Value};
+use meerkat_lib::runtime::ast::{ActionStmt, Expr, Stmt, Value};
 use meerkat_lib::runtime::manager::ParkedRequest;
 use meerkat_lib::runtime::parser::parse_string;
-use meerkat_lib::runtime::txn::{Transaction, TxnId, VarLock, WaitKey};
+use meerkat_lib::runtime::txn::{Transaction, TxnId, VClock, VarLock, WaitKey};
 use meerkat_lib::runtime::{Interner, Manager, Node, Symbol};
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -95,7 +96,12 @@ async fn reply(net: &mut NetworkActor, reply_to: &str, msg: MeerkatMessage) {
 /// `reason` after recording in `got_commit` that it arrived, and so go on
 /// serving reads of and subscriptions to the `gc = 1` it had committed before.
 /// Runs forever.
-async fn refuse_commits(net: &mut NetworkActor, reason: &str, got_commit: &Cell<bool>) {
+async fn refuse_commits(
+    net: &mut NetworkActor,
+    reason: &str,
+    got_commit: &Cell<bool>,
+    read_clock: &[ClockEntry],
+) {
     loop {
         match net.event_rx.try_recv() {
             Ok(NetworkEvent::MessageReceived { msg, .. }) => match msg {
@@ -108,7 +114,7 @@ async fn refuse_commits(net: &mut NetworkActor, reason: &str, got_commit: &Cell<
                     let msg = MeerkatMessage::LookupResponse {
                         request_id,
                         value,
-                        clock: Some(Vec::new()),
+                        clock: Some(read_clock.to_vec()),
                         sources: Some(vec![("rc".into(), "cv".into())]),
                     };
                     reply(net, &reply_to, msg).await;
@@ -125,7 +131,7 @@ async fn refuse_commits(net: &mut NetworkActor, reason: &str, got_commit: &Cell<
                         source_service: "rc".to_string(),
                         member: "gc".to_string(),
                         value: NetValue::Int { val: 1 },
-                        clock: Vec::new(),
+                        clock: read_clock.to_vec(),
                         sources: Some(vec![("rc".into(), "cv".into())]),
                     };
                     reply(net, &reply_to, msg).await;
@@ -186,7 +192,7 @@ async fn await_gc_update(m: &mut Manager, rc_net: &mut NetworkActor) {
         r = tokio::time::timeout(std::time::Duration::from_secs(10), pump) => {
             r.expect("rc must answer mid's subscription")
         }
-        _ = refuse_commits(rc_net, REASON, &got_commit) => {
+        _ = refuse_commits(rc_net, REASON, &got_commit, &[]) => {
             unreachable!("the stand-in for rc runs forever")
         }
     }
@@ -281,7 +287,7 @@ async fn test_originator_surfaces_a_participant_commit_failure() {
     let result = tokio::select! {
         biased;
         r = m.execute_action(mid, &stmts) => r,
-        _ = refuse_commits(&mut rc_net, REASON, &got_commit) => {
+        _ = refuse_commits(&mut rc_net, REASON, &got_commit, &[]) => {
             unreachable!("the stand-in for rc runs forever")
         }
     };
@@ -296,6 +302,37 @@ async fn test_originator_surfaces_a_participant_commit_failure() {
     );
     await_gc_update(&mut m, &mut rc_net).await;
     assert_committed_locally(&mut m);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_read_only_commit_keeps_the_previous_binding_and_history() {
+    let (mid_net, _) = listening_node().await;
+    let (mut rc_net, rc_addr) = listening_node().await;
+    let mut m = middle_node(mid_net, &mut rc_net, &rc_addr).await;
+    let mid = m.interner.insert("mid");
+    let t = m.interner.insert("t");
+    let program = parse_string("let t = rc.gc;", &mut m.interner).unwrap();
+    let [Stmt::ActionStmt(binding)] = program.as_slice() else {
+        panic!("expected one let statement");
+    };
+    let read_clock = [ClockEntry {
+        service: "rc".into(),
+        member: "cv".into(),
+        counter: 2,
+    }];
+    let old_env = vec![(t, Value::Int { val: 5 })];
+    let mut env = old_env.clone();
+    let mut clock = VClock::new();
+    let got_commit = Cell::new(false);
+    let result = tokio::select! {
+        r = m.execute_statement(mid, binding, &mut env, &mut clock) => r,
+        _ = refuse_commits(&mut rc_net, REASON, &got_commit, &read_clock) => unreachable!(),
+    };
+
+    assert!(got_commit.get());
+    assert!(result.unwrap_err().to_string().contains(REASON));
+    assert_eq!(env, old_env);
+    assert!(clock.is_empty());
 }
 
 /// A participant whose forward of the commit failed reports the failure, and
@@ -327,7 +364,7 @@ async fn test_participant_reports_a_failed_commit_forward_and_still_propagates()
     let committed = tokio::select! {
         biased;
         c = m.commit_participant(&tid, &clock) => c,
-        _ = refuse_commits(&mut rc_net, REASON, &got_commit) => {
+        _ = refuse_commits(&mut rc_net, REASON, &got_commit, &[]) => {
             unreachable!("the stand-in for rc runs forever")
         }
     };
@@ -362,10 +399,10 @@ async fn test_every_participant_is_committed_after_one_refuses() {
     let committed = tokio::select! {
         biased;
         c = m.commit_participant(&tid, &clock) => c,
-        _ = refuse_commits(&mut rc_net, "rc refused", &rc_got) => {
+        _ = refuse_commits(&mut rc_net, "rc refused", &rc_got, &[]) => {
             unreachable!("the stand-in for rc runs forever")
         }
-        _ = refuse_commits(&mut other_net, "other refused", &other_got) => {
+        _ = refuse_commits(&mut other_net, "other refused", &other_got, &[]) => {
             unreachable!("the other stand-in runs forever")
         }
     };

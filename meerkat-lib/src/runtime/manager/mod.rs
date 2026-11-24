@@ -4,7 +4,9 @@ use super::graphs::{
     effects::{self, Effects},
     uninstallable, ServiceGraphs, Uninstallable,
 };
-use super::interpreter::{eval, execute_seq, EvalContext, EvalError, WAIT_DIE_DISPLAY_PREFIX};
+use super::interpreter::{
+    eval, execute, execute_seq, EvalContext, EvalError, ExecuteEffect, WAIT_DIE_DISPLAY_PREFIX,
+};
 use crate::net::ast::{NetActionStmt, NetValue};
 use crate::net::network_layer::NetworkLayer;
 use crate::net::{
@@ -27,7 +29,7 @@ use tokio::sync::oneshot;
 /// to wait before giving up.
 ///
 /// An originator has no queue to park in, so it waits by retrying (see
-/// `execute_action_with_txn`). That makes this budget the originator's wait
+/// `execute_transaction`). That makes this budget the originator's wait
 /// **timeout** as well: an older transaction -- one wait-die says should win --
 /// is killed after `MAX_WAIT_DIE_RETRIES * WAIT_ON_RETRY_BACKOFF_MS` (200ms)
 /// of backoff, plus however long the attempts themselves take. That includes
@@ -45,7 +47,7 @@ pub const WAIT_DIE_RETRY_BACKOFF_MS: u64 = 2;
 /// wait must give the holder time to commit, so this is longer than a die's.
 pub const WAIT_ON_RETRY_BACKOFF_MS: u64 = 20;
 
-/// Pause between two attempts of a transaction in `execute_action_with_txn`,
+/// Pause between two attempts of a transaction in `execute_transaction`,
 /// and between two checks for a code update's first values in
 /// `await_first_values`.
 ///
@@ -409,12 +411,16 @@ pub fn local_service_names(prog: &[Stmt]) -> HashSet<Symbol> {
 fn join_clocks<'a>(clocks: impl IntoIterator<Item = &'a VClock>) -> VClock {
     let mut joined = VClock::new();
     for clock in clocks {
-        for (&dim, &counter) in clock {
-            let entry = joined.entry(dim).or_insert(0);
-            *entry = (*entry).max(counter);
-        }
+        merge_clock(&mut joined, clock);
     }
     joined
+}
+
+fn merge_clock(joined: &mut VClock, clock: &VClock) {
+    for (&dim, &counter) in clock {
+        let entry = joined.entry(dim).or_insert(0);
+        *entry = (*entry).max(counter);
+    }
 }
 
 /// Whether an input's `clock` has reached `target` on every dimension its
@@ -1242,7 +1248,7 @@ impl Manager {
 
             // Commit only after every initializer succeeds; participant failures
             // take the same rollback path as failed initialization
-            self.commit_txn(&txn).await.map_or(Ok(()), Err)
+            self.commit_txn(&txn, None).await
         }
         .await;
         if result.is_ok() {
@@ -1464,93 +1470,32 @@ impl Manager {
             .map(|fields| fields.iter().map(|f| f.name).collect())
     }
 
-    /// Assign a value to a service variable
-    ///
-    /// In a transaction, this acquires a write lock (or upgrades an existing read lock)
-    /// and buffers the write. Non-transactional writes are applied immediately and propagated.
-    ///
-    /// Args:
-    ///     service_name (Symbol): The symbol of the service containing the variable
-    ///     var_name (Symbol): The symbol of the variable to assign
-    ///     value (Value): The value to assign to the variable
-    ///     txn (Option<&mut Transaction>): An optional active transaction context
-    ///
-    /// Returns:
-    ///     Result<(), EvalError>: Ok on success, or a lock/validation error
-    ///
-    /// Raises:
-    ///     EvalError::VarNotFound: If the variable does not exist in the service
-    ///     EvalError::ServiceNotFound: If the service is not found
-    ///     EvalError::WaitDieAbort: If the transaction aborts due to lock contention
-    pub async fn assign(
+    /// Lock an existing action target, upgrading a read lock if necessary.
+    fn lock_action_target(
+        &mut self,
+        service: Symbol,
+        member: Symbol,
+        txn: &mut Transaction,
+    ) -> Result<(ServiceNetId, Symbol), EvalError> {
+        self.ensure_service_visible(service, Some(&txn.id))?;
+        self.acquire_write_lock(service, member, &txn.id, false)?;
+        let key = (self.service_net_id_for_name(service), member);
+        txn.locked.insert(key.clone());
+        Ok(key)
+    }
+
+    /// Stage an assignment until commit. Later reads in this transaction
+    /// see the buffered value, which has no commit stamp yet.
+    pub fn assign(
         &mut self,
         service_name: Symbol,
         var_name: Symbol,
         value: Value,
-        txn: Option<&mut Transaction>,
+        txn: &mut Transaction,
     ) -> Result<(), EvalError> {
-        self.ensure_service_visible(service_name, txn.as_deref().map(|t| &t.id))?;
-        // Inside a transaction: acquire the write lock lazily (upgrading from a
-        // read lock for read-then-write patterns like x = x + 1) and buffer the
-        // write. The buffered value is applied to the service only at commit, so
-        // a transaction that fails partway leaves no partial writes behind.
-        if txn.is_some() {
-            let key = (self.service_net_id_for_name(service_name), var_name);
-            enum LockAction {
-                Acquire,
-                Upgrade,
-            }
-            let (txn_id, kind) = {
-                let t = txn.as_deref().unwrap();
-                let kind = if t.locked.contains(&key) {
-                    LockAction::Upgrade
-                } else {
-                    LockAction::Acquire
-                };
-                (t.id.clone(), kind)
-            };
-            match kind {
-                LockAction::Upgrade => {
-                    self.upgrade_to_write_lock(service_name, var_name, &txn_id)?
-                }
-                LockAction::Acquire => self.acquire_write_lock(service_name, var_name, &txn_id)?,
-            }
-            if let Some(t) = txn {
-                t.locked.insert(key.clone());
-                t.written.insert(key.clone(), value.clone());
-                // Reads later in the same transaction see the buffered write
-                t.read_cache.insert(key, (value, None, None));
-            }
-            return Ok(());
-        }
-
-        // Non-transactional path: apply the write immediately and propagate.
-        // A function value is stored only if the defs applying it keep the
-        // reads they were installed with
-        self.check_function_writes([((service_name, var_name), &value)])?;
-        let clock = self.write_clock(VClock::new(), &HashSet::from([(service_name, var_name)]))?;
-        if let Some(service) = self.services.get_mut(&service_name) {
-            if let Some(var_state) = service.vars.get_mut(&var_name) {
-                var_state.value = value;
-                var_state.vector_clock = clock;
-            } else {
-                // in theory we should never encounter this after nameres is fully integrated
-                // keep this in mind to guide future development
-                return Err(EvalError::VarNotFound(format!(
-                    "Variable '{}' not found in service '{}'",
-                    self.interner.get(var_name),
-                    self.interner.get(service_name)
-                )));
-            }
-        } else {
-            return Err(EvalError::ServiceNotFound(format!(
-                "Service '{}' not found",
-                self.interner.get(service_name)
-            )));
-        }
-
-        // propagate: re-evaluate defs that depend on this var in topo order
-        self.propagate(service_name, var_name).await;
+        let key = self.lock_action_target(service_name, var_name, txn)?;
+        txn.written.insert(key.clone(), value.clone());
+        txn.read_cache.insert(key, (value, None, None));
         Ok(())
     }
 
@@ -1606,149 +1551,35 @@ impl Manager {
         (v_base, write_set)
     }
 
-    /// Append one row to a table without copying the rows already stored.
-    ///
-    /// Outside a transaction the live list is extended in place. Inside a
-    /// transaction the buffered list is extended in place; the live table is
-    /// copied only when that buffer does not exist yet.
-    pub(crate) async fn append_table_row(
+    /// Append to the buffered table. After the first insert, both the
+    /// staged value and its read-your-writes cache can grow in place.
+    pub(crate) fn append_table_row(
         &mut self,
         service_name: Symbol,
         table_name: Symbol,
         row: Value,
-        mut txn: Option<&mut Transaction>,
+        txn: &mut Transaction,
     ) -> Result<(), EvalError> {
-        if let Some(t) = txn.as_mut() {
-            let key = (self.service_net_id_for_name(service_name), table_name);
-            enum LockAction {
-                Acquire,
-                Upgrade,
-            }
-            let (txn_id, kind, staged) = {
-                // Reject a missing or non-list target before locking. The
-                // write lock would otherwise create the variable.
-                let staged = if let Some(existing) = t
-                    .written
-                    .get(&key)
-                    .or_else(|| t.read_cache.get(&key).map(|(value, _, _)| value))
-                {
-                    if !matches!(existing, Value::List { .. }) {
-                        return Err(EvalError::TypeError(
-                            "insert target is not a table".to_string(),
-                        ));
-                    }
-                    None
-                } else {
-                    let current = self.current_table(service_name, table_name)?;
-                    if !matches!(current, Value::List { .. }) {
-                        return Err(EvalError::TypeError(
-                            "insert target is not a table".to_string(),
-                        ));
-                    }
-                    Some(current)
-                };
-                let kind = if t.locked.contains(&key) {
-                    LockAction::Upgrade
-                } else {
-                    LockAction::Acquire
-                };
-                (t.id.clone(), kind, staged)
-            };
-            match kind {
-                LockAction::Upgrade => {
-                    self.upgrade_to_write_lock(service_name, table_name, &txn_id)?
-                }
-                LockAction::Acquire => {
-                    self.acquire_write_lock(service_name, table_name, &txn_id)?
-                }
-            }
-            t.locked.insert(key.clone());
-
-            if t.written.contains_key(&key) {
-                if !matches!(t.written.get(&key), Some(Value::List { .. })) {
-                    return Err(EvalError::TypeError(
-                        "insert target is not a table".to_string(),
-                    ));
-                }
-                if let Some(Value::List { vals }) = t.written.get_mut(&key) {
-                    vals.push(row.clone());
-                }
-                if let Some((Value::List { vals }, _, _)) = t.read_cache.get_mut(&key) {
-                    vals.push(row);
-                } else {
-                    let updated = t.written.get(&key).unwrap().clone();
-                    t.read_cache.insert(key, (updated, None, None));
-                }
-                return Ok(());
-            }
-
-            let taken_from_cache = t.read_cache.contains_key(&key);
-            let (mut table, clock, sources) = if taken_from_cache {
-                let (value, clock, sources) = t.read_cache.remove(&key).unwrap();
-                (value, clock, sources)
-            } else {
-                (staged.unwrap(), None, None)
-            };
-            match &mut table {
-                Value::List { vals } => vals.push(row),
-                _ => {
-                    if taken_from_cache {
-                        t.read_cache.insert(key, (table, clock, sources));
-                    }
-                    return Err(EvalError::TypeError(
-                        "insert target is not a table".to_string(),
-                    ));
-                }
-            }
-            t.read_cache
-                .insert(key.clone(), (table.clone(), clock, sources));
-            t.written.insert(key, table);
-            return Ok(());
+        let key = self.lock_action_target(service_name, table_name, txn)?;
+        let table = txn.written.entry(key.clone()).or_insert_with(|| {
+            txn.read_cache
+                .get(&key)
+                .map(|(value, _, _)| value)
+                .unwrap_or_else(|| &self.services[&service_name].vars[&table_name].value)
+                .clone()
+        });
+        let Value::List { vals } = table else {
+            return Err(EvalError::TypeError(
+                "insert target is not a table".to_string(),
+            ));
+        };
+        vals.push(row.clone());
+        if let Some((Value::List { vals }, _, _)) = txn.read_cache.get_mut(&key) {
+            vals.push(row);
+        } else {
+            txn.read_cache.insert(key, (table.clone(), None, None));
         }
-
-        {
-            let service = self.services.get_mut(&service_name).ok_or_else(|| {
-                EvalError::ServiceNotFound(format!(
-                    "Service '{}' not found",
-                    self.interner.get(service_name)
-                ))
-            })?;
-            let var_state = service.vars.get_mut(&table_name).ok_or_else(|| {
-                EvalError::VarNotFound(format!(
-                    "Variable '{}' not found in service '{}'",
-                    self.interner.get(table_name),
-                    self.interner.get(service_name)
-                ))
-            })?;
-            match &mut var_state.value {
-                Value::List { vals } => vals.push(row),
-                _ => {
-                    return Err(EvalError::TypeError(
-                        "insert target is not a table".to_string(),
-                    ))
-                }
-            }
-        }
-        self.propagate(service_name, table_name).await;
         Ok(())
-    }
-
-    /// Clone of a local variable, or the same not-found errors as `lookup`.
-    fn current_table(&self, service_name: Symbol, table_name: Symbol) -> Result<Value, EvalError> {
-        let service = self.services.get(&service_name).ok_or_else(|| {
-            EvalError::ServiceNotFound(format!(
-                "Service '{}' not found",
-                self.interner.get(service_name)
-            ))
-        })?;
-        let var_state = service.vars.get(&table_name).ok_or_else(|| {
-            EvalError::VarNotFound(format!(
-                "Variable '{}' not found in service '{}'",
-                self.interner.get(table_name),
-                self.interner.get(service_name)
-            ))
-        })?;
-        Ok(var_state.value.clone())
     }
 
     pub(crate) async fn propagate(&mut self, service_name: Symbol, changed_var: Symbol) {
@@ -3213,7 +3044,7 @@ impl Manager {
                     // here. Only the clock is kept: the value is fetched again
                     // on every read
                     if let Some(clock) = &entry.1 {
-                        txn.participant_history = join_clocks([&txn.participant_history, clock]);
+                        merge_clock(&mut txn.participant_history, clock);
                     }
                     // Initialization keeps the pair: it stamps and seeds the
                     // def that read it
@@ -3415,7 +3246,7 @@ impl Manager {
                             .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?;
                         let writes = codec::decode_sources(writes, &mut self.interner)
                             .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?;
-                        txn.participant_history = join_clocks([&txn.participant_history, &history]);
+                        merge_clock(&mut txn.participant_history, &history);
                         txn.participant_writes.extend(writes);
                     }
                     Ok(())
@@ -3875,30 +3706,14 @@ impl Manager {
         }
     }
 
-    /// Attempt to acquire a write lock on a service variable
-    ///
-    /// If lock contention occurs, determines whether the transaction
-    /// should wait or die according to the wait-die deadlock prevention
-    /// scheme
-    ///
-    /// Args:
-    ///     `service_name` (`Symbol`): The symbol of the service
-    ///     `var` (`Symbol`): The symbol of the variable to lock
-    ///     `txn_id` (`&TxnId`): The ID of the requesting transaction
-    ///
-    /// Returns:
-    ///     `Result<(), EvalError>`: `Ok` on successful lock acquisition, or an error
-    ///
-    /// Raises:
-    ///     `EvalError::VarNotFound`: If the variable does not exist
-    ///     `EvalError::ServiceNotFound`: If the service does not exist
-    ///     `EvalError::WaitDieAbort`: If the transaction aborts under wait-die
-    ///     `EvalError::WaitOn`: If the transaction must wait for the lock
+    /// Take or upgrade a member write lock. Code updates may introduce new
+    /// members, while value transactions can write only to existing ones.
     fn acquire_write_lock(
         &mut self,
         service_name: Symbol,
         var: Symbol,
         txn_id: &TxnId,
+        allow_new_member: bool,
     ) -> Result<(), EvalError> {
         let sid = self.service_net_id_for_name(service_name);
         let service = self.services.get_mut(&service_name).ok_or_else(|| {
@@ -3908,11 +3723,21 @@ impl Manager {
             ))
         })?;
         service_boundary(service, txn_id, &sid, service_name, &self.interner)?;
-        let var_state = service
-            .vars
-            .entry(var)
-            .or_insert_with(|| VarState::new(Value::Int { val: 0 }));
-        if var_state.lock.try_write(txn_id) {
+        let var_state = if allow_new_member {
+            service
+                .vars
+                .entry(var)
+                .or_insert_with(|| VarState::new(Value::Int { val: 0 }))
+        } else {
+            service.vars.get_mut(&var).ok_or_else(|| {
+                EvalError::VarNotFound(format!(
+                    "Variable '{}' not found in service '{}'",
+                    self.interner.get(var),
+                    self.interner.get(service_name)
+                ))
+            })?
+        };
+        if var_state.lock.try_write(txn_id) || var_state.lock.upgrade_to_write(txn_id) {
             Ok(())
         } else {
             match var_state.lock.wait_die(txn_id) {
@@ -3977,55 +3802,6 @@ impl Manager {
         }
     }
 
-    /// Upgrade an existing read lock to a write lock on a service variable
-    ///
-    /// Used for read-then-write patterns in transactions to avoid conflicts
-    ///
-    /// Args:
-    ///     `service_name` (`Symbol`): The symbol of the service
-    ///     `var` (`Symbol`): The symbol of the variable to lock
-    ///     `txn_id` (`&TxnId`): The ID of the requesting transaction
-    ///
-    /// Returns:
-    ///     `Result<(), EvalError>`: `Ok` on successful lock upgrade, or an error
-    ///
-    /// Raises:
-    ///     `EvalError::VarNotFound`: If the variable does not exist
-    ///     `EvalError::ServiceNotFound`: If the service does not exist
-    ///     `EvalError::WaitDieAbort`: If the transaction aborts under wait-die
-    ///     `EvalError::WaitOn`: If the transaction must wait for the lock
-    fn upgrade_to_write_lock(
-        &mut self,
-        service_name: Symbol,
-        var: Symbol,
-        txn_id: &TxnId,
-    ) -> Result<(), EvalError> {
-        let sid = self.service_net_id_for_name(service_name);
-        let service = self.services.get_mut(&service_name).ok_or_else(|| {
-            EvalError::ServiceNotFound(format!(
-                "Service '{}' not found",
-                self.interner.get(service_name)
-            ))
-        })?;
-        service_boundary(service, txn_id, &sid, service_name, &self.interner)?;
-        let var_state = service.vars.get_mut(&var).ok_or_else(|| {
-            EvalError::VarNotFound(format!("Variable '{}' not found", self.interner.get(var)))
-        })?;
-        if var_state.lock.upgrade_to_write(txn_id) {
-            Ok(())
-        } else {
-            match var_state.lock.wait_die(txn_id) {
-                crate::runtime::txn::WaitDie::Die => Err(EvalError::WaitDieAbort(format!(
-                    "transaction died contending to upgrade lock on '{}'",
-                    self.interner.get(var)
-                ))),
-                crate::runtime::txn::WaitDie::Wait => {
-                    Err(EvalError::WaitOn(WaitKey::Member(sid, var)))
-                }
-            }
-        }
-    }
-
     /// Helper to get all locked keys (variables and service locks) for a transaction
     fn all_locked_keys(&self, txn: &Transaction) -> HashSet<WaitKey> {
         let mut keys = HashSet::new();
@@ -4073,64 +3849,57 @@ impl Manager {
         self.freed_awaiting_wake.extend(waited_on);
     }
 
-    /// Execute action statements as a transaction with lazy lock
-    /// acquisition
-    ///
-    /// Locks are acquired on demand as each variable is first read or
-    /// written during execution (inside `lookup` and `assign`), rather
-    /// than upfront.
-    /// This handles actions invoked via function calls and conditional
-    /// branches, where the set of accessed variables cannot be
-    /// determined statically.
-    /// Read values are cached in the transaction to avoid re-fetching
-    /// (which also avoids redundant network round-trips for remote
-    /// reads)
-    ///
-    /// On completion, a commit records `latest_write_txn` for written
-    /// variables, then all locks are released (always, even on error)
-    ///
-    /// If a lock cannot be acquired, wait-die deadlock prevention
-    /// determines whether the transaction waits or dies
-    pub async fn execute_action_with_txn(
+    /// Execute an action with lazy locking and retry the whole action on wait-die.
+    /// A client statement uses the same driver and publishes its effect on commit.
+    async fn execute_transaction(
         &mut self,
         service_name: Symbol,
         stmts: &[ActionStmt],
         initial_env: &[(Symbol, Value)],
-    ) -> Result<(), EvalError> {
+        session_clock: Option<&mut VClock>,
+    ) -> Result<ExecuteEffect, EvalError> {
         let mut txn_id = TxnId::new(self.node_id);
 
         loop {
             let mut txn = Transaction::new(txn_id.clone());
-
-            let mut env: Vec<(Symbol, Value)> = initial_env.to_vec();
-            let mut exec_error = execute_seq(stmts, &mut env, self, service_name, Some(&mut txn))
+            let effect = match stmts {
+                [stmt] => execute(stmt, initial_env, self, service_name, &mut txn).await,
+                _ => execute_seq(
+                    stmts,
+                    &mut initial_env.to_vec(),
+                    self,
+                    service_name,
+                    &mut txn,
+                )
                 .await
-                .err();
-            // A function value written is committed only if the defs
-            // applying it keep the reads they were installed with
-            if exec_error.is_none() {
-                exec_error = self.check_buffered_writes(&mut txn).err();
+                .map(|()| ExecuteEffect::None),
             }
-
-            // Both wait-die outcomes retry the whole transaction. A participant
-            // told to wait parks on `wait_queue`, but an originator drives its
-            // own transaction and has no queue to park in, so retrying is how
-            // it waits.
-            if let Some(EvalError::WaitDieAbort(_) | EvalError::WaitOn(_)) = &exec_error {
-                self.abort_participants(&txn).await;
-                self.release_all_locks(&txn);
-                if txn_id.iteration < MAX_WAIT_DIE_RETRIES {
-                    txn_id = txn_id.retry();
-                    let backoff = match exec_error {
-                        Some(EvalError::WaitOn(_)) => WAIT_ON_RETRY_BACKOFF_MS,
-                        _ => WAIT_DIE_RETRY_BACKOFF_MS,
-                    };
-                    retry_backoff(backoff).await;
-                    continue;
+            .and_then(|effect| {
+                self.check_buffered_writes(&mut txn)?;
+                Ok(effect)
+            });
+            let error = match effect {
+                Ok(effect) => {
+                    // A participant may refuse Commit after local writes were
+                    // installed (#191). Report the error without retrying them.
+                    let committed = self.commit_txn(&txn, session_clock).await;
+                    self.release_all_locks(&txn);
+                    return committed.map(|()| effect);
                 }
-                // Out of retries. `WaitOn` never leaves this loop as itself:
-                // its `WaitKey` holds ids only this node can read back.
-                return Err(match exec_error.unwrap() {
+                Err(error) => error,
+            };
+            self.abort_participants(&txn).await;
+            self.release_all_locks(&txn);
+
+            // A participant can park on its wait queue. The originator waits
+            // by retrying with fresh buffers under the same transaction age.
+            let backoff = match &error {
+                EvalError::WaitOn(_) => WAIT_ON_RETRY_BACKOFF_MS,
+                EvalError::WaitDieAbort(_) => WAIT_DIE_RETRY_BACKOFF_MS,
+                _ => return Err(error),
+            };
+            if txn_id.iteration == MAX_WAIT_DIE_RETRIES {
+                return Err(match error {
                     EvalError::WaitOn(key) => EvalError::WaitDieAbort(format!(
                         "gave up waiting for {} after {} retries",
                         self.describe_wait_key(&key),
@@ -4139,22 +3908,8 @@ impl Manager {
                     other => other,
                 });
             }
-
-            // A refused commit is reported, not swallowed: on `Ok` the CLI
-            // prints `@test(...) passed` for a transaction only part of which
-            // committed. There is no rollback to offer -- this node's writes
-            // are already stored (#191)
-            let error = match exec_error {
-                None => self.commit_txn(&txn).await,
-                Some(e) => {
-                    self.abort_participants(&txn).await;
-                    Some(e)
-                }
-            };
-
-            self.release_all_locks(&txn);
-
-            return error.map_or(Ok(()), Err);
+            txn_id = txn_id.retry();
+            retry_backoff(backoff).await;
         }
     }
 
@@ -4175,8 +3930,8 @@ impl Manager {
         }
     }
 
-    /// Commit a transaction on this node and on every participant, returning
-    /// the first participant's failure to commit (see `commit_participants`)
+    /// Commit a transaction on this node and on every participant. Publish the
+    /// resulting clock to the session only after the participants acknowledge.
     ///
     /// Stores this node's writes, commits the participants, and only then
     /// recomputes what derives from the writes. Propagating first would
@@ -4189,20 +3944,39 @@ impl Manager {
     ///
     /// Every write, here and on every participant, is stamped with the one
     /// `V_new` of §5.2, computed from what the participants reported
-    async fn commit_txn(&mut self, txn: &Transaction) -> Option<EvalError> {
-        let (v_base, write_set) = self.transaction_history(txn);
-        if write_set.is_empty() {
-            // Read-only transactions install no stamp; Commit just releases locks.
-            return self.commit_participants(txn, &VClock::new()).await;
+    async fn commit_txn(
+        &mut self,
+        txn: &Transaction,
+        session_clock: Option<&mut VClock>,
+    ) -> Result<(), EvalError> {
+        let (mut clock, write_set) = self.transaction_history(txn);
+        if let Some(previous) = session_clock.as_deref() {
+            merge_clock(&mut clock, previous);
         }
-        let clock = match commit_clock(v_base, &write_set) {
-            Ok(clock) => clock,
-            Err(e) => {
-                self.abort_participants(txn).await;
-                return Some(e);
-            }
+        // A stamp installed on a var or retained by a session must be
+        // representable, even when this statement only read.
+        if !write_set.is_empty() || session_clock.is_some() {
+            clock = match commit_clock(clock, &write_set) {
+                Ok(clock) => clock,
+                Err(e) => {
+                    self.abort_participants(txn).await;
+                    return Err(e);
+                }
+            };
+        }
+        let error = if write_set.is_empty() {
+            // Read-only participants need only the Commit that releases their locks.
+            self.commit_participants(txn, &VClock::new()).await
+        } else {
+            self.commit_stamped(txn, &clock).await
         };
-        self.commit_stamped(txn, &clock).await
+        if let Some(error) = error {
+            return Err(error);
+        }
+        if let Some(session_clock) = session_clock {
+            *session_clock = clock;
+        }
+        Ok(())
     }
 
     /// Store `txn`'s writes on this node with `clock`, the transaction's
@@ -4279,7 +4053,7 @@ impl Manager {
             txn.composed_seq,
         );
         let mut env: Vec<(Symbol, Value)> = initial_env.to_vec();
-        let mut exec_error = execute_seq(stmts, &mut env, self, service_name, Some(&mut txn))
+        let mut exec_error = execute_seq(stmts, &mut env, self, service_name, &mut txn)
             .await
             .err();
         if exec_error.is_none() {
@@ -4554,19 +4328,12 @@ impl Manager {
                 // after we check its dependencies but before we lock it
                 let key = (self.service_net_id_for_name(svc_sym), mem_sym);
 
-                if !txn.locked.contains(&key) {
-                    // Acquire a new lock since the variable is not
-                    // yet locked by the current transaction
-                    if is_write {
-                        self.acquire_write_lock(svc_sym, mem_sym, &txn.id)?;
-                    } else {
-                        self.acquire_read_lock(svc_sym, mem_sym, &txn.id)?;
-                    }
+                if is_write {
+                    self.acquire_write_lock(svc_sym, mem_sym, &txn.id, true)?;
                     txn.locked.insert(key);
-                } else if is_write {
-                    // Upgrade the existing read lock to a write lock
-                    // if a write lock is requested
-                    self.upgrade_to_write_lock(svc_sym, mem_sym, &txn.id)?;
+                } else if !txn.locked.contains(&key) {
+                    self.acquire_read_lock(svc_sym, mem_sym, &txn.id)?;
+                    txn.locked.insert(key);
                 }
 
                 // Queue the member's inputs after locking it. The queue
@@ -4776,24 +4543,59 @@ impl Manager {
             .await
     }
 
-    /// Execute a `@test` block's statements outside any transaction
-    ///
-    /// The block as a whole is not a transaction. Each statement runs against
-    /// committed state, so reads see the latest values and assignments apply
-    /// and propagate immediately rather than being buffered until the end of
-    /// the block. Only `do` statements are transactional, and each one opens a
-    /// fresh transaction of its own (see `executor::execute`).
-    ///
-    /// The first statement to fail ends the block. Because there is no
-    /// enclosing transaction, the effects of the statements that already ran
-    /// -- including any `do` that already committed -- stay in place.
+    /// Run the whole action in one transaction with the supplied lexical bindings.
+    pub async fn execute_action_with_txn(
+        &mut self,
+        service_name: Symbol,
+        stmts: &[ActionStmt],
+        initial_env: &[(Symbol, Value)],
+    ) -> Result<(), EvalError> {
+        self.execute_transaction(service_name, stmts, initial_env, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// Commit one top-level client statement, retaining its history and any
+    /// binding for the next statement. Return an expression's value for display.
+    pub async fn execute_statement(
+        &mut self,
+        service_name: Symbol,
+        stmt: &ActionStmt,
+        env: &mut Vec<(Symbol, Value)>,
+        session_clock: &mut VClock,
+    ) -> Result<Option<Value>, EvalError> {
+        let effect = self
+            .execute_transaction(
+                service_name,
+                std::slice::from_ref(stmt),
+                env,
+                Some(session_clock),
+            )
+            .await?;
+        match effect {
+            ExecuteEffect::Binding(name, val) => {
+                env.push((name, val));
+                Ok(None)
+            }
+            ExecuteEffect::ExprValue(value) => Ok(Some(value)),
+            ExecuteEffect::None => Ok(None),
+        }
+    }
+
+    /// Each top-level statement commits independently. A failure ends the
+    /// block and leaves its previously committed statements in place.
     pub async fn execute_test_block(
         &mut self,
         service_name: Symbol,
         stmts: &[ActionStmt],
     ) -> Result<(), EvalError> {
-        let mut env: Vec<(Symbol, Value)> = Vec::new();
-        execute_seq(stmts, &mut env, self, service_name, None).await
+        let mut env = Vec::new();
+        let mut session_clock = VClock::new();
+        for stmt in stmts {
+            self.execute_statement(service_name, stmt, &mut env, &mut session_clock)
+                .await?;
+        }
+        Ok(())
     }
 }
 
@@ -4808,7 +4610,6 @@ mod tests {
     use super::*;
     use crate::ast::{Decl, Expr, Value};
     use crate::runtime::graphs::free_var::cross_service_deps;
-    use crate::runtime::interpreter::execute;
     use crate::runtime::{parser::parse_string, update::Transaction as CodeUpdate, Node};
 
     // #24: cross_service_deps pulls out exactly the (service, member) symbols
@@ -4921,7 +4722,7 @@ mod tests {
 
         // s1.x = 4  ->  s1.y = 5  ->  s2.z = 7, eagerly via the cascade
         tc.manager
-            .assign(tc.s1, tc.x, Value::Int { val: 4 }, None)
+            .execute_action(tc.s1, &[set_int(tc.x, 4)])
             .await
             .unwrap();
 
@@ -5242,6 +5043,23 @@ mod tests {
             tc.manager.lookup(total, tc.foo, None).await.unwrap(),
             Value::Int { val: 43 }
         );
+
+        let before = tc.manager.services[&tc.foo].vars[&tasks].entry();
+        let program = parse_string(
+            "@test(foo) { for i in 0..2 { insert 100 into tasks assert(i == 0); } }",
+            &mut tc.manager.interner,
+        )
+        .unwrap();
+        let [Stmt::Test { stmts, .. }] = program.as_slice() else {
+            panic!("expected a test block")
+        };
+        let error = tc
+            .manager
+            .execute_test_block(tc.foo, stmts)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, EvalError::AssertionError(_)));
+        assert_eq!(tc.manager.services[&tc.foo].vars[&tasks].entry(), before);
     }
 
     /// Recomputing a def must leave the inputs of an evaluation already in
@@ -5502,7 +5320,7 @@ mod tests {
 
         // update x to 5, f should become 15
         tc.manager
-            .assign(tc.foo, tc.x, Value::Int { val: 5 }, None)
+            .execute_action(tc.foo, &[set_int(tc.x, 5)])
             .await
             .unwrap();
         let result = tc.manager.lookup(tc.f, tc.foo, None).await.unwrap();
@@ -5510,6 +5328,13 @@ mod tests {
     }
 
     // ---- vector-clock local-diamond tests ----
+
+    fn set_int(name: Symbol, n: i32) -> ActionStmt {
+        ActionStmt::Assign {
+            name,
+            expr: lit_int(n),
+        }
+    }
 
     fn vint(n: i32) -> Value {
         Value::Int { val: n }
@@ -5574,7 +5399,7 @@ mod tests {
 
         // write x = 2  ->  a = 12, b = 22, q = 34
         tc.manager
-            .assign(tc.foo, tc.x, vint(2), None)
+            .execute_action(tc.foo, &[set_int(tc.x, 2)])
             .await
             .unwrap();
         assert_eq!(
@@ -5664,7 +5489,7 @@ mod tests {
 
         // settle at generation 1: x = 2, a = 12, q = 14
         tc.manager
-            .assign(tc.foo, tc.x, vint(2), None)
+            .execute_action(tc.foo, &[set_int(tc.x, 2)])
             .await
             .unwrap();
         assert_eq!(tc.manager.lookup(q, tc.foo, None).await.unwrap(), vint(14));
@@ -6221,6 +6046,19 @@ mod tests {
         assert_eq!(xc, yc, "co-written vars must share one identical stamp");
     }
 
+    #[tokio::test]
+    async fn test_block_assignment_rejects_an_undeclared_member() {
+        let mut tc = TestContext::new();
+        tc.manager.create_service(tc.foo, vec![]).await.unwrap();
+        let error = tc
+            .manager
+            .execute_test_block(tc.foo, &[set_int(tc.x, 1)])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, EvalError::VarNotFound(_)));
+        assert!(!tc.manager.services[&tc.foo].vars.contains_key(&tc.x));
+    }
+
     // Causal consistency (operation A): the read set is folded into V_base, so a
     // written var's clock dominates the vars it read. R = {y}, W = {x}.
     #[tokio::test]
@@ -6242,7 +6080,7 @@ mod tests {
 
         // advance y to generation 1 first
         tc.manager
-            .assign(tc.foo, tc.y, vint(9), None)
+            .execute_action(tc.foo, &[set_int(tc.y, 9)])
             .await
             .unwrap();
         // now write x having READ y
@@ -6294,7 +6132,7 @@ mod tests {
         let key = (tc.foo, tc.x);
         for expected in 1..=3u64 {
             tc.manager
-                .assign(tc.foo, tc.x, vint(7), None)
+                .execute_action(tc.foo, &[set_int(tc.x, 7)])
                 .await
                 .unwrap();
             let c = tc
@@ -6453,11 +6291,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_test_block_commits_each_do_separately() {
-        // A `@test` block is not itself a transaction: each `do` opens and
-        // commits a transaction of its own, so a failure later in the block
-        // cannot roll back a `do` that already committed. Contrast with
-        // `test_txn_failed_transaction_leaves_no_partial_writes`, where the
-        // whole statement list is one transaction
+        // Each top-level statement commits separately. A failing assertion
+        // leaves both earlier `do` statements committed.
         let mut tc = manager_with_x().await;
         let bump = Expr::Action(vec![ActionStmt::Assign {
             name: tc.x,
@@ -6726,7 +6561,7 @@ mod tests {
             node_id: 1,
             iteration: 0,
         };
-        let result = tc.manager.acquire_write_lock(tc.s1, tc.x, &younger);
+        let result = tc.manager.acquire_write_lock(tc.s1, tc.x, &younger, false);
         assert!(matches!(result, Err(EvalError::WaitDieAbort(_))));
     }
 
@@ -6768,7 +6603,7 @@ mod tests {
             node_id: 1,
             iteration: 0,
         };
-        let result = tc.manager.acquire_write_lock(tc.s1, tc.x, &older);
+        let result = tc.manager.acquire_write_lock(tc.s1, tc.x, &older, false);
         assert!(matches!(result, Err(EvalError::WaitOn(_))));
     }
 
@@ -6979,7 +6814,7 @@ mod tests {
             },
             "note == \"Wait-die abort: seen in the log\"".to_string(),
         );
-        let on_the_wire = match execute(&stmt, &[], &mut tc.manager, tc.foo, None).await {
+        let on_the_wire = match tc.manager.execute_action(tc.foo, &[stmt]).await {
             Err(e) => e.to_string(),
             Ok(_) => panic!("a false assertion must fail"),
         };
@@ -7461,7 +7296,7 @@ mod tests {
         assert!(matches!(res_read, Err(EvalError::WaitDieAbort(_))));
 
         // Younger transaction trying to write member should die
-        let res_write = tc.manager.acquire_write_lock(tc.s1, tc.x, &younger);
+        let res_write = tc.manager.acquire_write_lock(tc.s1, tc.x, &younger, false);
         assert!(matches!(res_write, Err(EvalError::WaitDieAbort(_))));
     }
 
@@ -7494,7 +7329,10 @@ mod tests {
         };
 
         // Acquire member write lock under older transaction
-        assert!(tc.manager.acquire_write_lock(tc.s1, tc.x, &older).is_ok());
+        assert!(tc
+            .manager
+            .acquire_write_lock(tc.s1, tc.x, &older, false)
+            .is_ok());
 
         // Younger transaction trying to acquire service lock should die
         let res_svc = tc.manager.acquire_service_lock(tc.s1, &younger);
@@ -7542,7 +7380,10 @@ mod tests {
         };
 
         // Younger transaction locks member x
-        assert!(tc.manager.acquire_write_lock(tc.s1, tc.x, &younger).is_ok());
+        assert!(tc
+            .manager
+            .acquire_write_lock(tc.s1, tc.x, &younger, false)
+            .is_ok());
 
         // Older transaction requests LockGroup covering y and x
         let mut writes = HashSet::new();
@@ -8007,19 +7848,13 @@ mod tests {
         assert_eq!(manager.services[&s].vars[&a].value, Value::Int { val: 1 });
         assert_eq!(manager.services[&s].vars[&b].value, Value::Int { val: 2 });
 
-        manager
-            .assign(s, y, Value::Int { val: 20 }, None)
-            .await
-            .unwrap();
+        manager.execute_action(s, &[set_int(y, 20)]).await.unwrap();
         assert_eq!(manager.services[&s].vars[&a].value, Value::Int { val: 1 });
         assert!(manager.services[&s].vars[&a].vector_clock.is_empty());
         assert_eq!(manager.services[&s].vars[&b].value, Value::Int { val: 2 });
         assert!(manager.services[&s].vars[&b].vector_clock.is_empty());
 
-        manager
-            .assign(s, x, Value::Int { val: 7 }, None)
-            .await
-            .unwrap();
+        manager.execute_action(s, &[set_int(x, 7)]).await.unwrap();
         let clock = HashMap::from([((s, x), 1)]);
         assert_eq!(manager.services[&s].vars[&a].value, Value::Int { val: 7 });
         assert_eq!(manager.services[&s].vars[&a].vector_clock, clock);

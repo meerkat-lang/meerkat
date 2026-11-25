@@ -8,7 +8,8 @@ Related work: [#265](https://github.com/meerkat-lang/meerkat/issues/265),
 [#267](https://github.com/meerkat-lang/meerkat/issues/267),
 [#180](https://github.com/meerkat-lang/meerkat/issues/180),
 [#293](https://github.com/meerkat-lang/meerkat/issues/293),
-[#86](https://github.com/meerkat-lang/meerkat/issues/86), and
+[#86](https://github.com/meerkat-lang/meerkat/issues/86),
+[#295](https://github.com/meerkat-lang/meerkat/issues/295), and
 [#213](https://github.com/meerkat-lang/meerkat/issues/213).
 The broader [code-update design](code-updates.md) covers syntax, migration,
 and coordination. The draft formal semantics,
@@ -16,7 +17,8 @@ and coordination. The draft formal semantics,
 effect of a code update (§2.3, §3.3.3) and sequential composition (§3.3.4),
 and models code installation with versioned names (§5–6). This document
 specifies how the implementation executes an update and what it does to
-stored values; reconciling it with §5–6 is under way. The order of work is in
+stored values. Where it differs from §5–6, and what is still open, is under
+"Relation to the formal semantics". The order of work is in
 the [implementation plan](../plan/sequential-code-updates-plan.md).
 
 ## Summary
@@ -49,9 +51,9 @@ The design rests on these choices. Each is argued in the section named.
 2. **Defs are computed when read.** A def step installs code. Reads during the
    update compute the def from the current view, and each def the update
    declares is evaluated against the final view before commit ("A def step").
-3. **One declaration per member per update block.** Separate update blocks in
-   one `atomic` block may redeclare a member ("Repeated declarations of a
-   member").
+3. **One declaration per member per transaction.** An update, or all the
+   updates of an `atomic` block, declares each member at most once. A later
+   transaction can replace it again ("One declaration per member").
 4. **Temporarily incompatible code is allowed** if the update repairs it
    before commit and nothing runs it in between. Stored function values may
    need the stricter rule instead ("Temporarily incompatible code").
@@ -131,11 +133,9 @@ inputs. With `x == 0`, the steps
 `def r = 10 / x; var x = 2;` would abort if `r` were evaluated at its step.
 Under this design they succeed, and `r == 5` after commit.
 
-Before commit, evaluate every member whose surviving binding is a def
-introduced or replaced by this transaction against the final view. A cached
-result may be reused only if it is valid for that view. Do not evaluate
-overwritten def expressions or members subsequently converted to vars.
-The update aborts if a required evaluation fails, including failure to obtain
+Before commit, evaluate every def this transaction introduces or replaces
+against the final view. A cached result may be reused only if it is valid for
+that view. The update aborts if a required evaluation fails, including failure to obtain
 its inputs. That changes current behavior: today a new def that lacks an
 input waits after commit until propagation delivers it. Under this design, the
 transaction reads the def's inputs itself, including remote ones, through the
@@ -148,15 +148,17 @@ the update, because that value is never observed. An unchanged def that
 nothing reads during the update catches up after commit through ordinary
 propagation, as after any transaction.
 
-### Repeated declarations of a member
+### One declaration per member
 
-Within one update block a member may be declared once, as in a service
-declaration. Successive update blocks in one `atomic` block may declare it
-again. Each of those steps executes, even if a later one replaces its result:
-an earlier var initializer can supply a value to another step, or fail. An
-earlier def installs code and is evaluated if read before replacement; it is
-not forced merely because it once appeared in the transaction. Only the last
-binding and value survive commit.
+A transaction declares each member at most once, as a service declaration
+does. The transaction is one update, or all the updates of an `atomic` block,
+so two updates in one `atomic` block cannot both declare `s.x`. They can
+declare different members of the same service. To replace a member twice, use
+two transactions. That exposes an intermediate committed state and loses the
+atomicity of a single transaction; it is a deliberate restriction, not an
+equivalent way to express repeated replacements atomically. The draft
+semantics makes the same restriction: a patch installs one version of each
+name (§5).
 
 ### Atomic blocks
 
@@ -255,7 +257,10 @@ A kind change also changes the member's place in the reactive graph. A var is
 a source, and its Sources are itself. A def's Sources come from its inputs.
 Defs downstream of the member, on this node or others, see different Sources
 after the update. Commit installs the new graph before anything propagates
-over it, and propagation uses the new Sources.
+over it, and propagation uses the new Sources. A value already in flight from
+the member's old version must not be accepted by a consumer that now expects
+the new one. How to guarantee that is an open requirement, shared with type
+changes ("Relation to the formal semantics").
 
 Tables are outside this design.
 
@@ -381,10 +386,13 @@ an error. Otherwise the update is valid.
 
 For defs, a step that reads `d` checks `d`'s current code against that step's
 bindings, including the code activated through its dependencies. Function
-values stored in vars are harder, because a value's type does not show which
-members its body reads.
-Before type and kind changes are implemented, small examples should establish
-whether existing analysis can check stored functions. If it cannot, bring
+values stored in vars are harder, because in the implementation a value's
+type does not show which members its body reads. The draft semantics records
+those reads and writes in the function's type as a latent effect (§2.1),
+which would make a stored function whose effects no longer fit the new
+bindings ill formed. Before type and kind changes are implemented, small
+examples should establish whether existing analysis can check stored
+functions, starting from that approach. If it cannot, bring
 concrete accepted and rejected examples back for review. The stricter rule,
 that every intermediate state must be well typed, is under "Alternatives
 considered".
@@ -402,9 +410,18 @@ updates are validated.
 ## Atomicity and failure
 
 No staged value, binding, type or graph becomes visible outside the
-transaction before commit. A failed check or evaluation, including a required
-final def evaluation, aborts the update, discards its staged state,
-and releases its local and participant locks.
+transaction before commit. Commit publishes var initializer results and
+required final def results together with their bindings. No other transaction
+sees a new binding without its corresponding value. Until remote participation
+is implemented, one exception remains: a new def whose inputs depend on this
+update's changes on another node can be evaluated only after the local commit,
+so it gets its first value after commit, as on main (see "Remote
+participants"). No initializer may read such a deferred def, directly or
+transitively. Failure on this interim first-value path follows current
+post-commit error handling and does not undo the committed update. A failed
+check or evaluation before commit, including a required final def evaluation,
+aborts the update, discards its staged state, and releases its local and
+participant locks.
 
 Distributed updates must establish that every participant can commit before
 publishing the update. The protocol and its recovery guarantees are #180's;
@@ -509,6 +526,83 @@ Replay needs more than the final declaration list: either a snapshot of state
 with current code, or the original declarations and ordered update history.
 This design adds no persistence.
 
+## Relation to the formal semantics
+
+The [draft semantics](../meerkat-semantics.pdf) models code installation in
+§5–6. This design agrees with it that installing a def does not evaluate it,
+that only vars can be written, that a member's kind can change, that a
+retained def made ill typed by an update is rejected, that updates compose
+sequentially, and that transactions read a committed snapshot under read
+locks on both source and definition dependencies. The points below differ or
+are open, and are being discussed with the draft's author.
+
+- **Installation and initialization are one event here.** In the draft, a
+  code installation writes no values: new versions start uninitialized and
+  separate value transactions initialize them (Definition 10, Theorem 8).
+  This design commits code and values together, so no transaction sees new
+  code without its data ("Atomicity and failure").
+- **Initializers are expressions here.** The draft restricts a code update's
+  var right-hand side, and a var's initial code, to values (T-Var), as a
+  simplification for formalization. The implementation keeps expressions,
+  because migration needs them: `var x = x + 1`, `var before = x`, and
+  `var x0 = x; def x = x0 + y;` all read old values. In the draft's versioned
+  model, an old version's value remains available during the installation
+  event, so this may be expressible there.
+- **Expression initializers have runtime read effects.** T-Update and
+  Theorem 8 give a code patch an empty value-read/write footprint, with source
+  initialization handled separately using specified values. That argument
+  does not carry over unchanged. Starting with `x == 1`, the updates
+  `update s { var y = x; }` and `update s { var x = 2; }` have disjoint
+  destinations, but their order determines whether `y` becomes 1 or 2.
+  Initializer reads, including reads through functions and defs, participate
+  in locking, conflict checks, and causal history through the ordinary
+  transaction machinery. The combined installation and initialization event
+  must account for those reads and its writes before applying a commutation
+  argument.
+- **One declaration per member per transaction** matches the draft's one
+  version per name per patch ("One declaration per member").
+- **Open requirement: values from old versions.** The draft tags each
+  propagated value with the version that produced it. Its use must agree
+  with the versions selected by the consumer's history and the types expected
+  by its declaration (§5.1, Definition 12, §6). Historical values can remain
+  valid under compatible historical selections; installation does not mean
+  every consumer must immediately discard every old value. The implementation
+  has no such tags; its current-graph delivery filter (#264) does not itself
+  establish this version agreement. A consumer expecting a new version must
+  not accept an incompatible old value, whether delayed in transit or retained
+  in an input cache. Type equality alone does not establish code provenance,
+  so this concerns same-type replacements as well as type and kind changes.
+  Main lacks explicit code-version tags; #295 investigates whether delayed
+  or retained values can consequently be accepted incorrectly. A failure has
+  not yet been reproduced. This design keeps main's behavior for same-type
+  replacements, including type-preserving def-to-var changes, and enables no
+  new affected cases until the question is settled: other type and kind
+  changes whose old values can reach a consumer (locally or on another node)
+  stay unsupported until then.
+  Version tags (the draft's "generation fencing") are one possible mechanism;
+  vector clocks alone do not encode code versions (§7).
+- **Stored functions.** The draft's latent effects in function types (§2.1)
+  are the starting point for checking stored function values across type and
+  kind changes ("Temporarily incompatible code"). Summaries must preserve
+  expected member types and read/write capabilities, including latent effects
+  inside returned functions and actions; dependency names alone are
+  insufficient for WF-δ. The higher-order compatibility premise in §6's
+  progress theorem remains an obligation to establish.
+- **Open question: constant and function-valued defs.** T-Def requires a
+  nonempty immediate read effect. This excludes `def d = 5` and defs whose
+  expressions only construct closures, which the implementation permits.
+  Confirm whether this restriction is intended or should be removed from
+  the formalization.
+- **Open question: intermediate checking environments.** The expression
+  rules assume well-formed environments (§2.2), while this design permits
+  retained code to be temporarily incompatible during an update, provided
+  it is repaired before commit and not run in between. Clarify how patch
+  checking can operate under those intermediate bindings. Final-state
+  compatibility alone does not justify those intermediate judgments.
+- **Evaluation failure.** The draft assumes evaluation always succeeds. This
+  design's abort when a declared def fails before commit goes beyond the
+  model rather than conflicting with it.
+
 ## Alternatives considered
 
 | Alternative | What it simplifies | Decision |
@@ -517,7 +611,7 @@ This design adds no persistence.
 | Require every intermediate state to be well typed | No reasoning about code that is incompatible but not run | Fallback if stored functions cannot otherwise be checked; rejects some coordinated migrations, notably across services |
 | Evaluate each def at its own step | A literal reading of "every declaration is a step" | Not adopted: it adds failures on values nothing observes, and still needs the final evaluation |
 | Forbid type or kind changes | No old and new interfaces within one update | Rejected: both are important kinds of evolution, and they share one validation |
-| Forbid redeclaring a member within one atomic block | Fewer execution histories | Little saving once execution follows the steps; successive update blocks stay allowed |
+| Forbid declaring a member twice in one transaction | No repeated steps, no overwritten initializers or defs to account for | Adopted: it matches the draft semantics; splitting replacements into two transactions loses atomicity |
 | Let every initializer read the state before the update | Less staging | Rejected: an initializer could not use a member added earlier in the update |
 
 ## Boundaries and review questions
@@ -535,6 +629,11 @@ Review should establish that:
 - stored function values keep sound types and captures across replacements,
   or the stricter rule is adopted explicitly;
 - a kind change gives downstream defs, local and remote, the right Sources;
+- initializer reads participate in locking, conflict checks, and causal
+  history, including indirect reads;
+- consumed values agree with the code versions and types the consumer
+  expects, including delayed and cached values across updates (the open
+  requirement under "Relation to the formal semantics", tracked in #295);
 - def evaluation, invalidation and publication preserve the clock and Sources
   contracts, including failures before commit;
 - the distributed protocol preserves step order and isolation.

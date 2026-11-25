@@ -95,6 +95,7 @@ through the CLI; the rest are from reading the code.
 | Kind changes | `var x0 = x; def x = x0 + y;` and `var d = d;` both fail with "dependency cycle detected" (ran) | E2 (def to var), H1/H2 (var to def) |
 | `node.rs` `static_checks` | Checks top-level actions, tests and watches against the final declarations | F |
 | `imports.rs` peer folding | Folds a peer's startup updates into its declarations and checks the result as a program to initialize | G |
+| `manager/mod.rs` `DepState::offer`, `accept_delivery` | A delivery with the same clock but another value or Sources is taken as a code update, and nothing records which code version produced a value, so a delayed old-code value can look like a new one on a remote consumer (unconfirmed; #295). Local propagation after a code-only change is correct (ran) | H2/H3 (and #295) |
 | PR #266 at `8cba620` | Reorders the merged declarations; stages var values in `Transaction::staged` in merged order | Salvage tests and fixtures in E2; not its order or staging map |
 
 The #267 issue body describes #266's behavior as "today". Correct it when #266
@@ -142,8 +143,8 @@ give `y == 1`. Initializing the final declarations first gives `y == 2`.
 Add one helper that yields an update's steps in order (service and
 declaration, flattening the one atomic level), and use it for lock
 collection, evaluation, `unvalued_defs` and `declared`. Union lock groups per
-service. Test an atomic block that updates the same service twice and holds
-both blocks' locks.
+service. Test an atomic block whose two updates declare different members of
+the same service, and check that both updates' locks are held.
 
 ### C. Reject writes to defs (#293)
 
@@ -178,6 +179,21 @@ initializers, and report concrete accepted and rejected examples.
 - checking against supplied installed-state metadata, for live services,
   without changing that state.
 
+Start from the draft semantics' approach: function and action types carry
+latent effects, the members their bodies read and write (§2.1, rule WF-δ). A
+stored function whose recorded effects no longer fit the new bindings, or
+that writes a member that became a def, is then ill formed. The effects
+analysis already summarizes functions, so check whether those summaries can
+serve as the recorded effects of stored values. The draft's §6 notes the same
+gap for higher-order values, so share D2's findings with its author.
+Establish whether summaries retain expected member types and read/write
+capabilities, including latent effects inside returned functions and actions;
+a set of dependency names is insufficient for WF-δ. Include returned closures
+and actions in the examples. Resolve how patch checking handles temporarily
+incompatible bindings despite §2.2's well-formed-environment premise, before
+H1 enables that behavior. Final-state compatibility alone does not justify
+the intermediate checking judgments.
+
 If stored functions need substantial new machinery, bring the stricter rule
 ("every intermediate state is well typed") back for review instead of
 building it. Distinguish static metadata that is required from runtime values
@@ -211,7 +227,8 @@ unsupported execution cases explicitly.
   including calls through replaced functions.
 - Run final-state validation: types, graphs, cycles. No initialization-order
   check on final storage positions, and no final def evaluation.
-- Reject a duplicate member within one update block.
+- Reject a member declared twice in one transaction: within one update, or
+  across the updates of one `atomic` block.
 - Expose a checker taking an update and static service environment. It must
   not require an executing `Manager` or call the evaluator. Reuse it in the
   existing CLI `--check` path for files containing updates; separate-update
@@ -241,6 +258,19 @@ unchanged. Test the checker directly without service creation, plus CLI
   state.
 - Invoke E1 against the protected environment before evaluation. Keep
   execution-support checks separate from language typing errors.
+- Reuse ordinary transaction locking, conflict checks, and read-history
+  recording for initializer reads, including calls and supported def reads.
+  The draft's empty value-read/write footprint for code patches does not
+  apply to expression initializers committed with their values. Account for
+  those reads and writes in the combined event; settle this with the draft's
+  author before E2.
+- Enable no new cases affected by values from old versions (#295). Same-type
+  replacements, including type-preserving def-to-var changes, keep main's
+  behavior. #295 investigates whether main can incorrectly accept delayed
+  or retained old-code values; a failure has not yet been reproduced. E2's
+  new initializer forms, such as `var d = d`, do not add new kinds of change.
+  Type changes, including def-to-var changes that also change the value's
+  type, and var-to-def changes that reach consumers stay with H2 and H3.
 
 Until I, execution cannot promise current-view def reads or final def
 evaluation before commit. E2 therefore refuses, as unsupported execution
@@ -254,8 +284,11 @@ conservatively. An unaffected old def can still be read, as in `var d = d`
 before any change to its inputs or code.
 
 This refuses some updates that main accepts today while silently reading
-stale values. That change is intended; say so in E2's PR, with a test. The
-same restriction keeps type-changing execution safe until H2: with existing
+stale values. That change is intended; say so in E2's PR, with a test. This
+#267 restriction concerns reads during an update and remains in place;
+factoring out #295 adds no rejection of existing cases solely for its
+suspected delayed-delivery problem. The same restriction keeps type-changing
+execution safe until H2: with existing
 `var x = 1; def d = x;`, the update `var x = "new"; var copy = d;` is refused,
 not given an old integer under a string type. Record the remaining
 post-commit def-failure behavior until I; do not claim E2 implements the
@@ -266,9 +299,12 @@ Execution evidence:
 - `meerkat/tests/test_update.mkt` runs through the CLI, with assertions on
   every changed or new value;
 - the design's var examples (before/after, added/result, `var x = x + 1`);
+- with initial `x == 1`, separate updates `var y = x` and `var x = 2`
+  produce `y == 1` or `y == 2` according to their order; disjoint destinations
+  must not cause the runtime to ignore the read conflict. Assert that
+  committed values retain initializer read history, including indirect reads;
 - def to var with `var d = d`;
-- repeated declarations across blocks, including an overwritten initializer
-  that fails;
+- an `atomic` block whose updates declare different members of one service;
 - unavailable reads still rejected, and initialization errors unchanged;
 - the mkn `local_update` and `remote_update` scenarios salvaged from #266,
   with assertions rewritten to observable values, not member order.
@@ -309,11 +345,28 @@ Test type preservation through intermediate reads, local kind transitions,
 and downstream values, clocks and Sources. This removes E2's migration
 restriction; it does not introduce another checker or derived-read path.
 
+Old-version safety is a prerequisite for H2 and H3, the stages that enable
+type changes and var-to-def changes that can reach consumers. Consumed values
+must agree with the versions and types the consumer expects; the draft can
+retain historical values under compatible historical selections. Check
+delayed messages and retained cached inputs. Establish whether local commit
+and propagation order suffice for each case H2 enables. A locally changed
+service may have remote consumers, and current-graph delivery filtering
+(#264) alone does not establish version agreement. #295 investigates this
+unconfirmed failure scenario on main, including same-type replacements; its
+tests and any necessary fix should come first or with H2. The draft tags
+values with their producing version ("generation fencing", §5). Settle a
+mechanism or a safety argument
+with the draft's author before enabling each case, or keep it unsupported.
+Coordinate distributed support with J.
+
 **H3: distributed validation and publication.** Separate review from local
 migration. Identify how relevant remote clients and their interface versions
 are obtained, using G's peer metadata work; do not claim all clients were
 checked from incomplete information. Test retained remote writers and
-downstream values, clocks and Sources across nodes. Coordinate with J for
+downstream values, clocks and Sources across nodes, including a value in
+flight or retained in an input cache from an old version when the update
+commits. Coordinate with J for
 atomic migrations spanning owners. Individual static metadata/checking work
 can land earlier, but remote execution claims require protocol evidence.
 
@@ -335,10 +388,9 @@ supported types; H2 then enables full type-changing execution on that base.
   entries; do not clear it wholesale.
 - Reads of defs during the update go through task 12's compute-on-read, with
   the staged code.
-- Before commit, evaluate every member whose surviving binding is a def
-  introduced or replaced by the transaction, using the final view. Reuse a
-  cached result only if it remains valid there. Skip overwritten expressions
-  and members converted to vars. Failure to evaluate or obtain required
+- Before commit, evaluate every def the transaction introduces or replaces,
+  using the final view. Reuse a cached result only if it remains valid there.
+  Failure to evaluate or obtain required
   inputs aborts before publication; it is not grounds for silently omitting
   that member from this check.
 - Until J, keep today's post-commit first-value path (`first_values`,
@@ -346,7 +398,10 @@ supported types; H2 then enables full type-changing execution on that base.
   part on another node: before J, that part is applied only after the local
   commit, so I cannot evaluate the def before commit. Decide which defs those
   are before execution, from E1's analysis, and record the limitation. Do not
-  abort them, which would refuse updates that work today. J removes this path.
+  abort them, which would refuse updates that work today. Failure on this
+  first-value path follows current post-commit error handling and cannot
+  roll back the committed update. No initializer may read a deferred def,
+  directly or transitively, as specified below. J removes this path.
 - Publish values with clocks and Sources consistent with commit. Do not
   publish a def value cached at an earlier step.
 - Lift E2's def-read restriction only for reads I can serve from the current
@@ -362,9 +417,7 @@ Evidence: new, changed and unchanged defs read during an update reflect
 earlier steps; a read, write, read sequence refreshes transitive dependents;
 replacing a def's code invalidates earlier results; a def that fails on the
 final view aborts the update and leaves live state unchanged.
-Also test a failing overwritten def that is never read (does not cause
-evaluation failure), the same def read before replacement (fails), and a def
-converted to a var before commit. Preserve eager service initialization. Test
+Preserve eager service initialization. Test
 the design's `def r = 10 / x; var x = 2;` with old `x == 0`: the update
 succeeds and `r == 5`. Test a new def with a remote input from the same
 update's forwarded part: when no initializer reads it, it gets its first
@@ -406,8 +459,10 @@ preparation leaves services usable and releases participant locks.
   and effect summaries, the other with values and locks. Check-only and
   execution reuse the same static checker; runtime-support restrictions are
   separate diagnostics, not additions to the language's typing rules.
-- One evolving view of current bindings. No per-prefix snapshots, historical
-  version lookup, or version identifiers on members. An old closure kept as a
+- One evolving view of current bindings. Sequential evaluation needs no
+  per-prefix snapshots or historical-version lookup. Generation identifiers
+  used to validate deliveries are a separate possible mechanism; they need
+  not require retaining historical code or values. An old closure kept as a
   value keeps its code and captures under the existing value representation.
 - One authoritative buffer for var writes: the transaction's. No second map
   of staged values. Code-update commit installs values and structural changes
@@ -432,8 +487,9 @@ static checks and runtime where both apply.
   validity and temporarily unsupported execution have distinct diagnostics.
 - Existing later-position member; new earlier member; unavailable later
   member; existing member replaced later; self-migration.
-- Duplicate member within one update block; redeclaration across blocks in
-  one atomic block; same service twice in one atomic block (locks).
+- A member declared twice within one update, or across the updates of one
+  atomic block, is rejected; different members of one service in two updates
+  of one atomic block are accepted, with both updates' locks held.
 - Type changes: retained var type; temporarily incompatible def, read and not
   read; client incompatibility; stored closures (per D2).
 - Kind changes in both directions; retained local and remote writers of a
@@ -452,9 +508,12 @@ static checks and runtime where both apply.
   as unsupported before execution, including after I.
 - New, changed and unchanged defs read during an update; transitive
   invalidation; final reactive cycles; failure on the final view, but not at
-  an intermediate step nothing reads (`def r = 10 / x; var x = 2;`); overwritten
-  defs evaluated only if read before replacement; final def-to-var bindings
-  excluded from the final def-evaluation set.
+  an intermediate step nothing reads (`def r = 10 / x; var x = 2;`).
+- Across type and kind changes enabled by H2 and H3, consumed values agree
+  with the versions and types the consumer expects, locally and across nodes,
+  including delayed messages and retained input caches; cases without that
+  evidence are rejected before execution. Same-type replacements are covered
+  by #295's tests.
 - Top-level statements before and after an update.
 - CLI startup (initializers run once), local imports, peer imports, runtime
   updates, and a second update after a final state whose stored order puts a
@@ -471,10 +530,19 @@ flake and stopping servers started by hand.
 
 ## Related documents to update
 
-- **[Semantics PDF](../meerkat-semantics.pdf):** reconcile the design with
-  its code-installation model (§5–6) before implementation starts on E2; the
-  open questions are being discussed with its author. Keep the committed PDF
-  current when a new draft replaces it.
+- **[Semantics PDF](../meerkat-semantics.pdf):** the design's "Relation to
+  the formal semantics" lists where it differs from the draft's
+  code-installation model (§5–6), and the open requirement on values from old
+  versions. These are with the draft's author. Settle installation with
+  initialization, expression initializers, and their read/write footprints
+  before E2. Establish old-version safety (#295) before H2 and H3 enable
+  type and kind changes that reach consumers, or keep those cases unsupported.
+  Ask whether T-Def's exclusion of constant and closure-only defs is intended:
+  the implementation keeps both, since actions are declared as defs, so this
+  is a question for the model and does not gate E1. Resolve the
+  well-formed-environment premise for temporarily incompatible
+  bindings through D2 before H1. Keep the committed PDF current when a new
+  draft replaces it.
 - **Task 12's spec:** as above, before task 12 starts.
 - **#267's body:** describe main, not #266, and point to the design.
 - **#28 and #213 checklists:** the update retry loop, and

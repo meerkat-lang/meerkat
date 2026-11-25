@@ -1,5 +1,12 @@
 # Design for code updates in Meerkat
 
+For the proposed execution semantics, initialization checks, and runtime
+architecture, see [Sequential code updates](sequential-code-updates.md).
+That document treats an update as a sequence of steps over existing state,
+separates that order from the storage order of the resulting declarations,
+covers changes of a member's type and kind, and gives the design behind issues
+#265 and #267.
+
 ## Syntax
 
 The syntax for code updates should distinguish updating existing definitions

@@ -1,74 +1,122 @@
 # Sequential code updates
 
-Status: proposed design for pre-implementation review, 2026-11-24.
+Status: proposed design for pre-implementation review, revised 2026-11-24.
 This describes intended behavior, not a claim that the runtime implements it.
 
 Related work: [#265](https://github.com/meerkat-lang/meerkat/issues/265),
 [PR #266](https://github.com/meerkat-lang/meerkat/pull/266),
-[#267](https://github.com/meerkat-lang/meerkat/issues/267), and
-[#180](https://github.com/meerkat-lang/meerkat/issues/180).
+[#267](https://github.com/meerkat-lang/meerkat/issues/267),
+[#180](https://github.com/meerkat-lang/meerkat/issues/180),
+[#293](https://github.com/meerkat-lang/meerkat/issues/293), and
+[#213](https://github.com/meerkat-lang/meerkat/issues/213).
 The broader [code-update design](code-updates.md) covers syntax, migration,
-and coordination. Implementation sequencing and verification belong in the
-associated issue and implementation plans rather than this durable contract.
+and coordination. The [draft semantics](../meerkat-semantics.pdf) gives the
+static effect of a code update (§3.3.3) and sequential composition (§3.3.4),
+and leaves the update's effect on the store unspecified; this document
+describes that effect. Implementation order belongs in the issues and
+implementation plans.
 
-## Motivation and decision
+## Summary
 
-A service initializes its fields from top to bottom. An eager initializer
-cannot read a field that has not yet been initialized. Constructing a function
-or action does not itself perform the reads in its body; calling a function
-can perform those reads and is subject to the initialization check.
+A code update is a sequence of steps. Each declaration in it is one step,
+executed in source order against the service's existing state and the steps
+before it. A var step evaluates its initializer and stores the value. A def
+step installs new code. The update commits all its steps together, or none.
 
-A code update starts with an existing service state. Its declarations execute
-in source order, with each step seeing the existing state and the preceding
-steps of the same transaction. Existing fields do not need to be initialized
-again merely because an update changes the service's code.
+A service declaration is the same thing applied to an empty service: each
+declaration is a step, so a member can eagerly read only members declared
+before it. Today's initialization rule is the special case of the update rule
+that starts from no members.
 
-The order used to store the resulting declarations has no language-level
-meaning. Keep existing declarations in their positions and append new ones in
-order of first introduction. This is an implementation convenience, not an
-initialization schedule. Do not reorder declarations to satisfy dependencies.
+The order in which the resulting declarations are stored has no meaning. The
+implementation keeps a replaced declaration in its place and appends new ones.
+It does not reorder declarations to satisfy dependencies.
 
-This replaces the dependency-based AST reordering proposed in #265 and #266.
-It retains source-order service initialization; it does not introduce
-topological initialization. Reactive dependency graphs still determine
-dependencies and detect cycles.
+This replaces the dependency-based reordering proposed in #265 and #266.
 
-## Execution semantics
+## Why not reorder
 
-An ordinary `update` is one transaction. Within an `atomic` block, traverse
-the contained updates and their declarations in source order, including nested
-atomic blocks. Nesting does not create an intermediate commit. The order
-extends across services; grouping steps by service must not change it.
+#266 reordered the merged declarations so that each followed the members it
+reads. The discussion on #265 also proposed initializing services in
+topological order. Both treat the final declaration list as a program to
+initialize, and neither can express migration:
 
-Before a declaration executes, its view consists of:
+- `update s { var before = x; var x = 2; }` needs `before` to read the old
+  `x`. Reordering has to move the new `x` first.
+- `update s { var x = x + 1; }` reads the old `x`. As a final declaration it
+  reads itself, which a dependency order rejects as a cycle.
+- A kind change such as `update s { var x0 = x; def x = x0 + y; }` looks like
+  a cycle between `x0` and `x` in the final declarations. Main rejects it
+  today for this reason.
 
-- The members, types, code, and values available before the transaction,
-  protected by the transaction's consistency and locking rules.
-- All additions and replacements performed by earlier declarations in this
-  transaction. An earlier replacement takes precedence over the old member.
+Sequential steps express all three directly.
 
-Evaluate a declaration's initializer in that view. If it succeeds, stage its
-value, type, and declaration for subsequent steps. The declaration being
-evaluated does not make its new value available to its own initializer. An
-existing member of the same name remains readable there; a wholly new member
-does not yet have a value.
+## Steps
 
-New and changed `def` declarations receive an initial evaluation at their
-step, as they do during service initialization. Their expressions remain
-reactive afterward. Existing, unchanged defs are not all eagerly reevaluated
-at every step: recompute them when a transaction reads them and their cached
-values are no longer valid for its view.
+### The view
 
-Repeated replacements are execution steps, not redundant declarations.
-Execute every initializer, even if a later step replaces its result. An
-earlier initializer can supply a value to another step or fail. Only the last
-declaration and final value for a member survive commit. This rule does not
-relax duplicate-member rejection in a service declaration; repeated update
-blocks are sufficient to express successive replacements.
+Each step sees a *view* of every service the transaction touches:
+
+- **Bindings:** each member's kind (var or def), type, and code (a def's
+  expression).
+- **Values:** each var's value, and cached values of defs.
+
+The view starts as the state before the transaction, protected by the
+transaction's locks, and each step changes it. Every read in the transaction
+uses the current view: unqualified and qualified reads, reads inside called
+functions, and reads answered by another node. Other transactions never see
+it.
+
+### A var step: `var x = e`
+
+1. Check `e` against the current bindings. Each member `e` reads eagerly,
+   directly or through functions it calls, must have a value in the view, and
+   has the type its current binding gives it.
+2. Evaluate `e` in the current view.
+3. Bind `x` as a var with `e`'s type, and store the value.
+
+If `x` already exists, `e` reads its old value: `var x = x + 1` increments it,
+and creates no dependency of `x` on itself. If `x` is new, `e` cannot read it.
+
+### A def step: `def d = e`
+
+1. Check `e` against the current bindings, as for a var step. `e` must not
+   read `d`, directly or through other defs. That is a cycle, whatever `d` was
+   before.
+2. Bind `d` as a def with `e`'s type, install `e` as its code, and discard
+   cached derived values that depend on `d`.
+
+A def step does not evaluate `d`. A later step that reads `d` computes it from
+the current view, as compute-on-read does in an ordinary transaction. Since
+`e` cannot read `d`, installing the code first gives the same values as
+evaluating `e` at the step.
+
+Before commit, each def the update declares is evaluated against the final
+view, and the update aborts if one fails. This catches a failure that only the
+final inputs cause: `def r = 10 / x;` followed by `var x = 0;`. A def that
+would fail only at an intermediate step, where nothing reads it, does not fail
+the update, because that value is never observed. An unchanged def that
+nothing reads during the update catches up after commit through ordinary
+propagation, as after any transaction.
+
+### Repeated declarations of a member
+
+Within one update block a member may be declared once, as in a service
+declaration. Successive update blocks in one `atomic` block may declare it
+again. Each of those steps executes, even if a later one replaces its result:
+an earlier initializer can supply a value to another step, or fail. Only the
+last binding and value survive commit.
+
+### Atomic blocks
+
+`atomic { update s1 { … } update s2 { … } }` is one transaction whose steps
+are those of its updates, in source order. The order holds across services;
+grouping steps by service must not change it. An atomic block contains only
+updates: the grammar has no nested atomic blocks.
 
 ### Examples
 
-Starting with `service s { var x = 1; }`:
+Starting with `service s { var x = 1; def d = x * 2; }`:
 
 ```meerkat
 update s {
@@ -78,19 +126,9 @@ update s {
 }
 ```
 
-The result is `before == 1`, `x == 2`, and `after == 2`, regardless of the
-stored position of `x`. If `x` is instead replaced by a string, `before`
-still has the old integer type and value. Reads after the replacement see
-the string type and value.
-
-```meerkat
-update s {
-    var x = x + 1;
-}
-```
-
-This reads the old integer `x` and stages its successor. The initializer is
-migration code; it does not create a persistent dependency of `x` on itself.
+`before == 1`, `x == 2` and `after == 2`, wherever `x` is stored. If `x` is
+instead replaced by a string, `before` keeps the old integer type and value,
+and reads after the replacement see the string.
 
 ```meerkat
 update s {
@@ -99,11 +137,23 @@ update s {
 }
 ```
 
-This is valid. Reversing the declarations is invalid if `added` did not
-already exist. If it did exist, the earlier read uses its previous version.
+This is valid. Reversed, it is invalid if `added` did not already exist; if
+it did, `result` reads its previous value.
 
-For the original #265 case, the following update is valid even though the
-stored `is_warm` declaration precedes the newly appended `is_celsius`:
+```meerkat
+update s {
+    var before = d;
+    var x = 2;
+    var after = d;
+}
+```
+
+`before == 2` and `after == 4`. The second read must not reuse the first
+read's cached value. A def the update adds or replaces is read the same way,
+from its new code.
+
+The #265 case is valid, although the stored `is_warm` precedes the appended
+`is_celsius`:
 
 ```meerkat
 service weather_station {
@@ -118,311 +168,226 @@ update weather_station {
 }
 ```
 
-### Reactive reads and code versions
+## Kind changes
 
-All reads within the transaction use the same view: unqualified reads,
-qualified reads, reads inside called functions, and reads handled by a remote
-participant. Staging a member invalidates cached derived values that depend
-on it, transitively. Replacing a definition also invalidates results obtained
-from its previous code.
-
-With existing `var x = 1; def d = x * 2;`:
+A step may change a member's kind, with no extra rules: a var step leaves the
+member a var with the step's value, and a def step leaves it a def with the
+step's code. Migration reads the old member before replacing it:
 
 ```meerkat
-update s {
-    var before = d;
-    var x = 2;
-    var after = d;
-}
+service s { var x = 1; var y = 5; }
+
+// var to def: keep the old value in a new var, and derive x from it
+update s { var x0 = x; def x = x0 + y; }    // x == 6
+
+service t { var y = 5; def d = y * 2; }
+
+// def to var: freeze the current value
+update t { var d = d; }                     // d == 10, and no longer follows y
 ```
 
-The result is `before == 2` and `after == 4`. The second read must not reuse
-the first read's cached value. A newly introduced or replaced def is equally
-available to subsequent steps. An unchanged def uses its existing expression
-with the transaction's current inputs. Reading a function-valued member uses
-the version stored at that step; calling it reads through the same
-transactional view, with its actual captured environment.
+A member's kind is part of its interface: a var can be read and written, a def
+can only be read.
 
-This is the contract of #267. It applies only to this transaction and its
-participants. Independent transactions never observe these staged changes.
+- **def to var** adds writability, so readers are unaffected. The member stops
+  reacting to its old inputs, and deliveries from subscriptions made for the
+  old def are dropped (#264's tests).
+- **var to def** removes writability, like an incompatible type change.
+  Retained code that writes the member fails final validation. That includes
+  actions in defs, action values stored in vars, and clients on other nodes.
+  This requires that writing a def is rejected in the first place, which it
+  is not today (#293).
 
-### Atomicity and failure
+A kind change also changes the member's place in the reactive graph. A var is
+a source, and its Sources are itself. A def's Sources come from its inputs.
+Defs downstream of the member, on this node or others, see different Sources
+after the update. Commit installs the new graph before anything propagates
+over it, and propagation uses the new Sources.
 
-No staged values, declarations, types, or graphs become externally visible
-before commit. An initializer failure or a failed static check aborts the
-update, discards its staged state, and releases its local and participant
-locks. In particular, failure of a new def's initial evaluation must be
-reported before publication, not after installing an unvalued def.
-
-Distributed updates must establish that every participant can commit before
-publishing the update. The protocol and recovery guarantees are work for
-#180; this document does not select a crash-recovery protocol or promise that
-an arbitrary network failure can be handled by unilateral rollback.
+Tables are outside this design.
 
 ## Static validation
 
-There are three distinct validation contexts.
+### Each step
 
-### Service initialization
+Check each step against the bindings at that step:
 
-Keep the existing source-order initialization checks. This proposal does not
-change the existing rules for cross-service startup dependencies. Reuse the
-effects analysis for eager reads, including reads activated by function calls,
-rather than introducing a second syntactic dependency scan.
+- **Availability.** Every member the step's code reads eagerly, directly or
+  through calls, has a value at that step. A member that existed before the
+  update has one from the start, and a new member from its own step. Starting
+  from an empty service, this is today's initialization check.
+- **Types.** Existing members have their current types, and a member replaced
+  by an earlier step has its new type.
+- **Delayed code.** Creating a function or action does not require the
+  members its body reads to have values; delayed code keeps the language's
+  forward references. Calling it during the update does require them, with
+  types compatible at that step.
 
-### Update execution
+A def's availability is checked at its own step, although it is evaluated
+later. A step that reads a def then needs only the def to be available, not
+everything the def reads. This is also why a service declaration cannot have
+a def read a member declared after it.
 
-Check each initializer against the types and versions available at its step.
-Initially, existing members are available. Add a new member or replace its
-binding only after checking its initializer. The check needs more than a set
-of names: a field updated later still has its old type and code before that
-replacement.
+### Final state
 
-Delayed bodies keep the language's support for forward references. Creating
-a closure does not require the members its body will later read to have
-values already. Calling it during the update does require those members to
-be available, with types compatible with that call. Validate delayed code
-that survives the transaction against the final environment as well.
+After the last step, validate the state to be installed:
 
-An atomic update may temporarily leave retained code incompatible with the
-current types, provided it repairs that code before commit and does not
-evaluate the incompatible code in the meantime. The checker must validate
-the code activated by each step, not require the entire service to be a
-valid final program after every step. This rule needs particular review in
-the implementation of higher-order calls and derived reads.
+- Retained defs, and function and action values stored in vars, are well
+  typed against the final bindings and do not write a def.
+- Service interfaces stay compatible with their clients, including clients on
+  other nodes, or the update changes those clients too.
+- Reactive graphs are complete and acyclic, across services, within the
+  analysis limits.
 
-### Final installed state
+Retained vars keep the types of their stored values. Their initializers are
+history: they are not re-run or re-inferred against the final bindings. After
+`var x = 1; var saved = x + 1;`, replacing `x` with a string leaves `saved`
+an integer. Final validation applies no initialization-order check, since
+every member of the final state has a value.
 
-Validate the resulting service interfaces, retained executable code,
-dependent clients, and reactive graphs. Preserve analysis limits and reject
-reactive dependency cycles, including cycles across services. For example,
-`def x = x + 1` remains an invalid final definition even when an old `x` was
-available during its initial evaluation.
+### Temporarily incompatible code
 
-Retained vars keep the types of their stored values. Do not rerun or reinfer
-their historical initializers against the final environment. For example,
-after `var x = 1; var saved = x + 1;`, replacing `x` with a string does not
-change `saved`'s integer value or type. Retained defs do need validation
-against the new interface because they will execute again. Function and
-action values stored in vars also retain executable code and captures whose
-compatibility must be checked; treating an initializer as historical does not
-exempt those stored values from analysis.
+An atomic update may leave retained code incompatible with the current
+bindings for some steps, provided it repairs that code before commit and does
+not run it in between. With `var x = 1; def d = x + 1;`, an update can replace
+`x` with a string and then replace `d`. Reading `d` between those two steps is
+an error. Otherwise the update is valid.
 
-The final declaration list is not a fresh initialization program. In
-particular, checking it must not reapply source-position forward-reference
-constraints to already available members.
+For defs, a step that reads `d` checks `d`'s current code against that step's
+bindings, so nothing more is needed. Function values stored in vars are
+harder, because a value's type does not show which members its body reads.
+Before type and kind changes are implemented, small examples should establish
+whether existing analysis can check stored functions. If it cannot, bring
+concrete accepted and rejected examples back for review. The stricter rule,
+that every intermediate state must be well typed, is under "Alternatives
+considered".
+
+### Top-level statements
+
+Actions, tests and watches in a file run in order with the file's updates.
+Each is checked against the bindings at its position, not the final state: an
+action written before an update cannot read a member that update adds.
+
+## Atomicity and failure
+
+No staged value, binding, type or graph becomes visible outside the
+transaction before commit. A failed check or evaluation, including the final
+evaluation of a declared def, aborts the update, discards its staged state,
+and releases its local and participant locks.
+
+Distributed updates must establish that every participant can commit before
+publishing the update. The protocol and its recovery guarantees are #180's;
+this document does not choose them.
 
 ## Architecture
 
-### Separate execution history from installed state
+### Steps and installed state
 
-Maintain two representations with different responsibilities:
+There are two representations:
 
-- An ordered sequence of update steps, preserving every initializer and its
-  source location. Static update checking and runtime execution consume this
-  sequence in the same order.
-- The resulting service state: current member types, declarations, stored
-  values, and dependency information. AST merging can retain its simple
-  replace-in-place/append policy, but does not determine execution order.
+- **The ordered steps:** every declaration of the update in source order,
+  with its source location. Static checking and runtime execution consume the
+  same sequence.
+- **The installed state:** member bindings, stored values with their types,
+  and dependency graphs. The final declaration list comes from merging the
+  update into the service's declarations. It is not the execution order.
 
-Do not infer a stored var's current type or a closure's captures solely from
-the position and initializer of its final AST declaration. Migration may
-have used an older environment. Preserve the type and effect information
-established when the value was produced, together with the runtime's existing
-analysis of actual function values.
+A stored var's type is the type established when its value was produced, not
+one inferred again from its final declaration.
 
-### Reuse the effects and typing infrastructure
+### Reuse
 
-Provide initialization, update-step, and final-state entry points over the
-same name resolution, inference, and effects machinery. These are different
-validation contexts, not three implementations of expression checking. The
-exact Rust API is an implementation choice.
+The checks above use the existing analyses with a different starting state.
+They need no second expression checker:
 
-Effects analysis currently uses declaration positions both for forward-read
-checks and for closure-capture analysis and memoization. An update-aware
-analysis must represent the available versions and capture context explicitly;
-changing only `forward_reference` is insufficient. Cached analysis of a
-member or function must not survive a relevant code or environment change.
+- Name resolution and type inference stay as they are, over one view that
+  evolves step by step. Installed vars enter it with their stored types.
+- The effects analysis's initialization-order check becomes an availability
+  check. Each member gets the step from which it has a value: its declaration
+  position for a service declaration, 0 for an existing member in an update,
+  and its step for a new one.
+- A var step's value goes in the transaction's ordinary write buffer, the one
+  assignment uses. A def read during the update uses compute-on-read
+  ([task 12](../../tasks/12-compute-on-read.md)).
 
-Do not run ordinary initialization checking on every patched AST prefix.
-Besides unnecessary work, that would recheck historical var initializers and
-reject temporary interface changes that the atomic update repairs.
+### Staged state belongs to the transaction
 
-### Reuse boundaries and simple defaults
+All staged bindings, types, code and values belong to the update's
+transaction or its execution context, never to shared `Manager` state. Once
+execution is suspendable (#213), other actions run while an update waits for
+a lock or a reply, and they must not see its staged state. #213 moves
+`reactive_cache` into each execution's context for the same reason.
 
-Use the following boundaries to keep the implementation small. Introduce
-helpers around existing code as their callers need them; a general compiler
-or transaction framework is not a prerequisite.
+Update initializers are expressions and cannot run actions. An update that
+must wait can therefore discard its staged state and restart from its first
+step, as an originator does under #28's park-and-restart, with nothing to
+replay. Once execution is suspendable, it suspends with its locks held.
 
-| Responsibility | Shared implementation | Context that differs |
-| --- | --- | --- |
-| Enumerate update declarations | One traversal of existing `Stmt`/`Decl` nodes | Consumers collect locks, check steps, evaluate, or merge final declarations |
-| Resolve a member and infer an expression | Existing name resolver, `tt::check` expression routines, and member lookup | Current bindings and the declarations available to delayed code |
-| Determine eager reads and captures | Existing `Effects` visitor and function analysis | Which members exist at the current step and which code/values they hold |
-| Validate reactive dependencies | Existing graph construction and cycle checks | Current executable definitions and stored function values |
-| Evaluate an expression | Existing interpreter and transaction-aware lookup | Committed members plus staged values and code |
-| Buffer writes and manage read history | Existing lock transaction and task 12's read machinery | Code updates can introduce members and replace definitions as well as values |
+### Locks
 
-The declaration traversal can be an iterator or a small collected sequence
-of references. Preserve available source information without introducing a
-new intermediate language. Lock collection may aggregate that sequence, but
-evaluation must retain every step. Reuse the merge helper for the final AST;
-do not recover the execution sequence from its result.
+Lock requirements are the union over all steps, including steps that revisit
+a service. Definition reads are protected as well as value reads, under the
+existing transactional read-lock rules.
 
-Initialization and update checking share the rule "check/evaluate, then make
-available." A newly initializing service begins without initialized local
-members; an update begins with its existing members available. Keep
-declaration visibility distinct from value availability so delayed forward
-references still work. This shared rule does not require rewriting service
-creation as a code-update transaction or changing cross-service startup.
+### Remote participants
 
-One evolving view of current bindings is sufficient for sequential execution.
-Before a step, lookup returns the current binding; after that step succeeds,
-replace it. Final declarations remain available separately for final checks
-and delayed code. An old closure retained as a value keeps its code and
-captures under the existing value representation. Do not introduce arbitrary
-historical-version lookup, persistent AST snapshots for every prefix, or a
-new version identifier on every member merely to express these semantics.
+The contract is the same across nodes. A read answered by another node during
+the update sees the update's staged state for that node's services. A later
+step observes every earlier step, wherever it ran.
 
-Keep static and runtime drivers small and separate: one works with types and
-effect summaries, the other with values and locks. Share traversal and the
-underlying expression operations, rather than forcing both through a generic
-execution engine with unrelated modes. Member-existence checks used for
-capture must agree with the corresponding view, including staged additions.
-
-For static analysis, start with a fresh analysis context for each changed
-view, preserving established var types and stored-function summaries as
-inputs. This trades repeated analysis for simple cache correctness. It does
-not mean invoking whole-program initialization checking on each prefix.
-Introduce incremental caches only when measured cost justifies them.
-
-For runtime state, prefer one authoritative buffer for var writes in the
-existing transaction. Extract the buffer-and-invalidate operation used by
-assignment if needed; do not call the public assignment operation when its
-existing-member checks or publication behavior are inappropriate. Structural
-changes need additional staged code/type metadata, but should not need a
-second competing map of var values. Keep code-update commit responsible for
-installing values and structural changes together.
-
-Begin with conservative invalidation: discard all derived memoized results
-in the affected transaction view after a staged value or code change. Keep
-authoritative var writes, locked base snapshots, and accumulated read history.
-Use a clear distinction between those entries and disposable derived results;
-do not simply clear today's combined `read_cache`. This avoids maintaining a
-second incremental dependency graph solely for transaction caches. If task
-12 already supplies selective invalidation, reuse its interface and allow
-the update path to invalidate more broadly while definitions are changing.
-Participant caches must receive corresponding invalidation information; a
-local cache clear alone cannot establish the distributed contract.
-
-Reuse the same compute-on-read operation for ordinary transactions and code
-updates. New or changed defs still require an initial evaluation at their
-step. Factor the common expression evaluation and result bookkeeping out of
-that operation; do not stage the replacement early merely to make an ordinary
-lookup evaluate it, since its initializer must still see the previous view.
-
-### Transaction state and reads
-
-Provide a transaction-local view of staged values and code alongside the
-locked existing state. Evaluate update initializers through this view, using
-the ordinary member lookup path so qualified reads and function calls behave
-the same as direct reads. Closure creation must consult this view when
-deciding which members exist.
-
-Build on [compute-on-read](../../tasks/12-compute-on-read.md) for derived
-values. Distinguish an authoritative staged var value from a cached def value
-that can be invalidated. Invalidation must account for dependency and code
-changes within the transaction, not only the committed listener graph.
-Conservative invalidation of derived caches is acceptable initially if it
-preserves authoritative writes and read history.
-
-Reads used for an earlier initializer remain part of the transaction's read
-history even if its cached result is invalidated. Commit must preserve the
-existing clock and Sources contracts. A def cached during an early step may
-be stale after later writes: do not publish it as the final derived value.
-Unchanged defs that nobody reads during the update can catch up through
-ordinary propagation after commit.
-
-### Locks and remote participants
-
-Union structural and member lock requirements over the complete ordered
-sequence, including repeated updates to a service. Protect definition reads
-as well as value reads and retain the existing transactional read-lock rules.
-
-Remote owners evaluate their steps as participants in the same transaction.
-An owner must have completed an earlier step before a subsequent step on
-another owner can observe it. Multiple visits to one service retain their
-positions in the global sequence. Participants must serve transactional reads
-from their staged code and values. Sending each owner only its final
-declarations after a local commit cannot implement this contract.
+How a remote owner gets that state is a protocol choice for #180. Owners could
+evaluate their own steps as participants, or the coordinator could evaluate
+every step and send staged writes and code to each owner before any read that
+can observe them. Either way, forwarding final declarations after a local
+commit cannot meet the contract. #180 should be designed with #191 (participant
+failure during commit) alongside #28, and implemented after #213, so that a
+participant running update steps suspends rather than replays. Until then,
+updates of remote services commit locally first and forward afterwards, a
+documented limitation.
 
 ### Startup, imports, and replay
 
-A file containing service declarations and startup updates must initialize
-the original services and then execute the updates exactly once, in order.
-Name resolution must preserve that executable sequence; validating the final
-state does not authorize substituting final declarations into startup.
+A file containing services and updates initializes the original services and
+then executes the updates once each, in order. Validating the final state does
+not license initializing services from their final declarations.
 
-Locally instantiated imports execute their own initialization history. A
-service fetched from an already-running peer supplies current state and code;
-the importer does not replay its initializers or require its folded
-declarations to be a valid source-order initialization program. Keep enough
-type and dependency information to validate that current interface.
+A locally instantiated import executes its own declarations and updates. A
+service fetched from a running peer supplies its current state and code. The
+importer validates that state as installed state, not as a program to
+initialize.
 
-Persisting only the final declaration list is not sufficient for replay.
-A future persistence mechanism needs either a state snapshot with current
-code or the original initialization and ordered update history. This proposal
-does not add persistence.
+Replay needs more than the final declaration list: either a snapshot of state
+with current code, or the original declarations and ordered update history.
+This design adds no persistence.
 
-## Semantic simplifications considered
+## Alternatives considered
 
-The choices below are for review; they do not change the contract above.
-Implementation shortcuts should preserve observable values, failures, and
-transaction boundaries.
-
-| Alternative | What it simplifies | Recommendation |
+| Alternative | What it simplifies | Decision |
 | --- | --- | --- |
-| Require all retained code to remain well typed after every step | Avoids checking whether temporarily incompatible code is activated before repair | Consider if prefix checking proves too complex; it restricts coordinated type migration |
-| Make new and changed defs entirely lazy | Removes their mandatory evaluation at the declaration step | Keep eager initial evaluation: it matches service initialization and reports initializer failures before commit |
-| Forbid type changes in updates | Avoids old/new type environments for replacements | Do not adopt: type migration is an existing goal, and new-member availability still needs update checking |
-| Forbid repeated replacements within one atomic transaction | Removes some execution histories | Little implementation saving once execution uses an ordered sequence; retain successive update blocks |
-| Let every initializer read the pre-update snapshot | Reduces staging requirements | Do not adopt: it prevents an initializer from using a new field introduced earlier in the same update |
-
-The first alternative is the substantial semantic tradeoff. For example,
-with `var x = 1; def d = x + 1;`, an update can first replace `x` with a
-string and then replace `d` with `x`. This design permits that transaction
-if it does not read the old `d` after replacing `x`. Requiring every prefix
-to be well typed would reject that ordering, even though the final state is
-valid. Some migrations can be reordered or use temporary fields; others
-become awkward, particularly across services. Even that stricter rule would
-still need separate validation of stored vars and historical initializers.
-
-Retain the current semantics unless this restriction is explicitly accepted.
-Before building a large analysis for temporarily incompatible code, use small
-type-changing and higher-order examples to establish whether existing
-on-demand inference and effects analysis can check the code actually
-activated at each step. If they cannot, bring that result back for semantic
-review instead of silently rejecting migrations or weakening safety.
+| Reorder declarations, or initialize in topological order | Keeps one initialization check over the final declarations | Rejected: cannot express migration that reads old values (see "Why not reorder") |
+| Require every intermediate state to be well typed | No reasoning about code that is incompatible but not run | Fallback if stored functions cannot otherwise be checked; rejects some coordinated migrations, notably across services |
+| Evaluate each def at its own step | A literal reading of "every declaration is a step" | Not adopted: it adds failures on values nothing observes, and still needs the final evaluation |
+| Forbid type or kind changes | No old and new interfaces within one update | Rejected: both are important kinds of evolution, and they share one validation |
+| Forbid redeclaring a member within one atomic block | Fewer execution histories | Little saving once execution follows the steps; successive update blocks stay allowed |
+| Let every initializer read the state before the update | Less staging | Rejected: an initializer could not use a member added earlier in the update |
 
 ## Boundaries and review questions
 
-The design covers additions and replacements supported by code updates. It
-does not add deletion, renaming, service classes, new update syntax, or table
-migration support. Those features should follow the same state-transition
-model when designed.
+This design covers adding and replacing members, including changes of type and
+kind. It does not add deletion, renaming, service classes, new update syntax,
+or table migration. Those should follow the same step model when designed.
 
 Review should establish that:
 
-- Prefix typing and activated-code checks permit atomic type migration while
-  rejecting reads of temporarily incompatible definitions.
-- Stored function values and delayed bodies retain sound types and captures
-  across replacements, without making final storage order significant.
-- Def evaluation, invalidation, and publication preserve the clock and
-  Sources contracts, including failures before commit.
-- The distributed implementation preserves step order and isolation without
-  claiming completion of #180 before its protocol is implemented and tested.
+- the availability and type checks accept the migrations above and reject
+  reads of unavailable or temporarily incompatible members;
+- stored function values keep sound types and captures across replacements,
+  or the stricter rule is adopted explicitly;
+- a kind change gives downstream defs, local and remote, the right Sources;
+- def evaluation, invalidation and publication preserve the clock and Sources
+  contracts, including failures before commit;
+- the distributed protocol preserves step order and isolation.
 
-Implementation may land in stages. A limited #265 fix does not establish
-#267's read-your-writes contract; local tests alone do not establish the
-distributed contract. Track those limitations explicitly until their stated
-verification evidence passes.
+Implementation may land in stages. A stage that limits def reads during an
+update, or that runs on one node only, records the limitation until the
+verification that lifts it passes.

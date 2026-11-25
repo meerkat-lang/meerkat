@@ -544,18 +544,15 @@ differences or open questions, agreed with the draft's author where noted.
   `var x0 = x; def x = x0 + y;`. The draft's constant stands for the value
   such an expression produces.
 
-  This difference is why the draft can separate installation from
-  initialization and the implementation cannot. In the draft, a code
-  installation writes no values: new versions start uninitialized, and
-  separate value transactions write their constants (Definition 10,
-  Theorem 8). A constant does not depend on any state, so nothing between the
-  two events can change it, and a transaction that reaches an uninitialized
-  version only waits. An expression's value depends on the state it reads, so
-  the implementation evaluates initializers inside the update transaction,
-  against its protected view, and commits code and values together
-  ("Atomicity and failure"). Apart from the reads behind its values (next
-  point), that single event is one execution the draft already allows: an
-  installation followed at once by its initializing writes.
+  The draft abstracts away initializer evaluation by supplying its resulting
+  value. The implementation evaluates initializer expressions against the
+  update's protected view, including earlier steps, and publishes code and
+  values together at one commit ("Atomicity and failure"). Evaluation and
+  installation may be separate internal phases, but no intermediate state is
+  exposed. The draft's separate installation and initialization events
+  (Definition 10, Theorem 8) motivate this correspondence; relating their
+  histories to the combined event, including initializer reads and evaluation
+  failure, remains formalization work. This follow-up does not gate E2.
 - **Initializer read footprint (formalization follow-up).** The draft gives a
   code patch an empty read/write footprint (T-Update, Theorem 8), which its
   commutation argument relies on. With expression initializers the combined

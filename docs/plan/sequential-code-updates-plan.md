@@ -15,7 +15,7 @@ issues and branches before starting a unit.
 | --- | --- |
 | Now, independently | #86 (lexical closure capture), A (startup history: #285 item 1), B (one traversal, union locks), C (#293: no writes to defs), D1 (spike: checking without execution) |
 | After #86 and D1, alongside task 12 | E1 (pure update checking), then E2 (ordered execution and staged vars); F follows E1, G follows installed-state checking |
-| After E1 | D2 (spike: type and kind changes, stored functions, live metadata) |
+| After E1 | D2 (effect-system design and prototype: type and kind changes, stored functions, live metadata) |
 | After C, D2 and E1 | H1 (static type/kind migration checks); no initializer execution required |
 | After task 12 and E2 | I (def steps and def reads during an update: #267 on one node), then H2 (full local type/kind migration execution) |
 | After local migration and the required peer/protocol support | H3 (distributed client validation and Sources evidence) |
@@ -166,11 +166,11 @@ Reject `ActionStmt::Assign` to a def in the type checker. Also reject it in
 `Manager::assign`, since writes arrive from other nodes. This is a
 prerequisite for var-to-def changes (H).
 
-### D. Spikes on throwaway branches
+### D. Analysis and design investigations
 
-D is split so that #265 waits only on the questions E1 needs. In both spikes,
-use existing on-demand inference and the effects analysis, evaluate no
-initializers, and report concrete accepted and rejected examples.
+D is split so that #265 waits only on the questions E1 needs. Both
+investigations start from existing on-demand inference and effects analysis,
+evaluate no initializers, and report concrete accepted and rejected examples.
 
 **D1, before E1: checking without execution.** With source code only (what
 `--check` has), establish whether these can be checked:
@@ -182,7 +182,8 @@ initializers, and report concrete accepted and rejected examples.
 - a whole file of declarations and updates checked without a running
   `Manager`.
 
-**D2, after E1 and before H1: type and kind changes.**
+**D2, after E1 and before H1: effect-system design and prototype.** Cover
+type and kind changes, stored functions, and live metadata:
 
 - a retained def read between a type change and its repair (should be
   rejected);
@@ -553,9 +554,10 @@ flake and stopping servers started by hand.
   the formal semantics" lists where it differs from the draft's
   code-installation model (§5–6), and the open requirement on values from old
   versions. Expression initializers, and therefore installing code and
-  values in one event, are agreed with the draft's author (Nov 25); adding
-  the initializer read footprint to the draft's patches is a formalization
-  follow-up that does not gate E2. Establish old-version safety (#295) before H2 and H3 enable
+  values in one event, are agreed with the draft's author (Nov 25). Relating
+  the draft's separate event histories to the combined event, including
+  initializer reads and evaluation failure, is a formalization follow-up
+  that does not gate E2. Establish old-version safety (#295) before H2 and H3 enable
   type and kind changes that reach consumers, or keep those cases unsupported.
   Ask whether T-Def's exclusion of constant and closure-only defs is intended:
   the implementation keeps both, since actions are declared as defs, so this

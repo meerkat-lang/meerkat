@@ -1074,6 +1074,13 @@ impl Manager {
         // evaluating any declarations, so action closures built during
         // initialization are stamped with the correct `ServiceNetId`
         // instead of `service_net_id_for_name`'s bare-name fallback
+        if self.services.contains_key(&name) {
+            return Err(EvalError::RuntimeError(format!(
+                "service '{}' already exists",
+                self.interner.get(name)
+            )));
+        }
+
         let inserted = !local_service_names(&self.unified_ast).contains(&name);
         if inserted {
             self.unified_ast.push(Stmt::Service {
@@ -1856,14 +1863,31 @@ impl Manager {
             );
             return false;
         };
+
         if let Some(state) = service.vars.get_mut(&def) {
-            let differs =
-                state.value != value || state.vector_clock != clock || state.sources != sources;
+            let value_changed = state.value != value;
+            let differs = value_changed || state.vector_clock != clock || state.sources != sources;
+            if value_changed {
+                log::warn!(
+                    target: "WATCH",
+                    "    def {}.{} changed to {:?}",
+                    self.interner.get(svc),
+                    self.interner.get(def),
+                    value,
+                );
+            }
             state.value = value;
             state.vector_clock = clock;
             state.sources = sources;
             differs
         } else {
+            log::warn!(
+                target: "WATCH",
+                "    def {}.{} changed to {:?}",
+                self.interner.get(svc),
+                self.interner.get(def),
+                value,
+            );
             let mut state = VarState::new(value);
             state.vector_clock = clock;
             state.sources = sources;

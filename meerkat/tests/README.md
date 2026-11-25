@@ -22,6 +22,8 @@ across all participating nodes.
 statement commits in its own transaction. A `for` loop runs all iterations and
 nested `do` actions in that transaction. A failing assertion in the loop
 discards its buffered writes. Earlier top-level statements stay committed.
+Within the loop, reads of a written variable see its buffered value. A local
+`def` that depends on it keeps its cached value until the loop commits.
 
 Each `@test` block and each REPL session keeps its own vector clock. A later
 write carries the versions observed or written by earlier successful statements

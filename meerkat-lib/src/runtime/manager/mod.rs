@@ -18,7 +18,7 @@ use crate::runtime::limits::{
     FIRST_VALUE_TIMEOUT, KEEPALIVE_INTERVAL, MAX_PENDING_UPDATES_PER_PEER, REPLY_TIMEOUT,
 };
 use crate::runtime::txn::{
-    ComposedCall, ReadEntry, Sources, Transaction, TxnId, VClock, VarState, WaitKey,
+    BufferedWrite, ComposedCall, ReadEntry, Sources, Transaction, TxnId, VClock, VarState, WaitKey,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(not(target_arch = "wasm32"))]
@@ -432,23 +432,17 @@ fn caught_up(target: &VClock, clock: &VClock, sources: Option<&Sources>) -> bool
     })
 }
 
-/// §5.2's `V_new`: the joined history `v_base` advanced once in each written var
-fn advance(mut v_base: VClock, write_set: &HashSet<(Symbol, Symbol)>) -> VClock {
-    for &var in write_set {
-        let counter = v_base.entry(var).or_insert(0);
-        // Wire counters are bounded far below the maximum (`MAX_NET_CLOCK_COUNTER`)
-        *counter = counter.checked_add(1).expect("a clock counter overflowed");
-    }
-    v_base
-}
-
-/// Admit the complete stamp before installing any of the values it describes.
-/// Valid input clocks need not have a wire-representable join or successor.
+/// §5.2's simultaneous bump. Admit the complete stamp before installing
+/// any of its values, even when a caller supplies an out-of-range clock.
 fn commit_clock(
-    v_base: VClock,
+    mut clock: VClock,
     write_set: &HashSet<(Symbol, Symbol)>,
 ) -> Result<VClock, EvalError> {
-    let clock = advance(v_base, write_set);
+    for &var in write_set {
+        let counter = clock.entry(var).or_default();
+        // A saturated counter exceeds the wire limit and is rejected below.
+        *counter = counter.saturating_add(1);
+    }
     codec::validate_clock_bounds(clock.len(), clock.values().copied())
         .map_err(|e| EvalError::RuntimeError(e.to_string()))?;
     Ok(clock)
@@ -738,7 +732,10 @@ impl Manager {
         let writes: HashMap<_, _> = txn
             .written
             .iter()
-            .filter_map(|((sid, var), value)| {
+            .filter_map(|((sid, var), write)| {
+                let BufferedWrite::Set(value) = write else {
+                    return None;
+                };
                 Some(((self.service_name_for_net_id(sid)?, *var), value))
             })
             .filter(|&(member, value)| self.code_changes(member, value))
@@ -1076,6 +1073,10 @@ impl Manager {
         })?;
         let id = self.compute_service_net_id(name);
         let mut txn = Transaction::new(TxnId::new(self.node_id));
+        if self.services.contains_key(&name) {
+            // Replacing the service also replaces its members and their locks.
+            self.acquire_service_lock(name, &txn.id)?;
+        }
         txn.service_locked.insert(id.clone());
         // Register the service (with its real `ServiceNetId`) before
         // evaluating any declarations, so action closures built during
@@ -1144,6 +1145,7 @@ impl Manager {
                         env.push((name, value.clone()));
                         if let Some(service) = self.services.get_mut(&svc_name) {
                             let mut table_value = VarState::new(value);
+                            table_value.sources = Some(Sources::from([(svc_name, name)]));
                             table_value.latest_write_txn = Some(txn.id.clone());
                             service.vars.insert(name, table_value);
                         }
@@ -1248,7 +1250,7 @@ impl Manager {
 
             // Commit only after every initializer succeeds; participant failures
             // take the same rollback path as failed initialization
-            self.commit_txn(&txn, None).await
+            self.commit_txn(&mut txn, None).await
         }
         .await;
         if result.is_ok() {
@@ -1404,6 +1406,10 @@ impl Manager {
         // in different services never collides.
         let key = (self.service_net_id_for_name(service_name), var_name);
         if let Some(t) = txn.as_deref_mut() {
+            if let Some(write) = t.written.get(&key) {
+                let committed = &self.services[&service_name].vars[&var_name].value;
+                return Ok(write.read(committed));
+            }
             if let Some(cached) = t.read_cache.get(&key) {
                 return Ok(cached.0.clone());
             }
@@ -1448,8 +1454,11 @@ impl Manager {
             .await?;
         let (clock, sources) = match txn {
             Some(txn) => {
-                let entry =
-                    &txn.read_cache[&(self.service_net_id_for_name(service_name), var_name)];
+                let key = (self.service_net_id_for_name(service_name), var_name);
+                if txn.written.contains_key(&key) {
+                    return Ok((value, None, None));
+                }
+                let entry = &txn.read_cache[&key];
                 (entry.1.clone(), entry.2.clone())
             }
             None => {
@@ -1486,7 +1495,7 @@ impl Manager {
 
     /// Stage an assignment until commit. Later reads in this transaction
     /// see the buffered value, which has no commit stamp yet.
-    pub fn assign(
+    pub(crate) fn assign(
         &mut self,
         service_name: Symbol,
         var_name: Symbol,
@@ -1494,8 +1503,7 @@ impl Manager {
         txn: &mut Transaction,
     ) -> Result<(), EvalError> {
         let key = self.lock_action_target(service_name, var_name, txn)?;
-        txn.written.insert(key.clone(), value.clone());
-        txn.read_cache.insert(key, (value, None, None));
+        txn.written.insert(key, BufferedWrite::Set(value));
         Ok(())
     }
 
@@ -1551,8 +1559,8 @@ impl Manager {
         (v_base, write_set)
     }
 
-    /// Append to the buffered table. After the first insert, both the
-    /// staged value and its read-your-writes cache can grow in place.
+    /// Buffer only new rows. A table replaced earlier in the transaction
+    /// already has a complete staged value, so extend that value instead.
     pub(crate) fn append_table_row(
         &mut self,
         service_name: Symbol,
@@ -1560,26 +1568,29 @@ impl Manager {
         row: Value,
         txn: &mut Transaction,
     ) -> Result<(), EvalError> {
+        use std::collections::hash_map::Entry;
+
         let key = self.lock_action_target(service_name, table_name, txn)?;
-        let table = txn.written.entry(key.clone()).or_insert_with(|| {
-            txn.read_cache
-                .get(&key)
-                .map(|(value, _, _)| value)
-                .unwrap_or_else(|| &self.services[&service_name].vars[&table_name].value)
-                .clone()
-        });
-        let Value::List { vals } = table else {
-            return Err(EvalError::TypeError(
-                "insert target is not a table".to_string(),
-            ));
-        };
-        vals.push(row.clone());
-        if let Some((Value::List { vals }, _, _)) = txn.read_cache.get_mut(&key) {
-            vals.push(row);
-        } else {
-            txn.read_cache.insert(key, (table.clone(), None, None));
+        match txn.written.entry(key) {
+            Entry::Occupied(mut entry) => {
+                if let BufferedWrite::Set(Value::List { vals }) | BufferedWrite::Append(vals) =
+                    entry.get_mut()
+                {
+                    vals.push(row);
+                    return Ok(());
+                }
+            }
+            Entry::Vacant(entry) => {
+                if matches!(
+                    self.services[&service_name].vars[&table_name].value,
+                    Value::List { .. }
+                ) {
+                    entry.insert(BufferedWrite::Append(vec![row]));
+                    return Ok(());
+                }
+            }
         }
-        Ok(())
+        Err(EvalError::TypeError("insert target is not a table".into()))
     }
 
     pub(crate) async fn propagate(&mut self, service_name: Symbol, changed_var: Symbol) {
@@ -3882,7 +3893,7 @@ impl Manager {
                 Ok(effect) => {
                     // A participant may refuse Commit after local writes were
                     // installed (#191). Report the error without retrying them.
-                    let committed = self.commit_txn(&txn, session_clock).await;
+                    let committed = self.commit_txn(&mut txn, session_clock).await;
                     self.release_all_locks(&txn);
                     return committed.map(|()| effect);
                 }
@@ -3946,7 +3957,7 @@ impl Manager {
     /// `V_new` of §5.2, computed from what the participants reported
     async fn commit_txn(
         &mut self,
-        txn: &Transaction,
+        txn: &mut Transaction,
         session_clock: Option<&mut VClock>,
     ) -> Result<(), EvalError> {
         let (mut clock, write_set) = self.transaction_history(txn);
@@ -3981,21 +3992,21 @@ impl Manager {
 
     /// Store `txn`'s writes on this node with `clock`, the transaction's
     /// `V_new`, commit its participants with the same clock, then propagate
-    async fn commit_stamped(&mut self, txn: &Transaction, clock: &VClock) -> Option<EvalError> {
-        for ((sid, var), value) in &txn.written {
-            if let Some(service) = self.service_by_net_id_mut(sid) {
-                if let Some(var_state) = service.vars.get_mut(var) {
-                    var_state.value = value.clone();
-                    var_state.latest_write_txn = Some(txn.id.clone());
-                    var_state.vector_clock = clock.clone();
+    async fn commit_stamped(&mut self, txn: &mut Transaction, clock: &VClock) -> Option<EvalError> {
+        let mut changed = Vec::with_capacity(txn.written.len());
+        for ((sid, var), write) in txn.written.drain() {
+            if let Some(service) = self.service_by_net_id_mut(&sid) {
+                if let Some(state) = service.vars.get_mut(&var) {
+                    write.apply(&mut state.value);
+                    state.latest_write_txn = Some(txn.id.clone());
+                    state.vector_clock = clock.clone();
+                    changed.push((service.name, var));
                 }
             }
         }
         let error = self.commit_participants(txn, clock).await;
-        for (sid, var) in txn.written.keys() {
-            if let Some(name) = self.service_name_for_net_id(sid) {
-                self.propagate(name, *var).await;
-            }
+        for (service, var) in changed {
+            self.propagate(service, var).await;
         }
         error
     }
@@ -4096,10 +4107,10 @@ impl Manager {
         tid: &TxnId,
         clock: &VClock,
     ) -> Result<(), EvalError> {
-        let Some(txn) = self.pending_txns.remove(tid) else {
+        let Some(mut txn) = self.pending_txns.remove(tid) else {
             return Ok(());
         };
-        let forward_error = self.commit_stamped(&txn, clock).await;
+        let forward_error = self.commit_stamped(&mut txn, clock).await;
         // Held until here, like the originator holds its own. Today the
         // event loop is blocked for the whole of this call, so an earlier
         // release would be harmless. That stops being true under #28's
@@ -4557,6 +4568,8 @@ impl Manager {
 
     /// Commit one top-level client statement, retaining its history and any
     /// binding for the next statement. Return an expression's value for display.
+    /// Start each session with an empty environment and clock and carry that
+    /// pair across its statements.
     pub async fn execute_statement(
         &mut self,
         service_name: Symbol,
@@ -7751,7 +7764,7 @@ mod tests {
             .expect("with `a` free the action completes");
         assert_eq!(
             tc.manager.pending_txns[&older].written[&(sid, tc.x)],
-            Value::Int { val: 1 },
+            BufferedWrite::Set(Value::Int { val: 1 }),
             "2 means the re-run read the value the parked attempt buffered"
         );
     }
@@ -7786,8 +7799,14 @@ mod tests {
             .unwrap();
 
         let written = &tc.manager.pending_txns[&tid].written;
-        assert_eq!(written[&(sid.clone(), a)], Value::Int { val: 7 });
-        assert_eq!(written[&(sid, tc.x)], Value::Int { val: 1 });
+        assert_eq!(
+            written[&(sid.clone(), a)],
+            BufferedWrite::Set(Value::Int { val: 7 })
+        );
+        assert_eq!(
+            written[&(sid, tc.x)],
+            BufferedWrite::Set(Value::Int { val: 1 })
+        );
     }
 
     async fn start_local_manager(code: &str) -> Manager {

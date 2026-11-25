@@ -147,12 +147,13 @@ impl Setup {
         let rc = self.child.interner.insert("rc");
         let cv = self.child.interner.insert("cv");
         let sid = self.child.service_net_id_for_name(rc);
+        let committed = &self.child.services[&rc].vars[&cv].value;
         let buffered = self
             .child
             .pending_txns
             .get(tid)
-            .and_then(|t| t.written.get(&(sid, cv)).cloned());
-        let value = buffered.unwrap_or_else(|| self.child.services[&rc].vars[&cv].value.clone());
+            .and_then(|t| t.written.get(&(sid, cv)));
+        let value = buffered.map_or_else(|| committed.clone(), |write| write.read(committed));
         match value {
             Value::Int { val } => val,
             other => panic!("rc.cv should be an Int, got {:?}", other),

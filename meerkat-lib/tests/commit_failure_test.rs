@@ -19,7 +19,7 @@ use meerkat_lib::net::{
 use meerkat_lib::runtime::ast::{ActionStmt, Expr, Stmt, Value};
 use meerkat_lib::runtime::manager::ParkedRequest;
 use meerkat_lib::runtime::parser::parse_string;
-use meerkat_lib::runtime::txn::{Transaction, TxnId, VClock, VarLock, WaitKey};
+use meerkat_lib::runtime::txn::{BufferedWrite, Transaction, TxnId, VClock, VarLock, WaitKey};
 use meerkat_lib::runtime::{Interner, Manager, Node, Symbol};
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -249,7 +249,8 @@ fn hold_participant_txn(
         .lock = VarLock::WriteLocked(tid.clone());
     let mut txn = Transaction::new(tid.clone());
     txn.locked.insert(key.clone());
-    txn.written.insert(key.clone(), Value::Int { val: 1 });
+    txn.written
+        .insert(key.clone(), BufferedWrite::Set(Value::Int { val: 1 }));
     txn.participants
         .extend(participants.iter().map(|a| (*a).clone()));
     m.pending_txns.insert(tid.clone(), txn);

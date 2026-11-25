@@ -261,6 +261,43 @@ impl VarState {
     }
 }
 
+/// A transaction can replace a value, or append rows to the table it locked.
+/// The latter keeps the committed rows in place until commit.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BufferedWrite {
+    Set(Value),
+    Append(Vec<Value>),
+}
+
+impl BufferedWrite {
+    /// The value a reader in this transaction observes.
+    pub fn read(&self, committed: &Value) -> Value {
+        match self {
+            Self::Set(value) => value.clone(),
+            Self::Append(rows) => {
+                let Value::List { vals } = committed else {
+                    unreachable!("appended rows require a locked table");
+                };
+                Value::List {
+                    vals: vals.iter().chain(rows).cloned().collect(),
+                }
+            }
+        }
+    }
+
+    pub(crate) fn apply(self, committed: &mut Value) {
+        match self {
+            Self::Set(value) => *committed = value,
+            Self::Append(rows) => {
+                let Value::List { vals } = committed else {
+                    unreachable!("appended rows require a locked table");
+                };
+                vals.extend(rows);
+            }
+        }
+    }
+}
+
 /// Per-transaction state represented by `Transaction`
 ///
 /// Owned by the code executing a transaction and passed around
@@ -282,7 +319,7 @@ pub struct Transaction {
     /// Values written by this transaction, keyed by (service, variable),
     /// buffered and applied only on successful commit (so a failed
     /// transaction leaves no partial writes)
-    pub written: HashMap<(ServiceNetId, Symbol), Value>,
+    pub written: HashMap<(ServiceNetId, Symbol), BufferedWrite>,
     /// Remote nodes that joined this transaction (executed a composed action
     /// under this `id` and are holding locks or buffered writes until commit or abort)
     pub participants: HashSet<Address>,

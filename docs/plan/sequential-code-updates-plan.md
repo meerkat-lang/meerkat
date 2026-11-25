@@ -13,7 +13,7 @@ issues and branches before starting a unit.
 
 | When | Units |
 | --- | --- |
-| Now, independently | #86 (lexical closure capture), A (startup history), B (one traversal, union locks), C (#293: no writes to defs), D1 (spike: checking without execution) |
+| Now, independently | #86 (lexical closure capture), A (startup history: #285 item 1), B (one traversal, union locks), C (#293: no writes to defs), D1 (spike: checking without execution) |
 | After #86 and D1, alongside task 12 | E1 (pure update checking), then E2 (ordered execution and staged vars); F follows E1, G follows installed-state checking |
 | After E1 | D2 (spike: type and kind changes, stored functions, live metadata) |
 | After C, D2 and E1 | H1 (static type/kind migration checks); no initializer execution required |
@@ -80,7 +80,7 @@ through the CLI; the rest are from reading the code.
 
 | Area | Current behavior | Unit |
 | --- | --- | --- |
-| `node.rs` `with_resolved_services_and_tests` | Substitutes each service's final, updated declarations into the startup program, so startup initializes the final declarations and then runs the updates again. `update s { var y = x; var x = 2; }` after `var x = 1` gives `y == 2`, not 1 (ran) | A |
+| `node.rs` `with_resolved_services_and_tests` | Substitutes each service's final, updated declarations into the startup program, so startup initializes the final declarations and then runs the updates again. `update s { var y = x; var x = 2; }` after `var x = 1` gives `y == 2`, not 1 (ran). Imported services are instantiated from unresolved declarations when the root file has updates (#285 item 1) | A |
 | `update.rs:167` | `lock_groups.insert` per update statement: a second update of the same service in one atomic block overwrites the first one's locks | B |
 | Grammar (`meerkat.lalrpop:98`) | `atomic` contains only `update` statements; nesting is impossible. `manager::run_update` flattens the one level | B |
 | `update.rs` traversals | Lock collection, evaluation, `unvalued_defs` and `declared` each walk `Stmt::Update`/`Stmt::Service` separately | B |
@@ -132,11 +132,25 @@ that relied on the old filter.
 
 ### A. Preserve the startup history
 
-Resolve names in the original service statements in place, instead of
-substituting the final declarations. Test with a program whose result detects
-early installation: `service s { var x = 1; }` then
-`update s { var y = x; var x = 2; }` passes static checks on main, and must
-give `y == 1`. Initializing the final declarations first gives `y == 2`.
+This is #285's item 1, a regression from #216, and is related to #280 (the
+runtime should execute the AST the static checks produced). Fix both cases
+#285 describes:
+
+- **Root services.** Resolve names in the original service statements in
+  place, instead of substituting the final declarations. Test with a program
+  whose result detects early installation: `service s { var x = 1; }` then
+  `update s { var y = x; var x = 2; }` passes static checks on main, and must
+  give `y == 1`. Initializing the final declarations first gives `y == 2`.
+- **Imported services.** When the root file has updates, `static_checks`
+  resolves separate copies and rebuilds only the root program, so imported
+  services are instantiated from unresolved declarations. #285's example (an
+  imported `helper` whose action reads a record member) fails with "Service
+  'r' not found" only because the root file has an unrelated update. Imported
+  services must also run their resolved declarations, before any update.
+
+Cover root and imported services, with sequential updates and an `atomic`
+block, and apply each update at its original position. Close #285's item 1
+with this unit, and check whether #280 can close with it or needs more.
 
 ### B. One traversal, union locks
 

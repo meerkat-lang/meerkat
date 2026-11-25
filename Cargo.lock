@@ -2372,7 +2372,7 @@ dependencies = [
  "async-recursion",
  "enum-as-inner",
  "futures",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "gloo-timers 0.3.0",
  "inline_colorization",
  "kameo",

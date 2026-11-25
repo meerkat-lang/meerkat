@@ -1,6 +1,6 @@
 # Sequential code updates
 
-Status: proposed design for pre-implementation review, revised 2026-11-24.
+Status: proposed design for pre-implementation review, revised 2026-11-25.
 This describes intended behavior, not a claim that the runtime implements it.
 
 Related work: [#265](https://github.com/meerkat-lang/meerkat/issues/265),
@@ -10,7 +10,7 @@ Related work: [#265](https://github.com/meerkat-lang/meerkat/issues/265),
 [#293](https://github.com/meerkat-lang/meerkat/issues/293), and
 [#213](https://github.com/meerkat-lang/meerkat/issues/213).
 The broader [code-update design](code-updates.md) covers syntax, migration,
-and coordination. The [draft semantics](../meerkat-semantics.pdf) gives the
+and coordination. The draft semantics reviewed on 2026-11-24 gives the
 static effect of a code update (§3.3.3) and sequential composition (§3.3.4),
 and leaves the update's effect on the store unspecified; this document
 describes that effect. Implementation order belongs in the issues and
@@ -23,10 +23,12 @@ executed in source order against the service's existing state and the steps
 before it. A var step evaluates its initializer and stores the value. A def
 step installs new code. The update commits all its steps together, or none.
 
-A service declaration is the same thing applied to an empty service: each
-declaration is a step, so a member can eagerly read only members declared
-before it. Today's initialization rule is the special case of the update rule
-that starts from no members.
+Service initialization shares the availability principle, starting with no
+initialized local members: an eager read must refer to a member already
+available. This work retains today's eager evaluation of service declarations
+and existing cross-service startup rules. Def evaluation during an update,
+described below, is a separate choice. Making service initialization lazy too
+would require a separate compatibility review, including closure captures.
 
 The order in which the resulting declarations are stored has no meaning. The
 implementation keeps a replaced declaration in its place and appends new ones.
@@ -70,8 +72,8 @@ it.
 ### A var step: `var x = e`
 
 1. Check `e` against the current bindings. Each member `e` reads eagerly,
-   directly or through functions it calls, must have a value in the view, and
-   has the type its current binding gives it.
+   directly or through functions and defs it reads, must be available in the
+   view and has the type its current binding gives it.
 2. Evaluate `e` in the current view.
 3. Bind `x` as a var with `e`'s type, and store the value.
 
@@ -81,19 +83,25 @@ and creates no dependency of `x` on itself. If `x` is new, `e` cannot read it.
 ### A def step: `def d = e`
 
 1. Check `e` against the current bindings, as for a var step. `e` must not
-   read `d`, directly or through other defs. That is a cycle, whatever `d` was
-   before.
+   eagerly read `d`, directly or through other defs. That is a cycle,
+   whatever `d` was before.
 2. Bind `d` as a def with `e`'s type, install `e` as its code, and discard
    cached derived values that depend on `d`.
 
 A def step does not evaluate `d`. A later step that reads `d` computes it from
-the current view, as compute-on-read does in an ordinary transaction. Since
-`e` cannot read `d`, installing the code first gives the same values as
-evaluating `e` at the step.
+the current view, as compute-on-read does in an ordinary transaction. This
+is a semantic choice, not an equivalent way to evaluate `e` at its declaration:
+inputs, failures, and the members visible during closure creation can differ
+by the time it is evaluated. For example, with `x == 1`, the steps
+`def d = x; var x = 2; var result = d;` give `result == 2`.
 
-Before commit, each def the update declares is evaluated against the final
-view, and the update aborts if one fails. This catches a failure that only the
-final inputs cause: `def r = 10 / x;` followed by `var x = 0;`. A def that
+Before commit, evaluate every member whose surviving binding is a def
+introduced or replaced by this transaction against the final view. A cached
+result may be reused only if it is valid for that view. Do not evaluate
+overwritten def expressions or members subsequently converted to vars.
+The update aborts if a required evaluation fails, including failure to obtain
+its inputs. This catches a failure that only the final inputs cause:
+`def r = 10 / x;` followed by `var x = 0;`. A def that
 would fail only at an intermediate step, where nothing reads it, does not fail
 the update, because that value is never observed. An unchanged def that
 nothing reads during the update catches up after commit through ordinary
@@ -104,8 +112,10 @@ propagation, as after any transaction.
 Within one update block a member may be declared once, as in a service
 declaration. Successive update blocks in one `atomic` block may declare it
 again. Each of those steps executes, even if a later one replaces its result:
-an earlier initializer can supply a value to another step, or fail. Only the
-last binding and value survive commit.
+an earlier var initializer can supply a value to another step, or fail. An
+earlier def installs code and is evaluated if read before replacement; it is
+not forced merely because it once appeared in the transaction. Only the last
+binding and value survive commit.
 
 ### Atomic blocks
 
@@ -128,7 +138,9 @@ update s {
 
 `before == 1`, `x == 2` and `after == 2`, wherever `x` is stored. If `x` is
 instead replaced by a string, `before` keeps the old integer type and value,
-and reads after the replacement see the string.
+and reads after the replacement see the string. That version of the example
+must also replace `d = x * 2` with code valid for a string `x`, such as
+`def d = x`, before commit.
 
 ```meerkat
 update s {
@@ -170,9 +182,9 @@ update weather_station {
 
 ## Kind changes
 
-A step may change a member's kind, with no extra rules: a var step leaves the
-member a var with the step's value, and a def step leaves it a def with the
-step's code. Migration reads the old member before replacing it:
+A step may change a member's kind subject to interface validation: a var step
+leaves the member a var with the step's value, and a def step leaves it a def
+with the step's code. Migration reads the old member before replacing it:
 
 ```meerkat
 service s { var x = 1; var y = 5; }
@@ -189,9 +201,9 @@ update t { var d = d; }                     // d == 10, and no longer follows y
 A member's kind is part of its interface: a var can be read and written, a def
 can only be read.
 
-- **def to var** adds writability, so readers are unaffected. The member stops
-  reacting to its old inputs, and deliveries from subscriptions made for the
-  old def are dropped (#264's tests).
+- **def to var** adds writability; readers remain type-compatible if its value
+  type is preserved. The member stops reacting to its old inputs, and
+  deliveries from subscriptions made for the old def are dropped (#264's tests).
 - **var to def** removes writability, like an incompatible type change.
   Retained code that writes the member fails final validation. That includes
   actions in defs, action values stored in vars, and clients on other nodes.
@@ -208,14 +220,64 @@ Tables are outside this design.
 
 ## Static validation
 
+### Checking without execution
+
+An update can be statically checked against a supplied service environment
+without executing initializers or modifying running services. Checking
+validates names, types, member kinds, availability, and reactive dependencies.
+Success establishes static validity against that environment; it does not
+establish successful evaluation or commit. Execution uses the same static
+checker before evaluating the update.
+
+The checker maintains a static view containing bindings, availability, and
+the code and conservative effect information needed to analyze possible
+function values. It checks each declaration, then advances the view without
+computing its value. "Available after this step" means available if execution
+reaches the next step successfully. A def is available for transactional
+evaluation; it need not have a cached value already. Def and function bodies
+are analyzed, not executed, including at the final-state check.
+
+For example:
+
+```meerkat
+update s {
+    var x = 1 / 0;
+    var y = x + true;
+}
+```
+
+Checking reports the type error in `y` without evaluating `x`. With only the
+first declaration, checking succeeds and execution fails with division by
+zero. Final pre-commit def evaluation is also execution, not static checking.
+Both branches of an expression must be checked as required by ordinary
+typing and effects rules; the checker must not execute a condition to select
+which code to validate.
+
+Checking from source uses inferred interfaces and conservative code/effect
+summaries. Checking against running services uses a consistent description of
+their installed interfaces and relevant code, including information needed
+for stored functions. If that information is insufficient, report the missing
+information or analysis limitation; do not run an initializer to obtain it.
+Execution must revalidate under transaction protection if the environment
+could have changed since an earlier check. A checked update is not an
+unconditional authorization to commit against a different environment.
+
+The first command-line interface is the existing `--check` mode for files
+containing declarations and updates. A separate update can later be checked
+against a supplied base program or a running-service description using the
+same checker. Temporary execution-support restrictions are separate from
+typing errors: a statically valid update may require runtime work that has
+not landed yet, which execution must report explicitly.
+
 ### Each step
 
 Check each step against the bindings at that step:
 
 - **Availability.** Every member the step's code reads eagerly, directly or
-  through calls, has a value at that step. A member that existed before the
-  update has one from the start, and a new member from its own step. Starting
-  from an empty service, this is today's initialization check.
+  through calls and derived reads, is available in the current view. Existing
+  members are available from the start. A new member becomes available after
+  its own step; checking a var initializer uses the preceding view, so it can
+  read an old binding of itself but not its new value.
 - **Types.** Existing members have their current types, and a member replaced
   by an earlier step has its new type.
 - **Delayed code.** Creating a function or action does not require the
@@ -223,10 +285,30 @@ Check each step against the bindings at that step:
   forward references. Calling it during the update does require them, with
   types compatible at that step.
 
-A def's availability is checked at its own step, although it is evaluated
-later. A step that reads a def then needs only the def to be available, not
-everything the def reads. This is also why a service declaration cannot have
-a def read a member declared after it.
+A def's eager dependencies are checked at its own step, although it is
+evaluated later. Reading it at a later step must also check the code that
+read can activate against the current bindings. Its earlier check is not a
+permanent guarantee: replacing a function it calls can introduce a dependency
+that was absent before. For example:
+
+```meerkat
+service s {
+    var f = fn () => 1;
+    def d = f();
+}
+
+update s {
+    var f = fn () => later;
+    var result = d;
+    var later = 2;
+}
+```
+
+Creating `f` permits the delayed reference, but reading `d` calls the new
+`f` before `later` is available. Reject that read even though `d` existed
+before the update and the final graph is valid. Reuse the effects analysis
+to check activated code; do not assume its current handling of cached def
+reads establishes this property for compute-on-read.
 
 ### Final state
 
@@ -242,8 +324,9 @@ After the last step, validate the state to be installed:
 Retained vars keep the types of their stored values. Their initializers are
 history: they are not re-run or re-inferred against the final bindings. After
 `var x = 1; var saved = x + 1;`, replacing `x` with a string leaves `saved`
-an integer. Final validation applies no initialization-order check, since
-every member of the final state has a value.
+an integer. Final validation applies no declaration-position initialization
+check: availability follows from the checked step sequence. Establishing
+actual values, including the required final def evaluations, is runtime work.
 
 ### Temporarily incompatible code
 
@@ -254,8 +337,9 @@ not run it in between. With `var x = 1; def d = x + 1;`, an update can replace
 an error. Otherwise the update is valid.
 
 For defs, a step that reads `d` checks `d`'s current code against that step's
-bindings, so nothing more is needed. Function values stored in vars are
-harder, because a value's type does not show which members its body reads.
+bindings, including the code activated through its dependencies. Function
+values stored in vars are harder, because a value's type does not show which
+members its body reads.
 Before type and kind changes are implemented, small examples should establish
 whether existing analysis can check stored functions. If it cannot, bring
 concrete accepted and rejected examples back for review. The stricter rule,
@@ -264,15 +348,19 @@ considered".
 
 ### Top-level statements
 
-Actions, tests and watches in a file run in order with the file's updates.
-Each is checked against the bindings at its position, not the final state: an
-action written before an update cannot read a member that update adds.
+Check actions, tests and watches against the bindings at their position in
+the file, not the final state: an action written before an update cannot read
+a member that update adds.
+Their runtime ordering must agree wherever those statements are executed.
+This rule does not add execution of statement forms currently skipped by a
+CLI mode. A watch that remains active is also a retained client when later
+updates are validated.
 
 ## Atomicity and failure
 
 No staged value, binding, type or graph becomes visible outside the
-transaction before commit. A failed check or evaluation, including the final
-evaluation of a declared def, aborts the update, discards its staged state,
+transaction before commit. A failed check or evaluation, including a required
+final def evaluation, aborts the update, discards its staged state,
 and releases its local and participant locks.
 
 Distributed updates must establish that every participant can commit before
@@ -300,12 +388,16 @@ one inferred again from its final declaration.
 The checks above use the existing analyses with a different starting state.
 They need no second expression checker:
 
-- Name resolution and type inference stay as they are, over one view that
-  evolves step by step. Installed vars enter it with their stored types.
+- Name resolution, expression inference, and effects analysis are shared by
+  check-only and execution paths, over a static view that evolves step by
+  step. Installed vars enter it with their established types. The checker
+  does not require an evaluator or an executing `Manager`.
 - The effects analysis's initialization-order check becomes an availability
-  check. Each member gets the step from which it has a value: its declaration
-  position for a service declaration, 0 for an existing member in an update,
-  and its step for a new one.
+  check. Each member records when it becomes available: its declaration step
+  during service initialization, before the first step for existing members
+  in an update, and after its step for a new one. This information also informs
+  capture analysis. Derived reads require analysis in the current bindings,
+  not just an availability lookup for the named def.
 - A var step's value goes in the transaction's ordinary write buffer, the one
   assignment uses. A def read during the update uses compute-on-read
   ([task 12](../../tasks/12-compute-on-read.md)).
@@ -313,15 +405,23 @@ They need no second expression checker:
 ### Staged state belongs to the transaction
 
 All staged bindings, types, code and values belong to the update's
-transaction or its execution context, never to shared `Manager` state. Once
-execution is suspendable (#213), other actions run while an update waits for
-a lock or a reply, and they must not see its staged state. #213 moves
+transaction or its execution context. A `Manager` may own contexts indexed
+by transaction ID; it must not expose one transaction's staged view as ambient
+state used by other executions. Once execution is suspendable (#213), other
+actions run while an update waits for a lock or a reply, and they must not
+see its staged state. #213 moves
 `reactive_cache` into each execution's context for the same reason.
 
-Update initializers are expressions and cannot run actions. An update that
-must wait can therefore discard its staged state and restart from its first
-step, as an originator does under #28's park-and-restart, with nothing to
-replay. Once execution is suspendable, it suspends with its locks held.
+Update initializers are expressions and cannot run actions, but their reads
+can acquire remote locks and create participant state. Restarting before the
+commit decision requires discarding the entire attempt's staged state,
+aborting and cleaning up its participants, and following the transaction's
+lock-release and retry rules. If remote steps have staged writes or code,
+those buffers must be discarded too. Purity alone does not make replay over
+retained participant state safe. Under suspendable execution, a waiting
+update can instead retain its transaction and locks and resume the same
+attempt. A commit decision must be completed under the commit protocol, not
+treated as a restartable evaluation failure.
 
 ### Locks
 
@@ -339,11 +439,10 @@ How a remote owner gets that state is a protocol choice for #180. Owners could
 evaluate their own steps as participants, or the coordinator could evaluate
 every step and send staged writes and code to each owner before any read that
 can observe them. Either way, forwarding final declarations after a local
-commit cannot meet the contract. #180 should be designed with #191 (participant
-failure during commit) alongside #28, and implemented after #213, so that a
-participant running update steps suspends rather than replays. Until then,
-updates of remote services commit locally first and forward afterwards, a
-documented limitation.
+commit cannot meet the contract. Participant failure during commit (#191)
+must be covered by that protocol. Current updates of remote services commit
+locally first and forward afterwards; this is an implementation limitation,
+not the distributed semantics specified here.
 
 ### Startup, imports, and replay
 
@@ -379,6 +478,8 @@ or table migration. Those should follow the same step model when designed.
 
 Review should establish that:
 
+- checking uses static information alone, reports typing errors without
+  running initializers, and leaves runtime state unchanged;
 - the availability and type checks accept the migrations above and reject
   reads of unavailable or temporarily incompatible members;
 - stored function values keep sound types and captures across replacements,

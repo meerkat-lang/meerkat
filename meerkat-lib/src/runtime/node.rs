@@ -25,12 +25,14 @@ use crate::runtime::limits::{IMPORT_POLL_INTERVAL_MS, IMPORT_RETRY_DELAY_MS};
 use crate::runtime::tt::types::ServiceType;
 use crate::runtime::{nameres, tt, Env, Manager};
 
-/// The static checks a program passes before it runs or is installed, in
-/// order: names resolve, types check, the dependency graph is complete and
-/// acyclic. The typing environment of the checked program is the result
+/// Run the static checks before a program starts or is installed.
+/// Verify unique service names, resolve names, check types, and ensure the
+/// dependency graph is complete and acyclic. Return the program's typing
+/// environment.
 pub(crate) fn check_program(
     ast: &mut [Stmt],
 ) -> std::result::Result<Env<'static, ServiceType>, StaticError> {
+    tt::check::check_unique_services(ast).map_err(StaticError::Types)?;
     nameres::resolve(ast).map_err(StaticError::Names)?;
     let mut types = Env::new(None);
     tt::check(ast, &mut types).map_err(StaticError::Types)?;
@@ -86,6 +88,10 @@ impl StaticError {
             }
             StaticError::Types(tt::check::Error::UnknownUpdateTarget(service)) => format!(
                 "Target service '{}' for update not found",
+                interner.get(*service)
+            ),
+            StaticError::Types(tt::check::Error::DuplicateService(service)) => format!(
+                "type check error: service '{}' is declared more than once.",
                 interner.get(*service)
             ),
             StaticError::Types(tt::check::Error::DuplicateMember { service, member }) => format!(

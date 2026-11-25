@@ -329,6 +329,59 @@ fn unique_temp_dir(label: &str) -> std::path::PathBuf {
     dir
 }
 
+#[test]
+fn duplicate_service_names_across_disk_imports_are_rejected() {
+    let mut results = Vec::new();
+    let mut expected = Vec::new();
+    for (label, program, files, duplicate) in [
+        (
+            "duplicate_root_service",
+            "import helper\nservice app { var x = 0; } @test(app) { assert(x == 0); }",
+            vec![(
+                "helper.mkt",
+                "service helper { var v = 1; } service app { var y = 1; }",
+            )],
+            "app",
+        ),
+        (
+            "duplicate_imported_service",
+            "import a\nimport b\nservice app { var x = 0; } @test(shared) { assert(v == 2); }",
+            vec![
+                (
+                    "a.mkt",
+                    "service a { var q = 0; } service shared { var v = 1; }",
+                ),
+                (
+                    "b.mkt",
+                    "service b { var q = 0; } service shared { var v = 2; }",
+                ),
+            ],
+            "shared",
+        ),
+    ] {
+        let dir = unique_temp_dir(label);
+        for (file, source) in files {
+            std::fs::write(dir.join(file), source).unwrap();
+        }
+        let mut node = meerkat_lib::runtime::Node::new();
+        let base = parser::parse_string(program, &mut node.interner).unwrap();
+        let (imports, commands) =
+            Imports::new(&mut node.interner, HashMap::new(), &base, &dir, "").unwrap();
+        assert!(commands.is_empty());
+        let (mut imported, _) = imports.finalize().unwrap();
+        imported.extend(base);
+        let result = node
+            .run_static_checks(&imported)
+            .map_err(|error| error.to_string());
+        let _ = std::fs::remove_dir_all(&dir);
+        results.push(result);
+        expected.push(Err(format!(
+            "type check error: service '{duplicate}' is declared more than once."
+        )));
+    }
+    assert_eq!(results, expected);
+}
+
 /// The service names in `unified_ast`, in order.
 fn service_order(node: &meerkat_lib::runtime::Node) -> Vec<String> {
     node.unified_ast
@@ -652,6 +705,10 @@ fn test_root_declarations_are_not_claimed_by_a_peer() {
         !owners.contains_key("b"),
         "this program declares `b`, so it is served here, not at the peer"
     );
+    let (mut program, _) = imports.finalize().expect("finalize peer imports");
+    program.extend(base_ast);
+    node.run_static_checks(&program)
+        .expect("the local declaration shadows the peer's copy");
 }
 
 /// A module read from local disk is served by this node, so it claims nothing.

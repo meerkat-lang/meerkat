@@ -11,11 +11,13 @@ Related work: [#265](https://github.com/meerkat-lang/meerkat/issues/265),
 [#86](https://github.com/meerkat-lang/meerkat/issues/86), and
 [#213](https://github.com/meerkat-lang/meerkat/issues/213).
 The broader [code-update design](code-updates.md) covers syntax, migration,
-and coordination. The draft formal semantics, [Semantics for Meerkat
-(draft)](docs/meerkat-semantics.pdf), as reviewed on 2026-11-24, gives the static effect of a code update (§3.3.3) and sequential composition (§3.3.4),
-and leaves the update's effect on the store unspecified; this document
-describes that effect. Implementation order belongs in the issues and
-implementation plans.
+and coordination. The draft formal semantics,
+[Semantics for Meerkat (draft)](../meerkat-semantics.pdf), gives the static
+effect of a code update (§2.3, §3.3.3) and sequential composition (§3.3.4),
+and models code installation with versioned names (§5–6). This document
+specifies how the implementation executes an update and what it does to
+stored values; reconciling it with §5–6 is under way. The order of work is in
+the [implementation plan](../plan/sequential-code-updates-plan.md).
 
 ## Summary
 
@@ -36,6 +38,32 @@ implementation keeps a replaced declaration in its place and appends new ones.
 It does not reorder declarations to satisfy dependencies.
 
 This replaces the dependency-based reordering proposed in #265 and #266.
+
+## Decisions for review
+
+The design rests on these choices. Each is argued in the section named.
+
+1. **Steps, not reordering.** An update executes its declarations in source
+   order against the existing state, and the stored order of declarations has
+   no meaning ("Why not reorder").
+2. **Defs are computed when read.** A def step installs code. Reads during the
+   update compute the def from the current view, and each def the update
+   declares is evaluated against the final view before commit ("A def step").
+3. **One declaration per member per update block.** Separate update blocks in
+   one `atomic` block may redeclare a member ("Repeated declarations of a
+   member").
+4. **Temporarily incompatible code is allowed** if the update repairs it
+   before commit and nothing runs it in between. Stored function values may
+   need the stricter rule instead ("Temporarily incompatible code").
+5. **Types and kinds may change,** validated as interface changes. A var may
+   become a def once writes to defs are rejected (#293) ("Kind changes").
+6. **Updates can be checked without running anything.** Static success
+   promises neither successful evaluation nor runtime support that has not
+   landed ("Checking without execution").
+7. **Closure capture is lexical** (#86), so closure creation does not depend
+   on which members exist ("Reuse").
+8. **The distributed contract is fixed here; the protocol is #180's**
+   ("Remote participants").
 
 ## Why not reorder
 
@@ -92,11 +120,14 @@ and creates no dependency of `x` on itself. If `x` is new, `e` cannot read it.
 A def step does not evaluate `d`. A later step that reads `d` computes it from
 the current view, as compute-on-read does in an ordinary transaction.
 
-This is a semantic choice. Evaluating `d` at its step would give the same
-values to later reads, since a later write to one of `d`'s inputs invalidates
-that result and the next read recomputes it. Closure capture is lexical (#86),
-so the members that exist when a closure is created do not matter either. The
-two choices differ only in failures. With `x == 0`, the steps
+This is a semantic choice. With correct invalidation, when both executions
+succeed against the same protected inputs, evaluating `d` at its step gives
+the same values to later reads: a later write to one of `d`'s inputs
+invalidates that result and the next read recomputes it. Closure capture is
+lexical (#86), so the members that exist when a closure is created do not
+determine its captures. Eager evaluation does additional work, can acquire
+locks and add reads to transaction history, and can fail on intermediate
+inputs. With `x == 0`, the steps
 `def r = 10 / x; var x = 2;` would abort if `r` were evaluated at its step.
 Under this design they succeed, and `r == 5` after commit.
 
@@ -324,8 +355,10 @@ reads establishes this property for compute-on-read.
 
 After the last step, validate the state to be installed:
 
-- Retained defs, and function and action values stored in vars, are well
-  typed against the final bindings and do not write a def.
+- Every installed def, whether retained, new or replaced, and every function
+  and action value stored in a var, is well typed against the final bindings
+  and does not write a def. A def declared before a later step changed a
+  member's type is checked again here.
 - Service interfaces stay compatible with their clients, including clients on
   other nodes, or the update changes those clients too.
 - Reactive graphs are complete and acyclic, across services, within the
@@ -409,9 +442,12 @@ They need no second expression checker:
   analysis in the current bindings, not just an availability lookup for the
   named def.
 - Closure capture is lexical (#86): a closure captures the locals free in its
-  body, whichever members exist when it is created. Capture analysis
-  therefore needs no availability information, and the effects analysis's
-  separate pass for locals that shadow members goes away.
+  body, whichever members exist when it is created. Unshadowed service-member
+  references remain live lookups, including in closures created by startup
+  var initializers. The evaluator must distinguish those members from lexical
+  locals even where initialization currently puts both in its environment.
+  Capture analysis therefore needs no availability information, and the
+  effects analysis's separate pass for locals that shadow members goes away.
 - A var step's value goes in the transaction's ordinary write buffer, the one
   assignment uses. A def read during the update uses compute-on-read
   ([task 12](../../tasks/12-compute-on-read.md)).

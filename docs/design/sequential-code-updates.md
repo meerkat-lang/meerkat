@@ -7,11 +7,12 @@ Related work: [#265](https://github.com/meerkat-lang/meerkat/issues/265),
 [PR #266](https://github.com/meerkat-lang/meerkat/pull/266),
 [#267](https://github.com/meerkat-lang/meerkat/issues/267),
 [#180](https://github.com/meerkat-lang/meerkat/issues/180),
-[#293](https://github.com/meerkat-lang/meerkat/issues/293), and
+[#293](https://github.com/meerkat-lang/meerkat/issues/293),
+[#86](https://github.com/meerkat-lang/meerkat/issues/86), and
 [#213](https://github.com/meerkat-lang/meerkat/issues/213).
 The broader [code-update design](code-updates.md) covers syntax, migration,
-and coordination. The draft semantics reviewed on 2026-11-24 gives the
-static effect of a code update (§3.3.3) and sequential composition (§3.3.4),
+and coordination. The draft formal semantics, [Semantics for Meerkat
+(draft)](docs/meerkat-semantics.pdf), as reviewed on 2026-11-24, gives the static effect of a code update (§3.3.3) and sequential composition (§3.3.4),
 and leaves the update's effect on the store unspecified; this document
 describes that effect. Implementation order belongs in the issues and
 implementation plans.
@@ -28,7 +29,7 @@ initialized local members: an eager read must refer to a member already
 available. This work retains today's eager evaluation of service declarations
 and existing cross-service startup rules. Def evaluation during an update,
 described below, is a separate choice. Making service initialization lazy too
-would require a separate compatibility review, including closure captures.
+would require a separate compatibility review.
 
 The order in which the resulting declarations are stored has no meaning. The
 implementation keeps a replaced declaration in its place and appends new ones.
@@ -89,18 +90,27 @@ and creates no dependency of `x` on itself. If `x` is new, `e` cannot read it.
    cached derived values that depend on `d`.
 
 A def step does not evaluate `d`. A later step that reads `d` computes it from
-the current view, as compute-on-read does in an ordinary transaction. This
-is a semantic choice, not an equivalent way to evaluate `e` at its declaration:
-inputs, failures, and the members visible during closure creation can differ
-by the time it is evaluated. For example, with `x == 1`, the steps
-`def d = x; var x = 2; var result = d;` give `result == 2`.
+the current view, as compute-on-read does in an ordinary transaction.
+
+This is a semantic choice. Evaluating `d` at its step would give the same
+values to later reads, since a later write to one of `d`'s inputs invalidates
+that result and the next read recomputes it. Closure capture is lexical (#86),
+so the members that exist when a closure is created do not matter either. The
+two choices differ only in failures. With `x == 0`, the steps
+`def r = 10 / x; var x = 2;` would abort if `r` were evaluated at its step.
+Under this design they succeed, and `r == 5` after commit.
 
 Before commit, evaluate every member whose surviving binding is a def
 introduced or replaced by this transaction against the final view. A cached
 result may be reused only if it is valid for that view. Do not evaluate
 overwritten def expressions or members subsequently converted to vars.
 The update aborts if a required evaluation fails, including failure to obtain
-its inputs. This catches a failure that only the final inputs cause:
+its inputs. That changes current behavior: today a new def that lacks an
+input waits after commit until propagation delivers it. Under this design, the
+transaction reads the def's inputs itself, including remote ones, through the
+same view. Where an input depends on this update's changes on another node,
+that read needs remote participation (see "Remote participants"). This rule
+catches a failure that only the final inputs cause:
 `def r = 10 / x;` followed by `var x = 0;`. A def that
 would fail only at an intermediate step, where nothing reads it, does not fail
 the update, because that value is never observed. An unchanged def that
@@ -395,9 +405,13 @@ They need no second expression checker:
 - The effects analysis's initialization-order check becomes an availability
   check. Each member records when it becomes available: its declaration step
   during service initialization, before the first step for existing members
-  in an update, and after its step for a new one. This information also informs
-  capture analysis. Derived reads require analysis in the current bindings,
-  not just an availability lookup for the named def.
+  in an update, and after its step for a new one. Derived reads require
+  analysis in the current bindings, not just an availability lookup for the
+  named def.
+- Closure capture is lexical (#86): a closure captures the locals free in its
+  body, whichever members exist when it is created. Capture analysis
+  therefore needs no availability information, and the effects analysis's
+  separate pass for locals that shadow members goes away.
 - A var step's value goes in the transaction's ordinary write buffer, the one
   assignment uses. A def read during the update uses compute-on-read
   ([task 12](../../tasks/12-compute-on-read.md)).

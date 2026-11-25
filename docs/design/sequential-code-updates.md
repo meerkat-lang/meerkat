@@ -55,8 +55,9 @@ The design rests on these choices. Each is argued in the section named.
    updates of an `atomic` block, declares each member at most once. A later
    transaction can replace it again ("One declaration per member").
 4. **Temporarily incompatible code is allowed** if the update repairs it
-   before commit and nothing runs it in between. Stored function values may
-   need the stricter rule instead ("Temporarily incompatible code").
+   before commit and nothing runs it in between. Stored function values are
+   checked through an effect system that records what their code reads and
+   writes ("Temporarily incompatible code").
 5. **Types and kinds may change,** validated as interface changes. A var may
    become a def once writes to defs are rejected (#293) ("Kind changes").
 6. **Updates can be checked without running anything.** Static success
@@ -386,16 +387,16 @@ an error. Otherwise the update is valid.
 
 For defs, a step that reads `d` checks `d`'s current code against that step's
 bindings, including the code activated through its dependencies. Function
-values stored in vars are harder, because in the implementation a value's
-type does not show which members its body reads. The draft semantics records
-those reads and writes in the function's type as a latent effect (§2.1),
-which would make a stored function whose effects no longer fit the new
-bindings ill formed. Before type and kind changes are implemented, small
-examples should establish whether existing analysis can check stored
-functions, starting from that approach. If it cannot, bring
-concrete accepted and rejected examples back for review. The stricter rule,
-that every intermediate state must be well typed, is under "Alternatives
-considered".
+values stored in vars need more, because in the implementation a value's type
+does not show which members its body reads or writes. The approach is an
+effect system: as in the draft semantics, a function's or action's type
+records the members its code reads and writes, with their types, as a latent
+effect (§2.1). A stored function whose recorded effects no longer fit the new
+bindings is then ill formed, and calling it at a step is checked against that
+step's bindings like any other code. How to extend the effect system to do
+this, including effects inside returned functions and actions and the
+intermediate bindings of an update, is a semantic design question to solve
+before type and kind changes are implemented.
 
 ### Top-level statements
 
@@ -533,32 +534,39 @@ The [draft semantics](../meerkat-semantics.pdf) models code installation in
 that only vars can be written, that a member's kind can change, that a
 retained def made ill typed by an update is rejected, that updates compose
 sequentially, and that transactions read a committed snapshot under read
-locks on both source and definition dependencies. The points below differ or
-are open, and are being discussed with the draft's author.
+locks on both source and definition dependencies. The points below are
+differences or open questions, agreed with the draft's author where noted.
 
-- **Installation and initialization are one event here.** In the draft, a
-  code installation writes no values: new versions start uninitialized and
-  separate value transactions initialize them (Definition 10, Theorem 8).
-  This design commits code and values together, so no transaction sees new
-  code without its data ("Atomicity and failure").
-- **Initializers are expressions here.** The draft restricts a code update's
-  var right-hand side, and a var's initial code, to values (T-Var), as a
-  simplification for formalization. The implementation keeps expressions,
-  because migration needs them: `var x = x + 1`, `var before = x`, and
-  `var x0 = x; def x = x0 + y;` all read old values. In the draft's versioned
-  model, an old version's value remains available during the installation
-  event, so this may be expressible there.
-- **Expression initializers have runtime read effects.** T-Update and
-  Theorem 8 give a code patch an empty value-read/write footprint, with source
-  initialization handled separately using specified values. That argument
-  does not carry over unchanged. Starting with `x == 1`, the updates
+- **Expression initializers, and so one event (agreed).** For simplicity,
+  the draft gives a var in a code update, and a var's initial code, a
+  constant right-hand side (T-Var). The implementation needs expressions,
+  because migration reads old values: `var x = x + 1`, `var before = x`, and
+  `var x0 = x; def x = x0 + y;`. The draft's constant stands for the value
+  such an expression produces.
+
+  This difference is why the draft can separate installation from
+  initialization and the implementation cannot. In the draft, a code
+  installation writes no values: new versions start uninitialized, and
+  separate value transactions write their constants (Definition 10,
+  Theorem 8). A constant does not depend on any state, so nothing between the
+  two events can change it, and a transaction that reaches an uninitialized
+  version only waits. An expression's value depends on the state it reads, so
+  the implementation evaluates initializers inside the update transaction,
+  against its protected view, and commits code and values together
+  ("Atomicity and failure"). Apart from the reads behind its values (next
+  point), that single event is one execution the draft already allows: an
+  installation followed at once by its initializing writes.
+- **Initializer read footprint (formalization follow-up).** The draft gives a
+  code patch an empty read/write footprint (T-Update, Theorem 8), which its
+  commutation argument relies on. With expression initializers the combined
+  event reads state. Starting with `x == 1`, the updates
   `update s { var y = x; }` and `update s { var x = 2; }` have disjoint
-  destinations, but their order determines whether `y` becomes 1 or 2.
-  Initializer reads, including reads through functions and defs, participate
-  in locking, conflict checks, and causal history through the ordinary
-  transaction machinery. The combined installation and initialization event
-  must account for those reads and its writes before applying a commutation
-  argument.
+  destinations, but their order determines whether `y` becomes 1 or 2. The
+  implementation treats initializer reads, including reads through functions
+  and defs, like a value transaction's: they take locks, enter conflict
+  checks, and become part of the event's causal history. Extending the
+  draft's patches with that footprint is follow-up work for the
+  formalization; it does not change the implementation.
 - **One declaration per member per transaction** matches the draft's one
   version per name per patch ("One declaration per member").
 - **Open requirement: values from old versions.** The draft tags each
@@ -582,8 +590,9 @@ are open, and are being discussed with the draft's author.
   Version tags (the draft's "generation fencing") are one possible mechanism;
   vector clocks alone do not encode code versions (§7).
 - **Stored functions.** The draft's latent effects in function types (§2.1)
-  are the starting point for checking stored function values across type and
-  kind changes ("Temporarily incompatible code"). Summaries must preserve
+  are the basis for checking stored function values across type and kind
+  changes ("Temporarily incompatible code"); extending the effect system for
+  this is a semantic design question. Summaries must preserve
   expected member types and read/write capabilities, including latent effects
   inside returned functions and actions; dependency names alone are
   insufficient for WF-δ. The higher-order compatibility premise in §6's
@@ -608,7 +617,7 @@ are open, and are being discussed with the draft's author.
 | Alternative | What it simplifies | Decision |
 | --- | --- | --- |
 | Reorder declarations, or initialize in topological order | Keeps one initialization check over the final declarations | Rejected: cannot express migration that reads old values (see "Why not reorder") |
-| Require every intermediate state to be well typed | No reasoning about code that is incompatible but not run | Fallback if stored functions cannot otherwise be checked; rejects some coordinated migrations, notably across services |
+| Require every intermediate state to be well typed | No reasoning about code that is incompatible but not run | Rejected: it rejects coordinated migrations, notably across services. Stored functions are handled with an effect system instead |
 | Evaluate each def at its own step | A literal reading of "every declaration is a step" | Not adopted: it adds failures on values nothing observes, and still needs the final evaluation |
 | Forbid type or kind changes | No old and new interfaces within one update | Rejected: both are important kinds of evolution, and they share one validation |
 | Forbid declaring a member twice in one transaction | No repeated steps, no overwritten initializers or defs to account for | Adopted: it matches the draft semantics; splitting replacements into two transactions loses atomicity |
@@ -626,8 +635,8 @@ Review should establish that:
   running initializers, and leaves runtime state unchanged;
 - the availability and type checks accept the migrations above and reject
   reads of unavailable or temporarily incompatible members;
-- stored function values keep sound types and captures across replacements,
-  or the stricter rule is adopted explicitly;
+- the effect system records enough about stored function values to keep
+  their types and captures sound across replacements;
 - a kind change gives downstream defs, local and remote, the right Sources;
 - initializer reads participate in locking, conflict checks, and causal
   history, including indirect reads;

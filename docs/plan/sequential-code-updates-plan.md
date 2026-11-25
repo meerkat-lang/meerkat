@@ -193,8 +193,9 @@ initializers, and report concrete accepted and rejected examples.
 - checking against supplied installed-state metadata, for live services,
   without changing that state.
 
-Start from the draft semantics' approach: function and action types carry
-latent effects, the members their bodies read and write (§2.1, rule WF-δ). A
+The design's approach is an effect system, as in the draft semantics:
+function and action types carry latent effects, the members their bodies read
+and write, with their types (§2.1, rule WF-δ). A
 stored function whose recorded effects no longer fit the new bindings, or
 that writes a member that became a def, is then ill formed. The effects
 analysis already summarizes functions, so check whether those summaries can
@@ -208,11 +209,14 @@ incompatible bindings despite §2.2's well-formed-environment premise, before
 H1 enables that behavior. Final-state compatibility alone does not justify
 the intermediate checking judgments.
 
-If stored functions need substantial new machinery, bring the stricter rule
-("every intermediate state is well typed") back for review instead of
-building it. Distinguish static metadata that is required from runtime values
-that are merely convenient; incomplete metadata must not trigger evaluation
-as a fallback.
+D2's main output is the design of that effect-system extension: what a
+stored value's recorded effects contain, how they are checked at an
+intermediate step and against the final bindings, and how they are kept for
+live services. It is a semantic design question as well as an implementation
+one, so bring the proposal back for design review, with concrete accepted and
+rejected examples, before H1 is built on it. Distinguish static metadata that
+is required from runtime values that are merely convenient; incomplete
+metadata must not trigger evaluation as a fallback.
 
 ### E. Update steps (the #265 fix)
 
@@ -275,9 +279,10 @@ unchanged. Test the checker directly without service creation, plus CLI
 - Reuse ordinary transaction locking, conflict checks, and read-history
   recording for initializer reads, including calls and supported def reads.
   The draft's empty value-read/write footprint for code patches does not
-  apply to expression initializers committed with their values. Account for
-  those reads and writes in the combined event; settle this with the draft's
-  author before E2.
+  apply to expression initializers committed with their values. The
+  implementation accounts for those reads like a value transaction's. Adding
+  the footprint to the draft is a formalization follow-up and does not gate
+  E2.
 - Enable no new cases affected by values from old versions (#295). Same-type
   replacements, including type-preserving def-to-var changes, keep main's
   behavior. #295 investigates whether main can incorrectly accept delayed
@@ -547,15 +552,16 @@ flake and stopping servers started by hand.
 - **[Semantics PDF](../meerkat-semantics.pdf):** the design's "Relation to
   the formal semantics" lists where it differs from the draft's
   code-installation model (§5–6), and the open requirement on values from old
-  versions. These are with the draft's author. Settle installation with
-  initialization, expression initializers, and their read/write footprints
-  before E2. Establish old-version safety (#295) before H2 and H3 enable
+  versions. Expression initializers, and therefore installing code and
+  values in one event, are agreed with the draft's author (Nov 25); adding
+  the initializer read footprint to the draft's patches is a formalization
+  follow-up that does not gate E2. Establish old-version safety (#295) before H2 and H3 enable
   type and kind changes that reach consumers, or keep those cases unsupported.
   Ask whether T-Def's exclusion of constant and closure-only defs is intended:
   the implementation keeps both, since actions are declared as defs, so this
   is a question for the model and does not gate E1. Resolve the
-  well-formed-environment premise for temporarily incompatible
-  bindings through D2 before H1. Keep the committed PDF current when a new
+  well-formed-environment premise for temporarily incompatible bindings as
+  part of D2's effect-system design, before H1. Keep the committed PDF current when a new
   draft replaces it.
 - **Task 12's spec:** as above, before task 12 starts.
 - **#267's body:** describe main, not #266, and point to the design.

@@ -10,7 +10,7 @@ use meerkat_lib::runtime::ast::{ActionStmt, Stmt, Value};
 use meerkat_lib::runtime::interpreter::EvalError;
 use meerkat_lib::runtime::manager::InputState;
 use meerkat_lib::runtime::parser::parse_string;
-use meerkat_lib::runtime::txn::{TxnId, VClock};
+use meerkat_lib::runtime::txn::{TxnId, VClock, VarLock};
 use meerkat_lib::runtime::{Interner, Manager, Node};
 use std::collections::HashMap;
 
@@ -58,6 +58,108 @@ async fn run_test_block(
 ) -> Result<(), EvalError> {
     let svc = manager.interner.insert(service);
     manager.execute_action(svc, stmts).await
+}
+
+#[tokio::test]
+async fn test_block_carries_committed_history_between_statements() {
+    let (mut m, blocks) = setup(
+        "service s { var u = 0; pub def d = u; }
+         service c { var direct = 0; var x = 0; var next = 0; var separate = 0; }
+         @test(s) { u = 7; }
+         @test(c) { direct = s.d + 1; }
+         @test(c) { let t = s.d; x = t + 1; assert(direct == 8); next = 42; }
+         @test(c) { separate = 42; }",
+    )
+    .await;
+    for (service, stmts) in blocks {
+        let svc = m.interner.insert(&service);
+        m.execute_test_block(svc, &stmts).await.unwrap();
+    }
+
+    let [s, u, c, direct, x, next, separate] =
+        ["s", "u", "c", "direct", "x", "next", "separate"].map(|n| m.interner.insert(n));
+    let vars = &m.services[&c].vars;
+    for dest in [direct, x] {
+        assert_eq!(vars[&dest].value, Value::Int { val: 8 });
+        assert_eq!(
+            vars[&dest].vector_clock,
+            VClock::from([((s, u), 1), ((c, dest), 1)])
+        );
+    }
+    assert_eq!(
+        vars[&next].vector_clock,
+        VClock::from([((s, u), 1), ((c, x), 1), ((c, direct), 1), ((c, next), 1)])
+    );
+    assert_eq!(
+        vars[&separate].vector_clock,
+        VClock::from([((c, separate), 1)])
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_block_read_and_write_respect_a_participants_write_lock() {
+    let (mut m, blocks) = setup(
+        "service s { var x = 0; }
+         @test(s) { x = 99; }
+         @test(s) { assert(x == 0); }
+         @test(s) { x = 42; }",
+    )
+    .await;
+    let [s, x] = ["s", "x"].map(|n| m.interner.insert(n));
+    let tid = TxnId::new(m.node_id);
+    m.execute_action_participant(s, &blocks[0].1, &[], tid.clone())
+        .await
+        .unwrap();
+    for (_, stmts) in &blocks[1..] {
+        let error = m.execute_test_block(s, stmts).await.unwrap_err();
+        assert!(matches!(error, EvalError::WaitDieAbort(_)));
+    }
+    let state = &m.services[&s].vars[&x];
+    assert_eq!(state.value, Value::Int { val: 0 });
+    assert!(matches!(&state.lock, VarLock::WriteLocked(holder) if holder == &tid));
+    m.abort_participant(&tid).await;
+    m.execute_test_block(s, &blocks[2].1).await.unwrap();
+    assert_eq!(m.services[&s].vars[&x].value, Value::Int { val: 42 });
+}
+
+#[tokio::test]
+async fn failed_statement_keeps_the_previous_bindings_writes_and_clock() {
+    let (mut m, blocks) = setup(
+        "service s { var x = 0; var y = 0; }
+         @test(s) { y = 7; }
+         @test(s) {
+             let saved = 5;
+             x = saved;
+             for i in 0..2 {
+                 let local = y;
+                 do action { x = x + 1; };
+                 assert(i == 0);
+             }
+         }",
+    )
+    .await;
+    let [s, x, y, saved] = ["s", "x", "y", "saved"].map(|n| m.interner.insert(n));
+    m.execute_test_block(s, &blocks[0].1).await.unwrap();
+    let stmts = &blocks[1].1;
+    let mut env = Vec::new();
+    let mut clock = VClock::new();
+    for stmt in &stmts[..2] {
+        m.execute_statement(s, stmt, &mut env, &mut clock)
+            .await
+            .unwrap();
+    }
+    let error = m
+        .execute_statement(s, &stmts[2], &mut env, &mut clock)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, EvalError::AssertionError(_)));
+    assert_eq!(env, vec![(saved, Value::Int { val: 5 })]);
+    assert_eq!(clock, VClock::from([((s, x), 1)]));
+    let vars = &m.services[&s].vars;
+    assert_eq!(vars[&x].value, Value::Int { val: 5 });
+    assert_eq!(vars[&x].vector_clock, clock);
+    assert!(matches!(vars[&x].lock, VarLock::Unlocked));
+    assert!(matches!(vars[&y].lock, VarLock::Unlocked));
 }
 
 /// A transaction that writes `x` must see `def y = x + 1` refreshed, including

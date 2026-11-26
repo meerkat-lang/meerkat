@@ -6,7 +6,7 @@
 
 use meerkat_lib::net::ServiceNetId;
 use meerkat_lib::runtime::ast::{AstPrinter, Decl, Stmt};
-use meerkat_lib::runtime::txn::{Transaction, TxnId};
+use meerkat_lib::runtime::txn::{BufferedWrite, Transaction, TxnId};
 use meerkat_lib::runtime::{Interner, Symbol};
 use std::collections::HashMap;
 
@@ -51,7 +51,7 @@ fn test_transaction_maps_indexing() {
     txn.read_cache.insert(key.clone(), read_entry.clone());
     assert_eq!(txn.read_cache.get(&key), Some(&read_entry));
 
-    let write_value = meerkat_lib::runtime::ast::Value::Int { val: 100 };
+    let write_value = BufferedWrite::Set(meerkat_lib::runtime::ast::Value::Int { val: 100 });
     txn.written.insert(key.clone(), write_value.clone());
     assert_eq!(txn.written.get(&key), Some(&write_value));
 }

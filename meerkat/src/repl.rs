@@ -1,8 +1,9 @@
 use meerkat_lib::runtime::ast::{Expr, Stmt, Value};
 use meerkat_lib::runtime::interner::Symbol;
-use meerkat_lib::runtime::interpreter::{eval, execute, EvalContext, ExecuteEffect};
+use meerkat_lib::runtime::interpreter::{eval, EvalContext};
 use meerkat_lib::runtime::parser::ReplParseResult;
 use meerkat_lib::runtime::parser::{parse_file, parse_repl};
+use meerkat_lib::runtime::txn::VClock;
 use meerkat_lib::runtime::Manager;
 
 use directories::ProjectDirs;
@@ -104,6 +105,7 @@ pub async fn run_repl(
     }
 
     let mut repl_env: Vec<(Symbol, Value)> = Vec::new();
+    let mut session_clock = VClock::new();
     let mut watches: Vec<Watch> = Vec::new();
 
     let mut buffer = String::new();
@@ -162,6 +164,7 @@ pub async fn run_repl(
                         stmt,
                         &mut manager,
                         &mut repl_env,
+                        &mut session_clock,
                         &mut watches,
                         &remote_url_map,
                     )
@@ -190,6 +193,7 @@ async fn exec_stmt(
     stmt: Stmt,
     manager: &mut Manager,
     repl_env: &mut Vec<(Symbol, Value)>,
+    session_clock: &mut VClock,
     watches: &mut Vec<Watch>,
     remote_url_map: &std::collections::HashMap<String, String>,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
@@ -242,17 +246,10 @@ async fn exec_stmt(
             Ok(Some(format!("Imported service(s): {}.", loaded.join(", "))))
         }
         Stmt::ActionStmt(action_stmt) => {
-            let effect = execute(&action_stmt, repl_env, manager, Symbol::empty(), None)
-                .await
-                .map_err(|e| format!("{}", e))?;
-            match effect {
-                ExecuteEffect::Binding(name, val) => {
-                    repl_env.push((name, val));
-                    Ok(None)
-                }
-                ExecuteEffect::ExprValue(val) => Ok(Some(val.to_string())),
-                ExecuteEffect::None => Ok(None),
-            }
+            let value = manager
+                .execute_statement(Symbol::empty(), &action_stmt, repl_env, session_clock)
+                .await?;
+            Ok(value.map(|value| value.to_string()))
         }
         Stmt::Watch { expr } => {
             let label = meerkat_lib::runtime::update::format_expr(&expr, &manager.interner);
@@ -283,5 +280,67 @@ async fn exec_stmt(
             Ok(Some("(not yet supported in REPL: Update)".to_string()))
         }
         Stmt::Connect { .. } => Ok(Some("(not yet supported in REPL: Connect)".to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn repl_commits_each_statement_in_a_complete_input() {
+        let input = r"
+            service s {
+                var n = 0;
+                var unrelated = 0;
+                var x = 0;
+                pub def bump = action { x = x + 1; };
+            }
+            @test(s) { n = 3; unrelated = 4; }
+            watch s.unrelated;
+            let t = s.n; do s.bump;
+            for i in 0..2 {
+                do s.bump;
+                assert(i == 0);
+            }
+            t + s.x;
+        ";
+        let mut manager = Manager::default();
+        let ReplParseResult::Complete(stmts) = parse_repl(input, &mut manager.interner) else {
+            panic!("expected a complete REPL input");
+        };
+        let mut env = Vec::new();
+        let mut clock = VClock::new();
+        let mut watches = Vec::new();
+        let remotes = Default::default();
+        let mut output = None;
+        let mut errors = Vec::new();
+        for stmt in stmts {
+            match exec_stmt(
+                stmt,
+                &mut manager,
+                &mut env,
+                &mut clock,
+                &mut watches,
+                &remotes,
+            )
+            .await
+            {
+                Ok(value) => output = value,
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+        assert_eq!(errors, ["Assertion failed: i == 0"]);
+        assert_eq!(output.as_deref(), Some("4"));
+
+        // The first bump inherited the let's read. The separate @test block
+        // and watch did not add unrelated to its clock.
+        let s = manager.interner.insert("s");
+        let n = manager.interner.insert("n");
+        let x = manager.interner.insert("x");
+        assert_eq!(
+            manager.services[&s].vars[&x].vector_clock,
+            VClock::from([((s, n), 1), ((s, x), 1)])
+        );
     }
 }

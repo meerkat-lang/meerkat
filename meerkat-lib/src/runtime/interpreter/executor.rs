@@ -29,11 +29,11 @@ pub async fn execute_seq(
     env: &mut Vec<(Symbol, Value)>,
     manager: &mut Manager,
     service_name: Symbol,
-    mut txn: Option<&mut Transaction>,
+    txn: &mut Transaction,
 ) -> Result<(), EvalError> {
     for stmt in stmts {
         if let ExecuteEffect::Binding(name, val) =
-            execute(stmt, env, manager, service_name, txn.as_deref_mut()).await?
+            execute(stmt, env, manager, service_name, txn).await?
         {
             env.push((name, val));
         }
@@ -49,7 +49,7 @@ pub async fn execute(
     env: &[(Symbol, Value)],
     manager: &mut Manager,
     service_name: Symbol,
-    mut txn: Option<&mut Transaction>,
+    txn: &mut Transaction,
 ) -> Result<ExecuteEffect, EvalError> {
     match stmt {
         ActionStmt::Assign { name, expr } => {
@@ -59,34 +59,21 @@ pub async fn execute(
                 &mut EvalContext {
                     manager,
                     service_name,
-                    txn: txn.as_deref_mut(),
+                    txn: Some(txn),
                 },
             )
             .await?;
-            manager.assign(service_name, *name, value, txn).await?;
+            manager.assign(service_name, *name, value, txn)?;
             Ok(ExecuteEffect::None)
         }
         ActionStmt::Do(expr) => {
-            // A `do` reached with no transaction in progress -- one written
-            // directly in a `@test` block, which is not itself a transaction,
-            // or typed as a bare statement at the REPL -- runs in a fresh
-            // transaction of its own and commits before the next statement. A
-            // `do` reached from inside an action that is already under a
-            // transaction joins that one instead, so composed and cross-service
-            // actions stay atomic.
-            if txn.is_none() {
-                return manager
-                    .execute_action_with_txn(service_name, std::slice::from_ref(stmt), env)
-                    .await
-                    .map(|()| ExecuteEffect::None);
-            }
             let val = eval(
                 expr,
                 env,
                 &mut EvalContext {
                     manager,
                     service_name,
-                    txn: txn.as_deref_mut(),
+                    txn: Some(txn),
                 },
             )
             .await?;
@@ -104,27 +91,15 @@ pub async fn execute(
                     // imported into this scope
                     match manager.service_name_for_net_id(&service_net_id) {
                         Some(svc_name) => {
-                            let mut exec_env = closure_env.clone();
-                            execute_seq(
-                                &stmts,
-                                &mut exec_env,
-                                manager,
-                                svc_name,
-                                txn.as_deref_mut(),
-                            )
-                            .await?;
+                            let mut exec_env = closure_env;
+                            execute_seq(&stmts, &mut exec_env, manager, svc_name, txn).await?;
                         }
                         None => {
                             // Ship to its owning node under the shared
                             // transaction; the remote node executes
                             // and holds until our `commit` or `abort`
                             manager
-                                .remote_action(
-                                    &service_net_id,
-                                    stmts,
-                                    closure_env,
-                                    txn.as_deref_mut(),
-                                )
+                                .remote_action(&service_net_id, stmts, closure_env, Some(txn))
                                 .await?;
                         }
                     }
@@ -140,7 +115,7 @@ pub async fn execute(
                 &mut EvalContext {
                     manager,
                     service_name,
-                    txn: txn.as_deref_mut(),
+                    txn: Some(txn),
                 },
             )
             .await?;
@@ -166,7 +141,7 @@ pub async fn execute(
                 &mut EvalContext {
                     manager,
                     service_name,
-                    txn: txn.as_deref_mut(),
+                    txn: Some(txn),
                 },
             )
             .await?;
@@ -179,7 +154,7 @@ pub async fn execute(
                 &mut EvalContext {
                     manager,
                     service_name,
-                    txn: txn.as_deref_mut(),
+                    txn: Some(txn),
                 },
             )
             .await?;
@@ -192,7 +167,7 @@ pub async fn execute(
                 &mut EvalContext {
                     manager,
                     service_name,
-                    txn: txn.as_deref_mut(),
+                    txn: Some(txn),
                 },
             )
             .await?;
@@ -200,14 +175,12 @@ pub async fn execute(
                 .table_field_names(service_name, *table_name)
                 .unwrap_or_default();
             let record = row_to_record(row_val, &names)?;
-            manager
-                .append_table_row(
-                    service_name,
-                    *table_name,
-                    Value::Record { fields: record },
-                    txn,
-                )
-                .await?;
+            manager.append_table_row(
+                service_name,
+                *table_name,
+                Value::Record { fields: record },
+                txn,
+            )?;
             Ok(ExecuteEffect::None)
         }
         ActionStmt::For {
@@ -221,7 +194,7 @@ pub async fn execute(
                 &mut EvalContext {
                     manager,
                     service_name,
-                    txn: txn.as_deref_mut(),
+                    txn: Some(txn),
                 },
             )
             .await?;
@@ -241,14 +214,7 @@ pub async fn execute(
             for elem in elements {
                 loop_env.truncate(base_len);
                 loop_env.push((*var, elem));
-                execute_seq(
-                    body,
-                    &mut loop_env,
-                    manager,
-                    service_name,
-                    txn.as_deref_mut(),
-                )
-                .await?;
+                execute_seq(body, &mut loop_env, manager, service_name, txn).await?;
             }
             Ok(ExecuteEffect::None)
         }
@@ -295,7 +261,7 @@ mod tests {
             "x == 5".to_string(),
         );
 
-        let res = execute(&stmt, &[], &mut manager, Symbol::empty(), None).await;
+        let res = manager.execute_action(Symbol::empty(), &[stmt]).await;
 
         match res {
             Ok(_) => panic!("Expected assertion to fail"),

@@ -18,12 +18,18 @@ across separate network nodes. A transaction starting in one service can run
 an action defined in another service atomically; commit and abort coordinate
 across all participating nodes.
 
-**Transaction boundaries in `@test`.** As of PR #201 an `@test` block is not
-itself a transaction. Each `do` in the block runs in its own transaction and
-commits before the next statement, while a `do` nested inside an action that is
-already in a transaction joins that one. So a composed action is still atomic
-end to end, but an assertion written at the `@test` level runs *after* the
-preceding `do` has committed and cannot roll it back.
+**Transaction boundaries in `@test` and the REPL.** Each top-level action
+statement commits in its own transaction. A `for` loop runs all iterations and
+nested `do` actions in that transaction. A failing assertion in the loop
+discards its buffered writes. Earlier top-level statements stay committed.
+Within the loop, reads of a written variable see its buffered value. A local
+`def` that depends on it keeps its cached value until the loop commits.
+
+Each `@test` block and each REPL session keeps its own vector clock. A later
+write carries the versions observed or written by earlier successful statements
+in that session. For example, in `let t = s.d; x = t + 1;`, the write to `x`
+carries the history of the read of `s.d`. An `@test` entered at the REPL starts
+a fresh block, and background `watch` evaluations leave the session clock alone.
 
 ## Local (single process)
 

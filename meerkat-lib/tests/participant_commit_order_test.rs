@@ -25,7 +25,7 @@ use meerkat_lib::net::{
 use meerkat_lib::runtime::ast::{ActionStmt, Expr, Value};
 use meerkat_lib::runtime::manager::InputState;
 use meerkat_lib::runtime::parser::parse_string;
-use meerkat_lib::runtime::txn::{Transaction, TxnId};
+use meerkat_lib::runtime::txn::{BufferedWrite, Transaction, TxnId};
 use meerkat_lib::runtime::{Interner, Manager, Node};
 use std::collections::{HashMap, HashSet};
 
@@ -321,8 +321,10 @@ async fn commit_as_participant(m: &mut Manager, rc_net: &mut NetworkActor, rc_ad
         iteration: 0,
     };
     let mut txn = Transaction::new(tid.clone());
-    txn.written
-        .insert((m.service_net_id_for_name(mid), mv), Value::Int { val: 1 });
+    txn.written.insert(
+        (m.service_net_id_for_name(mid), mv),
+        BufferedWrite::Set(Value::Int { val: 1 }),
+    );
     txn.participants.insert(rc_addr.clone());
     m.pending_txns.insert(tid.clone(), txn);
     // What the originator commits with: both writes, neither with any history

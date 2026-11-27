@@ -25,22 +25,6 @@ discards its buffered writes. Earlier top-level statements stay committed.
 Within the loop, reads of a written variable see its buffered value. A local
 `def` that depends on it keeps its cached value until the loop commits.
 
-**Read-back guard (task 12 preparation).** The transactional lookup API rejects
-a read-back under the same transaction id if it reaches a member buffered by
-an enclosing execution still running on this node. The error names the
-transaction and member. Untouched members are allowed, and an execution still
-reads its own buffered writes normally. This covers table inserts as well as
-assignments; following a def's inputs awaits task 12's compute-on-read work.
-
-`cargo test -p meerkat-lib --lib read_back_tests` exercises this API boundary,
-including nested calls, earlier participant writes, and cleanup after failure
-or parking. The current RPC loop still defers incoming lookups while awaiting
-a reply. Enabling read-backs over the network also needs commit/abort handling
-for calls back into the active node, as part of #213's suspendable execution
-work following #28's event loop; the guard alone does not enable them.
-Actions composed back onto a node whose transaction is already running remain
-unsupported.
-
 Each `@test` block and each REPL session keeps its own vector clock. A later
 write carries the versions observed or written by earlier successful statements
 in that session. For example, in `let t = s.d; x = t + 1;`, the write to `x`

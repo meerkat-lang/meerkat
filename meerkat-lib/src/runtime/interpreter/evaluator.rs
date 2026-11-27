@@ -14,11 +14,15 @@ pub enum EvalError {
     RemoteDispatchFailed(String),
     NotImplemented,
     WaitDieAbort(String),
+    RunningTransaction(String),
     WaitOn(WaitKey),
     AssertionError(String),
     RuntimeError(String),
     InputNotReady(String),
 }
+
+/// Prefix preserved when forwarding read-back rejection and abort errors.
+pub const RUNNING_TRANSACTION_PREFIX: &str = "Running transaction: ";
 
 /// The text `EvalError::WaitDieAbort` displays itself with.
 ///
@@ -47,6 +51,7 @@ impl std::fmt::Display for EvalError {
             EvalError::LocalDispatchFailed(s) => write!(f, "Local dispatch failed: {}", s),
             EvalError::RemoteDispatchFailed(s) => write!(f, "Remote dispatch failed: {}", s),
             EvalError::NotImplemented => write!(f, "Not implemented"),
+            EvalError::RunningTransaction(s) => write!(f, "{}{}", RUNNING_TRANSACTION_PREFIX, s),
             EvalError::WaitDieAbort(s) => write!(f, "{}{}", WAIT_DIE_DISPLAY_PREFIX, s),
             EvalError::WaitOn(key) => {
                 write!(f, "Wait-die wait on {:?}", key)

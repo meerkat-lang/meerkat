@@ -367,7 +367,7 @@ for other transactions are queued as before. Rejecting the request must also
 let the original operation return the named error and complete abort cleanup
 without waiting for `REPLY_TIMEOUT`, assuming responsive peers.
 
-**Open design requirement: rejection must not create an abort wait cycle.**
+**Rejection must not create an abort wait cycle.**
 An immediate error reply alone does not meet that contract. In `A → B → A`,
 B pre-registers A in `txn.participants` before sending its read-back. On
 failure, `discard_failed_participant_txn` awaits `abort_participants` before
@@ -375,14 +375,50 @@ returning B's error to A. B therefore sends A an `Abort` and waits for its
 acknowledgement, while A still queues `Abort` until B's original reply
 arrives. The operation can still time out despite the immediate rejection.
 
-Settle and document a safe rejection/cleanup mechanism before landing this
-slice. It must preserve cleanup of earlier work under the same transaction
-id, including locks and downstream participants. Do not simply remove the
-rejecting node from the participant set: earlier requests may already have
-created state there. Nor is acknowledging an abort sufficient unless the
-protocol ensures the affected work cannot commit and its cleanup completes.
-If resolving this requires substantial protocol changes, revisit the split
-and sequencing with #213 rather than expanding the first PR implicitly.
+**Mechanism: a rejecting node owns its own cleanup, so the requester does not
+abort it.**
+
+- **Why that is safe.** A node rejects a request only when the transaction is
+  running there. A transaction has one outstanding call at a time, so a node
+  that is running it and receives a request under the same id is waiting,
+  directly or through others, on the requester's reply: it is an ancestor of
+  the requester in the current call chain. The requester's error therefore
+  reaches that node's running execution, which fails, and that execution's
+  own failure path, followed by its upstream's abort down to the originator's
+  `abort_participants`, releases the node's state. Earlier work the requester
+  did there under the same id (for example, reads served while the node was
+  idle between requests) lives in the same transaction state the node checked
+  out when it started running, so it is released with it.
+- **A typed rejection.** Add an `EvalError` variant for it (for example
+  `RunningTransaction`) with a display prefix that `remote_error` recognizes,
+  as it already does for `WaitDieAbort`, so the rejection travels in the
+  existing `LookupError` and `ActionResponse.error` strings and is rebuilt as
+  that variant on arrival. The message format does not change.
+- **The requester skips only those nodes.** When a request fails with that
+  variant, record the rejecting node in the transaction (for example
+  `Transaction::cleanup_owners`). `abort_participants`, including through
+  `discard_failed_participant_txn`, skips the nodes recorded there and aborts
+  every other participant as it does now, so downstream participants are
+  still cleaned up promptly. Do not remove the node from `txn.participants`:
+  the record says who owns cleanup for this failure, not that the node holds
+  nothing.
+- **The rejection always fails the operation.** The requester propagates the
+  error rather than handling it, so it reaches the rejecting node's
+  execution. That is true of every error today, since the language has no
+  way to catch one; keep it true for this variant.
+- **Aborts stay idempotent.** When the rejecting node's own cleanup later
+  aborts the requester, or the originator aborts both, a participant that has
+  already discarded its transaction acknowledges and does nothing, as today.
+
+With this, `A → B → A` unwinds without waiting on a queued message: A rejects
+B's request; B aborts its other participants, which are not waiting, and
+replies to A with the error; A's wait ends, its execution fails, and its
+cleanup and the originator's proceed as for any failed transaction. The same
+holds for longer chains such as `A → B → C → A`, where C is the requester.
+This adds one error variant and one per-transaction set, with no new
+messages, so it fits the first slice. If an implementation finds a path where
+the rejecting node is not an ancestor of the requester, stop and revisit the
+split with #213 rather than extending the protocol in this slice.
 
 Keep membership correct on every exit: success, failure, and parking (a
 parked participant's transaction goes back into `pending_txns`). Keep the
@@ -544,7 +580,10 @@ those two hooks in place.
    cleanup completes, buffered writes are discarded, and a subsequent
    transaction can acquire the affected locks. Include earlier participant
    work and a downstream participant so rejection cannot silently abandon
-   their state. The composed-action case can land in the first slice; the
+   their state. Cover `A → B → A` and `A → B → C → A`; check that the
+   requester aborts its other participants but sends no `Abort` to the
+   rejecting node, and that the rejecting node's earlier state under the same
+   id is released by its own failure and the originator's abort. The composed-action case can land in the first slice; the
    def case follows with compute-on-read. A request for a *different*
    transaction arriving during the wait is still queued and served afterwards.
    Check registrations through success, failure (including asynchronous

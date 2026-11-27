@@ -110,41 +110,65 @@ path.
 #### 1a. The clock and Sources of a computed def
 
 A def has no clock dimension of its own. The entry a recompute stores in
-`txn.read_cache` is a receipt for the value it computed:
+`txn.read_cache` is a receipt for the value it computed, and it must be a pair
+that propagation's batch check accepts, because initialization feeds it to
+that check (below). So build it with **the rule initialization already uses
+for a def's first pair**, over the def's **static inputs**
+(`graphs.inputs`), not just the reads this evaluation made:
 
-- **Clock:** the **join of the clocks of the reads it actually made**. An input
-  that is this transaction's own buffered write contributes no clock (the
-  write set covers it). Nested def reads contribute their own receipts'
-  clocks, so the join is the history of the value read.
-- **Sources:** the def's **static Sources**, the set propagation maintains for
-  it from its declaration's inputs, not the union of the reads made. A def
-  that branches on a condition depends on both branches' sources whichever
-  branch this evaluation took, and its Sources are unknown if any static
-  input's Sources are unknown. Use the def's installed Sources; for a def
-  being initialized, the Sources initialization computes for it.
+- an input the evaluation read contributes its receipt (for a var, its
+  snapshot pair; for a def, its own receipt; for this transaction's buffered
+  write, no clock and its own name as a Source);
+- a local input the evaluation did not read, such as one in a branch not
+  taken, contributes its current state;
+- a remote input the evaluation did not read makes the receipt's Sources
+  unknown, without a network read.
 
-The clock describes what this transaction observed; the Sources describe the
-def, so they never shrink to the branch one evaluation took.
+The receipt's clock is the join of those clocks and its Sources the union of
+those Sources (`join_receipts`); reuse `input_candidates` and `join_receipts`
+rather than writing a second version. Do not apply `close_batch`'s rejection
+to the receipt itself: the receipt only reports what the value is consistent
+with, and the batch check happens where it is consumed.
 
-The receipt is needed in two places:
+Why the unread inputs count: with `def a = if s.flag then s.x else s.y;` and
+`flag == true`, a receipt with only the reads made would have no clock for
+`s.y` while `a`'s Sources include it. If `s.y` had been updated, a downstream
+`def b = a + s.y;` would then fail `close_batch`, because `a` would appear
+not to have caught up on `s.y`. Including `s.y`'s current state is sound: `a`'s
+value is the same for any value of the branch it did not take, so it agrees
+with `s.y`'s current value too.
+
+The same receipt serves the transaction's history: `transaction_history`
+joins its clock into the commit stamp. The clocks of unread inputs make that
+stamp larger than the reads strictly require, which is the conservative
+direction: a later gate may wait for history it does not need, but never
+accepts an inconsistent batch (the trade-off #262's session clock already
+makes). One representation, used for both purposes, keeps the two from
+drifting apart.
+
+The receipt is consumed in two places:
 
 - **A participant answering a transactional read of a def.**
   `remote_read_participant` returns the receipt through `lookup_with_clock`,
   and the originator merges its clock into `txn.participant_history`
   (`remote_lookup`, `manager/mod.rs:3057`). Without it, `x = remote.d + 1`
   would not carry the history of what `d` was computed from, which is the
-  guarantee #262 added for statements.
+  guarantee #262 added for statements. During initialization the originator
+  also keeps the pair to seed the def that read it.
 - **Service initialization.** `input_candidates` seeds a def's first batch
   from the pairs in the initializing transaction's `read_cache`. For an input
-  that is a def, that pair is now a receipt. Initialization keeps its own rules
-  for inputs it did not read: an unread local input (an untaken branch)
-  contributes its current state, and an unread remote one leaves the Sources
-  unknown. So the installed clock of a def can be larger than a receipt for
-  the same value, which is the conservative direction, and its Sources agree
-  with the receipt's because both are static.
+  that is a def, that pair is now its receipt, built by the same rule, so the
+  batch check sees what it would have seen for an installed def.
+
+As with initialization today, the current state of an unread input is sampled
+without a read lock, so an input updated between that sample and a later
+locked read can still make a downstream batch check fail. That is today's
+behavior, not a new failure; locking unread inputs would give up "unread
+defs and branches lock nothing".
 
 Record a recompute's reads in a frame on `Transaction`, pushed on entry and
-popped on every exit, beside §4's in-progress set.
+popped on every exit, beside §4's in-progress set, so the rule above knows
+which inputs were read.
 
 ### 2. The recompute
 
@@ -465,12 +489,17 @@ those two hooks in place.
     memoised def invalidated by a later write still leaves its inputs' history
     in the commit stamp.
 15. **New — initialization.** A service whose def `b` reads an earlier def `a`
-    initializes `b` with the same Sources as before this task, and a clock at
-    least as large as the receipt for the value it read. Cover three shapes of
-    `a`: an unconditional chain; `a` choosing between local `x` and `y` with a
-    condition, so one branch is not taken (both stay in `b`'s Sources); and `a`
-    choosing between a local input and a remote one, with the remote branch
-    not taken (`b`'s Sources stay unknown, as today).
+    initializes, with the same Sources for `b` as before this task. Cover:
+    - an unconditional chain;
+    - `a` choosing between local `x` and `y` with a condition, one branch not
+      taken: both stay in `b`'s Sources;
+    - the case where the untaken input is also read directly downstream and
+      has an advanced clock: with an existing service `s` where
+      `flag == true` and `s.y` has been updated, a new service declaring
+      `def a = if s.flag then s.x else s.y;` and `def b = a + s.y;`
+      initializes `b` without a batch error;
+    - `a` choosing between a local input and a remote one, with the remote
+      branch not taken: `b`'s Sources stay unknown, as today.
 16. **New — tables.** A def that folds over a table sees rows inserted earlier
     in the same transaction (`BufferedWrite::Append`), including in a `for`
     loop in a `@test` block.

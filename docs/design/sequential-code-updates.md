@@ -53,9 +53,9 @@ The design rests on these choices. Each is argued in the section named.
 2. **Defs are computed when read.** A def step installs code. Reads during the
    update compute the def from the current view, and each def the update
    declares is evaluated against the final view before commit ("A def step").
-3. **One declaration per member per transaction.** An update, or all the
-   updates of an `atomic` block, declares each member at most once. A later
-   transaction can replace it again ("One declaration per member").
+3. **One declaration per member per update block.** An `atomic` block may
+   declare a member again in a later update; only the last binding and value
+   are installed ("Repeated declarations").
 4. **Temporarily incompatible code is allowed** if the update repairs it
    before commit and nothing runs it in between. Stored function values are
    checked through an effect system: a var's type bounds the reads and writes
@@ -102,11 +102,15 @@ Each step sees a *view* of every service the transaction touches:
 A def has no separate value in the view: reading a def evaluates its current
 code against the current view.
 
-The view starts as the state before the transaction, protected by the
-transaction's locks, and each step changes it. Every read in the transaction
-uses the current view: unqualified and qualified reads, reads inside called
-functions, and reads answered by another node. Other transactions never see
-it.
+The view is the committed state, protected by the transaction's locks, with
+the transaction's staged changes laid over it: in effect copy-on-write, not a
+copy. A step that declares a member stages its new binding, and a var step
+also stages its value. A read takes the staged binding or value if there is
+one and the committed one otherwise; nothing is copied, and commit installs
+the staged changes. The view starts with no staged changes, and each step
+adds to them. Every read in the transaction uses the current view:
+unqualified and qualified reads, reads inside called functions, and reads
+answered by another node. Other transactions never see it.
 
 ### A var step: `var x = e`
 
@@ -118,6 +122,13 @@ it.
 
 If `x` already exists, `e` reads its old value: `var x = x + 1` increments it,
 and creates no dependency of `x` on itself. If `x` is new, `e` cannot read it.
+
+`e` may construct a function or action, for example `var f = fn () => y;`.
+Constructing it does not run its body, so the members the body reads need not
+be available yet; calling it during the update does need them ("Delayed code"
+under "Each step"). Initializers are expressions and cannot run actions, so
+no step suspends or performs an action. The effects of a stored function are
+bounded by the var's type ("Temporarily incompatible code").
 
 ### A def step: `def d = e`
 
@@ -141,7 +152,9 @@ history, and can fail on intermediate inputs. With `x == 0`, the steps
 Under this design they succeed, and `r == 5` after commit.
 
 Before commit, evaluate every def this transaction introduces or replaces
-against the final view. The update aborts if a required evaluation fails,
+whose binding survives to the final view: a def that a later step replaces
+again, or turns into a var, is not evaluated in its earlier form. The update
+aborts if a required evaluation fails,
 including failure to obtain
 its inputs. That changes current behavior: today a new def that lacks an
 input waits after commit until propagation delivers it. Under this design, the
@@ -155,17 +168,30 @@ the update, because that value is never observed. An unchanged def that
 nothing reads during the update catches up after commit through ordinary
 propagation, as after any transaction.
 
-### One declaration per member
+### Repeated declarations
 
-A transaction declares each member at most once, as a service declaration
-does. The transaction is one update, or all the updates of an `atomic` block,
-so two updates in one `atomic` block cannot both declare `s.x`. They can
-declare different members of the same service. To replace a member twice, use
-two transactions. That exposes an intermediate committed state and loses the
-atomicity of a single transaction; it is a deliberate restriction, not an
-equivalent way to express repeated replacements atomically. The draft
-semantics makes the same restriction: a patch installs one version of each
-name (§5).
+Within one update block a member may be declared once, as in a service
+declaration. Separate updates in one `atomic` block may declare it again:
+
+```meerkat
+atomic {
+    update s { var x = x + 1; }
+    update s { var x = x * 2; }
+}
+```
+
+Each declaration is a step. Every var initializer runs, even if a later step
+replaces its result, so an earlier initializer can supply a value to another
+step, or fail and abort the update. A def that a later step replaces is
+evaluated only if something reads it before the replacement. Only the last
+binding and value of each member are installed at commit, so the intermediate
+ones are never visible outside the transaction.
+
+This matches the draft semantics: an update block is one patch, whose
+destinations are distinct (T-Var, T-Def), and an `atomic` block is the
+sequential composition of its patches (§3.3.4), committed as one transaction.
+The installed state still has one version of each name per commit. `main`
+accepts such re-declarations today; this design keeps them.
 
 ### Atomic blocks
 
@@ -181,6 +207,10 @@ or `insert` is a write step and a `let` binds a value for later steps. Their
 reads and writes join the transaction's footprint like an initializer's.
 
 ### Examples
+
+The implementation plan turns these examples, and the other forms in this
+document with their counterexamples, into runnable programs with expected
+outcomes.
 
 Starting with `service s { var x = 1; def d = x * 2; }`:
 
@@ -360,6 +390,18 @@ The first command-line interface is the existing `--check` mode for files
 containing declarations and updates. A separate update can later be checked
 against a supplied base program or a running-service description using the
 same checker.
+
+### Name resolution
+
+The members of a service are visible jointly, in any order, as the fields of
+a record are. A name in an update resolves against every member the service
+has once the transaction commits: its existing members and every member the
+transaction declares. So name resolution collects all of those members first
+and then resolves names, as it already does for a service declaration.
+Whether a resolved member can be read at a given point is a separate
+question, answered by availability below: delayed code may refer to a member
+the update declares later, while an eager read of one is an availability
+error, not an unknown name.
 
 ### Each step
 
@@ -620,8 +662,11 @@ differences or open questions, agreed with the draft's author where noted.
   checks, and become part of the event's causal history. Extending the
   draft's patches with that footprint is follow-up work for the
   formalization; it does not change the implementation.
-- **One declaration per member per transaction** matches the draft's one
-  version per name per patch ("One declaration per member").
+- **Repeated declarations** are sequential composition. An update block is
+  one patch with distinct destinations, as in the draft, and an `atomic`
+  block is the sequential composition of its patches (§3.3.4), committed as
+  one transaction. Only the last version of each name is installed, so each
+  commit still has one version per name ("Repeated declarations").
 - **Open requirement: values from old versions.** The draft tags each
   propagated value with the version that produced it. Its use must agree
   with the versions selected by the consumer's history and the types expected
@@ -681,7 +726,7 @@ differences or open questions, agreed with the draft's author where noted.
 | Require every intermediate state to be well typed | No reasoning about code that is incompatible but not run | Rejected: it rejects coordinated migrations, notably across services. Stored functions are handled with an effect system instead |
 | Evaluate each def at its own step | A literal reading of "every declaration is a step" | Not adopted: it adds failures on values nothing observes, and still needs the final evaluation |
 | Forbid type or kind changes | No old and new interfaces within one update | Rejected: both are important kinds of evolution, and they share one validation |
-| Forbid declaring a member twice in one transaction | No repeated steps, no overwritten initializers or defs to account for | Adopted: it matches the draft semantics; splitting replacements into two transactions loses atomicity |
+| Forbid declaring a member twice in one transaction | No overwritten initializers or defs | Rejected: it saves little once execution follows the steps, narrows what `main` accepts, and splitting replacements into two transactions loses atomicity. Re-declarations are sequential composition of patches, which the draft already types |
 | Let every initializer read the state before the update | Less staging | Rejected: an initializer could not use a member added earlier in the update |
 
 ## Boundaries and review questions
@@ -690,7 +735,10 @@ This design covers adding and replacing members, including changes of type and
 kind, and tables as vars that hold a list of records. It does not add
 deletion, renaming, service classes, or new update syntax; the table
 initializer comes with #298, and statements other than updates in atomic
-blocks with #297. Those should follow the same step model when designed.
+blocks with #297. Those should follow the same step model when designed. In
+that model, deleting a member is a step that removes its binding, valid only
+if final validation finds no retained reader or writer of it (#136). Renaming
+is a new member, a migration step that reads the old one, and a deletion.
 
 Review should establish that:
 

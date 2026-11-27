@@ -13,7 +13,7 @@ issues and branches before starting a unit.
 
 | When | Units |
 | --- | --- |
-| Now, independently | #86 (lexical closure capture), A (startup history: #285 item 1), B (one traversal, union locks), C (#293: no writes to defs), D1 (spike: checking without execution) |
+| Now, independently | #86 (lexical closure capture), A (startup history: #285 item 1), B (one traversal, union locks), C (#293: no writes to defs), D1 (spike: checking without execution), X (example corpus) |
 | After #86 and D1, alongside task 12 | E1 (pure update checking), then E2 (ordered execution and staged vars); F follows E1, G follows installed-state checking |
 | After E1 | D2 (effect-system design and prototype: type and kind changes, stored functions, live metadata) |
 | After C, D2 and E1 | H1 (static type/kind migration checks); no initializer execution required |
@@ -108,6 +108,22 @@ is retired.
 
 ## Units
 
+### X. Example corpus (alongside D1, before E1)
+
+Turn the design's examples and the regression matrix into runnable Meerkat
+programs with expected outcomes, one per canonical form and counterexample,
+for example under `meerkat/tests/updates/`. Cover migration that reads old
+values, sequencing within an update and across an `atomic` block, repeated
+declarations, availability and delayed code, cross-service and remote
+updates, kind and type changes, and tables. Mark each with its expected
+result: a value, a static error, or a runtime abort. Forms that depend on
+later units are written now and marked as expected to fail, with the unit
+that enables them, so each unit turns its own examples on.
+
+The corpus is the executable statement of the design: it removes ambiguity
+from the prose, gives every later unit its tests, and gives the formal
+semantics concrete cases to check against.
+
 ### #86. Lexical closure capture (before E1)
 
 Fix #86 first. A closure captures every local free in its body, including one
@@ -163,7 +179,8 @@ Add one helper that yields an update's steps in order (service and
 declaration, flattening the one atomic level), and use it for lock
 collection, evaluation, `unvalued_defs` and `declared`. Union lock groups per
 service. Test an atomic block whose two updates declare different members of
-the same service, and check that both updates' locks are held.
+the same service, and one whose two updates declare the same member, and check
+that both updates' locks are held.
 
 ### C. Reject writes to defs (#293)
 
@@ -263,8 +280,8 @@ unsupported execution cases explicitly.
   including calls through replaced functions.
 - Run final-state validation: types, graphs, cycles. No initialization-order
   check on final storage positions, and no final def evaluation.
-- Reject a member declared twice in one transaction: within one update, or
-  across the updates of one `atomic` block.
+- Reject a member declared twice within one update block. Separate updates
+  in one `atomic` block may declare it again; each declaration is a step.
 - Expose a checker taking an update and static service environment. It must
   not require an executing `Manager` or call the evaluator. Reuse it in the
   existing CLI `--check` path for files containing updates; separate-update
@@ -351,7 +368,10 @@ Execution evidence:
   must not cause the runtime to ignore the read conflict. Assert that
   committed values retain initializer read history, including indirect reads;
 - def to var with `var d = d`;
-- an `atomic` block whose updates declare different members of one service;
+- an `atomic` block whose updates declare different members of one service,
+  and one whose updates re-declare the same member, installing only the last
+  binding and value;
+- an overwritten initializer that fails still aborts the update;
 - unavailable reads still rejected, and initialization errors unchanged;
 - the mkn `local_update` and `remote_update` scenarios salvaged from #266,
   with assertions rewritten to observable values, not member order.
@@ -438,8 +458,10 @@ supported types; H2 then enables full type-changing execution on that base.
   entries; do not clear it wholesale.
 - Reads of defs during the update go through task 12's compute-on-read, with
   the staged code.
-- Before commit, evaluate every def the transaction introduces or replaces,
-  using the final view. Reuse a cached result only if it remains valid there.
+- Before commit, evaluate every def the transaction introduces or replaces
+  whose binding survives to the final view, using that view. Skip a def that a
+  later step replaced again or turned into a var. Reuse a cached result only
+  if it remains valid there.
   Failure to evaluate or obtain required
   inputs aborts before publication; it is not grounds for silently omitting
   that member from this check.
@@ -467,7 +489,9 @@ Evidence: new, changed and unchanged defs read during an update reflect
 earlier steps; a read, write, read sequence refreshes transitive dependents;
 replacing a def's code invalidates earlier results; a def that fails on the
 final view aborts the update and leaves live state unchanged.
-Preserve eager service initialization. Test
+Test a def re-declared later in the same `atomic` block: if nothing reads
+its first form, the first form is not evaluated, even if it would fail; if
+something reads it, it is. Preserve eager service initialization. Test
 the design's `def r = 10 / x; var x = 2;` with old `x == 0`: the update
 succeeds and `r == 5`. Test a new def with a remote input from the same
 update's forwarded part: when no initializer reads it, it gets its first
@@ -533,7 +557,12 @@ which E2 refuses until T2; land that test with or after T2.
 
 Designed with #191 alongside #28, built after #213. #286 (serializing tables,
 `fold`, `select`, `map`, actions and lambdas in remote updates) is a
-prerequisite for updates that carry those forms to another node. Review
+prerequisite for updates that carry those forms to another node. Today an
+update reaches another node as source text (`format_update_source`), which is
+parsed again there, and the receiving node merges it into its stored AST
+(#280, #286). Design J's protocol to carry structured steps instead, the same
+ordered steps the checker and the runtime consume, and co-design the messages
+with the update semantics rather than fitting the semantics to text. Review
 subjects, in order:
 
 1. The protocol and failure model as a design change: owner-evaluated steps
@@ -552,6 +581,15 @@ preparation leaves services usable and releases participant locks.
 
 ## Implementation guidance
 
+- New update code works through a small interface over service state
+  (looking up and staging bindings and values, installing them at commit)
+  rather than changing `Service` fields and copying ASTs directly. The broader
+  refactor of node and program representations is #106; don't block on it,
+  but don't add new direct manipulation either.
+- The view is an overlay of staged changes on locked committed state (design,
+  "The view"). A persistent map, such as a hash array mapped trie, is an
+  acceptable way to implement the overlay if profiling or rollback complexity
+  calls for one; it isn't required.
 - One traversal (B) serves locks, checking, evaluation and the final merge.
   The merge helper builds the final declarations; nothing recovers the
   execution order from them.
@@ -588,9 +626,12 @@ static checks and runtime where both apply.
   validity and temporarily unsupported execution have distinct diagnostics.
 - Existing later-position member; new earlier member; unavailable later
   member; existing member replaced later; self-migration.
-- A member declared twice within one update, or across the updates of one
-  atomic block, is rejected; different members of one service in two updates
-  of one atomic block are accepted, with both updates' locks held.
+- A member declared twice within one update block is rejected. Across the
+  updates of one atomic block, re-declaring a member is accepted and only its
+  last binding and value are installed; different members of one service in
+  two updates are accepted too, with both updates' locks held. An overwritten
+  initializer that fails aborts the update; an overwritten def nothing reads
+  is not evaluated.
 - Type changes: retained var type; temporarily incompatible def, read and not
   read; client incompatibility; stored closures (per D2).
 - Kind changes in both directions; retained local and remote writers of a

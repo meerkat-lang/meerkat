@@ -105,7 +105,7 @@ impl Transaction {
             manager.abort_participants(&txn).await;
         }
         manager.release_all_locks(&txn);
-        txn.finish(result)
+        result
     }
 
     /// `apply` up to the release of its locks
@@ -171,7 +171,8 @@ impl Transaction {
                 {
                     manager.release_all_locks(txn);
                     manager.abort_participants(txn).await;
-                    txn.finish(Ok(()))?;
+                    // Abort callbacks during cleanup concern this discarded
+                    // attempt, not the fresh transaction ID used by the retry.
                     *txn = manager.checkout_transaction(txn.id.retry());
                     continue;
                 }
@@ -309,10 +310,7 @@ impl Transaction {
             if let Some(addr) = manager.remote_services.get(svc_name).cloned() {
                 let source = format_update_source(*svc_name, decls, &manager.interner);
                 let svc_str = manager.interner.get(*svc_name).to_string();
-                static NEXT_UPDATE_REQ_ID: std::sync::atomic::AtomicU64 =
-                    std::sync::atomic::AtomicU64::new(1);
-                let request_id =
-                    NEXT_UPDATE_REQ_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let request_id = Manager::next_request_id();
                 let reply_to = manager.local_reply_addr().await;
                 let msg = crate::net::types::MeerkatMessage::UpdateServiceRequest {
                     request_id,

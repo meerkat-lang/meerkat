@@ -1118,13 +1118,15 @@ impl Manager {
 
         let mut env: Vec<(Symbol, Value)> = vec![];
         let svc_name = name;
+        let mut previous_service = None;
+        let mut installed = false;
 
         let result = async {
             // The graphs must be complete and acyclic, as those recomputed
             // below; the other services' follow from the same declarations
             // and do not change
             self.check_graphs(&graphs)?;
-            self.services.insert(
+            previous_service = self.services.insert(
                 name,
                 Service {
                     id,
@@ -1138,6 +1140,7 @@ impl Manager {
                     service_lock: Some(txn.id.clone()),
                 },
             );
+            installed = true;
             // Functions read from remote owners, published so far
             let mut published = 0;
             for decl in decls {
@@ -1276,7 +1279,12 @@ impl Manager {
         } else {
             // Initialization only reads participants. Abort releases their locks.
             self.abort_participants(&txn).await;
-            self.services.remove(&svc_name);
+            if installed {
+                self.services.remove(&svc_name);
+                if let Some(previous) = previous_service.filter(|_| txn.is_running()) {
+                    self.services.insert(svc_name, previous);
+                }
+            }
             // A failed local instance must not erase an existing import
             if inserted {
                 self.unified_ast.retain(
@@ -1300,7 +1308,7 @@ impl Manager {
             "Invariant violation: phantom service leaked into unified_ast on failure"
         );
 
-        txn.finish(result)
+        result
     }
 
     /// Update pre-computed dependency graphs for a service, drop the cached
@@ -2216,14 +2224,12 @@ impl Manager {
         this_id: ServiceNetId,
         listener_def: Symbol,
     ) {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT_SUB_ID: AtomicU64 = AtomicU64::new(1);
         let addr = match self.remote_addr(owner) {
             Ok(a) => a,
             Err(_) => return,
         };
         let reply_to = self.local_reply_addr().await;
-        let request_id = NEXT_SUB_ID.fetch_add(1, Ordering::SeqCst);
+        let request_id = Self::next_request_id();
         let msg = MeerkatMessage::RequestUpdates {
             request_id,
             service: self.interner.get(owner).to_string(),
@@ -2619,6 +2625,28 @@ impl Manager {
                                 .push_back(NetworkEvent::MessageReceived { msg, peer });
                         }
                     }
+                    MeerkatMessage::LockRequest {
+                        request_id,
+                        txn_id,
+                        reply_to,
+                        ..
+                    } if self.running.rejects_locks(&txn_id) => {
+                        self.send_oneway(
+                            Address::new(reply_to),
+                            MeerkatMessage::LockResponse {
+                                request_id,
+                                txn_id,
+                                success: false,
+                                error: Some(
+                                    EvalError::RunningTransaction(
+                                        "cannot acquire locks for an aborting transaction".into(),
+                                    )
+                                    .to_string(),
+                                ),
+                            },
+                        )
+                        .await;
+                    }
                     msg @ MeerkatMessage::LockRequest { .. } if serve => {
                         Box::pin(self.serve_request(msg)).await;
                     }
@@ -2640,11 +2668,8 @@ impl Manager {
                             success,
                             error,
                         };
-                        let target_addr = if !peer.is_empty() { peer } else { reply_to };
-                        if !target_addr.is_empty() {
-                            self.send_oneway(Address::new(&target_addr), reply_msg)
-                                .await;
-                        }
+                        // `peer` is a bare PeerId, not a dialable address.
+                        self.send_oneway(Address::new(reply_to), reply_msg).await;
                     }
                     // Everything else is a reply: route it to its waiter.
                     other => {
@@ -2747,6 +2772,13 @@ impl Manager {
         let mut hasher = DefaultHasher::new();
         bytes.hash(&mut hasher);
         Ok(hasher.finish())
+    }
+
+    /// All RPC kinds share the reply table, including nested requests.
+    pub(crate) fn next_request_id() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
     }
 
     /// shared by remote_lookup and remote_action.
@@ -2982,10 +3014,7 @@ impl Manager {
         path: &str,
         server_addr: Address,
     ) -> Result<String, EvalError> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-
-        let request_id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+        let request_id = Self::next_request_id();
         let reply_to = self.local_reply_addr().await;
 
         let msg = MeerkatMessage::ServiceCodeRequest {
@@ -3046,9 +3075,6 @@ impl Manager {
         member: Symbol,
         mut txn: Option<&mut Transaction>,
     ) -> Result<ReadEntry, EvalError> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-
         // Remote reads are always served by the owning node, which holds this
         // transaction's buffered writes and read locks. We deliberately do not
         // reuse a cached result on the requesting side: a def's value can change
@@ -3058,7 +3084,7 @@ impl Manager {
         // with the owner's buffered state. (Caching provably-immutable reads to
         // save round-trips could be a later optimization.)
         let addr = self.remote_addr(service)?;
-        let request_id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+        let request_id = Self::next_request_id();
         let reply_to = self.local_reply_addr().await;
         let shared_tid = txn.as_ref().map(|t| t.id.clone());
 
@@ -3191,7 +3217,7 @@ impl Manager {
                 // Could not acquire the read lock (e.g. conflict): release any
                 // locks taken and do not keep this transaction prepared.
                 self.discard_failed_participant_txn(&txn).await;
-                txn.finish(Err(e))
+                Err(e)
             }
         }
     }
@@ -3203,15 +3229,12 @@ impl Manager {
         env: Vec<(Symbol, Value)>,
         mut txn: Option<&mut Transaction>,
     ) -> Result<(), EvalError> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT_ACTION_ID: AtomicU64 = AtomicU64::new(1);
-
         // Dial the node address embedded in the `ServiceNetId`; send the
         // slug as the service name the remote node uses to find its local
         // service. This works even if the service was never imported
         // into the current scope
         let (addr, slug) = Self::split_service_net_id(service_net_id);
-        let request_id = NEXT_ACTION_ID.fetch_add(1, Ordering::SeqCst);
+        let request_id = Self::next_request_id();
         let reply_to = self.local_reply_addr().await;
 
         // When part of a transaction, ship its id so the remote node executes
@@ -3966,7 +3989,8 @@ impl Manager {
             };
             self.abort_participants(&txn).await;
             self.release_all_locks(&txn);
-            let error = txn.finish::<()>(Err(error)).unwrap_err();
+            // The attempt is already discarded. Abort forwarding can return
+            // to us during cleanup; it must not cancel a retry under a new ID.
             drop(txn);
 
             // A participant can park on its wait queue. The originator waits
@@ -4155,7 +4179,7 @@ impl Manager {
                 return Err(e);
             }
             self.discard_failed_participant_txn(&txn).await;
-            return txn.finish(Err(e));
+            return Err(e);
         }
         self.pending_txns.insert(tid, txn.into_inner());
         Ok(())
@@ -4213,6 +4237,7 @@ impl Manager {
     /// Tell every participant of `txn` to abort
     pub(super) async fn abort_participants(&mut self, txn: &Transaction) {
         let _running = self.running.enter(&txn.id);
+        self.running.begin_abort(&txn.id);
         for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
             self.send_abort(addr, &txn.id).await;
         }
@@ -4314,7 +4339,9 @@ impl Manager {
 
         match txn.finish(result) {
             Ok(()) => {
-                self.pending_txns.insert(txn_id, txn.into_inner());
+                if let Some(txn) = txn.park_locks() {
+                    self.pending_txns.insert(txn_id, txn);
+                }
                 Ok(())
             }
             // CRITICAL: All-or-Nothing Eager Lock Group Release
@@ -4336,12 +4363,14 @@ impl Manager {
                 txn.participants.clear();
                 txn.finish(Ok(()))?;
 
-                self.pending_txns.insert(txn_id, txn.into_inner());
+                if let Some(txn) = txn.park_locks() {
+                    self.pending_txns.insert(txn_id, txn);
+                }
                 Err(EvalError::WaitOn(key))
             }
             Err(e) => {
                 self.discard_failed_participant_txn(&txn).await;
-                txn.finish(Err(e))
+                Err(e)
             }
         }
     }
@@ -4481,9 +4510,7 @@ impl Manager {
         for (addr, remote_services) in node_requests {
             txn.participants.insert(addr.clone());
 
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static NEXT_LOCK_REQ_ID: AtomicU64 = AtomicU64::new(1);
-            let request_id = NEXT_LOCK_REQ_ID.fetch_add(1, Ordering::SeqCst);
+            let request_id = Self::next_request_id();
 
             let msg = MeerkatMessage::LockRequest {
                 request_id,
@@ -4528,9 +4555,7 @@ impl Manager {
         tid: &TxnId,
         clock: &VClock,
     ) -> Result<(), EvalError> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT_COMMIT_ID: AtomicU64 = AtomicU64::new(1);
-        let request_id = NEXT_COMMIT_ID.fetch_add(1, Ordering::SeqCst);
+        let request_id = Self::next_request_id();
         let reply_to = self.local_reply_addr().await;
         let msg = MeerkatMessage::Commit {
             request_id,
@@ -4587,9 +4612,7 @@ impl Manager {
     /// Originator side: tell a participant to abort, awaiting acknowledgement
     /// so its locks are released before we return (and the process may exit).
     async fn send_abort(&mut self, addr: Address, tid: &TxnId) {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT_ABORT_ID: AtomicU64 = AtomicU64::new(1);
-        let request_id = NEXT_ABORT_ID.fetch_add(1, Ordering::SeqCst);
+        let request_id = Self::next_request_id();
         let reply_to = self.local_reply_addr().await;
         let msg = MeerkatMessage::Abort {
             request_id,

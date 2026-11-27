@@ -414,7 +414,7 @@ async fn dropped_future_and_doomed_park() {
     let running = RunningTransactions::default();
     let tid = TxnId::new(1);
     let future = async {
-        let registration = running.checkout(Transaction::new(tid.clone()));
+        let mut registration = running.checkout(Transaction::new(tid.clone()));
         running.doom(&tid);
         let wait = EvalError::WaitOn(WaitKey::Service(ServiceNetId("s".into())));
         assert!(matches!(
@@ -626,6 +626,7 @@ async fn abort_ack_precedes_cleanup_while_child_is_parked() {
 #[derive(Clone, Copy, Debug)]
 enum Entry {
     Initialization,
+    Replacement,
     Update,
     Locks,
 }
@@ -634,6 +635,7 @@ enum Entry {
 enum Outcome {
     Rejection,
     AbortThenSuccess,
+    AbortThenWaitDie,
     Success,
 }
 
@@ -641,14 +643,30 @@ enum Outcome {
 /// attempts a real network callback during a lookup or cascading lock wait.
 #[tokio::test]
 async fn initialization_update_and_lock_request_lifetimes() {
-    for entry in [Entry::Initialization, Entry::Update, Entry::Locks] {
+    for entry in [
+        Entry::Initialization,
+        Entry::Replacement,
+        Entry::Update,
+        Entry::Locks,
+    ] {
         for outcome in [
             Outcome::Rejection,
             Outcome::AbortThenSuccess,
+            Outcome::AbortThenWaitDie,
             Outcome::Success,
         ] {
             let (mut manager, _) = node("s").await;
             let (mut remote, address) = node("r").await;
+            let (mut dependency, dependency_address) = node("t").await;
+            let t = manager.interner.insert("t");
+            manager
+                .remote_services
+                .insert(t, Address::new(format!("{}/t", dependency_address.0)));
+            let held = parse_string("service held { var x = 0; }", &mut manager.interner).unwrap();
+            let Stmt::Service { name, decls } = held[0].clone() else {
+                unreachable!()
+            };
+            manager.create_service(name, decls).await.unwrap();
             let mut peer = remote.network.take().unwrap();
             let r = manager.interner.insert("r");
             manager
@@ -664,12 +682,22 @@ async fn initialization_update_and_lock_request_lifetimes() {
             let Stmt::Service { name: fresh, decls } = init[0].clone() else {
                 unreachable!()
             };
+            let s = manager.interner.insert("s");
+            if matches!(entry, Entry::Replacement) && !matches!(outcome, Outcome::Success) {
+                let x = manager.interner.insert("x");
+                manager.services.get_mut(&s).unwrap().listeners.insert(
+                    x,
+                    HashSet::from([(ServiceNetId("existing-subscriber".into()), x)]),
+                );
+            }
+            let old_listeners = manager.services[&s].listeners.clone();
             let tid = TxnId::new(manager.node_id);
             let running = manager.running.clone();
             let running_peer = running.clone();
             let driver = async {
                 match entry {
                     Entry::Initialization => manager.create_service(fresh, decls).await,
+                    Entry::Replacement => manager.create_service(s, decls).await,
                     Entry::Update => {
                         crate::runtime::update::Transaction::new_with_id(tid.clone(), updates)
                             .apply(&mut manager)
@@ -716,6 +744,53 @@ async fn initialization_update_and_lock_request_lifetimes() {
                 };
                 assert!(running_peer.contains(&tid));
                 let address = peer_address(&mut peer).await;
+                // An acyclic dependency can lock back into the running node.
+                // Its reservation must join the outer owner's commit/abort,
+                // even though this member was not touched by the outer call.
+                send(
+                    &mut peer,
+                    &reply_to,
+                    MeerkatMessage::LockRequest {
+                        request_id: 9000,
+                        txn_id: tid.clone(),
+                        services: HashMap::from([
+                            (
+                                "s".into(),
+                                LockGroup {
+                                    service_level_lock: true,
+                                    reads: HashSet::new(),
+                                    writes: HashSet::new(),
+                                },
+                            ),
+                            (
+                                "held".into(),
+                                LockGroup {
+                                    service_level_lock: false,
+                                    reads: HashSet::from(["x".into()]),
+                                    writes: HashSet::new(),
+                                },
+                            ),
+                            (
+                                "t".into(),
+                                LockGroup {
+                                    service_level_lock: false,
+                                    reads: HashSet::from(["x".into()]),
+                                    writes: HashSet::new(),
+                                },
+                            ),
+                        ]),
+                        reply_to: address.clone(),
+                    },
+                )
+                .await;
+                assert!(matches!(
+                    receive(&mut peer).await,
+                    MeerkatMessage::LockResponse {
+                        request_id: 9000,
+                        success: true,
+                        ..
+                    }
+                ));
                 send(
                     &mut peer,
                     &reply_to,
@@ -728,19 +803,23 @@ async fn initialization_update_and_lock_request_lifetimes() {
                     },
                 )
                 .await;
+                let callback_reply = receive(&mut peer).await;
                 let MeerkatMessage::LookupError {
                     request_id: 9001,
                     error,
-                } = receive(&mut peer).await
+                } = callback_reply
                 else {
-                    panic!("{entry:?}: callback was not rejected")
+                    panic!("{entry:?}/{outcome:?}: callback was not rejected: {callback_reply:?}")
                 };
                 assert!(matches!(
                     Manager::remote_error(error.clone()),
                     EvalError::RunningTransaction(_)
                 ));
                 assert!(error.contains("read-back"));
-                if matches!(outcome, Outcome::AbortThenSuccess) {
+                if matches!(
+                    outcome,
+                    Outcome::AbortThenSuccess | Outcome::AbortThenWaitDie
+                ) {
                     send(
                         &mut peer,
                         &reply_to,
@@ -757,7 +836,13 @@ async fn initialization_update_and_lock_request_lifetimes() {
                     ));
                     assert!(running_peer.check(&tid).is_err());
                 }
-                let error = matches!(outcome, Outcome::Rejection).then_some(error);
+                let error = match outcome {
+                    Outcome::Rejection => Some(error),
+                    Outcome::AbortThenWaitDie => {
+                        Some(EvalError::WaitDieAbort("test contention".into()).to_string())
+                    }
+                    _ => None,
+                };
                 let reply = if lock {
                     MeerkatMessage::LockResponse {
                         request_id,
@@ -831,7 +916,10 @@ async fn initialization_update_and_lock_request_lifetimes() {
                 tid
             };
             let (result, observed_tid) = tokio::time::timeout(Duration::from_secs(5), async {
-                tokio::join!(driver, probe)
+                tokio::select! {
+                    result = async { tokio::join!(driver, probe) } => result,
+                    _ = serve(&mut dependency) => unreachable!(),
+                }
             })
             .await
             .unwrap_or_else(|_| panic!("{entry:?}/{outcome:?}: timed out"));
@@ -853,7 +941,10 @@ async fn initialization_update_and_lock_request_lifetimes() {
             }
             let s = manager.interner.insert("s");
             let x = manager.interner.insert("x");
-            let expected = if matches!((entry, outcome), (Entry::Update, Outcome::Success)) {
+            let expected = if matches!(
+                (entry, outcome),
+                (Entry::Update | Entry::Replacement, Outcome::Success)
+            ) {
                 10
             } else {
                 0
@@ -862,7 +953,17 @@ async fn initialization_update_and_lock_request_lifetimes() {
                 manager.services[&s].vars[&x].value,
                 Value::Int { val: expected }
             );
-            for service in manager.services.values() {
+            if matches!(entry, Entry::Replacement) && !matches!(outcome, Outcome::Success) {
+                assert_eq!(manager.services[&s].listeners, old_listeners);
+                let y = manager.interner.insert("y");
+                assert!(manager.services[&s].vars.contains_key(&y));
+            }
+            assert!(dependency.pending_txns.is_empty());
+            for service in manager
+                .services
+                .values()
+                .chain(dependency.services.values())
+            {
                 assert!(service.service_lock.is_none());
                 assert!(service
                     .vars
@@ -1016,6 +1117,51 @@ async fn update_aborts_before_retry_but_not_after_installation() {
                 };
                 assert_eq!(aborted, txn_id);
                 assert!(running.contains(&txn_id));
+                // A participant can forward our abort back to us. This old
+                // attempt has already been discarded; its callback must not
+                // suppress the retry or trigger a second round of aborts.
+                let address = peer_address(&mut peer).await;
+                send(
+                    &mut peer,
+                    &reply_to,
+                    MeerkatMessage::Abort {
+                        request_id: 9010,
+                        txn_id: txn_id.clone(),
+                        reply_to: address.clone(),
+                    },
+                )
+                .await;
+                assert!(matches!(
+                    receive(&mut peer).await,
+                    MeerkatMessage::AbortResponse { request_id: 9010 }
+                ));
+                // No new reservations may arrive during abort cleanup.
+                send(
+                    &mut peer,
+                    &reply_to,
+                    MeerkatMessage::LockRequest {
+                        request_id: 9011,
+                        txn_id: txn_id.clone(),
+                        services: HashMap::from([(
+                            "s".into(),
+                            LockGroup {
+                                service_level_lock: true,
+                                reads: HashSet::new(),
+                                writes: HashSet::new(),
+                            },
+                        )]),
+                        reply_to: address,
+                    },
+                )
+                .await;
+                assert!(matches!(
+                    receive(&mut peer).await,
+                    MeerkatMessage::LockResponse {
+                        request_id: 9011,
+                        success: false,
+                        ..
+                    }
+                ));
                 send(
                     &mut peer,
                     &reply_to,

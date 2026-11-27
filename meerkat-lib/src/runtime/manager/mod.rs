@@ -18,7 +18,8 @@ use crate::runtime::limits::{
     FIRST_VALUE_TIMEOUT, KEEPALIVE_INTERVAL, MAX_PENDING_UPDATES_PER_PEER, REPLY_TIMEOUT,
 };
 use crate::runtime::txn::{
-    BufferedWrite, ComposedCall, ReadEntry, Sources, Transaction, TxnId, VClock, VarState, WaitKey,
+    ActiveTransactions, BufferedWrite, ComposedCall, ReadEntry, Sources, Transaction, TxnId,
+    VClock, VarState, WaitKey,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(not(target_arch = "wasm32"))]
@@ -356,6 +357,8 @@ pub struct Manager {
     /// by a remote originator, executed under a shared id and held (locks +
     /// buffered writes) until a Commit or Abort arrives.
     pub pending_txns: HashMap<TxnId, Transaction>,
+    /// Checked-out executions, including nested read-backs under the same id.
+    active_txns: ActiveTransactions,
     /// Requests parked because the requesting transaction is older than a lock
     /// holder (wait-die wait), keyed by the contended WaitKey. Drained
     /// oldest-first when that lock frees on commit or abort.
@@ -461,6 +464,7 @@ impl Manager {
             applying_updates: Vec::new(),
             node_id: Self::random_node_id(),
             pending_txns: HashMap::new(),
+            active_txns: ActiveTransactions::default(),
             wait_queue: HashMap::new(),
             freed_awaiting_wake: HashSet::new(),
             local_address: None,
@@ -1409,6 +1413,14 @@ impl Manager {
                 let committed = &self.services[&service_name].vars[&var_name].value;
                 return Ok(write.read(committed));
             }
+            if self.active_txns.enclosing_write(t, &key) {
+                return Err(EvalError::RuntimeError(format!(
+                    "Cannot read '{}.{}' back into transaction {:?}: an enclosing execution has a buffered write",
+                    self.interner.get(service_name),
+                    self.interner.get(var_name),
+                    t.id,
+                )));
+            }
             if let Some(cached) = t.read_cache.get(&key) {
                 return Ok(cached.0.clone());
             }
@@ -1502,7 +1514,8 @@ impl Manager {
         txn: &mut Transaction,
     ) -> Result<(), EvalError> {
         let key = self.lock_action_target(service_name, var_name, txn)?;
-        txn.written.insert(key, BufferedWrite::Set(value));
+        txn.written.insert(key.clone(), BufferedWrite::Set(value));
+        self.active_txns.record_write(txn, key);
         Ok(())
     }
 
@@ -1570,26 +1583,25 @@ impl Manager {
         use std::collections::hash_map::Entry;
 
         let key = self.lock_action_target(service_name, table_name, txn)?;
-        match txn.written.entry(key) {
-            Entry::Occupied(mut entry) => {
-                if let BufferedWrite::Set(Value::List { vals }) | BufferedWrite::Append(vals) =
-                    entry.get_mut()
-                {
+        match txn.written.entry(key.clone()) {
+            Entry::Occupied(mut entry) => match entry.get_mut() {
+                BufferedWrite::Set(Value::List { vals }) | BufferedWrite::Append(vals) => {
                     vals.push(row);
-                    return Ok(());
                 }
-            }
-            Entry::Vacant(entry) => {
+                _ => return Err(EvalError::TypeError("insert target is not a table".into())),
+            },
+            Entry::Vacant(entry)
                 if matches!(
                     self.services[&service_name].vars[&table_name].value,
                     Value::List { .. }
-                ) {
-                    entry.insert(BufferedWrite::Append(vec![row]));
-                    return Ok(());
-                }
+                ) =>
+            {
+                entry.insert(BufferedWrite::Append(vec![row]));
             }
+            _ => return Err(EvalError::TypeError("insert target is not a table".into())),
         }
-        Err(EvalError::TypeError("insert target is not a table".into()))
+        self.active_txns.record_write(txn, key);
+        Ok(())
     }
 
     pub(crate) async fn propagate(&mut self, service_name: Symbol, changed_var: Symbol) {
@@ -3111,10 +3123,12 @@ impl Manager {
             .pending_txns
             .remove(&tid)
             .unwrap_or_else(|| Transaction::new(tid.clone()));
-        match self
+        self.active_txns.enter(&mut txn);
+        let result = self
             .lookup_with_clock(member, service, Some(&mut txn))
-            .await
-        {
+            .await;
+        self.active_txns.exit(&mut txn);
+        match result {
             Ok(v) => {
                 self.pending_txns.insert(tid, txn);
                 Ok(v)
@@ -3872,6 +3886,7 @@ impl Manager {
 
         loop {
             let mut txn = Transaction::new(txn_id.clone());
+            self.active_txns.enter(&mut txn);
             let effect = match stmts {
                 [stmt] => execute(stmt, initial_env, self, service_name, &mut txn).await,
                 _ => execute_seq(
@@ -3894,12 +3909,14 @@ impl Manager {
                     // installed (#191). Report the error without retrying them.
                     let committed = self.commit_txn(&mut txn, session_clock).await;
                     self.release_all_locks(&txn);
+                    self.active_txns.exit(&mut txn);
                     return committed.map(|()| effect);
                 }
                 Err(error) => error,
             };
             self.abort_participants(&txn).await;
             self.release_all_locks(&txn);
+            self.active_txns.exit(&mut txn);
 
             // A participant can park on its wait queue. The originator waits
             // by retrying with fresh buffers under the same transaction age.
@@ -4047,6 +4064,7 @@ impl Manager {
             .pending_txns
             .remove(&tid)
             .unwrap_or_else(|| Transaction::new(tid.clone()));
+        self.active_txns.enter(&mut txn);
         // A `WaitOn` parks the whole action and re-runs it from the first
         // statement, so a run that parks must leave the buffers as it found
         // them, or `x = x + 1` reads its own buffered `1` on replay and
@@ -4082,6 +4100,7 @@ impl Manager {
                 txn.composed_done.len() - start
             )));
         }
+        self.active_txns.exit(&mut txn);
         if let Some(e) = exec_error {
             if matches!(e, EvalError::WaitOn(_)) {
                 (txn.written, txn.read_cache, txn.composed_seq) = before;
@@ -4616,6 +4635,9 @@ impl Default for Manager {
         Self::new(Interner::new())
     }
 }
+
+#[cfg(test)]
+mod read_back_tests;
 
 #[cfg(test)]
 mod tests {

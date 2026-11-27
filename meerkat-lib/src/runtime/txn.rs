@@ -320,6 +320,8 @@ pub struct Transaction {
     /// buffered and applied only on successful commit (so a failed
     /// transaction leaves no partial writes)
     pub written: HashMap<(ServiceNetId, Symbol), BufferedWrite>,
+    /// This execution's registration while its state is checked out of Manager.
+    active_depth: Option<usize>,
     /// Remote nodes that joined this transaction (executed a composed action
     /// under this `id` and are holding locks or buffered writes until commit or abort)
     pub participants: HashSet<Address>,
@@ -364,12 +366,65 @@ impl Transaction {
             service_locked: HashSet::new(),
             read_cache: HashMap::new(),
             written: HashMap::new(),
+            active_depth: None,
             participants: HashSet::new(),
             participant_history: VClock::new(),
             participant_writes: HashSet::new(),
             composed_done: HashMap::new(),
             composed_seq: 0,
         }
+    }
+}
+
+/// Writes held by executions that can be re-entered while awaiting an RPC.
+/// A read-back has its own transaction state under the same id, so it cannot
+/// see an enclosing execution's buffers. Keep those writes visible to the
+/// read guard until that execution exits, including across nested read-backs.
+#[derive(Default)]
+pub(crate) struct ActiveTransactions {
+    stacks: HashMap<TxnId, Vec<HashSet<(ServiceNetId, Symbol)>>>,
+}
+
+impl ActiveTransactions {
+    #[cfg(test)]
+    pub fn contains(&self, id: &TxnId) -> bool {
+        self.stacks.contains_key(id)
+    }
+
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.stacks.is_empty()
+    }
+
+    pub fn enter(&mut self, txn: &mut Transaction) {
+        assert!(txn.active_depth.is_none());
+        let stack = self.stacks.entry(txn.id.clone()).or_default();
+        txn.active_depth = Some(stack.len());
+        stack.push(txn.written.keys().cloned().collect());
+    }
+
+    pub fn exit(&mut self, txn: &mut Transaction) {
+        let depth = txn.active_depth.take().expect("registered execution");
+        let stack = self.stacks.get_mut(&txn.id).unwrap();
+        assert_eq!(stack.len(), depth + 1, "executions exit in stack order");
+        stack.pop();
+        if stack.is_empty() {
+            self.stacks.remove(&txn.id);
+        }
+    }
+
+    pub fn record_write(&mut self, txn: &Transaction, key: (ServiceNetId, Symbol)) {
+        if let Some(depth) = txn.active_depth {
+            self.stacks.get_mut(&txn.id).unwrap()[depth].insert(key);
+        }
+    }
+
+    pub fn enclosing_write(&self, txn: &Transaction, key: &(ServiceNetId, Symbol)) -> bool {
+        txn.active_depth.is_some_and(|depth| {
+            self.stacks[&txn.id][..depth]
+                .iter()
+                .any(|writes| writes.contains(key))
+        })
     }
 }
 

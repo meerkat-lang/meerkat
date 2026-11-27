@@ -312,6 +312,14 @@ invalidation removes def entries only. Test 7 keeps that true.
 
 #### 3c. A participant invalidates on its own requests
 
+Implementation boundary: the current RPC wait loop (`dispatch_events(false)`)
+defers incoming lookup, action, commit, and abort requests. The registration
+and read-back guard below can land independently, tested through the participant
+API. Enabling read-backs belongs to #213's suspendable execution work, following
+#28's event loop: it must also handle commit/abort calls back into an active
+node, so merely admitting lookup requests is insufficient. The read-back
+examples below specify the guard's behavior when those calls are dispatched.
+
 §3a and §3b both run on the node that writes or composes, and neither can reach
 a **participant's** `pending_txns[tid].read_cache`. That cache has the mirror
 problem: with `def b.y = a.x` on B and the transaction originating at A, A reads
@@ -380,8 +388,8 @@ place, so a later read-back of `x` is rejected. A read-only checked-out
 transaction, or one whose writes a read-back does not reach, is unaffected:
 an `@test` on A asserting on a remote `b.d` that reads `a.x` keeps working
 while A has not written `x`. Making the rejected read-backs work means a
-transaction's state being addressable while it runs, which is #28's
-event-loop work.
+transaction's state being addressable while it runs, which is part of #213's
+suspendable execution work on top of #28's event loop.
 
 An action composed back onto a node whose transaction is checked out has the
 same problem and is outside this task; check whether any existing test does

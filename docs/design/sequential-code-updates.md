@@ -9,7 +9,9 @@ Related work: [#265](https://github.com/meerkat-lang/meerkat/issues/265),
 [#180](https://github.com/meerkat-lang/meerkat/issues/180),
 [#293](https://github.com/meerkat-lang/meerkat/issues/293),
 [#86](https://github.com/meerkat-lang/meerkat/issues/86),
-[#295](https://github.com/meerkat-lang/meerkat/issues/295), and
+[#295](https://github.com/meerkat-lang/meerkat/issues/295),
+[#298](https://github.com/meerkat-lang/meerkat/issues/298),
+[#297](https://github.com/meerkat-lang/meerkat/issues/297), and
 [#213](https://github.com/meerkat-lang/meerkat/issues/213).
 The broader [code-update design](code-updates.md) covers syntax, migration,
 and coordination. The draft formal semantics,
@@ -67,6 +69,8 @@ The design rests on these choices. Each is argued in the section named.
    on which members exist ("Reuse").
 8. **The distributed contract is fixed here; the protocol is #180's**
    ("Remote participants").
+9. **A table is a var that holds a list of records** (#298), so table steps,
+   re-declarations and schema changes follow the var rules ("Tables").
 
 ## Why not reorder
 
@@ -168,6 +172,12 @@ are those of its updates, in source order. The order holds across services;
 grouping steps by service must not change it. An atomic block contains only
 updates: the grammar has no nested atomic blocks.
 
+#297 proposes allowing other statements in an atomic block, such as `let`,
+assignments, `insert`, and new services. Those fit the same model: each is a
+step, checked and executed against the view at its position, so an assignment
+or `insert` is a write step and a `let` binds a value for later steps. Their
+reads and writes join the transaction's footprint like an initializer's.
+
 ### Examples
 
 Starting with `service s { var x = 1; def d = x * 2; }`:
@@ -263,7 +273,37 @@ the member's old version must not be accepted by a consumer that now expects
 the new one. How to guarantee that is an open requirement, shared with type
 changes ("Relation to the formal semantics").
 
-Tables are outside this design.
+## Tables
+
+A table is a var that holds a list of records (#298). Its type, the table
+type, is a list of records with the declared schema, which is how the type
+checker already represents it. `table t { n: int, };` declares a var of that
+type that starts empty, and `table t { … } = e;` gives it an initializer like
+any var's. `insert e into t` is a write that appends a row, `map`, `fold` and
+`select` are reads, and a table has Sources like any var.
+
+So a table step in an update is a var step, with no rules of its own:
+
+- **Re-declaring a table** replaces it like any var, and its schema may
+  change. Without an initializer the new table is empty; to keep or migrate
+  rows, give an initializer that reads the old table, for example
+  `table t { n: int, done: bool, } = map(r in t where true) {n: r.n, done: false};`.
+  With #297, rows can also be migrated by statements in the same atomic
+  block: bind the old rows with a `let` before the re-declaration, then
+  `insert` them after it.
+- **A schema change is a type change.** Retained code that uses the old
+  columns (`fold`, `select`, `map` bodies, field access, and `insert` in
+  retained actions, including action values stored in vars) is checked
+  against the new schema, and the open requirement on values from old
+  versions applies ("Relation to the formal semantics").
+- **Kind changes need no table case.** Changing between a table and a var is
+  a type change, and between a table and a def is the var-and-def case: a
+  table that becomes a def loses its writers, including `insert`.
+
+#298 makes the language match this: today, name resolution treats a table as
+a separate kind of member, so `insert`, `map`, `fold` and `select` accept
+only a declared table, and a table declaration has no initializer. Table steps
+in updates depend on that change.
 
 ## Static validation
 
@@ -608,6 +648,10 @@ differences or open questions, agreed with the draft's author where noted.
 - **Evaluation failure.** The draft assumes evaluation always succeeds. This
   design's abort when a declared def fails before commit goes beyond the
   model rather than conflicting with it.
+- **Tables.** The draft models only scalar values. Because a table here is a
+  var holding a list of records ("Tables"), it adds a value type rather than
+  a new kind of member, and needs no change to the draft's var and def
+  kinds.
 
 ## Alternatives considered
 
@@ -623,8 +667,10 @@ differences or open questions, agreed with the draft's author where noted.
 ## Boundaries and review questions
 
 This design covers adding and replacing members, including changes of type and
-kind. It does not add deletion, renaming, service classes, new update syntax,
-or table migration. Those should follow the same step model when designed.
+kind, and tables as vars that hold a list of records. It does not add
+deletion, renaming, service classes, or new update syntax; the table
+initializer comes with #298, and statements other than updates in atomic
+blocks with #297. Those should follow the same step model when designed.
 
 Review should establish that:
 

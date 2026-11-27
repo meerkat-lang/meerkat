@@ -17,6 +17,9 @@ issues and branches before starting a unit.
 | After #86 and D1, alongside task 12 | E1 (pure update checking), then E2 (ordered execution and staged vars); F follows E1, G follows installed-state checking |
 | After E1 | D2 (effect-system design and prototype: type and kind changes, stored functions, live metadata) |
 | After C, D2 and E1 | H1 (static type/kind migration checks); no initializer execution required |
+| Independently of the units above | T1 (#298: tables as vars that hold a list of records, with an optional initializer) |
+| After T1 and E2 | T2 (table steps in updates); schema changes join H1/H2 |
+| After E2 and F | K (#297: statements other than updates in `atomic` blocks) |
 | After task 12 and E2 | I (def steps and def reads during an update: #267 on one node), then H2 (full local type/kind migration execution) |
 | After local migration and the required peer/protocol support | H3 (distributed client validation and Sources evidence) |
 | Designed alongside #28, built after #213 | J (remote participation: #180, and #267 across nodes) |
@@ -96,6 +99,8 @@ through the CLI; the rest are from reading the code.
 | `node.rs` `static_checks` | Checks top-level actions, tests and watches against the final declarations | F |
 | `imports.rs` peer folding | Folds a peer's startup updates into its declarations and checks the result as a program to initialize | G |
 | `manager/mod.rs` `DepState::offer`, `accept_delivery` | A delivery with the same clock but another value or Sources is taken as a code update, and nothing records which code version produced a value, so a delayed old-code value can look like a new one on a remote consumer (unconfirmed; #295). Local propagation after a code-only change is correct (ran) | H2/H3 (and #295) |
+| `update.rs` `try_apply`; `nameres.rs` `resolve_table`; `graphs.rs` `tables` | A table declaration in an update returns `NotImplemented` (lock collection and evaluation). Name resolution treats a table as its own sort (`ExpectedSort::Table`), so `insert`, `map`, `fold` and `select` accept only a declared table, and `insert {n: 1} into d` for a def fails with "expected table" (ran). A table declaration has no initializer | T1, T2 |
+| `update.rs` `format_update_source` | Remote updates can't serialize tables, `fold`, `select`, `map`, actions or lambdas (#286) | J (and T2 for remote tables) |
 | PR #266 at `8cba620` | Reorders the merged declarations; stages var values in `Transaction::staged` in merged order | Salvage tests and fixtures in E2; not its order or staging map |
 
 The #267 issue body describes #266's behavior as "today". Correct it when #266
@@ -284,6 +289,8 @@ unchanged. Test the checker directly without service creation, plus CLI
   implementation accounts for those reads like a value transaction's. Adding
   the footprint to the draft is a formalization follow-up and does not gate
   E2.
+- Table declarations in updates stay unsupported until T2, reported before
+  any initializer runs; the static check (E1) can accept them once T1 lands.
 - Enable no new cases affected by values from old versions (#295). Same-type
   replacements, including type-preserving def-to-var changes, keep main's
   behavior. #295 investigates whether main can incorrectly accept delayed
@@ -451,9 +458,58 @@ publication bookkeeping if needed, but land the local feature only with
 correct failure handling, clocks and Sources. This is a review stack, not a
 claim that all of I is a small independent PR.
 
+### T. Tables as vars (#298)
+
+The design treats a table as a var that holds a list of records ("Tables").
+Two units:
+
+**T1: the language change (#298).** Independent of the update work, and
+worth checking with the author of #216.
+
+- `table t { … };` declares a var of the table type that starts empty, and
+  `table t { … } = e;` gives it an initializer. Allow the initializer in
+  service declarations and updates alike, and print it in
+  `format_update_source`.
+- `insert e into t` appends to a writable var of a table type, staying an
+  append in the transaction's buffer (#294's `BufferedWrite::Append`).
+- `map`, `fold` and `select` read any member of a table type, including a
+  def. Remove the separate table sort in name resolution (`resolve_table`,
+  `ExpectedSort::Table`) and the separate `tables` set in the graphs.
+- Existing table programs and tests keep working; "expected table" errors
+  become type errors.
+
+**T2: table steps in updates, after T1 and E2.** A table step is a var step:
+check its initializer (or empty table) against the declared type at its
+step, stage the value in the transaction's write buffer, and remove the
+`NotImplemented` cases in `update.rs` through B's traversal. Re-declaring a
+table with the same or a different schema works like re-declaring a var.
+Schema changes that retained code depends on are type changes, checked and
+executed by H1 and H2. #285's remaining table and `fold` reactivity items
+come before T2's tests of defs over a migrated table.
+
+Evidence: a new table, empty and initialized; a table re-declared with
+`= t`; a schema migration with `map`; a re-declaration without an
+initializer, which leaves the table empty; and, through H1/H2, retained
+`fold`, `select`, `map` and `insert` users across a schema change and
+table-to-def and table-to-var changes.
+
+### K. Statements in atomic blocks (#297)
+
+After E2 and F. Allow `let`, assignments, `insert` and new services in an
+`atomic` block, as further steps of the same transaction. Each is checked
+against the view at its position, using F's mechanism, and executed through
+the transaction's ordinary write buffer; their reads join the footprint like
+an initializer's. `insert` from a top-level block needs a qualified target
+(`s.t`), which T1 or K must add. Test migrating table rows with
+`let old = s.t;`, a re-declaration of `t`, and `insert` of each old row, all
+in one block, including a failure partway that leaves nothing installed.
+
 ### J. Remote participation (#180, and #267 across nodes)
 
-Designed with #191 alongside #28, built after #213. Review subjects, in order:
+Designed with #191 alongside #28, built after #213. #286 (serializing tables,
+`fold`, `select`, `map`, actions and lambdas in remote updates) is a
+prerequisite for updates that carry those forms to another node. Review
+subjects, in order:
 
 1. The protocol and failure model as a design change: owner-evaluated steps
    or coordinator-evaluated steps with staged writes and code pushed to
@@ -535,6 +591,11 @@ static checks and runtime where both apply.
   evidence are rejected before execution. Same-type replacements are covered
   by #295's tests.
 - Top-level statements before and after an update.
+- Tables: a new table, empty and initialized; re-declared with `= t`, with a
+  `map` migration, and without an initializer; schema changes against
+  retained `fold`, `select`, `map` and `insert` users; table-to-def and
+  table-to-var changes; and, with #297, rows migrated by `let` and `insert` in
+  one atomic block.
 - CLI startup (initializers run once), local imports, peer imports, runtime
   updates, and a second update after a final state whose stored order puts a
   member before one it reads.

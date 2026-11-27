@@ -365,8 +365,9 @@ holds a transaction outside `pending_txns` across an await**. Today that is:
   remote lookups while initializers run;
 - `handle_lock_request`, which takes a participant's transaction out of the
   map while `acquire_lock_group_internal` awaits other nodes;
-- `commit_participant` and `abort_participant`, which take the transaction
-  out of the map while forwarding `Commit` or `Abort` to sub-participants;
+- abort cleanup: `abort_participants`, including when called from
+  `abort_participant` (which takes the transaction out of the map while it
+  forwards the abort to sub-participants) and from a commit-clock failure;
 - a code update (`update::Transaction::apply`), whose lock transaction
   awaits remote reads and forwarding.
 
@@ -375,7 +376,9 @@ one checkout helper that takes the transaction (from `pending_txns`, or new),
 registers it, and returns a value that unregisters when the transaction is
 put back or dropped. A future path that runs a transaction outside the map
 then cannot forget to register. Audit for others by searching for
-`pending_txns.remove` and `Transaction::new`. When `dispatch_events(false)`
+`pending_txns.remove` and `Transaction::new`. Commit paths (`commit_txn`,
+`commit_participant`) are deliberately not registered; see "The commit
+boundary" below. When `dispatch_events(false)`
 would queue a `LookupRequest` or `ActionRequest` whose `txn_id` has a
 registration, reply at once with an error naming the transaction and saying
 that a read-back into a running transaction is not supported until #213. Requests
@@ -391,8 +394,8 @@ returning B's error to A. B therefore sends A an `Abort` and waits for its
 acknowledgement, while A still queues `Abort` until B's original reply
 arrives. The operation can still time out despite the immediate rejection.
 
-**Proposed mechanism, to be validated by a focused spike: a node never
-queues an `Abort` for a transaction it is running.**
+**Mechanism, validated by a spike: a node never queues an `Abort` for a
+transaction it is running.**
 
 Aborts can reach a waiting node by routes other than the request it
 rejected, so the cycle must be broken where it closes, at the waiting node,
@@ -439,28 +442,34 @@ The rule:
   error, so its work cannot commit. Either way its failure path releases its
   locks and aborts its participants as for any failed transaction. Clear the
   doomed mark when the id's last registration on this node exits.
-- **No dooming once commit has begun.** A registration records its phase.
-  Once the execution has started committing (an originator in `commit_txn`, a
-  participant in `commit_participant`), its local writes may already be
-  installed while it awaits participant commits, so an `Abort` arriving then
-  cannot be honoured by dooming it. Such an `Abort` means the commit decision
-  and an abort raced, which the current protocol does not allow: aborts
-  follow failures, and a failure stops the commit decision (see the next
-  point). Acknowledge it without dooming, and report it as a commit-phase
-  protocol violation, logged and surfaced like the participant commit
-  failures #191 already reports. Do not claim atomicity in that case;
-  commit-phase failures remain #191's.
+- **The commit boundary.** The originator checks the doomed mark and drops
+  its execution registration immediately before entering `commit_txn`, with
+  no await between the check and that transition. Commit paths are not
+  registered, so an `Abort` that arrives during commit keeps today's
+  handling. That is deliberate: `commit_stamped` installs local writes before
+  it awaits participant commits, so a doomed check there could not undo them.
+  Failures during commit remain #191's; this task does not resolve them.
 - **Why that is safe.** An `Abort` for a transaction means some part of it
   failed. Errors cannot be caught in the language, and a failing participant
   reports its error up the call chain, so the transaction as a whole fails
   and the originator does not commit it. A wait-die retry runs under a new
   attempt id (`TxnId::retry`), so aborts of an earlier attempt never match
   it. Acknowledging early therefore never lets an executing transaction's
-  work commit, and the previous point covers an `Abort` that would arrive
-  after commit had begun. What changes is the acknowledgement's
-  meaning for a running node: its locks are released when its execution
-  unwinds, shortly after, rather than before the reply. That affects
-  liveness only: a retry that arrives first waits or dies as usual.
+  work commit; an `Abort` after the commit boundary is handled as today.
+- **What the acknowledgement promises.** For a running execution, an early
+  acknowledgement means the abort is accepted and the execution will not
+  commit. It does not mean its locks are already released: they are released
+  when the execution's current wait returns. This task guarantees prompt
+  unwinding only for read-back rejection chains and abort-forwarding cycles,
+  where the wait returns as soon as the failing chain replies. Other waits
+  can last longer. If the doomed node is waiting on a child parked on another
+  transaction's lock, it stays in that wait until the lock is released, and
+  `WaitParked` keepalives can extend the wait; an abort caused by an upstream
+  timeout is one way that case arises. That is no worse than today, where the
+  same `Abort` is queued until the same wait returns and its sender also
+  blocks until its own timeout. Prompt cancellation of an arbitrary wait,
+  and its cleanup obligations, is #213's suspendable-task work; do not infer
+  it from the doomed mark or from unregistering when a future is dropped.
 - **Rejected requests still fail fast.** A `LookupRequest` or `ActionRequest`
   for a registered id is still answered at once with the typed rejection
   error, an `EvalError` variant with a display prefix that `remote_error`
@@ -471,15 +480,26 @@ The rule:
 - **Aborts stay idempotent.** A node that has already discarded the
   transaction acknowledges and does nothing, as today.
 
-Nothing here adds a message. The spike should confirm the three assumptions
-the rule rests on: that every `Abort` for a running transaction comes from a
-failure that propagates to the originator; that a running execution always
-reaches a point where it checks the doomed set promptly (its wait returns
-once the failing chain replies); and that no `Abort` arrives for a
-transaction whose commit has begun, so the commit-phase report never fires
-in correct runs. If either fails, or the fix needs
-broader protocol changes, revisit the split with #213 rather than extending
-this slice.
+Nothing here adds a message. A spike (branch `task12-abort-spike`) built
+the mechanism, about 170 production lines with no new messages or
+transaction fields, and tested it on real nodes over real network
+connections: lookup and action read-backs, a longer chain, an earlier
+participant relationship, the four-step forwarded-abort sequence above, and
+an abort cycle between idle participants with no read-back at all. Each
+failed operation completed with its cleanup in 0.13–0.36s, with writes
+discarded, locks released, no participant state left behind, and a later
+transaction able to write. It also showed that a doomed execution does not
+always unwind promptly (the parked-child case above), which is why the
+contract is the narrower one stated there, and it led to the commit boundary.
+If implementation finds a path the contract does not cover, revisit the
+split with #213 rather than extending this slice.
+
+Commit forwarding may have the analogous cycle: `commit_participant` takes
+the transaction out of the map and awaits each forwarded `Commit`, and a
+`Commit` arriving meanwhile is queued, so two participants with mutual
+participant relationships could wait on each other until `REPLY_TIMEOUT`.
+That would be an existing problem on main, independent of read-backs, and is
+outside this task; it is to be confirmed and tracked separately.
 
 Keep membership correct on every exit: success, failure, and parking (a
 parked participant's transaction goes back into `pending_txns`). Keep the
@@ -658,10 +678,17 @@ those two hooks in place.
    doomed execution whose pending call failed with the typed rejection
    reports that rejection, not an abort error. Cover read-backs into the other
    registered paths: a peer's def computed while `create_service` awaits a
-   remote lookup, and a request arriving while `handle_lock_request`,
-   `commit_participant` or `abort_participant` holds the transaction. Check
-   that an `Abort` injected after commit has begun is acknowledged without
-   dooming and is reported. The composed-action case can land in the first slice; the
+   remote lookup, and a request arriving while `handle_lock_request` or abort
+   cleanup holds the transaction (the composed-action forms can land in the
+   first slice; the def forms follow with compute-on-read). Include an abort
+   cycle between idle participants with no read-back, and that dropping a
+   registered future removes its registration (but not its locks). At the
+   commit boundary, check that an `Abort` arriving after the originator has
+   entered `commit_txn` is handled as today and cannot roll back installed
+   writes. As a documented limitation rather than an acceptance test, cover
+   the parked-child case: the doomed execution acknowledges at once, does not
+   commit when the child's success arrives, and cleans up only once the
+   child's lock is released. The composed-action case can land in the first slice; the
    def case follows with compute-on-read. A request for a *different*
    transaction arriving during the wait is still queued and served afterwards.
    Check registrations through success, failure (including asynchronous

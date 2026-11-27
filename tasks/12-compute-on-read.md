@@ -116,19 +116,26 @@ that check (below). So build it with **the rule initialization already uses
 for a def's first pair**, over the def's **static inputs**
 (`graphs.inputs`), not just the reads this evaluation made:
 
-- an input the evaluation read contributes its receipt (for a var, its
-  snapshot pair; for a def, its own receipt; for this transaction's buffered
-  write, no clock and its own name as a Source);
+- an input the evaluation read contributes **the pair that read returned**,
+  as recorded in the recompute's frame (below): for a local var, its snapshot
+  pair; for a remote member, the pair in the lookup reply; for a def, its own
+  receipt; for this transaction's buffered write, no clock and its own name
+  as a Source;
 - a local input the evaluation did not read, such as one in a branch not
-  taken, contributes its current state;
-- a remote input the evaluation did not read makes the receipt's Sources
-  unknown, without a network read.
+  taken, contributes its current state (`vars[member].entry()`);
+- a remote input the evaluation did not read contributes no clock and makes
+  the receipt's Sources unknown, without a network read. Do not use a
+  `dep_cache` delivery for it: a delivery would give known Sources with a
+  clock unrelated to anything this transaction read.
 
 The receipt's clock is the join of those clocks and its Sources the union of
-those Sources (`join_receipts`); reuse `input_candidates` and `join_receipts`
-rather than writing a second version. Do not apply `close_batch`'s rejection
-to the receipt itself: the receipt only reports what the value is consistent
-with, and the batch check happens where it is consumed.
+those Sources (`join_receipts`). Do not build it with `input_candidates`: for
+an input that was read, that function cannot recover a remote pair (outside
+initialization `remote_lookup` keeps none in `read_cache`), and for an unread
+remote input it returns any `dep_cache` delivery. Do not apply
+`close_batch`'s rejection to the receipt itself: the receipt only reports what
+the value is consistent with, and the batch check happens where it is
+consumed.
 
 Why the unread inputs count: with `def a = if s.flag then s.x else s.y;` and
 `flag == true`, a receipt with only the reads made would have no clock for
@@ -167,8 +174,9 @@ behavior, not a new failure; locking unread inputs would give up "unread
 defs and branches lock nothing".
 
 Record a recompute's reads in a frame on `Transaction`, pushed on entry and
-popped on every exit, beside §4's in-progress set, so the rule above knows
-which inputs were read.
+popped on every exit, beside §4's in-progress set. The frame maps each member
+read during the recompute to the pair that read returned, remote reads
+included, so the rule above builds the receipt from exactly what was read.
 
 ### 2. The recompute
 
@@ -333,17 +341,29 @@ state, and returns a stale value. For example, in `client → A → B`, A buffer
 `x` and then calls B, whose computation reads A's `x` while A's action is
 still running.
 
-Do not paper over it. Track the transaction ids whose state is checked out on
-this node (`Manager::active_txns: HashSet<TxnId>`): an originator while
-`execute_transaction` runs, and a participant while
+Do not paper over it, but do not reject read-backs that cannot be stale
+either. Track the transactions whose state is checked out on this node, with
+the members each has written here so far
+(`Manager::active_txns: HashMap<TxnId, HashSet<(ServiceNetId, Symbol)>>`): an
+originator while `execute_transaction` runs, and a participant while
 `execute_action_participant` or `remote_read_participant` holds its
-transaction outside the map. Have `remote_read_participant` return an
-`EvalError` naming the transaction when a read arrives for one, so this fails
-loudly instead of silently reading around the buffered writes. Clear the mark
-on every exit: success, failure, and parking (a parked participant's
-transaction goes back into `pending_txns`). Making these read-backs work
-means a transaction's state being addressable while it runs, which is #28's
-event-loop work.
+transaction outside the map. `assign` and `append_table_row` add the member to
+that set when they buffer a write for a checked-out transaction.
+
+A read-back for a checked-out transaction is then served as today, from a
+fresh `Transaction` under the same id, **unless it reaches a member in that
+set**. Check in `lookup`, for each local member the read-back reads, including
+the inputs of a def it recomputes; if one has been written by the checked-out
+transaction, return an `EvalError` naming the transaction and the member, so
+this fails loudly instead of silently reading around the buffered write. A
+read-only checked-out transaction, or one whose writes the read-back does not
+reach, is unaffected: an `@test` on A asserting on a remote `b.d` that reads
+`a.x` keeps working while A has not written `x`.
+
+Clear the entry on every exit: success, failure, and parking (a parked
+participant's transaction goes back into `pending_txns`). Making these
+read-backs work in all cases means a transaction's state being addressable
+while it runs, which is #28's event-loop work.
 
 An action composed back onto a node whose transaction is checked out has the
 same problem and is outside this task; check whether any existing test does
@@ -352,8 +372,9 @@ that, and record it with the boundary below if one does.
 Since #294 every `@test` and REPL statement is an originator transaction, so
 this is reachable from any `for` loop or action that writes a local var and
 then reads a remote def over it. The implementation PR records the boundary in
-`meerkat/tests/README.md` next to task 11's scenarios: a def on a node over a
-var whose writer is checked out is not yet in contract.
+`meerkat/tests/README.md` next to task 11's scenarios: a read-back that
+reaches a member written by a transaction still running on that node fails
+with an error; read-backs that reach no such member work as before.
 
 ### 4. Cycle detection
 
@@ -460,13 +481,15 @@ those two hooks in place.
    action, sees the new value on the second read.
 9. **New — §3c.** A participant's def over a *second participant's* var, read
    before and after a composed action that writes it, sees the new value. A
-   read-back to a node whose transaction is checked out fails with the named
-   error rather than returning a stale value, in both forms: a participant's
-   def over the **originator's** var, read after the originator writes it; and,
-   in `client → A → B`, B reading A's `x` that A buffered before calling B,
-   while A's action is still running. Check that the mark is cleared after the
-   action succeeds, fails, and parks, so a later read for the same transaction
-   is served normally.
+   read-back that reaches a member written by a checked-out transaction fails
+   with the named error rather than returning a stale value, in both forms: a
+   participant's def over the **originator's** var, read after the originator
+   writes it; and, in `client → A → B`, B reading A's `x` that A buffered
+   before calling B, while A's action is still running. A read-back to a
+   checked-out transaction that has written nothing it reaches is served
+   normally: an `@test` on A asserting on B's `def d = a.x + 1`, with no write
+   to `x`. Check that the entry is cleared after the action succeeds, fails,
+   and parks, so a later read for the same transaction is served normally.
 10. `meerkat/tests/s1.mkt` still passes. It has passed since PR #201 made each
     `do` in an `@test` its own transaction, so it no longer exercises
     read-your-own-writes and is only a regression check. Tests 1 and 3 are

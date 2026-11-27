@@ -354,26 +354,47 @@ whose inputs include a member of A becomes a read-back whenever A reads it
 inside a transaction: an `@test` on A asserting on B's `def d = a.x + 1`
 would wait until the timeout, where today it returns `d`'s stored value.
 
-**Rule for this task: reject such read-backs immediately.** Track the
-transaction ids running on this node (`Manager::running_txns:
-HashSet<TxnId>`): an originator while `execute_transaction` runs, and a
-participant while `execute_action_participant` or `remote_read_participant`
+**Rule for this task: reject such read-backs and unwind promptly.** Track
+counted registrations per transaction id on this node (for example,
+`Manager::running_txns: HashMap<TxnId, usize>`): an originator while
+`execute_transaction` runs, and a participant while
+`execute_action_participant` or `remote_read_participant`
 holds its transaction outside `pending_txns`. When `dispatch_events(false)`
-would queue a `LookupRequest` or `ActionRequest` whose `txn_id` is in that
-set, reply at once with an error naming the transaction and saying that a
-read-back into a running transaction is not supported until #213. Requests
-for other transactions are queued as before. A queued read-back for a running
-transaction can never succeed, so replying now loses nothing; it turns a 15s
-timeout into an immediate, explicit error.
+would queue a `LookupRequest` or `ActionRequest` whose `txn_id` has a
+registration, reply at once with an error naming the transaction and saying
+that a read-back into a running transaction is not supported until #213. Requests
+for other transactions are queued as before. Rejecting the request must also
+let the original operation return the named error and complete abort cleanup
+without waiting for `REPLY_TIMEOUT`, assuming responsive peers.
+
+**Open design requirement: rejection must not create an abort wait cycle.**
+An immediate error reply alone does not meet that contract. In `A → B → A`,
+B pre-registers A in `txn.participants` before sending its read-back. On
+failure, `discard_failed_participant_txn` awaits `abort_participants` before
+returning B's error to A. B therefore sends A an `Abort` and waits for its
+acknowledgement, while A still queues `Abort` until B's original reply
+arrives. The operation can still time out despite the immediate rejection.
+
+Settle and document a safe rejection/cleanup mechanism before landing this
+slice. It must preserve cleanup of earlier work under the same transaction
+id, including locks and downstream participants. Do not simply remove the
+rejecting node from the participant set: earlier requests may already have
+created state there. Nor is acknowledging an abort sufficient unless the
+protocol ensures the affected work cannot commit and its cleanup completes.
+If resolving this requires substantial protocol changes, revisit the split
+and sequencing with #213 rather than expanding the first PR implicitly.
 
 Keep membership correct on every exit: success, failure, and parking (a
-parked participant's transaction goes back into `pending_txns`). Nested
-executions under the same id on one node, such as a `remote_read_participant`
-that runs while its own node's originator waits, must not remove an
-enclosing execution's membership when they exit: count entries per id, or
-keep a stack, and remove the id only when the last one leaves. Prefer a guard
-that also cleans up when its future is dropped, since #213 runs actions as
-tasks that can be cancelled.
+parked participant's transaction goes back into `pending_txns`). Keep the
+registration through asynchronous failure cleanup, while the execution still
+holds its transaction outside the map; PR #300's participant exit calls
+currently precede that cleanup and cannot carry over unchanged. If nested
+executions use the same id, each releases only its own registration, and the
+id remains registered until the last one leaves. This lifecycle invariant
+does not enable nested requests through the dispatcher. Prefer a guard that
+also unregisters when its future is dropped, in preparation for #213's
+cancellable tasks. Unregistering alone does not make cancellation safe:
+releasing transaction locks and aborting participants are separate obligations.
 
 This is a deliberate, visible limitation until #213: a transactional read of
 a cross-node def whose inputs include a member of the reading node fails with
@@ -384,6 +405,7 @@ transaction's view.
 rather than blocking the node, a read-back can be served while the
 transaction runs. It must then still not read around that transaction's
 buffered writes, so #213 needs one of:
+
 - making the running transaction's state reachable by id, so the read-back
   sees its writes;
 - or a finer guard that allows read-backs which reach no buffered write and
@@ -391,6 +413,15 @@ buffered writes, so #213 needs one of:
   transaction id, each seeded from the writes already buffered, recording
   each later write, and popped only by its own execution, with the check in
   `lookup` consulting only enclosing registrations.
+
+Either approach must preserve transaction state and establish who owns
+commit/abort cleanup. The finer guard alone does not do this: a nested
+execution can insert its transaction into `pending_txns`, only for the
+enclosing participant to overwrite that entry when it returns, losing the
+nested execution's lock and read bookkeeping. Shared or explicitly merged
+state must retain buffered writes, locks, read snapshots, accumulated history,
+and participant membership. Preserve PR #300's prototype for reference, but
+do not treat it as sufficient to enable read-backs under #213.
 
 Since #294 every `@test` and REPL statement is an originator transaction, so
 the limitation is reachable from ordinary code. The implementation PR records
@@ -504,15 +535,22 @@ those two hooks in place.
    action, sees the new value on the second read.
 9. **New — §3c.** A participant's def over a *second participant's* var, read
    before and after a composed action that writes it, sees the new value. A
-   read-back into a transaction running on the node it reads from fails
-   immediately (well under `REPLY_TIMEOUT`) with the error naming the
-   transaction, in both forms: an `@test` on A asserting on B's
+   read-back into a transaction running on the node it reads from makes the
+   original operation fail promptly (well under `REPLY_TIMEOUT`) with the
+   error naming the transaction, in both forms: an `@test` on A asserting on B's
    `def d = a.x + 1`; and, in `client → A → B`, B's action reading `a.x` while
-   A's action is still running. A request for a *different* transaction that
-   arrives during the wait is still queued and served afterwards. After the
-   execution succeeds, fails, and parks, a later request for the same
-   transaction is served normally, including when a nested execution under
-   the same id exited first.
+   A's action is still running. Exercise the actual network dispatch and
+   participant abort paths, not only the immediate rejection reply. Verify
+   cleanup completes, buffered writes are discarded, and a subsequent
+   transaction can acquire the affected locks. Include earlier participant
+   work and a downstream participant so rejection cannot silently abandon
+   their state. The composed-action case can land in the first slice; the
+   def case follows with compute-on-read. A request for a *different*
+   transaction arriving during the wait is still queued and served afterwards.
+   Check registrations through success, failure (including asynchronous
+   cleanup), and parking, plus guard drop if implemented. A nested
+   registration's exit must leave the enclosing one present; after the last
+   exit, a later request for the same id is no longer rejected by this guard.
 10. `meerkat/tests/s1.mkt` still passes. It has passed since PR #201 made each
     `do` in an `@test` its own transaction, so it no longer exercises
     read-your-own-writes and is only a regression check. Tests 1 and 3 are

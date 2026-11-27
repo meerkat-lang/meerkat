@@ -96,8 +96,11 @@ today. Do not read `service.defs` directly in the recompute. Unit I of the
 makes that accessor return code staged by an update in progress (§6).
 
 Outside a transaction, behaviour is unchanged: return the stored value. Since
-#294 every `@test` and REPL statement runs in a transaction, so this path now
-serves only `watch` evaluations, propagation and subscription replies.
+#294 every `@test` and REPL statement runs in a transaction, but this path
+still has other callers: `watch` evaluations, propagation, subscription
+replies, and ordinary non-transactional remote reads (`remote_lookup` sends a
+`LookupRequest` with `txn_id: None`, which `serve_request` answers through
+`lookup_with_clock(…, None)`).
 
 `remote_read_participant` already routes through `lookup`, so a participant
 serving a transactional read of one of its defs gets this for free. Confirm with
@@ -107,28 +110,41 @@ path.
 #### 1a. The clock and Sources of a computed def
 
 A def has no clock dimension of its own. The entry a recompute stores in
-`txn.read_cache` carries the **join of the clocks of the reads it made**, and
-the **union of their Sources** (unknown if any input's Sources are unknown). An
-input that is this transaction's own buffered write contributes no clock — the
-write set covers it — and its own name as a Source. Nested def reads contribute
-their own entries' clocks, so the join is the def's whole input history.
+`txn.read_cache` is a receipt for the value it computed:
 
-Locally this repeats what the input entries already hold. It is needed in two
-places:
+- **Clock:** the **join of the clocks of the reads it actually made**. An input
+  that is this transaction's own buffered write contributes no clock (the
+  write set covers it). Nested def reads contribute their own receipts'
+  clocks, so the join is the history of the value read.
+- **Sources:** the def's **static Sources**, the set propagation maintains for
+  it from its declaration's inputs, not the union of the reads made. A def
+  that branches on a condition depends on both branches' sources whichever
+  branch this evaluation took, and its Sources are unknown if any static
+  input's Sources are unknown. Use the def's installed Sources; for a def
+  being initialized, the Sources initialization computes for it.
+
+The clock describes what this transaction observed; the Sources describe the
+def, so they never shrink to the branch one evaluation took.
+
+The receipt is needed in two places:
 
 - **A participant answering a transactional read of a def.**
-  `remote_read_participant` returns this pair through `lookup_with_clock`, and
-  the originator merges the clock into `txn.participant_history`
+  `remote_read_participant` returns the receipt through `lookup_with_clock`,
+  and the originator merges its clock into `txn.participant_history`
   (`remote_lookup`, `manager/mod.rs:3057`). Without it, `x = remote.d + 1`
   would not carry the history of what `d` was computed from, which is the
   guarantee #262 added for statements.
 - **Service initialization.** `input_candidates` seeds a def's first batch
-  from the pairs in the initializing transaction's `read_cache`. When an
-  initializer reads an earlier def, the computed pair must match what
-  initialization stored for that def.
+  from the pairs in the initializing transaction's `read_cache`. For an input
+  that is a def, that pair is now a receipt. Initialization keeps its own rules
+  for inputs it did not read: an unread local input (an untaken branch)
+  contributes its current state, and an unread remote one leaves the Sources
+  unknown. So the installed clock of a def can be larger than a receipt for
+  the same value, which is the conservative direction, and its Sources agree
+  with the receipt's because both are static.
 
 Record a recompute's reads in a frame on `Transaction`, pushed on entry and
-popped on exit, beside §4's in-progress set.
+popped on every exit, beside §4's in-progress set.
 
 ### 2. The recompute
 
@@ -157,13 +173,21 @@ of the work and each part of it is load-bearing:
 
   Memoisation is not lost: `lookup` serves from `txn.read_cache` (§3), which is
   the transactional cache and does carry locks.
-- A recompute failure **aborts** the transaction. This holds even when the def
-  has a stored value: a def whose last propagation failed keeps its old value
-  outside transactions (propagation logs the failure), but a transaction that
-  reads it fails rather than reading a value that does not follow from its
-  view. Swallowing the failure would commit a state whose derived member does
-  not follow from it, and would drop a `WaitDieAbort` or `WaitOn` from a live
-  re-read, defeating task 06's retry loop.
+- Distinguish two kinds of error from a recompute:
+  - **An evaluation error** (a runtime error in the def's code) **aborts** the
+    transaction. This holds even when the def has a stored value: a def whose
+    last propagation failed keeps its old value outside transactions
+    (propagation logs the failure), but a transaction that reads it fails
+    rather than reading a value that does not follow from its view.
+    Swallowing it would commit a state whose derived member does not follow
+    from it.
+  - **A transaction-control error** (`WaitOn`, `WaitDieAbort`) from a read
+    inside the recompute **propagates unchanged** into the existing park and
+    retry handling (task 06 for originators, parking for participants). It is
+    not an evaluation failure and must not be turned into one.
+
+  Either way, §1a's read frame and §4's in-progress marker are popped on the
+  way out, including when the error is `WaitOn` and the action parks.
 
 Inside a transaction, then, a cross-service dependency is **always** read from
 its owner under the shared transaction id. `remote_lookup` pre-registers the
@@ -218,92 +242,41 @@ following listeners into other services on this node.
 
 #### 3b. Invalidate on composed action
 
-That is exactly what `touched_services` reports, so bring that plumbing back —
-repurposed from "recompute these defs now" to "invalidate these cached reads":
+A composed action can write, on another node, a member that a memoised def
+here was computed from, directly or through nested composed actions further
+down. Start conservatively: **after a successful composed action, remove every
+memoised def entry**, following the two rules above (def entries only, and
+their clocks merged into the transaction's history first). Var snapshots and
+accumulated history stay. A def read again afterwards is recomputed; unread
+defs still cost nothing.
 
-- `Transaction.remote_writes: HashSet<Symbol>` — a **new** field. `main`'s
-  `Transaction` (`runtime/txn.rs`) does not have it; add it and initialise it
-  empty in `Transaction::new`. Everything below reads or writes it.
-- `ActionResponse.touched_services: Option<Vec<String>>` in
-  `meerkat-lib/src/net/types.rs`, with `#[serde(default)]` so older peers still
-  decode — as `None`, which step 2 treats differently from `Some(vec![])`.
-- `codec::validate_touched_services(&[String]) -> Result<()>`.
-- `Manager::touched_services_for_txn(&TxnId) -> Vec<String>` — the **transitive**
-  set: the union of `txn.remote_writes` and the services named in `txn.written`.
-  Transitivity matters because a node the originator never contacted may have
-  been written by a nested action, and nothing else reports it.
-- `ComposedCall` (task 10) gains `touched_services: Option<Vec<String>>`, so a
-  **replayed** dispatch reports the same set as the original, and an unknown
-  stays unknown. A replay that reported a narrower set would invalidate less and
-  serve a stale value.
-- The **producer**. Nothing on `main` fills the field, and it is easy to ship
-  the whole consumer side without noticing: the participant's `ActionRequest`
-  reply in `meerkat/src/main.rs` must call `touched_services_for_txn(&tid)` on
-  success — while the transaction is still in `pending_txns` — and send
-  `Some(result)`. The failure replies send `Some(vec![])`; they are about to
-  abort the transaction anyway. A producer that is never wired up looks exactly
-  like an old peer on the wire, which is why step 2 makes `None` conservative
-  rather than benign.
+The **replay** branch from task 10 must do the same: when a replayed run
+skips a composed action recorded in `composed_done`, it clears memoised def
+entries exactly as the original run did after that action. Otherwise the
+replay keeps entries the original run had dropped and serves stale values.
 
-On a successful `ActionResponse`, in `remote_action`:
+This replaces the reference branch's `touched_services` protocol and the new
+response field, transaction set, validator and replay record that an earlier
+draft of this spec reintroduced. They are not needed:
 
-1. **Merge the reported set into `txn.remote_writes`.** Nothing else populates
-   it, and `touched_services_for_txn` reads it to report transitively upward —
-   so without this merge a middle node reports only its own services and a
-   write two hops down is invisible to the originator, whose cached def then
-   stays stale. Validate with `validate_touched_services` before storing.
-2. **"Nothing touched" and "not reported" are different answers.** `None` is
-   the peer that did not send the field; `Some(vec![])` is the peer that ran and
-   wrote nothing. Collapsing them into an empty vec turns version skew into
-   silent staleness.
+- Nested writes are already reported. `ActionResponse.writes` carries the
+  participant's whole write set (`transaction_history`, which includes its own
+  participants' writes), built in `Manager::dispatch_parked`, and
+  `remote_action` merges it into `txn.participant_writes`. Every node sends
+  it, so there is no "not reported" case to carry upward.
+- Clearing every memoised def is correct without any of that information. It
+  costs recomputation of defs read again after a composed action, which
+  already costs a round trip itself.
 
-   On `None`, the reference branch's fallback — record the slug dispatched to,
-   as `record_touched_services` does — is not enough. In `client -> mid -> rc`,
-   a `mid` that does not report leaves the client believing only `mid` was
-   touched, so a write on `rc` one hop further down never invalidates anything.
-   Invalidate conservatively instead: every memoised def with any cross-service
-   dependency, plus §3a's walk from each. That is the widest seed for the same
-   primitive, and it is what `refresh_remote_cross_deps_in_txn` did on every
-   composed action.
-3. **Invalidate**, in two steps. First fix what "owned by a touched service"
-   means, because the three names involved are not the same name: a reported
-   entry is the *owner node's own* service name, `txn.read_cache` is keyed by
-   `(ServiceNetId, Symbol)`, and `graphs.cross_deps` is keyed by in-scope local
-   name. Match on the **slug** — `split_service_net_id(sid).1` for a cache key,
-   and the same applied to `service_net_id_for_name(owner)` for a cross-dep.
-   Comparing interned local names instead silently never fires under an import
-   alias, which is exactly the staleness §3b exists to close. Slug matching can
-   over-invalidate when two nodes each declare a service of that name; that
-   costs a recompute and is the safe direction.
-
-   Then find the *directly* affected entries: every memoised def owned by a
-   touched service, plus every memoised def whose `graphs.cross_deps` name one.
-   Then **run §3a's listener walk from each of them**, so anything derived from
-   a directly affected def is dropped too.
-
-   The second step is not optional. `graphs.cross_deps` records only a def's
-   *own* cross-service dependencies, so with `def y = remote.x` and
-   `def z = y + 1`, `z` has no cross-service dep at all. Stopping at the direct
-   set drops `y` and leaves a stale `z` for the rest of the transaction.
-
-   This is the same primitive as §3a with a different seed set: §3a seeds from
-   a written member, §3b seeds from the directly affected defs. Implement
-   invalidation once and call it from both.
+If profiling later shows that recomputation matters, a more precise
+invalidation can seed §3a's walk from the members in `ActionResponse.writes`:
+memoised defs whose `graphs.cross_deps` name a written member, and everything
+downstream of them. Do that as a separate change, from the existing field,
+not with a new protocol.
 
 This transaction's own buffered writes cannot be evicted: since #294 they live
 only in `txn.written`, which `lookup` checks before `read_cache`, and
 invalidation removes def entries only. Test 7 keeps that true.
-
-The **replay** branch from task 10 must do all of this too, from the recorded
-`ComposedCall`. A replay that skipped the merge or the invalidation would leave
-the transaction with a narrower touched set and a stale cache than the original
-run produced.
-
-Record the `ComposedCall` **first**, ahead of the merge, the validation and the
-invalidation. Note what this is and is not: none of those three can park — §3a's
-walk is pure removal and §3b reuses it — so this is ordering discipline, not a
-fix. It keeps the record ahead of the one fallible step there
-(`validate_touched_services`) and ahead of anything fallible added later.
 
 #### 3c. A participant invalidates on its own requests
 
@@ -325,23 +298,38 @@ already invalidate through §3a.
 That is sufficient whenever the writer is another *participant* — its buffered
 write is in its own `pending_txns` entry and the forced re-read finds it.
 
-⚠️ **It is not sufficient when the writer is the originator, and that case is
-out of contract.** The forced re-read of `a.x` arrives at A's
-`remote_read_participant`, which builds a **fresh** `Transaction`: the
-originator's live one is a local in `execute_transaction`
-(`manager/mod.rs:3864`) and never enters `pending_txns`, so the read-back sees
-pre-transaction state and returns the same stale value. Do not paper over it —
-track the originator's in-flight ids (`Manager::active_txns: HashSet<TxnId>`)
-and have `remote_read_participant` return an `EvalError` naming the transaction
-when a read arrives for one, so this fails loudly instead of silently reading
-around the buffered writes. Making it work means the originator's transaction
-becoming addressable while it runs, which is #28's event-loop work.
+⚠️ **It is not sufficient when the writer's transaction is checked out,
+and that case is out of contract.** A node's transaction state is out of
+`pending_txns` while it runs there: the originator's live transaction is a
+local in `execute_transaction` (`manager/mod.rs:3864`) and never enters the
+map, and `execute_action_participant` and `remote_read_participant` remove a
+participant's transaction from the map for as long as they run. A read-back
+that arrives meanwhile builds a **fresh** `Transaction`, sees pre-transaction
+state, and returns a stale value. For example, in `client → A → B`, A buffers
+`x` and then calls B, whose computation reads A's `x` while A's action is
+still running.
+
+Do not paper over it. Track the transaction ids whose state is checked out on
+this node (`Manager::active_txns: HashSet<TxnId>`): an originator while
+`execute_transaction` runs, and a participant while
+`execute_action_participant` or `remote_read_participant` holds its
+transaction outside the map. Have `remote_read_participant` return an
+`EvalError` naming the transaction when a read arrives for one, so this fails
+loudly instead of silently reading around the buffered writes. Clear the mark
+on every exit: success, failure, and parking (a parked participant's
+transaction goes back into `pending_txns`). Making these read-backs work
+means a transaction's state being addressable while it runs, which is #28's
+event-loop work.
+
+An action composed back onto a node whose transaction is checked out has the
+same problem and is outside this task; check whether any existing test does
+that, and record it with the boundary below if one does.
 
 Since #294 every `@test` and REPL statement is an originator transaction, so
 this is reachable from any `for` loop or action that writes a local var and
-then reads a remote def over it. Record the boundary in
-`meerkat/tests/README.md` next to task 11's scenarios: a def on the originator
-over a remote var is in contract; the inverse is not yet.
+then reads a remote def over it. The implementation PR records the boundary in
+`meerkat/tests/README.md` next to task 11's scenarios: a def on a node over a
+var whose writer is checked out is not yet in contract.
 
 ### 4. Cycle detection
 
@@ -361,6 +349,10 @@ spurious, load-dependent failure on a perfectly acyclic program. `Transaction`
 already owns the rest of the per-transaction evaluation state (`read_cache`,
 `locked`, `written`), and this belongs with it, as does §1a's frame of reads.
 
+Leave the set on every exit from the recompute, including an evaluation
+error and a `WaitOn` that parks the action (§2); a marker left behind would
+make the next read of that def report a cycle.
+
 This is a new failure mode, not a ported one; give it its own test.
 
 ### 5. Do not reintroduce
@@ -371,9 +363,10 @@ This is a new failure mode, not a ported one; give it its own test.
   `txn.written`, then runs §3a's invalidation walk, and nothing more. No
   recompute, no lock beyond the write lock, no network read happens in
   `assign`
-- `txn.remote_writes` **as a recompute trigger**. It survives, populated and
-  consumed as described in §3b, but only to drive invalidation and transitive
-  reporting — never to decide what to recompute.
+- the `touched_services` protocol (`ActionResponse.touched_services`,
+  `Transaction.remote_writes`, `touched_services_for_txn`,
+  `validate_touched_services`). §3b clears memoised defs instead, and
+  `ActionResponse.writes` already reports nested writes.
 - a propagation batch (`inputs`) passed to a transactional recompute (§2).
 
 The non-transactional path is unchanged: defs remain stored values, and
@@ -430,24 +423,26 @@ those two hooks in place.
 6. **New — invalidation on a composed action:** the same def, read before and
    after a composed action that writes its remote dependency, returns the
    updated value on the second read. This is the test for §3b. Include the
-   transitive form (`def y = remote.x`, `def z = y + 1`, read `z` first):
-   `z` has no cross-service dep of its own, so it passes only if §3b runs the
-   listener walk rather than stopping at the directly affected defs.
+   transitive form (`def y = remote.x`, `def z = y + 1`, read `z` first), and
+   check that var snapshots and the transaction's accumulated history survive
+   the clearing. Repeat it with a participant that parks and replays, so the
+   replayed run clears memoised defs where the original did.
 7. **New — a composed action does not evict this transaction's own writes.**
    Write a local member, compose an action, then read that member back; it must
    still be the buffered value. Since #294 this holds by construction; the test
    keeps it so.
-8. **New — transitive touched-services reporting.** In a `client -> mid -> rc`
-   chain where only `rc` is written, a `client` def over `rc` must see the new
-   value. Fails if §3b's merge into `txn.remote_writes` is missing — or if the
-   participant reply never fills the field. Run the same chain a second time
-   with the field **omitted from the wire** (the old-peer case): the client must
-   still see the new value, via step 2's conservative path.
-9. **New — §3c, both halves.** A participant's def over a *second participant's*
-   var, read before and after a composed action that writes it, sees the new
-   value. And a participant's def over the **originator's** var, read after the
-   originator writes it, fails with the named error rather than returning the
-   stale value.
+8. **New — nested writes.** In a `client -> mid -> rc` chain where only `rc`
+   is written, a `client` def over `rc`, read before and after the composed
+   action, sees the new value on the second read.
+9. **New — §3c.** A participant's def over a *second participant's* var, read
+   before and after a composed action that writes it, sees the new value. A
+   read-back to a node whose transaction is checked out fails with the named
+   error rather than returning a stale value, in both forms: a participant's
+   def over the **originator's** var, read after the originator writes it; and,
+   in `client → A → B`, B reading A's `x` that A buffered before calling B,
+   while A's action is still running. Check that the mark is cleared after the
+   action succeeds, fails, and parks, so a later read for the same transaction
+   is served normally.
 10. `meerkat/tests/s1.mkt` still passes. It has passed since PR #201 made each
     `do` in an `@test` its own transaction, so it no longer exercises
     read-your-own-writes and is only a regression check. Tests 1 and 3 are
@@ -470,13 +465,23 @@ those two hooks in place.
     memoised def invalidated by a later write still leaves its inputs' history
     in the commit stamp.
 15. **New — initialization.** A service whose def `b` reads an earlier def `a`
-    initializes `b` with the same clock and Sources as before this task.
+    initializes `b` with the same Sources as before this task, and a clock at
+    least as large as the receipt for the value it read. Cover three shapes of
+    `a`: an unconditional chain; `a` choosing between local `x` and `y` with a
+    condition, so one branch is not taken (both stay in `b`'s Sources); and `a`
+    choosing between a local input and a remote one, with the remote branch
+    not taken (`b`'s Sources stay unknown, as today).
 16. **New — tables.** A def that folds over a table sees rows inserted earlier
     in the same transaction (`BufferedWrite::Append`), including in a `for`
     loop in a `@test` block.
 17. **New — a def that fails is not read stale.** A def whose last propagation
     failed keeps its old stored value; a transaction that reads it aborts with
     the evaluation error instead of returning that value.
+18. **New — waiting inside a recompute.** A recompute that meets a held lock
+    returns `WaitOn` (or `WaitDieAbort`) unchanged: an originator retries and a
+    participant parks, rather than aborting with an evaluation error, and the
+    read frame and in-progress marker are gone afterwards, so the retried or
+    resumed read succeeds without a spurious cycle error.
 
 ## Notes
 
@@ -485,12 +490,15 @@ those two hooks in place.
   has already landed.
 - Performance to state in the PR description: first read of a def with N remote
   dependencies costs N round trips; subsequent reads in the same transaction
-  cost nothing until a composed action touches one of those services. Reading a
+  cost nothing until a local write to one of its inputs or a composed action
+  (which, for now, clears every memoised def). Reading a
   remote def read-locks the def and every input it reaches, on every node
   involved, which since #294 includes every `@test` assertion that reads one.
   That is the price of fully transactional semantics (the draft semantics
   accepts it in §3.3.1) and it was accepted deliberately.
-- Update `meerkat/tests/README.md`: remove #294's limitation that a local def
-  keeps its cached value until a loop commits, record §3c's boundary, and
-  state that a transaction reads a def's logically latest value while a `watch`
-  shows the propagated one.
+- `meerkat/tests/README.md` describes current behavior, so this spec revision
+  leaves it unchanged: its statement that a local def keeps its cached value
+  until a loop commits stays true until task 12 lands. The implementation PR
+  updates it: remove that limitation, record §3c's boundary, and state that a
+  transaction reads a def's logically latest value while a `watch` shows the
+  propagated one.

@@ -216,7 +216,9 @@ of the work and each part of it is load-bearing:
   - **A transaction-control error** (`WaitOn`, `WaitDieAbort`) from a read
     inside the recompute **propagates unchanged** into the existing park and
     retry handling (task 06 for originators, parking for participants). It is
-    not an evaluation failure and must not be turned into one.
+    not an evaluation failure and must not be turned into one. The one
+    exception is a doomed transaction (§3c): there it becomes a terminal
+    abort error, and the execution neither parks nor retries.
 
   Either way, §1a's read frame and §4's in-progress marker are popped on the
   way out, including when the error is `WaitOn` and the action parks.
@@ -453,7 +455,10 @@ The rule:
   a code update, it is immediately before `update::Transaction::commit`
   installs the staged declarations and values. The update stays unregistered
   during subsequent graph installation, propagation, and remote forwarding;
-  these steps cannot promise to undo the installed changes. Commit paths
+  these steps cannot promise to undo the installed changes. A read-back into
+  the updating node while it forwards to remote owners is therefore queued
+  and times out as it does today; serving or rejecting it belongs with remote
+  participation in updates (unit J of the sequential code updates plan). Commit paths
   (`commit_txn`, `commit_participant`) are not registered, so an `Abort` that
   arrives during commit keeps today's handling. That is deliberate:
   `commit_stamped` installs local writes before it awaits participant commits,

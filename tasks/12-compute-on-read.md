@@ -342,28 +342,46 @@ state, and returns a stale value. For example, in `client → A → B`, A buffer
 still running.
 
 Do not paper over it, but do not reject read-backs that cannot be stale
-either. Track the transactions whose state is checked out on this node, with
-the members each has written here so far
-(`Manager::active_txns: HashMap<TxnId, HashSet<(ServiceNetId, Symbol)>>`): an
-originator while `execute_transaction` runs, and a participant while
-`execute_action_participant` or `remote_read_participant` holds its
-transaction outside the map. `assign` and `append_table_row` add the member to
-that set when they buffer a write for a checked-out transaction.
+either. Track the executions whose transaction state is checked out on this
+node, as a **stack of registrations per transaction id**
+(`Manager::active_txns: HashMap<TxnId, Vec<HashSet<(ServiceNetId, Symbol)>>>`,
+each registration holding the members that execution's transaction has
+written here). A registration is pushed when an execution checks its
+transaction out (an originator when `execute_transaction` starts, a
+participant when `execute_action_participant` or `remote_read_participant`
+takes its transaction out of `pending_txns` or creates one) and popped when
+that execution exits. Record the registration's depth on the `Transaction`,
+so each execution knows which registration is its own.
 
-A read-back for a checked-out transaction is then served as today, from a
-fresh `Transaction` under the same id, **unless it reaches a member in that
-set**. Check in `lookup`, for each local member the read-back reads, including
-the inputs of a def it recomputes; if one has been written by the checked-out
-transaction, return an `EvalError` naming the transaction and the member, so
-this fails loudly instead of silently reading around the buffered write. A
-read-only checked-out transaction, or one whose writes the read-back does not
-reach, is unaffected: an `@test` on A asserting on a remote `b.d` that reads
-`a.x` keeps working while A has not written `x`.
+- **Seed from what is already buffered.** A participant's transaction can
+  hold writes from an earlier action under the same id, so a new registration
+  starts with the members already in that transaction's `written`, not empty.
+  `assign` and `append_table_row` then add each member they buffer to the
+  current execution's own registration.
+- **Reject only read-backs into an enclosing execution's writes.** When a
+  read-back for a checked-out transaction arrives, it is served as today,
+  from its own `Transaction` under the same id, unless it reaches a member
+  written by an **enclosing** execution: one whose registration sits below
+  its own on the stack. Check in `lookup`, for each local member the
+  read-back reads, including the inputs of a def it recomputes; if one is in
+  an enclosing registration, return an `EvalError` naming the transaction
+  and the member. An execution's own writes are never rejected: they are in
+  its own `txn.written`, which `lookup` checks first, and its own
+  registration is not consulted.
+- **Pop only your own registration.** A nested read-back that finishes pops
+  the registration it pushed and leaves the enclosing ones in place, so a
+  later read-back still sees them. Pop on every exit: success, failure, and
+  parking (a parked participant's transaction goes back into `pending_txns`).
+  Remove the id from the map only when its stack is empty.
 
-Clear the entry on every exit: success, failure, and parking (a parked
-participant's transaction goes back into `pending_txns`). Making these
-read-backs work in all cases means a transaction's state being addressable
-while it runs, which is #28's event-loop work.
+So in `client → A → B`, where A buffers `x` and then calls B: B may read A's
+unchanged `y`, and when that read-back finishes, A's registration is still in
+place, so a later read-back of `x` is rejected. A read-only checked-out
+transaction, or one whose writes a read-back does not reach, is unaffected:
+an `@test` on A asserting on a remote `b.d` that reads `a.x` keeps working
+while A has not written `x`. Making the rejected read-backs work means a
+transaction's state being addressable while it runs, which is #28's
+event-loop work.
 
 An action composed back onto a node whose transaction is checked out has the
 same problem and is outside this task; check whether any existing test does
@@ -488,8 +506,16 @@ those two hooks in place.
    before calling B, while A's action is still running. A read-back to a
    checked-out transaction that has written nothing it reaches is served
    normally: an `@test` on A asserting on B's `def d = a.x + 1`, with no write
-   to `x`. Check that the entry is cleared after the action succeeds, fails,
-   and parks, so a later read for the same transaction is served normally.
+   to `x`. Also cover:
+   - the lifecycle: in `client → A → B`, A buffers `x` and calls B; B reads
+     A's unchanged `y` (served), then A's `x` (rejected), showing that the
+     first read-back's exit left A's registration in place;
+   - seeding: A, as a participant, buffers `x` in one action, then a second
+     action under the same transaction calls B, which reads `x` (rejected,
+     because the registration starts from the writes already buffered);
+   - the executing transaction reading its own buffered `x` normally;
+   - cleanup: after the action succeeds, fails, and parks, a later read for
+     the same transaction is served normally.
 10. `meerkat/tests/s1.mkt` still passes. It has passed since PR #201 made each
     `do` in an `@test` its own transaction, so it no longer exercises
     read-your-own-writes and is only a regression check. Tests 1 and 3 are

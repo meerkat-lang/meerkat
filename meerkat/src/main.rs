@@ -144,6 +144,15 @@ fn remote_url_map(import_urls: &[String]) -> HashMap<String, String> {
         .collect()
 }
 
+fn explicit_import_path(prog: &[Stmt]) -> Option<&str> {
+    prog.iter().find_map(|stmt| match stmt {
+        Stmt::Import {
+            path: Some(path), ..
+        } => Some(path.as_str()),
+        _ => None,
+    })
+}
+
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
@@ -181,6 +190,14 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
             if args.ast {
                 let printer = AstPrinter::new(&node.interner);
                 printer.print_program(&prog);
+            }
+
+            if let Some(path) = explicit_import_path(&prog) {
+                return Err(format!(
+                    "Explicit imports are not supported in file-based execution: '{}'",
+                    path
+                )
+                .into());
             }
 
             let mut opt_server_net: Option<NetworkActor> = None;

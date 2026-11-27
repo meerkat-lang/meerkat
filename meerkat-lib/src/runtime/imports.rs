@@ -117,19 +117,30 @@ impl<'a> Imports<'a> {
         };
 
         let mut initial_cmds = Vec::new();
-        let imports_in_base: Vec<Symbol> = base_ast
-            .iter()
-            .filter_map(|stmt| match stmt {
-                Stmt::Import { service_name, .. } => Some(*service_name),
-                Stmt::Service { .. } => None,
-                Stmt::ActionStmt(_) => None,
-                Stmt::Atomic { .. } => None,
-                Stmt::Update { .. } => None,
-                Stmt::Connect { .. } => None,
-                Stmt::Test { .. } => None,
-                Stmt::Watch { .. } => None,
-            })
-            .collect();
+        let mut imports_in_base = Vec::new();
+        for stmt in base_ast {
+            match stmt {
+                Stmt::Import {
+                    path: None,
+                    service_name,
+                } => imports_in_base.push(*service_name),
+                Stmt::Import {
+                    path: Some(path), ..
+                } => {
+                    return Err(Error::Message(format!(
+                        "Explicit imports are not supported in file-based execution: '{}'",
+                        path
+                    )));
+                }
+                Stmt::Service { .. }
+                | Stmt::ActionStmt(_)
+                | Stmt::Atomic { .. }
+                | Stmt::Update { .. }
+                | Stmt::Connect { .. }
+                | Stmt::Test { .. }
+                | Stmt::Watch { .. } => {}
+            }
+        }
 
         for sym in imports_in_base {
             let cmds = imports.resolve_import(sym, base_dir)?;
@@ -305,10 +316,19 @@ impl<'a> Imports<'a> {
         for stmt in &parsed_stmts {
             match stmt {
                 Stmt::Import {
-                    service_name: sym, ..
+                    path: None,
+                    service_name: sym,
                 } => {
                     let cmds = self.resolve_import(*sym, base_dir)?;
                     new_cmds.extend(cmds);
+                }
+                Stmt::Import {
+                    path: Some(path), ..
+                } => {
+                    return Err(Error::Message(format!(
+                        "Explicit imports are not supported in file-based execution: '{}'",
+                        path
+                    )));
                 }
                 Stmt::Service { .. } => {}
                 Stmt::ActionStmt(_) => {}

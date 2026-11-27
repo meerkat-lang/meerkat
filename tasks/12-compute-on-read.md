@@ -369,12 +369,13 @@ holds a transaction outside `pending_txns` across an await**. Today that is:
   `abort_participant` (which takes the transaction out of the map while it
   forwards the abort to sub-participants) and from a commit-clock failure;
 - a code update (`update::Transaction::apply`), whose lock transaction
-  awaits remote reads and forwarding.
+  awaits remote reads before installing the staged changes.
 
 Rather than add a registration at each of these by hand, route them through
 one checkout helper that takes the transaction (from `pending_txns`, or new),
 registers it, and returns a value that unregisters when the transaction is
-put back or dropped. A future path that runs a transaction outside the map
+put back or dropped, with an explicit exit at the commit boundary below.
+A future path that runs a transaction outside the map
 then cannot forget to register. Audit for others by searching for
 `pending_txns.remove` and `Transaction::new`. Commit paths (`commit_txn`,
 `commit_participant`) are deliberately not registered; see "The commit
@@ -436,18 +437,28 @@ The rule:
   of queuing the message.
 - **A doomed execution fails and cleans up through its normal path.** The
   running execution checks the doomed set when its wait returns and before it
-  commits or returns success. If its pending call failed, it keeps that error
-  unchanged, including a typed rejection, so the rejection still reaches the
-  originator as itself. If its pending call succeeded, it fails with an abort
-  error, so its work cannot commit. Either way its failure path releases its
+  commits or returns success. If its pending call failed with a terminal
+  error, it keeps that error unchanged, including a typed rejection, so the
+  rejection still reaches the originator as itself. `WaitOn` and
+  `WaitDieAbort` are parking/retry outcomes, not terminal errors: when doomed,
+  replace either with a terminal abort error rather than parking or retrying
+  the execution. If its pending call succeeded, it also fails with a terminal
+  abort error, so its work cannot commit. Its failure path releases its
   locks and aborts its participants as for any failed transaction. Clear the
   doomed mark when the id's last registration on this node exits.
-- **The commit boundary.** The originator checks the doomed mark and drops
-  its execution registration immediately before entering `commit_txn`, with
-  no await between the check and that transition. Commit paths are not
-  registered, so an `Abort` that arrives during commit keeps today's
-  handling. That is deliberate: `commit_stamped` installs local writes before
-  it awaits participant commits, so a doomed check there could not undo them.
+- **The commit boundary.** Every registered execution checks the doomed mark
+  and exits its execution registration before crossing its commit boundary,
+  with no await between the check and that transition. For the originator
+  and service initialization, this is immediately before `commit_txn`. For
+  a code update, it is immediately before `update::Transaction::commit`
+  installs the staged declarations and values. The update stays unregistered
+  during subsequent graph installation, propagation, and remote forwarding;
+  these steps cannot promise to undo the installed changes. Commit paths
+  (`commit_txn`, `commit_participant`) are not registered, so an `Abort` that
+  arrives during commit keeps today's handling. That is deliberate:
+  `commit_stamped` installs local writes before it awaits participant commits,
+  so a doomed check there could not undo them. Abort cleanup after a failed
+  commit-clock calculation still registers through `abort_participants`.
   Failures during commit remain #191's; this task does not resolve them.
 - **Why that is safe.** An `Abort` for a transaction means some part of it
   failed. Errors cannot be caught in the language, and a failing participant
@@ -676,7 +687,9 @@ those two hooks in place.
    pending call returns success still fails rather than committing, and that
    the doomed mark is cleared after the id's last registration exits. A
    doomed execution whose pending call failed with the typed rejection
-   reports that rejection, not an abort error. Cover read-backs into the other
+   reports that rejection, not an abort error. A doomed execution returning
+   `WaitOn` or `WaitDieAbort` instead takes terminal cleanup and cannot park
+   or retry. Cover read-backs into the other
    registered paths: a peer's def computed while `create_service` awaits a
    remote lookup, and a request arriving while `handle_lock_request` or abort
    cleanup holds the transaction (the composed-action forms can land in the
@@ -685,7 +698,10 @@ those two hooks in place.
    registered future removes its registration (but not its locks). At the
    commit boundary, check that an `Abort` arriving after the originator has
    entered `commit_txn` is handled as today and cannot roll back installed
-   writes. As a documented limitation rather than an acceptance test, cover
+   writes. Cover the registration boundary for service initialization and
+   code updates too: an abort observed before the boundary prevents commit,
+   and the execution registration is absent during post-boundary awaits.
+   As a documented limitation rather than an acceptance test, cover
    the parked-child case: the doomed execution acknowledges at once, does not
    commit when the child's success arrives, and cleans up only once the
    child's lock is released. The composed-action case can land in the first slice; the

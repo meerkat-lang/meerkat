@@ -330,69 +330,74 @@ already invalidate through §3a.
 That is sufficient whenever the writer is another *participant* — its buffered
 write is in its own `pending_txns` entry and the forced re-read finds it.
 
-⚠️ **It is not sufficient when the writer's transaction is checked out,
-and that case is out of contract.** A node's transaction state is out of
-`pending_txns` while it runs there: the originator's live transaction is a
-local in `execute_transaction` (`manager/mod.rs:3864`) and never enters the
-map, and `execute_action_participant` and `remote_read_participant` remove a
-participant's transaction from the map for as long as they run. A read-back
-that arrives meanwhile builds a **fresh** `Transaction`, sees pre-transaction
-state, and returns a stale value. For example, in `client → A → B`, A buffers
-`x` and then calls B, whose computation reads A's `x` while A's action is
-still running.
+⚠️ **It does not cover a read-back into a transaction that is running on
+the node it reads from.** A node's transaction state is out of `pending_txns`
+while it runs there: the originator's live transaction is a local in
+`execute_transaction` and never enters the map, and
+`execute_action_participant` and `remote_read_participant` remove a
+participant's transaction from the map for as long as they run. Such a
+transaction is usually waiting on a reply from the very node that reads back.
 
-Do not paper over it, but do not reject read-backs that cannot be stale
-either. Track the executions whose transaction state is checked out on this
-node, as a **stack of registrations per transaction id**
-(`Manager::active_txns: HashMap<TxnId, Vec<HashSet<(ServiceNetId, Symbol)>>>`,
-each registration holding the members that execution's transaction has
-written here). A registration is pushed when an execution checks its
-transaction out (an originator when `execute_transaction` starts, a
-participant when `execute_action_participant` or `remote_read_participant`
-takes its transaction out of `pending_txns` or creates one) and popped when
-that execution exits. Record the registration's depth on the `Transaction`,
-so each execution knows which registration is its own.
+**What happens today.** While a node waits on a reply (`send_and_await_reply`
+dispatches through `dispatch_events(false)`), it queues incoming
+`LookupRequest`, `ActionRequest`, `Commit` and `Abort` messages until the wait
+ends (`manager/mod.rs`, since commit `4bc7816`). A read-back for the waiting
+transaction is never served: the requester waits for a reply that cannot come
+until its own reply arrives, and both sides fail when `REPLY_TIMEOUT` (15s)
+expires. Nothing stale is read, but the failure is slow and its message says
+only that a reply timed out. Today this needs an action composed back onto
+the waiting node, for example `client → A → B` where B's action reads `a.x`.
 
-- **Seed from what is already buffered.** A participant's transaction can
-  hold writes from an earlier action under the same id, so a new registration
-  starts with the members already in that transaction's `written`, not empty.
-  `assign` and `append_table_row` then add each member they buffer to the
-  current execution's own registration.
-- **Reject only read-backs into an enclosing execution's writes.** When a
-  read-back for a checked-out transaction arrives, it is served as today,
-  from its own `Transaction` under the same id, unless it reaches a member
-  written by an **enclosing** execution: one whose registration sits below
-  its own on the stack. Check in `lookup`, for each local member the
-  read-back reads, including the inputs of a def it recomputes; if one is in
-  an enclosing registration, return an `EvalError` naming the transaction
-  and the member. An execution's own writes are never rejected: they are in
-  its own `txn.written`, which `lookup` checks first, and its own
-  registration is not consulted.
-- **Pop only your own registration.** A nested read-back that finishes pops
-  the registration it pushed and leaves the enclosing ones in place, so a
-  later read-back still sees them. Pop on every exit: success, failure, and
-  parking (a parked participant's transaction goes back into `pending_txns`).
-  Remove the id from the map only when its stack is empty.
+**What compute-on-read adds.** Today a participant answers a read of its def
+with the stored value. After this task it recomputes the def, so a def on B
+whose inputs include a member of A becomes a read-back whenever A reads it
+inside a transaction: an `@test` on A asserting on B's `def d = a.x + 1`
+would wait until the timeout, where today it returns `d`'s stored value.
 
-So in `client → A → B`, where A buffers `x` and then calls B: B may read A's
-unchanged `y`, and when that read-back finishes, A's registration is still in
-place, so a later read-back of `x` is rejected. A read-only checked-out
-transaction, or one whose writes a read-back does not reach, is unaffected:
-an `@test` on A asserting on a remote `b.d` that reads `a.x` keeps working
-while A has not written `x`. Making the rejected read-backs work means a
-transaction's state being addressable while it runs, which is #28's
-event-loop work.
+**Rule for this task: reject such read-backs immediately.** Track the
+transaction ids running on this node (`Manager::running_txns:
+HashSet<TxnId>`): an originator while `execute_transaction` runs, and a
+participant while `execute_action_participant` or `remote_read_participant`
+holds its transaction outside `pending_txns`. When `dispatch_events(false)`
+would queue a `LookupRequest` or `ActionRequest` whose `txn_id` is in that
+set, reply at once with an error naming the transaction and saying that a
+read-back into a running transaction is not supported until #213. Requests
+for other transactions are queued as before. A queued read-back for a running
+transaction can never succeed, so replying now loses nothing; it turns a 15s
+timeout into an immediate, explicit error.
 
-An action composed back onto a node whose transaction is checked out has the
-same problem and is outside this task; check whether any existing test does
-that, and record it with the boundary below if one does.
+Keep membership correct on every exit: success, failure, and parking (a
+parked participant's transaction goes back into `pending_txns`). Nested
+executions under the same id on one node, such as a `remote_read_participant`
+that runs while its own node's originator waits, must not remove an
+enclosing execution's membership when they exit: count entries per id, or
+keep a stack, and remove the id only when the last one leaves. Prefer a guard
+that also cleans up when its future is dropped, since #213 runs actions as
+tasks that can be cancelled.
+
+This is a deliberate, visible limitation until #213: a transactional read of
+a cross-node def whose inputs include a member of the reading node fails with
+this error, instead of returning a stored value that may not follow from the
+transaction's view.
+
+**Serving read-backs is #213's work.** Once a waiting execution is suspended
+rather than blocking the node, a read-back can be served while the
+transaction runs. It must then still not read around that transaction's
+buffered writes, so #213 needs one of:
+- making the running transaction's state reachable by id, so the read-back
+  sees its writes;
+- or a finer guard that allows read-backs which reach no buffered write and
+  rejects those that do. PR #300 prototyped this: a stack of registrations per
+  transaction id, each seeded from the writes already buffered, recording
+  each later write, and popped only by its own execution, with the check in
+  `lookup` consulting only enclosing registrations.
 
 Since #294 every `@test` and REPL statement is an originator transaction, so
-this is reachable from any `for` loop or action that writes a local var and
-then reads a remote def over it. The implementation PR records the boundary in
-`meerkat/tests/README.md` next to task 11's scenarios: a read-back that
-reaches a member written by a transaction still running on that node fails
-with an error; read-backs that reach no such member work as before.
+the limitation is reachable from ordinary code. The implementation PR records
+it in `meerkat/tests/README.md` next to task 11's scenarios: inside a
+transaction, reading a def on another node whose inputs include a member of
+the reading node, or composing an action back onto it, fails with an error
+until #213.
 
 ### 4. Cycle detection
 
@@ -499,23 +504,15 @@ those two hooks in place.
    action, sees the new value on the second read.
 9. **New — §3c.** A participant's def over a *second participant's* var, read
    before and after a composed action that writes it, sees the new value. A
-   read-back that reaches a member written by a checked-out transaction fails
-   with the named error rather than returning a stale value, in both forms: a
-   participant's def over the **originator's** var, read after the originator
-   writes it; and, in `client → A → B`, B reading A's `x` that A buffered
-   before calling B, while A's action is still running. A read-back to a
-   checked-out transaction that has written nothing it reaches is served
-   normally: an `@test` on A asserting on B's `def d = a.x + 1`, with no write
-   to `x`. Also cover:
-   - the lifecycle: in `client → A → B`, A buffers `x` and calls B; B reads
-     A's unchanged `y` (served), then A's `x` (rejected), showing that the
-     first read-back's exit left A's registration in place;
-   - seeding: A, as a participant, buffers `x` in one action, then a second
-     action under the same transaction calls B, which reads `x` (rejected,
-     because the registration starts from the writes already buffered);
-   - the executing transaction reading its own buffered `x` normally;
-   - cleanup: after the action succeeds, fails, and parks, a later read for
-     the same transaction is served normally.
+   read-back into a transaction running on the node it reads from fails
+   immediately (well under `REPLY_TIMEOUT`) with the error naming the
+   transaction, in both forms: an `@test` on A asserting on B's
+   `def d = a.x + 1`; and, in `client → A → B`, B's action reading `a.x` while
+   A's action is still running. A request for a *different* transaction that
+   arrives during the wait is still queued and served afterwards. After the
+   execution succeeds, fails, and parks, a later request for the same
+   transaction is served normally, including when a nested execution under
+   the same id exited first.
 10. `meerkat/tests/s1.mkt` still passes. It has passed since PR #201 made each
     `do` in an `@test` its own transaction, so it no longer exercises
     read-your-own-writes and is only a regression check. Tests 1 and 3 are

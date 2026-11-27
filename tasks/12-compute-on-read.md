@@ -389,10 +389,20 @@ waiting:
   failure path aborts its participants, including A, though B never saw the
   rejection.
 - **Abort forwarding.** `abort_participant` forwards an abort to the
-  aborted node's own participants, so a node with an earlier relationship to
-  A forwards an abort to A. The same happens during A's own failure cleanup:
-  A aborts B, B forwards the abort back to A, and A is waiting for B's
-  acknowledgement.
+  aborted node's own participants and awaits each acknowledgement, so a node
+  with an earlier relationship to A forwards an abort to A. Concretely, under
+  one transaction:
+  1. The originator calls D, which reads A. Both return; D keeps A in its
+     participant set.
+  2. The originator then calls A, which calls B. B calls D successfully, then
+     attempts a read-back into A.
+  3. A rejects the read-back. B's failure path aborts its participants,
+     including D.
+  4. D forwards the abort to A and awaits the acknowledgement. A is waiting
+     for B, B for D, and D for A.
+
+  The same happens during A's own failure cleanup: A aborts B, B forwards the
+  abort back to A, and A is waiting for B's acknowledgement.
 
 A set of nodes that each requester skips cannot cover these, because the
 nodes that send the abort never saw the rejection.
@@ -602,7 +612,11 @@ those two hooks in place.
    routes: B with an earlier read from A (so A is in B's participants) when
    C's read-back is rejected; a node with an earlier relationship to A
    forwarding an abort to A; and A's own failure cleanup receiving an abort
-   forwarded back to it. In each, no wait reaches `REPLY_TIMEOUT`, the running
+   forwarded back to it. Include the four-step sequence from §3c as a named
+   acceptance test: the originator calls D, which reads A; the originator
+   then calls A, which calls B; B calls D, then reads back into A; A rejects,
+   and B's abort of D is forwarded to A. In each, no wait reaches
+   `REPLY_TIMEOUT`, the running
    node acknowledges the `Abort` at once, its execution fails and releases its
    state (including earlier work under the same id), and a later transaction
    can take the affected locks. Also check that a doomed execution whose

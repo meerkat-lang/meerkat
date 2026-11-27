@@ -1,3 +1,7 @@
+mod running;
+use super::interpreter::evaluator::RUNNING_TRANSACTION_PREFIX;
+use running::RunningTransactions;
+
 use super::ast::{table_decl_in_service, ActionStmt, Decl, Expr, Stmt, Value};
 use super::graphs::{
     analysis::service_declarations,
@@ -337,6 +341,7 @@ pub struct Manager {
     pub pending_replies: HashMap<u64, oneshot::Sender<MeerkatMessage>>,
     /// Requests received during an RPC, to serve after its caller finishes.
     deferred_events: VecDeque<NetworkEvent>,
+    running: RunningTransactions,
     /// Deliveries of function code the graphs of the running services could
     /// not take (a def's reads incomplete, or a cycle), kept outside the
     /// active inputs, the newest per edge, to be offered again when the
@@ -456,6 +461,7 @@ impl Manager {
             network: None,
             pending_replies: HashMap::new(),
             deferred_events: VecDeque::new(),
+            running: RunningTransactions::default(),
             deferred_deliveries: Vec::new(),
             completing_updates: Vec::new(),
             applying_updates: Vec::new(),
@@ -2556,6 +2562,49 @@ impl Manager {
                     msg @ MeerkatMessage::ServiceCodeRequest { .. } => {
                         Box::pin(self.serve_request(msg)).await;
                     }
+                    MeerkatMessage::Abort {
+                        request_id,
+                        txn_id,
+                        reply_to,
+                    } if self.running.doom(&txn_id) => {
+                        self.send_oneway(
+                            Address::new(reply_to),
+                            MeerkatMessage::AbortResponse { request_id },
+                        )
+                        .await;
+                    }
+                    MeerkatMessage::LookupRequest {
+                        request_id,
+                        txn_id: Some(tid),
+                        reply_to,
+                        ..
+                    } if self.running.contains(&tid) => {
+                        let error = self.read_back_error(&tid).to_string();
+                        self.send_oneway(
+                            Address::new(reply_to),
+                            MeerkatMessage::LookupError { request_id, error },
+                        )
+                        .await;
+                    }
+                    MeerkatMessage::ActionRequest {
+                        request_id,
+                        txn_id: Some(tid),
+                        reply_to,
+                        ..
+                    } if self.running.contains(&tid) => {
+                        let error = Some(self.read_back_error(&tid).to_string());
+                        self.send_oneway(
+                            Address::new(reply_to),
+                            MeerkatMessage::ActionResponse {
+                                request_id,
+                                success: false,
+                                error,
+                                history: Vec::new(),
+                                writes: Vec::new(),
+                            },
+                        )
+                        .await;
+                    }
                     msg @ (MeerkatMessage::LookupRequest { .. }
                     | MeerkatMessage::ActionRequest { .. }
                     | MeerkatMessage::Commit { .. }
@@ -2667,13 +2716,23 @@ impl Manager {
     ///     `err` (`String`): The `Display` text a remote node reported
     ///
     /// Returns:
-    ///     `EvalError`: `WaitDieAbort` for a lock conflict, otherwise
-    ///     `LocalDispatchFailed`
+    ///     `EvalError`: preserves lock conflicts and running-transaction errors;
+    ///     other failures become `LocalDispatchFailed`
     fn remote_error(err: String) -> EvalError {
+        if let Some(reason) = err.strip_prefix(RUNNING_TRANSACTION_PREFIX) {
+            return EvalError::RunningTransaction(reason.to_string());
+        }
         match err.strip_prefix(WAIT_DIE_DISPLAY_PREFIX) {
             Some(reason) => EvalError::WaitDieAbort(reason.to_string()),
             None => EvalError::LocalDispatchFailed(err),
         }
+    }
+
+    fn read_back_error(&self, tid: &TxnId) -> EvalError {
+        EvalError::RunningTransaction(format!(
+            "read-back into {tid:?} on node {} is not supported until #213",
+            self.node_id
+        ))
     }
 
     /// Identify a composed action by what its dispatch ships, so a replay can
@@ -3037,6 +3096,9 @@ impl Manager {
                 sources,
                 ..
             } => {
+                if let Some(t) = txn.as_ref() {
+                    self.running.check(&t.id)?;
+                }
                 let value = codec::decode_value(value, &mut self.interner)
                     .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?;
                 let clock = clock
@@ -3111,10 +3173,11 @@ impl Manager {
             .pending_txns
             .remove(&tid)
             .unwrap_or_else(|| Transaction::new(tid.clone()));
-        match self
+        let running = self.running.enter(&tid);
+        let result = self
             .lookup_with_clock(member, service, Some(&mut txn))
-            .await
-        {
+            .await;
+        match running.finish(result) {
             Ok(v) => {
                 self.pending_txns.insert(tid, txn);
                 Ok(v)
@@ -3246,6 +3309,9 @@ impl Manager {
                 ..
             } => {
                 if success {
+                    if let Some(t) = txn.as_ref() {
+                        self.running.check(&t.id)?;
+                    }
                     // Record completion before decoding metadata: the remote
                     // action has already run and must not run again on replay.
                     if let Some(txn) = txn {
@@ -3872,6 +3938,7 @@ impl Manager {
 
         loop {
             let mut txn = Transaction::new(txn_id.clone());
+            let running = self.running.enter(&txn_id);
             let effect = match stmts {
                 [stmt] => execute(stmt, initial_env, self, service_name, &mut txn).await,
                 _ => execute_seq(
@@ -3888,10 +3955,13 @@ impl Manager {
                 self.check_buffered_writes(&mut txn)?;
                 Ok(effect)
             });
-            let error = match effect {
+            let error = match running.finish(effect) {
                 Ok(effect) => {
                     // A participant may refuse Commit after local writes were
                     // installed (#191). Report the error without retrying them.
+                    // The spike handles aborts only before the commit decision.
+                    // After writes are installed, rollback is #191's problem.
+                    drop(running);
                     let committed = self.commit_txn(&mut txn, session_clock).await;
                     self.release_all_locks(&txn);
                     return committed.map(|()| effect);
@@ -3900,6 +3970,7 @@ impl Manager {
             };
             self.abort_participants(&txn).await;
             self.release_all_locks(&txn);
+            drop(running);
 
             // A participant can park on its wait queue. The originator waits
             // by retrying with fresh buffers under the same transaction age.
@@ -4047,6 +4118,7 @@ impl Manager {
             .pending_txns
             .remove(&tid)
             .unwrap_or_else(|| Transaction::new(tid.clone()));
+        let running = self.running.enter(&tid);
         // A `WaitOn` parks the whole action and re-runs it from the first
         // statement, so a run that parks must leave the buffers as it found
         // them, or `x = x + 1` reads its own buffered `1` on replay and
@@ -4082,6 +4154,7 @@ impl Manager {
                 txn.composed_done.len() - start
             )));
         }
+        let exec_error = running.finish(exec_error.map_or(Ok(()), Err)).err();
         if let Some(e) = exec_error {
             if matches!(e, EvalError::WaitOn(_)) {
                 (txn.written, txn.read_cache, txn.composed_seq) = before;
@@ -4136,6 +4209,7 @@ impl Manager {
 
     /// Tell every participant of `txn` to abort
     pub(super) async fn abort_participants(&mut self, txn: &Transaction) {
+        let _running = self.running.enter(&txn.id);
         for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
             self.send_abort(addr, &txn.id).await;
         }
@@ -7880,3 +7954,6 @@ mod tests {
         assert_eq!(manager.services[&s].vars[&b].vector_clock, clock);
     }
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod readback_spike_tests;

@@ -60,9 +60,12 @@ packaged with the service code update).
 
 It should be possible to type check a code update against code in one or more
 `.mkt` files, or against one or more running services.  In the latter case,
-the code update is guaranteed to succeed unless the code is changed by some
-other update in between.  This is a version of the usual type
-soundness property, extended to cover code updates.
+if the update passes static type checking and no other update changes the
+code in between, running it produces no type errors.  This is the usual
+type soundness property, extended to cover code updates.  It does not
+promise that the update succeeds: its migration code can still fail at run
+time for reasons other than types, such as division by zero, in which case
+the update aborts and changes nothing.
 
 Note that to make this work in practice, when a variable or table's type is
 changed, migration code must be written (as shown in Domingues and Seco) in

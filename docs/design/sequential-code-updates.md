@@ -97,7 +97,10 @@ Each step sees a *view* of every service the transaction touches:
 
 - **Bindings:** each member's kind (var or def), type, and code (a def's
   expression).
-- **Values:** each var's value, and cached values of defs.
+- **Values:** each var's value.
+
+A def has no separate value in the view: reading a def evaluates its current
+code against the current view.
 
 The view starts as the state before the transaction, protected by the
 transaction's locks, and each step changes it. Every read in the transaction
@@ -121,26 +124,25 @@ and creates no dependency of `x` on itself. If `x` is new, `e` cannot read it.
 1. Check `e` against the current bindings, as for a var step. `e` must not
    eagerly read `d`, directly or through other defs. That is a cycle,
    whatever `d` was before.
-2. Bind `d` as a def with `e`'s type, install `e` as its code, and discard
-   cached derived values that depend on `d`.
+2. Bind `d` as a def with `e`'s type, and install `e` as its code.
 
-A def step does not evaluate `d`. A later step that reads `d` computes it from
-the current view, as compute-on-read does in an ordinary transaction.
+A def step does not evaluate `d`. A later step that reads `d` evaluates its
+current code against the view at that read, as any read of a def does in a
+transaction.
 
-This is a semantic choice. With correct invalidation, when both executions
-succeed against the same protected inputs, evaluating `d` at its step gives
-the same values to later reads: a later write to one of `d`'s inputs
-invalidates that result and the next read recomputes it. Closure capture is
-lexical (#86), so the members that exist when a closure is created do not
-determine its captures. Eager evaluation does additional work, can acquire
-locks and add reads to transaction history, and can fail on intermediate
-inputs. With `x == 0`, the steps
+This is a semantic choice. Because every read of `d` evaluates it against the
+view at that read, also evaluating `d` at its own step would not change any
+value a later read sees, when both succeed. Closure capture is lexical (#86),
+so the members that exist when a closure is created do not determine its
+captures. The two choices differ in failures and cost: evaluating at the step
+does additional work, can acquire locks and add reads to the transaction's
+history, and can fail on intermediate inputs. With `x == 0`, the steps
 `def r = 10 / x; var x = 2;` would abort if `r` were evaluated at its step.
 Under this design they succeed, and `r == 5` after commit.
 
 Before commit, evaluate every def this transaction introduces or replaces
-against the final view. A cached result may be reused only if it is valid for
-that view. The update aborts if a required evaluation fails, including failure to obtain
+against the final view. The update aborts if a required evaluation fails,
+including failure to obtain
 its inputs. That changes current behavior: today a new def that lacks an
 input waits after commit until propagation delivers it. Under this design, the
 transaction reads the def's inputs itself, including remote ones, through the
@@ -214,9 +216,9 @@ update s {
 }
 ```
 
-`before == 2` and `after == 4`. The second read must not reuse the first
-read's cached value. A def the update adds or replaces is read the same way,
-from its new code.
+`before == 2` and `after == 4`: each read evaluates `d` against the view at
+that step. A def the update adds or replaces is read the same way, from its
+new code.
 
 The #265 case is valid, although the stored `is_warm` precedes the appended
 `is_celsius`:
@@ -296,9 +298,10 @@ So a table step in an update is a var step, with no rules of its own:
   retained actions, including action values stored in vars) is checked
   against the new schema, and the open requirement on values from old
   versions applies ("Relation to the formal semantics").
-- **Kind changes need no table case.** Changing between a table and a var is
-  a type change, and between a table and a def is the var-and-def case: a
-  table that becomes a def loses its writers, including `insert`.
+- **Kind changes need no table case.** Replacing a table with a var of a
+  different type is a type change, and with the same table type it is no
+  change at all. Changing between a table and a def is the var-and-def case:
+  a table that becomes a def loses its writers, including `insert`.
 
 #298 makes the language match this: today, name resolution treats a table as
 a separate kind of member, so `insert`, `map`, `fold` and `select` accept
@@ -320,8 +323,8 @@ The checker maintains a static view containing bindings, availability, and
 the code and conservative effect information needed to analyze possible
 function values. It checks each declaration, then advances the view without
 computing its value. "Available after this step" means available if execution
-reaches the next step successfully. A def is available for transactional
-evaluation; it need not have a cached value already. Def and function bodies
+reaches the next step successfully. A def is available once its code is
+installed; reading it evaluates that code. Def and function bodies
 are analyzed, not executed, including at the final-state check.
 
 For example:
@@ -342,19 +345,19 @@ which code to validate.
 
 Checking from source uses inferred interfaces and conservative code/effect
 summaries. Checking against running services uses a consistent description of
-their installed interfaces and relevant code, including information needed
-for stored functions. If that information is insufficient, report the missing
-information or analysis limitation; do not run an initializer to obtain it.
-Execution must revalidate under transaction protection if the environment
+their installed state: each member's kind and type, each def's code, and the
+latent effects of function and action values stored in vars ("Temporarily
+incompatible code"). Each node keeps that description current whenever it
+installs code or stores a function value, so checking never needs to run code
+to learn what a member holds. Execution must revalidate under transaction
+protection if the environment
 could have changed since an earlier check. A checked update is not an
 unconditional authorization to commit against a different environment.
 
 The first command-line interface is the existing `--check` mode for files
 containing declarations and updates. A separate update can later be checked
 against a supplied base program or a running-service description using the
-same checker. Temporary execution-support restrictions are separate from
-typing errors: a statically valid update may require runtime work that has
-not landed yet, which execution must report explicitly.
+same checker.
 
 ### Each step
 
@@ -508,7 +511,11 @@ They need no second expression checker:
   effects analysis's separate pass for locals that shadow members goes away.
 - A var step's value goes in the transaction's ordinary write buffer, the one
   assignment uses. A def read during the update uses compute-on-read
-  ([task 12](../../tasks/12-compute-on-read.md)).
+  ([task 12](../../tasks/12-compute-on-read.md)). It may cache results within
+  the transaction, but a cached result must equal what evaluating the def's
+  current code against the current view would give. A def step, or a write to
+  one of the def's inputs, invalidates it, and the final evaluation before
+  commit may reuse a result only if it is still valid for the final view.
 
 ### Staged state belongs to the transaction
 
@@ -619,11 +626,13 @@ differences or open questions, agreed with the draft's author where noted.
   so this concerns same-type replacements as well as type and kind changes.
   Main lacks explicit code-version tags; #295 investigates whether delayed
   or retained values can consequently be accepted incorrectly. A failure has
-  not yet been reproduced. This design keeps main's behavior for same-type
-  replacements, including type-preserving def-to-var changes, and enables no
-  new affected cases until the question is settled: other type and kind
-  changes whose old values can reach a consumer (locally or on another node)
-  stay unsupported until then.
+  not yet been reproduced. Same-type replacements, including type-preserving
+  def-to-var changes, keep main's existing behavior; this design makes no
+  claim that they are safe, and #295's question covers them too. If #295
+  confirms a failure, its fix covers them, or they are restricted then. Until
+  the question is settled, the design enables no new affected cases: other
+  type and kind changes whose old values can reach a consumer (locally or on
+  another node) stay unsupported.
   Version tags (the draft's "generation fencing") are one possible mechanism;
   vector clocks alone do not encode code versions (§7).
 - **Stored functions.** The draft's latent effects in function types (§2.1)

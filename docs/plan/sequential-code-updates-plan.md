@@ -19,7 +19,7 @@ issues and branches before starting a unit.
 | After C, D2 and E1 | H1 (static type/kind migration checks); no initializer execution required |
 | Independently of the units above | T1 (#298: tables as vars that hold a list of records, with an optional initializer) |
 | After T1 and E2 | T2 (table steps in updates); schema changes join H1/H2 |
-| After E2 and F | K (#297: statements other than updates in `atomic` blocks) |
+| After E2 and F | K (#297: statements other than updates in `atomic` blocks); its table-migration test lands with or after T2 |
 | After task 12 and E2 | I (def steps and def reads during an update: #267 on one node), then H2 (full local type/kind migration execution) |
 | After local migration and the required peer/protocol support | H3 (distributed client validation and Sources evidence) |
 | Designed alongside #28, built after #213 | J (remote participation: #180, and #267 across nodes) |
@@ -258,7 +258,12 @@ unsupported execution cases explicitly.
   existing CLI `--check` path for files containing updates; separate-update
   checking against a supplied base or live interface is a later adapter.
 - When checking against live services, acquire a consistent description of
-  interfaces and relevant code. Execution revalidates under transaction
+  their installed state (kinds, types, def code, and the latent effects of
+  stored function values). The design requires each node to keep that
+  description current as it installs code or stores a function value; D2
+  defines the latent effects and G how peers supply them. Until G, checking
+  against a remote peer may lack some of it: report that as unsupported,
+  never fill it in by running code. Execution revalidates under transaction
   protection if that description could have changed.
 
 Review E1's availability analysis separately from installed-state typing and
@@ -293,7 +298,9 @@ unchanged. Test the checker directly without service creation, plus CLI
   any initializer runs; the static check (E1) can accept them once T1 lands.
 - Enable no new cases affected by values from old versions (#295). Same-type
   replacements, including type-preserving def-to-var changes, keep main's
-  behavior. #295 investigates whether main can incorrectly accept delayed
+  existing behavior, with no claim that they are safe; #295 covers them too,
+  and if it confirms a failure, its fix covers them or they are restricted
+  then. #295 investigates whether main can incorrectly accept delayed
   or retained old-code values; a failure has not yet been reproduced. E2's
   new initializer forms, such as `var d = d`, do not add new kinds of change.
   Type changes, including def-to-var changes that also change the value's
@@ -351,7 +358,10 @@ Validate a service fetched from a running peer as installed state, with no
 initialization order. Test an import of a peer after an update that leaves a
 member stored before one it reads. Check whether #269 has the same cause
 before treating it separately. Look at the peer metadata available first; a
-change to the wire format needs its own review.
+change to the wire format needs its own review. G is also where a peer starts
+supplying the installed-state description the design requires (kinds, types,
+def code, and stored values' latent effects), so updates can be checked
+against it.
 
 ### H. Type changes and var-to-def (three review units)
 
@@ -500,9 +510,11 @@ After E2 and F. Allow `let`, assignments, `insert` and new services in an
 against the view at its position, using F's mechanism, and executed through
 the transaction's ordinary write buffer; their reads join the footprint like
 an initializer's. `insert` from a top-level block needs a qualified target
-(`s.t`), which T1 or K must add. Test migrating table rows with
-`let old = s.t;`, a re-declaration of `t`, and `insert` of each old row, all
-in one block, including a failure partway that leaves nothing installed.
+(`s.t`), which T1 or K must add. Test `let`, assignments and `insert` on
+existing members, including a failure partway that leaves nothing installed.
+Migrating table rows with `let old = s.t;`, a re-declaration of `t`, and
+`insert` of each old row, all in one block, re-declares a table in an update,
+which E2 refuses until T2; land that test with or after T2.
 
 ### J. Remote participation (#180, and #267 across nodes)
 

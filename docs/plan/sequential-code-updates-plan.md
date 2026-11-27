@@ -201,11 +201,22 @@ type and kind changes, stored functions, and live metadata:
 
 The design's approach is an effect system, as in the draft semantics:
 function and action types carry latent effects, the members their bodies read
-and write, with their types (§2.1, rule WF-δ). A
-stored function whose recorded effects no longer fit the new bindings, or
-that writes a member that became a def, is then ill formed. The effects
-analysis already summarizes functions, so check whether those summaries can
-serve as the recorded effects of stored values. The draft's §6 notes the same
+and write, with their types (§2.1, rule WF-δ). A var that holds functions
+has such a type, so its latent effect bounds every function the var may
+hold, and every assignment must fit it (rule A-Write). A var whose bound no
+longer fits the new bindings, or includes a write to a member that became a
+def, is then ill formed.
+
+The central design question is moving from values to types. Today's
+analysis is value-based: the effects analysis reads the functions vars
+currently hold (`published` values), and `check_function_writes` decides when
+a function value may be stored. With a value-based description, a value
+transaction that stores a new function changes what an update was checked
+against. D2 should design bounds carried in types instead, including how a
+var's bound is inferred when it has no annotation (from its initializer and
+every assignment in installed code), and how new code that assigns a larger
+effect is rejected. The effects analysis already summarizes functions, so
+check whether those summaries can supply the bounds. The draft's §6 notes the same
 gap for higher-order values, so share D2's findings with its author.
 Establish whether summaries retain expected member types and read/write
 capabilities, including latent effects inside returned functions and actions;
@@ -216,7 +227,8 @@ H1 enables that behavior. Final-state compatibility alone does not justify
 the intermediate checking judgments.
 
 D2's main output is the design of that effect-system extension: what a
-stored value's recorded effects contain, how they are checked at an
+var type's latent effect contains, how it is inferred, how assignments are
+checked against it, how it is checked at an
 intermediate step and against the final bindings, and how they are kept for
 live services. It is a semantic design question as well as an implementation
 one, so bring the proposal back for design review, with concrete accepted and
@@ -258,10 +270,11 @@ unsupported execution cases explicitly.
   existing CLI `--check` path for files containing updates; separate-update
   checking against a supplied base or live interface is a later adapter.
 - When checking against live services, acquire a consistent description of
-  their installed state (kinds, types, def code, and the latent effects of
-  stored function values). The design requires each node to keep that
-  description current as it installs code or stores a function value; D2
-  defines the latent effects and G how peers supply them. Until G, checking
+  their installed state (kinds, types including the latent effects that bound
+  what a var's functions may read and write, and def code). The design
+  requires each node to keep that description current as it installs code;
+  writing a value never changes it. D2 defines the latent effects and G how
+  peers supply them. Until G, checking
   against a remote peer may lack some of it: report that as unsupported,
   never fill it in by running code. Execution revalidates under transaction
   protection if that description could have changed.
@@ -360,8 +373,8 @@ member stored before one it reads. Check whether #269 has the same cause
 before treating it separately. Look at the peer metadata available first; a
 change to the wire format needs its own review. G is also where a peer starts
 supplying the installed-state description the design requires (kinds, types,
-def code, and stored values' latent effects), so updates can be checked
-against it.
+def code, with latent effects as part of var types), so updates can be
+checked against it.
 
 ### H. Type changes and var-to-def (three review units)
 

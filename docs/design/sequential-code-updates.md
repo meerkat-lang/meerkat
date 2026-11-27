@@ -58,8 +58,8 @@ The design rests on these choices. Each is argued in the section named.
    transaction can replace it again ("One declaration per member").
 4. **Temporarily incompatible code is allowed** if the update repairs it
    before commit and nothing runs it in between. Stored function values are
-   checked through an effect system that records what their code reads and
-   writes ("Temporarily incompatible code").
+   checked through an effect system: a var's type bounds the reads and writes
+   of every function it may hold ("Temporarily incompatible code").
 5. **Types and kinds may change,** validated as interface changes. A var may
    become a def once writes to defs are rejected (#293) ("Kind changes").
 6. **Updates can be checked without running anything.** Static success
@@ -345,12 +345,14 @@ which code to validate.
 
 Checking from source uses inferred interfaces and conservative code/effect
 summaries. Checking against running services uses a consistent description of
-their installed state: each member's kind and type, each def's code, and the
-latent effects of function and action values stored in vars ("Temporarily
-incompatible code"). Each node keeps that description current whenever it
-installs code or stores a function value, so checking never needs to run code
-to learn what a member holds. Execution must revalidate under transaction
-protection if the environment
+their installed state: each member's kind and type, and each def's code. A
+var's type includes the latent effect that bounds every function or action
+value the var may hold ("Temporarily incompatible code"), so the description
+depends on installed code, not on the values stored: writing a new function
+value never changes it. Each node keeps the description current whenever it
+installs code, so checking never needs to run code to learn what a member
+holds. Execution must revalidate under transaction protection if the
+environment
 could have changed since an earlier check. A checked update is not an
 unconditional authorization to commit against a different environment.
 
@@ -434,12 +436,19 @@ values stored in vars need more, because in the implementation a value's type
 does not show which members its body reads or writes. The approach is an
 effect system: as in the draft semantics, a function's or action's type
 records the members its code reads and writes, with their types, as a latent
-effect (§2.1). A stored function whose recorded effects no longer fit the new
-bindings is then ill formed, and calling it at a step is checked against that
-step's bindings like any other code. How to extend the effect system to do
-this, including effects inside returned functions and actions and the
-intermediate bindings of an update, is a semantic design question to solve
-before type and kind changes are implemented.
+effect (§2.1). A var that holds functions has such a type, so its latent
+effect bounds every function the var may ever hold. Every assignment to the
+var, whether from existing code or from new code such as a REPL line, must
+fit that type (as in the draft's rule A-Write). A value transaction can then
+change which function a var holds, but not what that function may read or
+write, so it cannot invalidate an update that was checked against the var's
+type. A var whose effect no longer fits the new bindings is ill formed unless
+the update repairs it, and calling its function at a step is checked against
+that step's bindings like any other code. How to extend the effect system to
+do this, including effects inside returned functions and actions, inferring
+the bound for a var without an annotation, and the intermediate bindings of
+an update, is a semantic design question to solve before type and kind
+changes are implemented.
 
 ### Top-level statements
 
@@ -637,8 +646,10 @@ differences or open questions, agreed with the draft's author where noted.
   vector clocks alone do not encode code versions (§7).
 - **Stored functions.** The draft's latent effects in function types (§2.1)
   are the basis for checking stored function values across type and kind
-  changes ("Temporarily incompatible code"); extending the effect system for
-  this is a semantic design question. Summaries must preserve
+  changes ("Temporarily incompatible code"): a var's type bounds the effects
+  of every function it may hold, and every assignment must fit it, as in
+  A-Write. Extending the effect system for this is a semantic design
+  question. Summaries must preserve
   expected member types and read/write capabilities, including latent effects
   inside returned functions and actions; dependency names alone are
   insufficient for WF-δ. The higher-order compatibility premise in §6's
@@ -687,8 +698,9 @@ Review should establish that:
   running initializers, and leaves runtime state unchanged;
 - the availability and type checks accept the migrations above and reject
   reads of unavailable or temporarily incompatible members;
-- the effect system records enough about stored function values to keep
-  their types and captures sound across replacements;
+- var types bound the effects of every function value the var may hold, so
+  that types and captures stay sound across replacements and no value
+  transaction can invalidate a checked update;
 - a kind change gives downstream defs, local and remote, the right Sources;
 - initializer reads participate in locking, conflict checks, and causal
   history, including indirect reads;

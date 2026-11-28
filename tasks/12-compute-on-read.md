@@ -216,7 +216,9 @@ of the work and each part of it is load-bearing:
   - **A transaction-control error** (`WaitOn`, `WaitDieAbort`) from a read
     inside the recompute **propagates unchanged** into the existing park and
     retry handling (task 06 for originators, parking for participants). It is
-    not an evaluation failure and must not be turned into one.
+    not an evaluation failure and must not be turned into one. The one
+    exception is a doomed transaction (§3c): there it becomes a terminal
+    abort error, and the execution neither parks nor retries.
 
   Either way, §1a's read frame and §4's in-progress marker are popped on the
   way out, including when the error is `WaitOn` and the action parks.
@@ -330,69 +332,256 @@ already invalidate through §3a.
 That is sufficient whenever the writer is another *participant* — its buffered
 write is in its own `pending_txns` entry and the forced re-read finds it.
 
-⚠️ **It is not sufficient when the writer's transaction is checked out,
-and that case is out of contract.** A node's transaction state is out of
-`pending_txns` while it runs there: the originator's live transaction is a
-local in `execute_transaction` (`manager/mod.rs:3864`) and never enters the
-map, and `execute_action_participant` and `remote_read_participant` remove a
-participant's transaction from the map for as long as they run. A read-back
-that arrives meanwhile builds a **fresh** `Transaction`, sees pre-transaction
-state, and returns a stale value. For example, in `client → A → B`, A buffers
-`x` and then calls B, whose computation reads A's `x` while A's action is
-still running.
+⚠️ **It does not cover a read-back into a transaction that is running on
+the node it reads from.** A node's transaction state is out of `pending_txns`
+while it runs there: the originator's live transaction is a local in
+`execute_transaction` and never enters the map, and
+`execute_action_participant` and `remote_read_participant` remove a
+participant's transaction from the map for as long as they run. Such a
+transaction is usually waiting on a reply from the very node that reads back.
 
-Do not paper over it, but do not reject read-backs that cannot be stale
-either. Track the executions whose transaction state is checked out on this
-node, as a **stack of registrations per transaction id**
-(`Manager::active_txns: HashMap<TxnId, Vec<HashSet<(ServiceNetId, Symbol)>>>`,
-each registration holding the members that execution's transaction has
-written here). A registration is pushed when an execution checks its
-transaction out (an originator when `execute_transaction` starts, a
-participant when `execute_action_participant` or `remote_read_participant`
-takes its transaction out of `pending_txns` or creates one) and popped when
-that execution exits. Record the registration's depth on the `Transaction`,
-so each execution knows which registration is its own.
+**What happens today.** While a node waits on a reply (`send_and_await_reply`
+dispatches through `dispatch_events(false)`), it queues incoming
+`LookupRequest`, `ActionRequest`, `Commit` and `Abort` messages until the wait
+ends (`manager/mod.rs`, since commit `4bc7816`). A read-back for the waiting
+transaction is never served: the requester waits for a reply that cannot come
+until its own reply arrives, and both sides fail when `REPLY_TIMEOUT` (15s)
+expires. Nothing stale is read, but the failure is slow and its message says
+only that a reply timed out. Today this needs an action composed back onto
+the waiting node, for example `client → A → B` where B's action reads `a.x`.
 
-- **Seed from what is already buffered.** A participant's transaction can
-  hold writes from an earlier action under the same id, so a new registration
-  starts with the members already in that transaction's `written`, not empty.
-  `assign` and `append_table_row` then add each member they buffer to the
-  current execution's own registration.
-- **Reject only read-backs into an enclosing execution's writes.** When a
-  read-back for a checked-out transaction arrives, it is served as today,
-  from its own `Transaction` under the same id, unless it reaches a member
-  written by an **enclosing** execution: one whose registration sits below
-  its own on the stack. Check in `lookup`, for each local member the
-  read-back reads, including the inputs of a def it recomputes; if one is in
-  an enclosing registration, return an `EvalError` naming the transaction
-  and the member. An execution's own writes are never rejected: they are in
-  its own `txn.written`, which `lookup` checks first, and its own
-  registration is not consulted.
-- **Pop only your own registration.** A nested read-back that finishes pops
-  the registration it pushed and leaves the enclosing ones in place, so a
-  later read-back still sees them. Pop on every exit: success, failure, and
-  parking (a parked participant's transaction goes back into `pending_txns`).
-  Remove the id from the map only when its stack is empty.
+**What compute-on-read adds.** Today a participant answers a read of its def
+with the stored value. After this task it recomputes the def, so a def on B
+whose inputs include a member of A becomes a read-back whenever A reads it
+inside a transaction: an `@test` on A asserting on B's `def d = a.x + 1`
+would wait until the timeout, where today it returns `d`'s stored value.
 
-So in `client → A → B`, where A buffers `x` and then calls B: B may read A's
-unchanged `y`, and when that read-back finishes, A's registration is still in
-place, so a later read-back of `x` is rejected. A read-only checked-out
-transaction, or one whose writes a read-back does not reach, is unaffected:
-an `@test` on A asserting on a remote `b.d` that reads `a.x` keeps working
-while A has not written `x`. Making the rejected read-backs work means a
-transaction's state being addressable while it runs, which is #28's
-event-loop work.
+**Rule for this task: reject such read-backs and unwind promptly.** Track
+counted registrations per transaction id on this node (for example,
+`Manager::running_txns: HashMap<TxnId, usize>`) for **every execution that
+holds a transaction outside `pending_txns` across an await**. Today that is:
 
-An action composed back onto a node whose transaction is checked out has the
-same problem and is outside this task; check whether any existing test does
-that, and record it with the boundary below if one does.
+- an originator in `execute_transaction`;
+- a participant in `execute_action_participant` or `remote_read_participant`;
+- service initialization in `create_service`, whose transaction awaits
+  remote lookups while initializers run;
+- `handle_lock_request`, which takes a participant's transaction out of the
+  map while `acquire_lock_group_internal` awaits other nodes;
+- abort cleanup: `abort_participants`, including when called from
+  `abort_participant` (which takes the transaction out of the map while it
+  forwards the abort to sub-participants) and from a commit-clock failure;
+- a code update (`update::Transaction::apply`), whose lock transaction
+  awaits remote reads before installing the staged changes.
+
+Rather than add a registration at each of these by hand, route them through
+one checkout helper that takes the transaction (from `pending_txns`, or new),
+registers it, and returns a value that unregisters when the transaction is
+put back or dropped, with an explicit exit at the commit boundary below.
+A future path that runs a transaction outside the map
+then cannot forget to register. Audit for others by searching for
+`pending_txns.remove` and `Transaction::new`. Commit paths (`commit_txn`,
+`commit_participant`) are deliberately not registered; see "The commit
+boundary" below. When `dispatch_events(false)`
+would queue a `LookupRequest` or `ActionRequest` whose `txn_id` has a
+registration, reply at once with an error naming the transaction and saying
+that a read-back into a running transaction is not supported until #213. Requests
+for other transactions are queued as before. Rejecting the request must also
+let the original operation return the named error and complete abort cleanup
+without waiting for `REPLY_TIMEOUT`, assuming responsive peers.
+
+**Lock requests are the exception.** An eager `LockRequest` may reenter a
+running transaction without executing its code, so it is served rather than
+rejected. Its reservations and participant relationships stay owned by that
+running transaction and join its eventual park, commit or abort; they must
+not be left in an independent `pending_txns` entry, which the running
+execution would overwrite or overlook. Lock acquisition is reentrant by
+transaction id, so a nested request can "acquire" keys the running
+execution already holds. It must record and release only the reservations
+it newly acquired: when a nested request parks or fails, releasing by
+transaction id would otherwise free the running execution's own locks while
+it is still running. Once an abort is accepted or cleanup begins, reject
+further lock requests for that attempt.
+
+**Rejection must not create an abort wait cycle.**
+An immediate error reply alone does not meet that contract. In `A → B → A`,
+B pre-registers A in `txn.participants` before sending its read-back. On
+failure, `discard_failed_participant_txn` awaits `abort_participants` before
+returning B's error to A. B therefore sends A an `Abort` and waits for its
+acknowledgement, while A still queues `Abort` until B's original reply
+arrives. The operation can still time out despite the immediate rejection.
+
+**Mechanism, validated by a spike: a node never queues an `Abort` for a
+transaction it is running.**
+
+Aborts can reach a waiting node by routes other than the request it
+rejected, so the cycle must be broken where it closes, at the waiting node,
+not by the requester. Two examples, where A is running the transaction and
+waiting:
+
+- **An earlier participant relationship.** B read from A earlier, while A
+  was idle between requests, so A is in B's `txn.participants`. In
+  `A → B → C → A`, C's read-back is rejected. When C's error reaches B, B's
+  failure path aborts its participants, including A, though B never saw the
+  rejection.
+- **Abort forwarding.** `abort_participant` forwards an abort to the
+  aborted node's own participants and awaits each acknowledgement, so a node
+  with an earlier relationship to A forwards an abort to A. Concretely, under
+  one transaction:
+  1. The originator calls D, which reads A. Both return; D keeps A in its
+     participant set.
+  2. The originator then calls A, which calls B. B calls D successfully, then
+     attempts a read-back into A.
+  3. A rejects the read-back. B's failure path aborts its participants,
+     including D.
+  4. D forwards the abort to A and awaits the acknowledgement. A is waiting
+     for B, B for D, and D for A.
+
+  The same happens during A's own failure cleanup: A aborts B, B forwards the
+  abort back to A, and A is waiting for B's acknowledgement.
+
+A set of nodes that each requester skips cannot cover these, because the
+nodes that send the abort never saw the rejection.
+
+The rule:
+
+- **Acknowledge at once and doom the transaction.** When `dispatch_events`
+  receives an `Abort` whose `txn_id` has a registration on this node (an
+  execution is running it, including during that execution's asynchronous
+  failure cleanup), reply with the acknowledgement immediately and record the
+  id as doomed (for example `Manager::doomed_txns: HashSet<TxnId>`), instead
+  of queuing the message.
+- **A doomed execution fails and cleans up through its normal path.** The
+  running execution checks the doomed set when its wait returns and before it
+  commits or returns success. If its pending call failed with a terminal
+  error, it keeps that error unchanged, including a typed rejection, so the
+  rejection still reaches the originator as itself. `WaitOn` and
+  `WaitDieAbort` are parking/retry outcomes, not terminal errors: when doomed,
+  replace either with a terminal abort error rather than parking or retrying
+  the execution. If its pending call succeeded, it also fails with a terminal
+  abort error, so its work cannot commit. Its failure path releases its
+  locks and aborts its participants as for any failed transaction. Clear the
+  doomed mark when the id's last registration on this node exits.
+- **Check for doom before choosing the outcome.** If the execution has
+  already chosen to discard its attempt and retry under a fresh transaction
+  id, an abort forwarded back during that attempt's cleanup does not cancel
+  the retry; the old attempt still cannot commit. An abort received before
+  the outcome is chosen remains terminal. Parking under the same id is
+  different: recheck after any asynchronous cleanup before keeping that
+  attempt for resumption.
+- **The commit boundary.** Every registered execution checks the doomed mark
+  and exits its execution registration before crossing its commit boundary,
+  with no await between the check and that transition. For the originator
+  and service initialization, this is immediately before `commit_txn`. For
+  a code update, it is immediately before `update::Transaction::commit`
+  installs the staged declarations and values. The update stays unregistered
+  during subsequent graph installation, propagation, and remote forwarding;
+  these steps cannot promise to undo the installed changes. A read-back into
+  the updating node while it forwards to remote owners is therefore queued
+  and times out as it does today; serving or rejecting it belongs with remote
+  participation in updates (unit J of the sequential code updates plan). Commit paths
+  (`commit_txn`, `commit_participant`) are not registered, so an `Abort` that
+  arrives during commit keeps today's handling. That is deliberate:
+  `commit_stamped` installs local writes before it awaits participant commits,
+  so a doomed check there could not undo them. Abort cleanup after a failed
+  commit-clock calculation still registers through `abort_participants`.
+  Failures during commit remain #191's; this task does not resolve them.
+- **Why that is safe.** An `Abort` for a transaction means some part of it
+  failed. Errors cannot be caught in the language, and a failing participant
+  reports its error up the call chain, so the transaction as a whole fails
+  and the originator does not commit it. A wait-die retry runs under a new
+  attempt id (`TxnId::retry`), so aborts of an earlier attempt never match
+  it. Acknowledging early therefore never lets an executing transaction's
+  work commit; an `Abort` after the commit boundary is handled as today.
+- **What the acknowledgement promises.** For a running execution, an early
+  acknowledgement means the abort is accepted and the execution will not
+  commit. It does not mean its locks are already released: they are released
+  when the execution's current wait returns. This task guarantees prompt
+  unwinding only for read-back rejection chains and abort-forwarding cycles,
+  where the wait returns as soon as the failing chain replies. Other waits
+  can last longer. If the doomed node is waiting on a child parked on another
+  transaction's lock, it stays in that wait until the lock is released, and
+  `WaitParked` keepalives can extend the wait; an abort caused by an upstream
+  timeout is one way that case arises. That is no worse than today, where the
+  same `Abort` is queued until the same wait returns and its sender also
+  blocks until its own timeout. Prompt cancellation of an arbitrary wait,
+  and its cleanup obligations, is #213's suspendable-task work; do not infer
+  it from the doomed mark or from unregistering when a future is dropped.
+- **Rejected requests still fail fast.** A `LookupRequest` or `ActionRequest`
+  for a registered id is still answered at once with the typed rejection
+  error, an `EvalError` variant with a display prefix that `remote_error`
+  recognizes (as it does for `WaitDieAbort`). The error names the
+  transaction and the rejecting node in its text and is forwarded unchanged
+  up the chain, for a clear message. Cleanup does not depend on who
+  rejected, so no node needs to preserve or act on that identity.
+- **Aborts stay idempotent.** A node that has already discarded the
+  transaction acknowledges and does nothing, as today.
+
+Nothing here adds a message. A spike (branch `task12-abort-spike`) built
+the mechanism, about 170 production lines with no new messages or
+transaction fields, and tested it on real nodes over real network
+connections: lookup and action read-backs, a longer chain, an earlier
+participant relationship, the four-step forwarded-abort sequence above, and
+an abort cycle between idle participants with no read-back at all. Each
+failed operation completed with its cleanup in 0.13–0.36s, with writes
+discarded, locks released, no participant state left behind, and a later
+transaction able to write. It also showed that a doomed execution does not
+always unwind promptly (the parked-child case above), which is why the
+contract is the narrower one stated there, and it led to the commit boundary.
+If implementation finds a path the contract does not cover, revisit the
+split with #213 rather than extending this slice.
+
+Commit forwarding may have the analogous cycle: `commit_participant` takes
+the transaction out of the map and awaits each forwarded `Commit`, and a
+`Commit` arriving meanwhile is queued, so two participants with mutual
+participant relationships could wait on each other until `REPLY_TIMEOUT`.
+That would be an existing problem on main, independent of read-backs, and is
+outside this task; it is to be confirmed and tracked separately.
+
+Keep membership correct on every exit: success, failure, and parking (a
+parked participant's transaction goes back into `pending_txns`). Keep the
+registration through asynchronous failure cleanup, while the execution still
+holds its transaction outside the map; PR #300's participant exit calls
+currently precede that cleanup and cannot carry over unchanged. If nested
+executions use the same id, each releases only its own registration, and the
+id remains registered until the last one leaves. This lifecycle invariant
+does not enable nested requests through the dispatcher. Prefer a guard that
+also unregisters when its future is dropped, in preparation for #213's
+cancellable tasks. Unregistering alone does not make cancellation safe:
+releasing transaction locks and aborting participants are separate obligations.
+
+This is a deliberate, visible limitation until #213: a transactional read of
+a cross-node def whose inputs include a member of the reading node fails with
+this error, instead of returning a stored value that may not follow from the
+transaction's view.
+
+**Serving read-backs is #213's work.** Once a waiting execution is suspended
+rather than blocking the node, a read-back can be served while the
+transaction runs. It must then still not read around that transaction's
+buffered writes, so #213 needs one of:
+
+- making the running transaction's state reachable by id, so the read-back
+  sees its writes;
+- or a finer guard that allows read-backs which reach no buffered write and
+  rejects those that do. PR #300 prototyped this: a stack of registrations per
+  transaction id, each seeded from the writes already buffered, recording
+  each later write, and popped only by its own execution, with the check in
+  `lookup` consulting only enclosing registrations.
+
+Either approach must preserve transaction state and establish who owns
+commit/abort cleanup. The finer guard alone does not do this: a nested
+execution can insert its transaction into `pending_txns`, only for the
+enclosing participant to overwrite that entry when it returns, losing the
+nested execution's lock and read bookkeeping. Shared or explicitly merged
+state must retain buffered writes, locks, read snapshots, accumulated history,
+and participant membership. Preserve PR #300's prototype for reference, but
+do not treat it as sufficient to enable read-backs under #213.
 
 Since #294 every `@test` and REPL statement is an originator transaction, so
-this is reachable from any `for` loop or action that writes a local var and
-then reads a remote def over it. The implementation PR records the boundary in
-`meerkat/tests/README.md` next to task 11's scenarios: a read-back that
-reaches a member written by a transaction still running on that node fails
-with an error; read-backs that reach no such member work as before.
+the limitation is reachable from ordinary code. The implementation PR records
+it in `meerkat/tests/README.md` next to task 11's scenarios: inside a
+transaction, reading a def on another node whose inputs include a member of
+the reading node, or composing an action back onto it, fails with an error
+until #213.
 
 ### 4. Cycle detection
 
@@ -499,23 +688,59 @@ those two hooks in place.
    action, sees the new value on the second read.
 9. **New — §3c.** A participant's def over a *second participant's* var, read
    before and after a composed action that writes it, sees the new value. A
-   read-back that reaches a member written by a checked-out transaction fails
-   with the named error rather than returning a stale value, in both forms: a
-   participant's def over the **originator's** var, read after the originator
-   writes it; and, in `client → A → B`, B reading A's `x` that A buffered
-   before calling B, while A's action is still running. A read-back to a
-   checked-out transaction that has written nothing it reaches is served
-   normally: an `@test` on A asserting on B's `def d = a.x + 1`, with no write
-   to `x`. Also cover:
-   - the lifecycle: in `client → A → B`, A buffers `x` and calls B; B reads
-     A's unchanged `y` (served), then A's `x` (rejected), showing that the
-     first read-back's exit left A's registration in place;
-   - seeding: A, as a participant, buffers `x` in one action, then a second
-     action under the same transaction calls B, which reads `x` (rejected,
-     because the registration starts from the writes already buffered);
-   - the executing transaction reading its own buffered `x` normally;
-   - cleanup: after the action succeeds, fails, and parks, a later read for
-     the same transaction is served normally.
+   read-back into a transaction running on the node it reads from makes the
+   original operation fail promptly (well under `REPLY_TIMEOUT`) with the
+   error naming the transaction, in both forms: an `@test` on A asserting on B's
+   `def d = a.x + 1`; and, in `client → A → B`, B's action reading `a.x` while
+   A's action is still running. Exercise the actual network dispatch and
+   participant abort paths, not only the immediate rejection reply. Verify
+   cleanup completes, buffered writes are discarded, and a subsequent
+   transaction can acquire the affected locks. Include earlier participant
+   work and a downstream participant so rejection cannot silently abandon
+   their state. Cover `A → B → A` and `A → B → C → A`, and the indirect
+   routes: B with an earlier read from A (so A is in B's participants) when
+   C's read-back is rejected; a node with an earlier relationship to A
+   forwarding an abort to A; and A's own failure cleanup receiving an abort
+   forwarded back to it. For nested lock requests, check that their reservations join the running
+   transaction's park, commit or abort; that a nested request which parks or
+   fails while covering a key the running execution already holds leaves that
+   key held; that lock requests are rejected once abort is accepted; and that
+   an abort reflected during a fresh-id retry's cleanup does not cancel the
+   retry or cause a second abort round. Include the four-step sequence from §3c as a named
+   acceptance test: the originator calls D, which reads A; the originator
+   then calls A, which calls B; B calls D, then reads back into A; A rejects,
+   and B's abort of D is forwarded to A. In each, no wait reaches
+   `REPLY_TIMEOUT`, the running
+   node acknowledges the `Abort` at once, its execution fails and releases its
+   state (including earlier work under the same id), and a later transaction
+   can take the affected locks. Also check that a doomed execution whose
+   pending call returns success still fails rather than committing, and that
+   the doomed mark is cleared after the id's last registration exits. A
+   doomed execution whose pending call failed with the typed rejection
+   reports that rejection, not an abort error. A doomed execution returning
+   `WaitOn` or `WaitDieAbort` instead takes terminal cleanup and cannot park
+   or retry. Cover read-backs into the other
+   registered paths: a peer's def computed while `create_service` awaits a
+   remote lookup, and a request arriving while `handle_lock_request` or abort
+   cleanup holds the transaction (the composed-action forms can land in the
+   first slice; the def forms follow with compute-on-read). Include an abort
+   cycle between idle participants with no read-back, and that dropping a
+   registered future removes its registration (but not its locks). At the
+   commit boundary, check that an `Abort` arriving after the originator has
+   entered `commit_txn` is handled as today and cannot roll back installed
+   writes. Cover the registration boundary for service initialization and
+   code updates too: an abort observed before the boundary prevents commit,
+   and the execution registration is absent during post-boundary awaits.
+   As a documented limitation rather than an acceptance test, cover
+   the parked-child case: the doomed execution acknowledges at once, does not
+   commit when the child's success arrives, and cleans up only once the
+   child's lock is released. The composed-action case can land in the first slice; the
+   def case follows with compute-on-read. A request for a *different*
+   transaction arriving during the wait is still queued and served afterwards.
+   Check registrations through success, failure (including asynchronous
+   cleanup), and parking, plus guard drop if implemented. A nested
+   registration's exit must leave the enclosing one present; after the last
+   exit, a later request for the same id is no longer rejected by this guard.
 10. `meerkat/tests/s1.mkt` still passes. It has passed since PR #201 made each
     `do` in an `@test` its own transaction, so it no longer exercises
     read-your-own-writes and is only a regression check. Tests 1 and 3 are

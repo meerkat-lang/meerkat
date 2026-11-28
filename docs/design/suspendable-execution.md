@@ -322,22 +322,27 @@ because a parked originator leaves the loop free to process the release.
   (`acquire_lock_group_internal`), and that callback must be served before the
   reply can come.  So `send_and_await_reply` keeps serving, while it waits,
   what `dispatch_network_events` serves today: `LockRequest`,
-  `RequestUpdates`, `Update` and `UpdateServiceRequest`, now taken from the
-  loop's channel.  Everything else, including REPL input, `ActionRequest`,
-  `Commit` and `Abort`, stays queued for the loop until the action finishes;
-  today it is dropped.  `Commit` and `Abort` are not served during the wait
-  on purpose: committing a participant can forward the commit to the nodes
-  below and wait for them, which nests one wait inside another, the waiting
-  in place shown above to deadlock.
+  `RequestUpdates`, `Update`, `UpdateServiceRequest` and `ServiceCodeRequest`,
+  now taken from the loop's channel.  Step 3 also preserves #300's dispatch
+  exceptions: lookups and actions targeting a running transaction are
+  rejected immediately; aborts targeting one mark it doomed and receive an
+  immediate acknowledgement.  Lock requests for a doomed or aborting
+  transaction are rejected.  Other lookups, actions, commits and aborts stay
+  queued until the action finishes, as they do today; REPL input also waits
+  for the loop.  Commits and aborts stay queued on purpose: serving a commit,
+  or an abort for a transaction that isn't running, forwards it to the nodes
+  below and waits for them, nesting one wait inside another, the waiting in
+  place shown above to deadlock.
 
-  This is no worse than today, and loses nothing that today drops.  It does
-  not help a request that starts an action and calls back (an action on A
-  composes onto B, which composes back onto A): that still waits until A's
-  action finishes.  Step 4 fixes it, since the loop then runs while A's action
-  waits.
+  A request that starts an action and calls back (an action on A composes
+  onto B, which composes back onto A under the same transaction id) therefore
+  still fails promptly.  Serving that callback waits for step 4, when the
+  loop runs while A's action waits.
 - Originator transactions should live in a table while they run, keyed by id,
-  like `pending_txns`.  Task 12 already needs the originator's transaction to
-  be reachable by id while it runs, and it names #28 as the fix.
+  like `pending_txns`.  Task 12 registers running transactions by id so it
+  can reject read-backs and accept aborts into them (#300); the table holds
+  the transaction itself.  It does not let a read-back be served, though,
+  which waits for step 4 (see "Cleanup").
 - An originator that must wait should park and restart, not replay.  On
   `WaitOn` it does what #202's retry does: it aborts its participants,
   releases its locks and discards its buffers.  Then, instead of sleeping and
@@ -393,11 +398,19 @@ to the new.
 - The separate places that handle network messages outside the loop: the
   `--watch` loop and the server loop in `main.rs`, and the REPL's lack of
   any.
-- Task 12's guard that makes a read of an originator's in-flight transaction
-  fail, since that transaction becomes reachable by id.
 
 **After step 4**, when execution is suspendable:
 
+- Task 12's rejection of read-backs into a running transaction (#300), which
+  becomes routing them to the suspended execution.  Step 3's table makes the
+  transaction reachable by id, but a lookup or action that calls back into it
+  is still queued until its execution finishes, so without the rejection it
+  waits until the reply timeout.  Serving lookups during the wait in step 3
+  would not help: with compute-on-read a lookup can call out to another node,
+  nesting one wait inside another, the deadlock step 3 avoids for `Commit`.
+- The hand-back of a nested lock request's reservations to the running
+  execution that owns its transaction (`running.rs`, #300).  A nested request
+  adds to the transaction in the table directly.
 - #209's replay machinery: the rollback of buffers on a park, the records of
   completed composed actions, and the checks that a replay matches them, along
   with their tests.  Task 12's additions to it go too.

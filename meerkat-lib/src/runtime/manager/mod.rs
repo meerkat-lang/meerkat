@@ -1,3 +1,8 @@
+mod running;
+use super::interpreter::evaluator::RUNNING_TRANSACTION_PREFIX;
+pub(crate) use running::RunningTransaction;
+use running::RunningTransactions;
+
 use super::ast::{table_decl_in_service, ActionStmt, Decl, Expr, Stmt, Value};
 use super::graphs::{
     analysis::service_declarations,
@@ -337,6 +342,7 @@ pub struct Manager {
     pub pending_replies: HashMap<u64, oneshot::Sender<MeerkatMessage>>,
     /// Requests received during an RPC, to serve after its caller finishes.
     deferred_events: VecDeque<NetworkEvent>,
+    running: RunningTransactions,
     /// Deliveries of function code the graphs of the running services could
     /// not take (a def's reads incomplete, or a cycle), kept outside the
     /// active inputs, the newest per edge, to be offered again when the
@@ -456,6 +462,7 @@ impl Manager {
             network: None,
             pending_replies: HashMap::new(),
             deferred_events: VecDeque::new(),
+            running: RunningTransactions::default(),
             deferred_deliveries: Vec::new(),
             completing_updates: Vec::new(),
             applying_updates: Vec::new(),
@@ -1071,7 +1078,7 @@ impl Manager {
             )
         })?;
         let id = self.compute_service_net_id(name);
-        let mut txn = Transaction::new(TxnId::new(self.node_id));
+        let mut txn = self.checkout_transaction(TxnId::new(self.node_id));
         if self.services.contains_key(&name) {
             // Replacing the service also replaces its members and their locks.
             self.acquire_service_lock(name, &txn.id)?;
@@ -1111,13 +1118,15 @@ impl Manager {
 
         let mut env: Vec<(Symbol, Value)> = vec![];
         let svc_name = name;
+        let mut previous_service = None;
+        let mut installed = false;
 
         let result = async {
             // The graphs must be complete and acyclic, as those recomputed
             // below; the other services' follow from the same declarations
             // and do not change
             self.check_graphs(&graphs)?;
-            self.services.insert(
+            previous_service = self.services.insert(
                 name,
                 Service {
                     id,
@@ -1131,6 +1140,7 @@ impl Manager {
                     service_lock: Some(txn.id.clone()),
                 },
             );
+            installed = true;
             // Functions read from remote owners, published so far
             let mut published = 0;
             for decl in decls {
@@ -1249,9 +1259,11 @@ impl Manager {
 
             // Commit only after every initializer succeeds; participant failures
             // take the same rollback path as failed initialization
+            txn.begin_commit()?;
             self.commit_txn(&mut txn, None).await
         }
         .await;
+        let result = txn.finish(result);
         if result.is_ok() {
             // Requests received during initialization remain registered, but
             // receive their initial snapshot only after this instance commits.
@@ -1267,7 +1279,12 @@ impl Manager {
         } else {
             // Initialization only reads participants. Abort releases their locks.
             self.abort_participants(&txn).await;
-            self.services.remove(&svc_name);
+            if installed {
+                self.services.remove(&svc_name);
+                if let Some(previous) = previous_service.filter(|_| txn.is_running()) {
+                    self.services.insert(svc_name, previous);
+                }
+            }
             // A failed local instance must not erase an existing import
             if inserted {
                 self.unified_ast.retain(
@@ -2207,14 +2224,12 @@ impl Manager {
         this_id: ServiceNetId,
         listener_def: Symbol,
     ) {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT_SUB_ID: AtomicU64 = AtomicU64::new(1);
         let addr = match self.remote_addr(owner) {
             Ok(a) => a,
             Err(_) => return,
         };
         let reply_to = self.local_reply_addr().await;
-        let request_id = NEXT_SUB_ID.fetch_add(1, Ordering::SeqCst);
+        let request_id = Self::next_request_id();
         let msg = MeerkatMessage::RequestUpdates {
             request_id,
             service: self.interner.get(owner).to_string(),
@@ -2556,6 +2571,53 @@ impl Manager {
                     msg @ MeerkatMessage::ServiceCodeRequest { .. } => {
                         Box::pin(self.serve_request(msg)).await;
                     }
+                    MeerkatMessage::Abort {
+                        request_id,
+                        txn_id,
+                        reply_to,
+                    } if self.running.doom(&txn_id) => {
+                        self.send_oneway(
+                            Address::new(reply_to),
+                            MeerkatMessage::AbortResponse { request_id },
+                        )
+                        .await;
+                    }
+                    // Scaffolding, removed by #213: a read-back into a running
+                    // transaction can't be served while its execution holds the
+                    // `Manager`, so reject it rather than queue it until timeout.
+                    // Once execution suspends, route these to that execution.
+                    MeerkatMessage::LookupRequest {
+                        request_id,
+                        txn_id: Some(tid),
+                        reply_to,
+                        ..
+                    } if self.running.contains(&tid) => {
+                        let error = self.read_back_error(&tid).to_string();
+                        self.send_oneway(
+                            Address::new(reply_to),
+                            MeerkatMessage::LookupError { request_id, error },
+                        )
+                        .await;
+                    }
+                    MeerkatMessage::ActionRequest {
+                        request_id,
+                        txn_id: Some(tid),
+                        reply_to,
+                        ..
+                    } if self.running.contains(&tid) => {
+                        let error = Some(self.read_back_error(&tid).to_string());
+                        self.send_oneway(
+                            Address::new(reply_to),
+                            MeerkatMessage::ActionResponse {
+                                request_id,
+                                success: false,
+                                error,
+                                history: Vec::new(),
+                                writes: Vec::new(),
+                            },
+                        )
+                        .await;
+                    }
                     msg @ (MeerkatMessage::LookupRequest { .. }
                     | MeerkatMessage::ActionRequest { .. }
                     | MeerkatMessage::Commit { .. }
@@ -2566,6 +2628,28 @@ impl Manager {
                             self.deferred_events
                                 .push_back(NetworkEvent::MessageReceived { msg, peer });
                         }
+                    }
+                    MeerkatMessage::LockRequest {
+                        request_id,
+                        txn_id,
+                        reply_to,
+                        ..
+                    } if self.running.rejects_locks(&txn_id) => {
+                        self.send_oneway(
+                            Address::new(reply_to),
+                            MeerkatMessage::LockResponse {
+                                request_id,
+                                txn_id,
+                                success: false,
+                                error: Some(
+                                    EvalError::RunningTransaction(
+                                        "cannot acquire locks for an aborting transaction".into(),
+                                    )
+                                    .to_string(),
+                                ),
+                            },
+                        )
+                        .await;
                     }
                     msg @ MeerkatMessage::LockRequest { .. } if serve => {
                         Box::pin(self.serve_request(msg)).await;
@@ -2588,11 +2672,8 @@ impl Manager {
                             success,
                             error,
                         };
-                        let target_addr = if !peer.is_empty() { peer } else { reply_to };
-                        if !target_addr.is_empty() {
-                            self.send_oneway(Address::new(&target_addr), reply_msg)
-                                .await;
-                        }
+                        // `peer` is a bare PeerId, not a dialable address.
+                        self.send_oneway(Address::new(reply_to), reply_msg).await;
                     }
                     // Everything else is a reply: route it to its waiter.
                     other => {
@@ -2667,13 +2748,23 @@ impl Manager {
     ///     `err` (`String`): The `Display` text a remote node reported
     ///
     /// Returns:
-    ///     `EvalError`: `WaitDieAbort` for a lock conflict, otherwise
-    ///     `LocalDispatchFailed`
+    ///     `EvalError`: preserves lock conflicts and running-transaction errors;
+    ///     other failures become `LocalDispatchFailed`
     fn remote_error(err: String) -> EvalError {
+        if let Some(reason) = err.strip_prefix(RUNNING_TRANSACTION_PREFIX) {
+            return EvalError::RunningTransaction(reason.to_string());
+        }
         match err.strip_prefix(WAIT_DIE_DISPLAY_PREFIX) {
             Some(reason) => EvalError::WaitDieAbort(reason.to_string()),
             None => EvalError::LocalDispatchFailed(err),
         }
+    }
+
+    fn read_back_error(&self, tid: &TxnId) -> EvalError {
+        EvalError::RunningTransaction(format!(
+            "read-back into {tid:?} on node {} is not supported until #213",
+            self.node_id
+        ))
     }
 
     /// Identify a composed action by what its dispatch ships, so a replay can
@@ -2685,6 +2776,13 @@ impl Manager {
         let mut hasher = DefaultHasher::new();
         bytes.hash(&mut hasher);
         Ok(hasher.finish())
+    }
+
+    /// All RPC kinds share the reply table, including nested requests.
+    pub(crate) fn next_request_id() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
     }
 
     /// shared by remote_lookup and remote_action.
@@ -2920,10 +3018,7 @@ impl Manager {
         path: &str,
         server_addr: Address,
     ) -> Result<String, EvalError> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-
-        let request_id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+        let request_id = Self::next_request_id();
         let reply_to = self.local_reply_addr().await;
 
         let msg = MeerkatMessage::ServiceCodeRequest {
@@ -2984,9 +3079,6 @@ impl Manager {
         member: Symbol,
         mut txn: Option<&mut Transaction>,
     ) -> Result<ReadEntry, EvalError> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-
         // Remote reads are always served by the owning node, which holds this
         // transaction's buffered writes and read locks. We deliberately do not
         // reuse a cached result on the requesting side: a def's value can change
@@ -2996,7 +3088,7 @@ impl Manager {
         // with the owner's buffered state. (Caching provably-immutable reads to
         // save round-trips could be a later optimization.)
         let addr = self.remote_addr(service)?;
-        let request_id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+        let request_id = Self::next_request_id();
         let reply_to = self.local_reply_addr().await;
         let shared_tid = txn.as_ref().map(|t| t.id.clone());
 
@@ -3037,6 +3129,9 @@ impl Manager {
                 sources,
                 ..
             } => {
+                if let Some(t) = txn.as_ref() {
+                    self.running.check(&t.id)?;
+                }
                 let value = codec::decode_value(value, &mut self.interner)
                     .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?;
                 let clock = clock
@@ -3107,28 +3202,25 @@ impl Manager {
         member: Symbol,
         tid: TxnId,
     ) -> Result<ReadEntry, EvalError> {
-        let mut txn = self
-            .pending_txns
-            .remove(&tid)
-            .unwrap_or_else(|| Transaction::new(tid.clone()));
-        match self
+        let mut txn = self.checkout_transaction(tid.clone());
+        let result = self
             .lookup_with_clock(member, service, Some(&mut txn))
-            .await
-        {
+            .await;
+        match txn.finish(result) {
             Ok(v) => {
-                self.pending_txns.insert(tid, txn);
+                self.pending_txns.insert(tid, txn.into_inner());
                 Ok(v)
             }
             Err(e) => {
                 // Wait-die wait: preserve the transaction so the parked read can
                 // resume on release; any other failure releases and drops it.
                 if matches!(e, EvalError::WaitOn(_)) {
-                    self.pending_txns.insert(tid, txn);
+                    self.pending_txns.insert(tid, txn.into_inner());
                     return Err(e);
                 }
                 // Could not acquire the read lock (e.g. conflict): release any
                 // locks taken and do not keep this transaction prepared.
-                self.discard_failed_participant_txn(txn).await;
+                self.discard_failed_participant_txn(&txn).await;
                 Err(e)
             }
         }
@@ -3141,15 +3233,12 @@ impl Manager {
         env: Vec<(Symbol, Value)>,
         mut txn: Option<&mut Transaction>,
     ) -> Result<(), EvalError> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT_ACTION_ID: AtomicU64 = AtomicU64::new(1);
-
         // Dial the node address embedded in the `ServiceNetId`; send the
         // slug as the service name the remote node uses to find its local
         // service. This works even if the service was never imported
         // into the current scope
         let (addr, slug) = Self::split_service_net_id(service_net_id);
-        let request_id = NEXT_ACTION_ID.fetch_add(1, Ordering::SeqCst);
+        let request_id = Self::next_request_id();
         let reply_to = self.local_reply_addr().await;
 
         // When part of a transaction, ship its id so the remote node executes
@@ -3246,6 +3335,9 @@ impl Manager {
                 ..
             } => {
                 if success {
+                    if let Some(t) = txn.as_ref() {
+                        self.running.check(&t.id)?;
+                    }
                     // Record completion before decoding metadata: the remote
                     // action has already run and must not run again on replay.
                     if let Some(txn) = txn {
@@ -3871,7 +3963,7 @@ impl Manager {
         let mut txn_id = TxnId::new(self.node_id);
 
         loop {
-            let mut txn = Transaction::new(txn_id.clone());
+            let mut txn = self.checkout_transaction(txn_id.clone());
             let effect = match stmts {
                 [stmt] => execute(stmt, initial_env, self, service_name, &mut txn).await,
                 _ => execute_seq(
@@ -3888,10 +3980,11 @@ impl Manager {
                 self.check_buffered_writes(&mut txn)?;
                 Ok(effect)
             });
-            let error = match effect {
+            let error = match txn.finish(effect) {
                 Ok(effect) => {
                     // A participant may refuse Commit after local writes were
                     // installed (#191). Report the error without retrying them.
+                    txn.begin_commit()?;
                     let committed = self.commit_txn(&mut txn, session_clock).await;
                     self.release_all_locks(&txn);
                     return committed.map(|()| effect);
@@ -3900,6 +3993,9 @@ impl Manager {
             };
             self.abort_participants(&txn).await;
             self.release_all_locks(&txn);
+            // The attempt is already discarded. Abort forwarding can return
+            // to us during cleanup; it must not cancel a retry under a new ID.
+            drop(txn);
 
             // A participant can park on its wait queue. The originator waits
             // by retrying with fresh buffers under the same transaction age.
@@ -3926,7 +4022,7 @@ impl Manager {
     /// Render a contended lock key in program terms: `service '<name>'` or
     /// `'<service>.<member>'`, falling back to the raw `ServiceNetId` when the
     /// service is not local.
-    fn describe_wait_key(&self, key: &WaitKey) -> String {
+    pub(super) fn describe_wait_key(&self, key: &WaitKey) -> String {
         let name_of = |sid: &ServiceNetId| {
             self.service_name_for_net_id(sid)
                 .map(|n| self.interner.get(n).to_string())
@@ -4043,10 +4139,7 @@ impl Manager {
         initial_env: &[(Symbol, Value)],
         tid: TxnId,
     ) -> Result<(), EvalError> {
-        let mut txn = self
-            .pending_txns
-            .remove(&tid)
-            .unwrap_or_else(|| Transaction::new(tid.clone()));
+        let mut txn = self.checkout_transaction(tid.clone());
         // A `WaitOn` parks the whole action and re-runs it from the first
         // statement, so a run that parks must leave the buffers as it found
         // them, or `x = x + 1` reads its own buffered `1` on replay and
@@ -4082,17 +4175,28 @@ impl Manager {
                 txn.composed_done.len() - start
             )));
         }
+        let exec_error = txn.finish(exec_error.map_or(Ok(()), Err)).err();
         if let Some(e) = exec_error {
             if matches!(e, EvalError::WaitOn(_)) {
                 (txn.written, txn.read_cache, txn.composed_seq) = before;
-                self.pending_txns.insert(tid, txn);
+                self.pending_txns.insert(tid, txn.into_inner());
                 return Err(e);
             }
-            self.discard_failed_participant_txn(txn).await;
+            self.discard_failed_participant_txn(&txn).await;
             return Err(e);
         }
-        self.pending_txns.insert(tid, txn);
+        self.pending_txns.insert(tid, txn.into_inner());
         Ok(())
+    }
+
+    /// Check out existing participant state or start a fresh attempt. All
+    /// pre-commit execution uses the same owner/registration lifetime.
+    pub(crate) fn checkout_transaction(&mut self, tid: TxnId) -> RunningTransaction {
+        let txn = self
+            .pending_txns
+            .remove(&tid)
+            .unwrap_or_else(|| Transaction::new(tid));
+        self.running.checkout(txn)
     }
 
     /// Participant side: apply and release a held transaction on `Commit`,
@@ -4129,13 +4233,15 @@ impl Manager {
     ///
     /// Args:
     ///     txn (Transaction): The transaction context
-    async fn discard_failed_participant_txn(&mut self, txn: Transaction) {
-        self.release_all_locks(&txn);
-        self.abort_participants(&txn).await;
+    async fn discard_failed_participant_txn(&mut self, txn: &Transaction) {
+        self.release_all_locks(txn);
+        self.abort_participants(txn).await;
     }
 
     /// Tell every participant of `txn` to abort
     pub(super) async fn abort_participants(&mut self, txn: &Transaction) {
+        let _running = self.running.enter(&txn.id);
+        self.running.begin_abort(&txn.id);
         for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
             self.send_abort(addr, &txn.id).await;
         }
@@ -4147,7 +4253,7 @@ impl Manager {
     /// The freed keys reach the server loop through `freed_awaiting_wake`
     pub async fn abort_participant(&mut self, tid: &TxnId) {
         if let Some(txn) = self.pending_txns.remove(tid) {
-            self.discard_failed_participant_txn(txn).await;
+            self.discard_failed_participant_txn(&txn).await;
         }
     }
 
@@ -4232,41 +4338,45 @@ impl Manager {
         codec::validate_lock_request(&services)
             .map_err(|e| EvalError::RuntimeError(e.to_string()))?;
 
-        let mut txn = self
-            .pending_txns
-            .remove(&txn_id)
-            .unwrap_or_else(|| Transaction::new(txn_id.clone()));
-
+        let mut txn = self.checkout_transaction(txn_id.clone());
+        let prior_locked = txn.locked.clone();
+        let prior_service_locked = txn.service_locked.clone();
         let result = self.acquire_lock_group_internal(&mut txn, &services).await;
 
-        match result {
+        match txn.finish(result) {
             Ok(()) => {
-                self.pending_txns.insert(txn_id, txn);
+                if let Some(txn) = txn.park_locks() {
+                    self.pending_txns.insert(txn_id, txn);
+                }
                 Ok(())
             }
-            // CRITICAL: All-or-Nothing Eager Lock Group Release
-            // If a lock group acquisition encounters contention and
-            // yields `WaitOn`, we MUST NOT hold onto partial locks.
-            // Holding partial locks while parked would stall incoming
-            // atomic updates that require those same locks.
-            // On `WaitOn`, we immediately release all partial locks taken
-            // so far and clear the transaction's lock tracking sets,
-            // ensuring the transaction yields completely and retries
-            // from scratch when unparked
             Err(EvalError::WaitOn(key)) => {
-                self.release_all_locks(&txn);
-                txn.locked.clear();
-                txn.service_locked.clear();
+                // Release this request's partial acquisition before parking,
+                // preserving locks that protect earlier work under the same ID.
+                let acquired = txn
+                    .locked
+                    .difference(&prior_locked)
+                    .map(|(sid, member)| WaitKey::Member(sid.clone(), *member))
+                    .chain(
+                        txn.service_locked
+                            .difference(&prior_service_locked)
+                            .cloned()
+                            .map(WaitKey::Service),
+                    )
+                    .collect();
+                self.release_locks(&acquired, &txn.id);
+                txn.locked = prior_locked;
+                txn.service_locked = prior_service_locked;
+                // WaitOn is local: acquisition has not sent any remote requests.
+                // Existing participants belong to earlier work and must survive.
 
-                // Abort sub-participants to release remote partial locks
-                self.abort_participants(&txn).await;
-                txn.participants.clear();
-
-                self.pending_txns.insert(txn_id, txn);
+                if let Some(txn) = txn.park_locks() {
+                    self.pending_txns.insert(txn_id, txn);
+                }
                 Err(EvalError::WaitOn(key))
             }
             Err(e) => {
-                self.discard_failed_participant_txn(txn).await;
+                self.discard_failed_participant_txn(&txn).await;
                 Err(e)
             }
         }
@@ -4300,8 +4410,12 @@ impl Manager {
             if group.service_level_lock {
                 if self.services.contains_key(&svc_sym) {
                     let net_id = self.service_net_id_for_name(svc_sym);
+                    let already_held =
+                        self.services[&svc_sym].service_lock.as_ref() == Some(&txn.id);
                     self.acquire_service_lock(svc_sym, &txn.id)?;
-                    txn.service_locked.insert(net_id);
+                    if !already_held {
+                        txn.service_locked.insert(net_id);
+                    }
                 } else if self.remote_services.contains_key(&svc_sym) {
                     remote_locks.insert(svc_sym, group.clone());
                 } else {
@@ -4337,12 +4451,19 @@ impl Manager {
                 // def expression is mutated by another transaction
                 // after we check its dependencies but before we lock it
                 let key = (self.service_net_id_for_name(svc_sym), mem_sym);
+                // A reentrant request can use or strengthen an outer owner's
+                // lock, but must not take ownership of releasing it on failure.
+                let already_held = self.services[&svc_sym]
+                    .vars
+                    .get(&mem_sym)
+                    .is_some_and(|state| state.lock.is_held_by(&txn.id));
 
                 if is_write {
                     self.acquire_write_lock(svc_sym, mem_sym, &txn.id, true)?;
-                    txn.locked.insert(key);
-                } else if !txn.locked.contains(&key) {
+                } else if !already_held {
                     self.acquire_read_lock(svc_sym, mem_sym, &txn.id)?;
+                }
+                if !already_held {
                     txn.locked.insert(key);
                 }
 
@@ -4407,9 +4528,7 @@ impl Manager {
         for (addr, remote_services) in node_requests {
             txn.participants.insert(addr.clone());
 
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static NEXT_LOCK_REQ_ID: AtomicU64 = AtomicU64::new(1);
-            let request_id = NEXT_LOCK_REQ_ID.fetch_add(1, Ordering::SeqCst);
+            let request_id = Self::next_request_id();
 
             let msg = MeerkatMessage::LockRequest {
                 request_id,
@@ -4434,6 +4553,7 @@ impl Manager {
                             .unwrap_or_else(|| "Lock request rejected by remote node".to_string());
                         return Err(Self::remote_error(err_str));
                     }
+                    self.running.check(&txn.id)?;
                 }
                 _ => {
                     return Err(EvalError::LocalDispatchFailed(
@@ -4453,9 +4573,7 @@ impl Manager {
         tid: &TxnId,
         clock: &VClock,
     ) -> Result<(), EvalError> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT_COMMIT_ID: AtomicU64 = AtomicU64::new(1);
-        let request_id = NEXT_COMMIT_ID.fetch_add(1, Ordering::SeqCst);
+        let request_id = Self::next_request_id();
         let reply_to = self.local_reply_addr().await;
         let msg = MeerkatMessage::Commit {
             request_id,
@@ -4512,9 +4630,7 @@ impl Manager {
     /// Originator side: tell a participant to abort, awaiting acknowledgement
     /// so its locks are released before we return (and the process may exit).
     async fn send_abort(&mut self, addr: Address, tid: &TxnId) {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT_ABORT_ID: AtomicU64 = AtomicU64::new(1);
-        let request_id = NEXT_ABORT_ID.fetch_add(1, Ordering::SeqCst);
+        let request_id = Self::next_request_id();
         let reply_to = self.local_reply_addr().await;
         let msg = MeerkatMessage::Abort {
             request_id,
@@ -7410,7 +7526,7 @@ mod tests {
         services.insert(tc.manager.interner.get(tc.s1).to_string(), lg);
 
         // Seed the older transaction in `pending_txns` with a dummy
-        // participant address to verify that `participants` are drained
+        // participant address to verify that earlier work is preserved
         let mut pre_txn = crate::runtime::txn::Transaction::new(older.clone());
         pre_txn
             .participants
@@ -7438,9 +7554,13 @@ mod tests {
             crate::runtime::txn::VarLock::Unlocked
         ));
 
-        // Assert all-or-nothing: `participants` were drained on `WaitOn`
+        // Local contention occurs before remote acquisition. Preserve participants
+        // from earlier operations instead of aborting their buffered work.
         let parked_txn = tc.manager.pending_txns.get(&older).unwrap();
-        assert!(parked_txn.participants.is_empty());
+        assert_eq!(
+            parked_txn.participants,
+            HashSet::from([Address::new("remote:1234")])
+        );
     }
 
     /// Verify that handle_lock_request rejects requests with invalid identifiers before interning
@@ -7880,3 +8000,6 @@ mod tests {
         assert_eq!(manager.services[&s].vars[&b].vector_clock, clock);
     }
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod read_back_tests;

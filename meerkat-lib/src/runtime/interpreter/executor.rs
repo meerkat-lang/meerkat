@@ -275,6 +275,7 @@ mod tests {
                 | EvalError::LocalDispatchFailed(_)
                 | EvalError::RemoteDispatchFailed(_)
                 | EvalError::NotImplemented
+                | EvalError::RunningTransaction(_)
                 | EvalError::WaitDieAbort(_)
                 | EvalError::WaitOn(_)
                 | EvalError::RuntimeError(_)

@@ -10,7 +10,7 @@ use crate::runtime::ast::{apply_updates_to_ast, Decl, Expr, Stmt, Value};
 use crate::runtime::graphs::analysis::service_declarations;
 use crate::runtime::interner::{Interner, Symbol};
 use crate::runtime::interpreter::evaluator::{eval, EvalContext, EvalError};
-use crate::runtime::manager::Manager;
+use crate::runtime::manager::{Manager, RunningTransaction};
 use crate::runtime::txn::{Transaction as LockTxn, TxnId, VClock, VarLock};
 use std::collections::{HashMap, HashSet};
 
@@ -19,7 +19,7 @@ pub struct Transaction {
     updates: Vec<Stmt>,
     ast: Vec<Stmt>,
     values: HashMap<(Symbol, Symbol), Value>,
-    lock_txn: Option<LockTxn>,
+    txn_id: Option<TxnId>,
 }
 
 impl Transaction {
@@ -35,7 +35,7 @@ impl Transaction {
             updates,
             ast: Vec::new(),
             values: HashMap::new(),
-            lock_txn: None,
+            txn_id: None,
         }
     }
 
@@ -52,17 +52,7 @@ impl Transaction {
             updates,
             ast: Vec::new(),
             values: HashMap::new(),
-            lock_txn: Some(LockTxn::new(txn_id)),
-        }
-    }
-
-    /// Release any locks currently held by this transaction on the manager
-    ///
-    /// Args:
-    ///     `manager` (`&mut Manager`): The active runtime manager
-    fn release_lock_txn(&self, manager: &mut Manager) {
-        if let Some(txn) = &self.lock_txn {
-            manager.release_all_locks(txn);
+            txn_id: Some(txn_id),
         }
     }
 
@@ -101,22 +91,36 @@ impl Transaction {
         &mut self,
         manager: &mut Manager,
     ) -> Result<Vec<(Symbol, Symbol)>, EvalError> {
-        let result = self.try_apply(manager).await;
-        // Whatever the outcome, the locks this update holds on this node are
-        // released here, once. Remote participants are told only on the paths
-        // that do so themselves: commit sends them `Commit`, and a failure in
-        // `commit` aborts them. Other failures before the local commit leave
-        // their locks held (to be fixed separately). A failure before the
-        // local commit leaves nothing installed here; one a remote owner
-        // reports afterwards leaves the local part installed and is returned
-        self.release_lock_txn(manager);
-        result
+        let tid = self
+            .txn_id
+            .take()
+            .unwrap_or_else(|| TxnId::new(manager.node_id));
+        let mut txn = manager.checkout_transaction(tid);
+        let result = self.try_apply(manager, &mut txn).await;
+        let result = txn.finish(result);
+        // Before installation, every failure discards this attempt, including
+        // remote locks acquired by initializers and cascading lock requests.
+        // After installation, failures cannot roll back the local update.
+        if result.is_err() && txn.is_running() {
+            manager.abort_participants(&txn).await;
+        }
+        manager.release_all_locks(&txn);
+        // Updates do not park. Render contention at this public boundary,
+        // after the doomed check, without exposing node-local wait keys.
+        result.map_err(|error| match error {
+            EvalError::WaitOn(key) => EvalError::RuntimeError(format!(
+                "Code update blocked waiting for {}",
+                manager.describe_wait_key(&key)
+            )),
+            other => other,
+        })
     }
 
     /// `apply` up to the release of its locks
     async fn try_apply(
         &mut self,
         manager: &mut Manager,
+        txn: &mut RunningTransaction,
     ) -> Result<Vec<(Symbol, Symbol)>, EvalError> {
         let mut lock_groups: HashMap<String, LockGroup> = HashMap::new();
         for stmt in &self.updates {
@@ -167,33 +171,24 @@ impl Transaction {
             lock_groups.insert(svc_name_str, group);
         }
 
-        let mut txn = self
-            .lock_txn
-            .take()
-            .unwrap_or_else(|| LockTxn::new(TxnId::new(manager.node_id)));
-
         loop {
-            let lock_res = manager
-                .acquire_lock_group_internal(&mut txn, &lock_groups)
-                .await;
-
-            if let Err(e) = lock_res {
-                manager.release_all_locks(&txn);
+            let lock_res = manager.acquire_lock_group_internal(txn, &lock_groups).await;
+            if let Err(e) = txn.finish(lock_res) {
                 if matches!(e, EvalError::WaitDieAbort(_))
                     && txn.id.iteration < crate::runtime::manager::MAX_WAIT_DIE_RETRIES
                 {
-                    txn = LockTxn::new(txn.id.retry());
+                    manager.release_all_locks(txn);
+                    manager.abort_participants(txn).await;
+                    // Abort callbacks during cleanup concern this discarded
+                    // attempt, not the fresh transaction ID used by the retry.
+                    *txn = manager.checkout_transaction(txn.id.retry());
                     continue;
                 }
-                return Err(EvalError::RuntimeError(format!(
-                    "Lock acquisition conflict during update: {}",
-                    e
-                )));
+                return Err(e);
             }
             break;
         }
 
-        self.lock_txn = Some(txn);
         match apply_updates_to_ast(manager.unified_ast(), &self.updates) {
             Ok(patched) => self.ast = patched,
             Err(sym) => {
@@ -239,7 +234,7 @@ impl Transaction {
                     let mut ctx = EvalContext {
                         manager,
                         service_name: *svc_name,
-                        txn: self.lock_txn.as_mut(),
+                        txn: Some(txn),
                     };
                     eval(expr, &env, &mut ctx).await
                 };
@@ -278,10 +273,9 @@ impl Transaction {
             .collect();
         let graphs = manager.graphs_of(&self.ast, services, &staged);
         manager.check_graphs(&graphs)?;
-        if let Err(e) = self.commit(manager) {
-            if let Some(txn) = &self.lock_txn {
-                manager.abort_participants(txn).await;
-            }
+        txn.begin_commit()?;
+        if let Err(e) = self.commit(manager, txn) {
+            manager.abort_participants(txn).await;
             return Err(e);
         }
 
@@ -324,14 +318,11 @@ impl Transaction {
             if let Some(addr) = manager.remote_services.get(svc_name).cloned() {
                 let source = format_update_source(*svc_name, decls, &manager.interner);
                 let svc_str = manager.interner.get(*svc_name).to_string();
-                static NEXT_UPDATE_REQ_ID: std::sync::atomic::AtomicU64 =
-                    std::sync::atomic::AtomicU64::new(1);
-                let request_id =
-                    NEXT_UPDATE_REQ_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let request_id = Manager::next_request_id();
                 let reply_to = manager.local_reply_addr().await;
                 let msg = crate::net::types::MeerkatMessage::UpdateServiceRequest {
                     request_id,
-                    txn_id: self.lock_txn.as_ref().map(|t| t.id.clone()),
+                    txn_id: Some(txn.id.clone()),
                     service_name: svc_str.clone(),
                     source,
                     reply_to,
@@ -372,9 +363,7 @@ impl Transaction {
         // Only releases the participants' locks: they buffered no
         // writes to stamp, and the vars this update changed were
         // stamped in `commit`
-        if let Some(lock_txn) = &self.lock_txn {
-            let _ = manager.commit_participants(lock_txn, &VClock::new()).await;
-        }
+        let _ = manager.commit_participants(txn, &VClock::new()).await;
 
         remote_failure.map_or(Ok(introduced), Err)
     }
@@ -416,7 +405,7 @@ impl Transaction {
     ///
     /// Args:
     ///     `manager` (`&mut Manager`): The active runtime manager
-    fn commit(&mut self, manager: &mut Manager) -> Result<(), EvalError> {
+    fn commit(&mut self, manager: &mut Manager, txn: &LockTxn) -> Result<(), EvalError> {
         let write_set: HashSet<_> = self
             .values
             .keys()
@@ -429,11 +418,7 @@ impl Transaction {
             // Remote owners stamp their own writes; this node installs no clock.
             VClock::new()
         } else {
-            let read_clock = self
-                .lock_txn
-                .as_ref()
-                .map(|txn| manager.transaction_history(txn).0)
-                .unwrap_or_default();
+            let read_clock = manager.transaction_history(txn).0;
             manager.write_clock(read_clock, &write_set)?
         };
         for ((svc_name, var_name), val) in std::mem::take(&mut self.values) {
@@ -848,7 +833,7 @@ mod tests {
         };
 
         let txn = Transaction::new(vec![update_stmt]);
-        assert!(txn.lock_txn.is_none());
+        assert!(txn.txn_id.is_none());
     }
 
     /// Test lock release when `nameres` fails during update transaction

@@ -125,6 +125,14 @@ impl VarLock {
         VarLock::Unlocked
     }
 
+    pub(crate) fn is_held_by(&self, txn_id: &TxnId) -> bool {
+        match self {
+            VarLock::Unlocked => false,
+            VarLock::ReadLocked(readers) => readers.contains(txn_id),
+            VarLock::WriteLocked(writer) => writer == txn_id,
+        }
+    }
+
     /// Try to acquire a read lock, succeeding unless write-locked
     pub fn try_read(&mut self, txn_id: &TxnId) -> bool {
         match self {

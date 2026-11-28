@@ -389,6 +389,19 @@ for other transactions are queued as before. Rejecting the request must also
 let the original operation return the named error and complete abort cleanup
 without waiting for `REPLY_TIMEOUT`, assuming responsive peers.
 
+**Lock requests are the exception.** An eager `LockRequest` may reenter a
+running transaction without executing its code, so it is served rather than
+rejected. Its reservations and participant relationships stay owned by that
+running transaction and join its eventual park, commit or abort; they must
+not be left in an independent `pending_txns` entry, which the running
+execution would overwrite or overlook. Lock acquisition is reentrant by
+transaction id, so a nested request can "acquire" keys the running
+execution already holds. It must record and release only the reservations
+it newly acquired: when a nested request parks or fails, releasing by
+transaction id would otherwise free the running execution's own locks while
+it is still running. Once an abort is accepted or cleanup begins, reject
+further lock requests for that attempt.
+
 **Rejection must not create an abort wait cycle.**
 An immediate error reply alone does not meet that contract. In `A → B → A`,
 B pre-registers A in `txn.participants` before sending its read-back. On
@@ -448,6 +461,13 @@ The rule:
   abort error, so its work cannot commit. Its failure path releases its
   locks and aborts its participants as for any failed transaction. Clear the
   doomed mark when the id's last registration on this node exits.
+- **Check for doom before choosing the outcome.** If the execution has
+  already chosen to discard its attempt and retry under a fresh transaction
+  id, an abort forwarded back during that attempt's cleanup does not cancel
+  the retry; the old attempt still cannot commit. An abort received before
+  the outcome is chosen remains terminal. Parking under the same id is
+  different: recheck after any asynchronous cleanup before keeping that
+  attempt for resumption.
 - **The commit boundary.** Every registered execution checks the doomed mark
   and exits its execution registration before crossing its commit boundary,
   with no await between the check and that transition. For the originator
@@ -681,7 +701,12 @@ those two hooks in place.
    routes: B with an earlier read from A (so A is in B's participants) when
    C's read-back is rejected; a node with an earlier relationship to A
    forwarding an abort to A; and A's own failure cleanup receiving an abort
-   forwarded back to it. Include the four-step sequence from §3c as a named
+   forwarded back to it. For nested lock requests, check that their reservations join the running
+   transaction's park, commit or abort; that a nested request which parks or
+   fails while covering a key the running execution already holds leaves that
+   key held; that lock requests are rejected once abort is accepted; and that
+   an abort reflected during a fresh-id retry's cleanup does not cancel the
+   retry or cause a second abort round. Include the four-step sequence from §3c as a named
    acceptance test: the originator calls D, which reads A; the originator
    then calls A, which calls B; B calls D, then reads back into A; A rejects,
    and B's abort of D is forwarded to A. In each, no wait reaches

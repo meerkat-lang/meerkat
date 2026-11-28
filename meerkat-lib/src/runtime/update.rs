@@ -105,7 +105,15 @@ impl Transaction {
             manager.abort_participants(&txn).await;
         }
         manager.release_all_locks(&txn);
-        result
+        // Updates do not park. Render contention at this public boundary,
+        // after the doomed check, without exposing node-local wait keys.
+        result.map_err(|error| match error {
+            EvalError::WaitOn(key) => EvalError::RuntimeError(format!(
+                "Code update blocked waiting for {}",
+                manager.describe_wait_key(&key)
+            )),
+            other => other,
+        })
     }
 
     /// `apply` up to the release of its locks

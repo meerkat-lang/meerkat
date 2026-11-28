@@ -4018,7 +4018,7 @@ impl Manager {
     /// Render a contended lock key in program terms: `service '<name>'` or
     /// `'<service>.<member>'`, falling back to the raw `ServiceNetId` when the
     /// service is not local.
-    fn describe_wait_key(&self, key: &WaitKey) -> String {
+    pub(super) fn describe_wait_key(&self, key: &WaitKey) -> String {
         let name_of = |sid: &ServiceNetId| {
             self.service_name_for_net_id(sid)
                 .map(|n| self.interner.get(n).to_string())
@@ -4403,8 +4403,12 @@ impl Manager {
             if group.service_level_lock {
                 if self.services.contains_key(&svc_sym) {
                     let net_id = self.service_net_id_for_name(svc_sym);
+                    let already_held =
+                        self.services[&svc_sym].service_lock.as_ref() == Some(&txn.id);
                     self.acquire_service_lock(svc_sym, &txn.id)?;
-                    txn.service_locked.insert(net_id);
+                    if !already_held {
+                        txn.service_locked.insert(net_id);
+                    }
                 } else if self.remote_services.contains_key(&svc_sym) {
                     remote_locks.insert(svc_sym, group.clone());
                 } else {
@@ -4440,12 +4444,19 @@ impl Manager {
                 // def expression is mutated by another transaction
                 // after we check its dependencies but before we lock it
                 let key = (self.service_net_id_for_name(svc_sym), mem_sym);
+                // A reentrant request can use or strengthen an outer owner's
+                // lock, but must not take ownership of releasing it on failure.
+                let already_held = self.services[&svc_sym]
+                    .vars
+                    .get(&mem_sym)
+                    .is_some_and(|state| state.lock.is_held_by(&txn.id));
 
                 if is_write {
                     self.acquire_write_lock(svc_sym, mem_sym, &txn.id, true)?;
-                    txn.locked.insert(key);
-                } else if !txn.locked.contains(&key) {
+                } else if !already_held {
                     self.acquire_read_lock(svc_sym, mem_sym, &txn.id)?;
+                }
+                if !already_held {
                     txn.locked.insert(key);
                 }
 

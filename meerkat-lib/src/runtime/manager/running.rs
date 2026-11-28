@@ -72,6 +72,11 @@ impl RunningTransaction {
         if let Some(registration) = &self.registration {
             let mut states = registration.registry.states();
             let state = states.get_mut(&self.txn.id).unwrap();
+            // Completed nested reservations belong to the outer owner. A
+            // later nested failure must not collect and release them.
+            if state.count > 1 {
+                return;
+            }
             self.txn.locked.extend(state.locked.drain());
             self.txn.service_locked.extend(state.service_locked.drain());
             self.txn.participants.extend(state.participants.drain());

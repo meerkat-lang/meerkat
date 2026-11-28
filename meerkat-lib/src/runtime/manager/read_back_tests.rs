@@ -208,6 +208,176 @@ fn registration_lifecycle() {
     assert!(running.enter(&tid).finish(Ok(())).is_ok());
 }
 
+#[tokio::test]
+async fn failed_nested_lock_request_preserves_outer_reservations() {
+    for wait in [true, false] {
+        for (outer_reads, nested_writes) in
+            [(true, true), (true, false), (false, true), (false, false)]
+        {
+            let (mut manager, _) = node("s").await;
+            let declarations = parse_string(
+                "service s { var y = 0; def z = y; def x = z; var prior = 0; }
+                 service held { var v = 0; } service freshlock { var v = 0; }",
+                &mut manager.interner,
+            )
+            .unwrap();
+            // x -> z -> y forces acquisition of the overlapping lock and a
+            // new lock before encountering contention, regardless of map order.
+            manager.unified_ast = declarations.clone();
+            for stmt in declarations {
+                let Stmt::Service { name, decls } = stmt else {
+                    unreachable!()
+                };
+                manager.create_service(name, decls).await.unwrap();
+            }
+            let s = manager.interner.insert("s");
+            let x = manager.interner.insert("x");
+            let y = manager.interner.insert("y");
+            let z = manager.interner.insert("z");
+            let prior = manager.interner.insert("prior");
+            let held = manager.interner.insert("held");
+            let fresh = manager.interner.insert("freshlock");
+            let tid = TxnId::new(manager.node_id);
+            let foreign = TxnId {
+                timestamp: if wait { u128::MAX } else { 0 },
+                node_id: 1,
+                iteration: 0,
+            };
+            let mut outer = manager.checkout_transaction(tid.clone());
+            if outer_reads {
+                manager.acquire_read_lock(s, x, &tid).unwrap();
+            } else {
+                manager.acquire_write_lock(s, x, &tid, false).unwrap();
+            }
+            outer.locked.insert((manager.service_net_id_for_name(s), x));
+            manager.acquire_service_lock(held, &tid).unwrap();
+            outer
+                .service_locked
+                .insert(manager.service_net_id_for_name(held));
+            manager.acquire_write_lock(s, y, &foreign, false).unwrap();
+            let member_group = |member: &str| LockGroup {
+                service_level_lock: false,
+                reads: HashSet::new(),
+                writes: HashSet::from([member.into()]),
+            };
+            // A previous successful nested request has handed this reservation
+            // to the outer owner. A subsequent failure must not collect it.
+            manager
+                .handle_lock_request(
+                    tid.clone(),
+                    HashMap::from([("s".into(), member_group("prior"))]),
+                )
+                .await
+                .unwrap();
+            let service_group = LockGroup {
+                service_level_lock: true,
+                reads: HashSet::new(),
+                writes: HashSet::new(),
+            };
+            let mut overlapping = member_group("x");
+            if !nested_writes {
+                overlapping.reads = std::mem::take(&mut overlapping.writes);
+            }
+            let result = manager
+                .handle_lock_request(
+                    tid.clone(),
+                    HashMap::from([
+                        ("s".into(), overlapping),
+                        ("held".into(), service_group.clone()),
+                        ("freshlock".into(), service_group),
+                    ]),
+                )
+                .await;
+            if wait {
+                assert!(matches!(result, Err(EvalError::WaitOn(_))), "{result:?}");
+            } else {
+                assert!(
+                    matches!(result, Err(EvalError::WaitDieAbort(_))),
+                    "{result:?}"
+                );
+            }
+            if outer_reads && !nested_writes {
+                assert!(matches!(&manager.services[&s].vars[&x].lock,
+                    VarLock::ReadLocked(owners) if owners.contains(&tid)));
+            } else {
+                assert!(
+                    matches!(&manager.services[&s].vars[&x].lock,
+                    VarLock::WriteLocked(owner) if owner == &tid),
+                    "nested failure released the outer reservation"
+                );
+            }
+            assert!(matches!(&manager.services[&s].vars[&prior].lock,
+                VarLock::WriteLocked(owner) if owner == &tid));
+            assert_eq!(manager.services[&held].service_lock.as_ref(), Some(&tid));
+            assert!(manager.services[&fresh].service_lock.is_none());
+            assert!(matches!(
+                manager.services[&s].vars[&z].lock,
+                VarLock::Unlocked
+            ));
+            assert!(matches!(&manager.services[&s].vars[&y].lock,
+                VarLock::WriteLocked(owner) if owner == &foreign));
+            assert!(manager.pending_txns.is_empty());
+            assert!(manager.running.contains(&tid));
+            outer.finish(Ok(())).unwrap();
+            manager.release_all_locks(&outer);
+            drop(outer);
+            assert!(!manager.running.contains(&tid));
+            for member in [x, prior] {
+                assert!(matches!(
+                    manager.services[&s].vars[&member].lock,
+                    VarLock::Unlocked
+                ));
+            }
+            assert!(manager.services[&held].service_lock.is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn update_reports_contention_without_exposing_wait_keys() {
+    for whole_service in [false, true] {
+        let (mut manager, _) = node("s").await;
+        let s = manager.interner.insert("s");
+        let x = manager.interner.insert("x");
+        let tid = TxnId::new(manager.node_id);
+        let holder = TxnId {
+            timestamp: u128::MAX,
+            node_id: 1,
+            iteration: 0,
+        };
+        if whole_service {
+            manager.acquire_service_lock(s, &holder).unwrap();
+        } else {
+            manager.acquire_write_lock(s, x, &holder, false).unwrap();
+        }
+        let updates = parse_string("update s { var x = 7; }", &mut manager.interner).unwrap();
+        let error = crate::runtime::update::Transaction::new_with_id(tid.clone(), updates)
+            .apply(&mut manager)
+            .await
+            .unwrap_err();
+        let EvalError::RuntimeError(message) = error else {
+            panic!("update exposed a control-flow error: {error:?}")
+        };
+        assert_eq!(
+            message,
+            if whole_service {
+                "Code update blocked waiting for service 's'"
+            } else {
+                "Code update blocked waiting for 's.x'"
+            }
+        );
+        assert_eq!(manager.services[&s].vars[&x].value, Value::Int { val: 0 });
+        assert!(manager.pending_txns.is_empty());
+        assert!(!manager.running.contains(&tid));
+        if whole_service {
+            assert_eq!(manager.services[&s].service_lock.as_ref(), Some(&holder));
+        } else {
+            assert!(matches!(&manager.services[&s].vars[&x].lock,
+                VarLock::WriteLocked(owner) if owner == &holder));
+        }
+    }
+}
+
 async fn receive(net: &mut NetworkActor) -> MeerkatMessage {
     loop {
         match net.try_recv_event() {

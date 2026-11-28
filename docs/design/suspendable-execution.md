@@ -322,19 +322,22 @@ because a parked originator leaves the loop free to process the release.
   (`acquire_lock_group_internal`), and that callback must be served before the
   reply can come.  So `send_and_await_reply` keeps serving, while it waits,
   what `dispatch_network_events` serves today: `LockRequest`,
-  `RequestUpdates`, `Update` and `UpdateServiceRequest`, now taken from the
-  loop's channel.  Everything else, including REPL input, `ActionRequest`,
-  `Commit` and `Abort`, stays queued for the loop until the action finishes;
-  today it is dropped.  `Commit` and `Abort` are not served during the wait
-  on purpose: committing a participant can forward the commit to the nodes
-  below and wait for them, which nests one wait inside another, the waiting
-  in place shown above to deadlock.
+  `RequestUpdates`, `Update`, `UpdateServiceRequest` and `ServiceCodeRequest`,
+  now taken from the loop's channel.  Step 3 also preserves #300's dispatch
+  exceptions: lookups and actions targeting a running transaction are
+  rejected immediately; aborts targeting one mark it doomed and receive an
+  immediate acknowledgement.  Lock requests for a doomed or aborting
+  transaction are rejected.  Other lookups, actions, commits and aborts stay
+  queued until the action finishes, as they do today; REPL input also waits
+  for the loop.  Commits and aborts stay queued on purpose: serving a commit,
+  or an abort for a transaction that isn't running, forwards it to the nodes
+  below and waits for them, nesting one wait inside another, the waiting in
+  place shown above to deadlock.
 
-  This is no worse than today, and loses nothing that today drops.  It does
-  not help a request that starts an action and calls back (an action on A
-  composes onto B, which composes back onto A): that still waits until A's
-  action finishes.  Step 4 fixes it, since the loop then runs while A's action
-  waits.
+  A request that starts an action and calls back (an action on A composes
+  onto B, which composes back onto A under the same transaction id) therefore
+  still fails promptly.  Serving that callback waits for step 4, when the
+  loop runs while A's action waits.
 - Originator transactions should live in a table while they run, keyed by id,
   like `pending_txns`.  Task 12 registers running transactions by id so it
   can reject read-backs and accept aborts into them (#300); the table holds

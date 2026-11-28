@@ -2582,6 +2582,10 @@ impl Manager {
                         )
                         .await;
                     }
+                    // Scaffolding, removed by #213: a read-back into a running
+                    // transaction can't be served while its execution holds the
+                    // `Manager`, so reject it rather than queue it until timeout.
+                    // Once execution suspends, route these to that execution.
                     MeerkatMessage::LookupRequest {
                         request_id,
                         txn_id: Some(tid),

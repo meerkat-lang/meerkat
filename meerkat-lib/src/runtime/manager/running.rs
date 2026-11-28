@@ -12,6 +12,10 @@ struct State {
     aborting: bool,
     // Reentrant lock requests cannot borrow the outer transaction. Hand their
     // reservations back to its owner instead of creating a second pending txn.
+    // Scaffolding, removed by #213: once a running transaction stays in a
+    // table, a nested request adds to it directly. This hand-back, and the
+    // `count > 1` rules below, assume nested requests finish before their
+    // owner, which stops holding once actions interleave.
     locked: HashSet<(ServiceNetId, Symbol)>,
     service_locked: HashSet<ServiceNetId>,
     participants: HashSet<Address>,

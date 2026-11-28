@@ -336,8 +336,10 @@ because a parked originator leaves the loop free to process the release.
   action finishes.  Step 4 fixes it, since the loop then runs while A's action
   waits.
 - Originator transactions should live in a table while they run, keyed by id,
-  like `pending_txns`.  Task 12 already needs the originator's transaction to
-  be reachable by id while it runs, and it names #28 as the fix.
+  like `pending_txns`.  Task 12 registers running transactions by id so it
+  can reject read-backs and accept aborts into them (#300); the table holds
+  the transaction itself.  It does not let a read-back be served, though,
+  which waits for step 4 (see "Cleanup").
 - An originator that must wait should park and restart, not replay.  On
   `WaitOn` it does what #202's retry does: it aborts its participants,
   releases its locks and discards its buffers.  Then, instead of sleeping and
@@ -393,11 +395,19 @@ to the new.
 - The separate places that handle network messages outside the loop: the
   `--watch` loop and the server loop in `main.rs`, and the REPL's lack of
   any.
-- Task 12's guard that makes a read of an originator's in-flight transaction
-  fail, since that transaction becomes reachable by id.
 
 **After step 4**, when execution is suspendable:
 
+- Task 12's rejection of read-backs into a running transaction (#300), which
+  becomes routing them to the suspended execution.  Step 3's table makes the
+  transaction reachable by id, but a lookup or action that calls back into it
+  is still queued until its execution finishes, so without the rejection it
+  waits until the reply timeout.  Serving lookups during the wait in step 3
+  would not help: with compute-on-read a lookup can call out to another node,
+  nesting one wait inside another, the deadlock step 3 avoids for `Commit`.
+- The hand-back of a nested lock request's reservations to the running
+  execution that owns its transaction (`running.rs`, #300).  A nested request
+  adds to the transaction in the table directly.
 - #209's replay machinery: the rollback of buffers on a park, the records of
   completed composed actions, and the checks that a replay matches them, along
   with their tests.  Task 12's additions to it go too.

@@ -334,6 +334,190 @@ async fn failed_nested_lock_request_preserves_outer_reservations() {
 }
 
 #[tokio::test]
+async fn nested_wait_allows_later_network_lock_request() {
+    let (mut manager, address) = node("s").await;
+    let (mut peer, reply_to) = node("peer").await;
+    let peer = peer.network.as_mut().unwrap();
+    let s = manager.interner.insert("s");
+    let x = manager.interner.insert("x");
+    let y = manager.interner.insert("y");
+    let tid = TxnId::new(manager.node_id);
+    let foreign = TxnId {
+        timestamp: u128::MAX,
+        node_id: 1,
+        iteration: 0,
+    };
+    let mut outer = manager.checkout_transaction(tid.clone());
+    manager.acquire_write_lock(s, x, &foreign, false).unwrap();
+    let group = |member: &str| {
+        HashMap::from([(
+            "s".into(),
+            LockGroup {
+                service_level_lock: false,
+                reads: HashSet::new(),
+                writes: HashSet::from([member.into()]),
+            },
+        )])
+    };
+    assert!(matches!(
+        manager.handle_lock_request(tid.clone(), group("x")).await,
+        Err(EvalError::WaitOn(_))
+    ));
+    assert!(!manager.running.rejects_locks(&tid));
+
+    // Exercise the dispatcher, whose abort guard is bypassed by direct calls
+    // to handle_lock_request (including parked-request retries).
+    send(
+        peer,
+        &address.0,
+        MeerkatMessage::LockRequest {
+            request_id: 9000,
+            txn_id: tid.clone(),
+            services: group("y"),
+            reply_to: reply_to.0,
+        },
+    )
+    .await;
+    let reply = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            reply = receive(peer) => reply,
+            _ = async {
+                loop {
+                    manager.dispatch_network_events().await;
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            } => unreachable!(),
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        matches!(
+            reply,
+            MeerkatMessage::LockResponse {
+                request_id: 9000,
+                success: true,
+                ..
+            }
+        ),
+        "{reply:?}"
+    );
+    assert!(manager.services[&s].vars[&y].lock.is_held_by(&tid));
+    assert!(manager.pending_txns.is_empty());
+    outer.finish(Ok(())).unwrap();
+    manager.release_all_locks(&outer);
+    drop(outer);
+    assert!(!manager.running.contains(&tid));
+    assert!(matches!(
+        manager.services[&s].vars[&y].lock,
+        VarLock::Unlocked
+    ));
+}
+
+#[tokio::test]
+async fn idle_participant_wait_preserves_prior_work() {
+    let mut manager = Manager::default();
+    let declarations = parse_string(
+        "service s { var x = 0; var y = 0; def z = y; }
+         service held { var v = 0; } service freshlock { var v = 0; }",
+        &mut manager.interner,
+    )
+    .unwrap();
+    manager.unified_ast = declarations.clone();
+    for stmt in declarations {
+        let Stmt::Service { name, decls } = stmt else {
+            unreachable!()
+        };
+        manager.create_service(name, decls).await.unwrap();
+    }
+    let s = manager.interner.insert("s");
+    let x = manager.interner.insert("x");
+    let y = manager.interner.insert("y");
+    let z = manager.interner.insert("z");
+    let held = manager.interner.insert("held");
+    let fresh = manager.interner.insert("freshlock");
+    let tid = TxnId::new(manager.node_id);
+    let foreign = TxnId {
+        timestamp: u128::MAX,
+        node_id: 1,
+        iteration: 0,
+    };
+    manager
+        .execute_action_participant(
+            s,
+            &[ActionStmt::Assign {
+                name: x,
+                expr: Expr::Literal {
+                    val: Value::Int { val: 7 },
+                },
+            }],
+            &[],
+            tid.clone(),
+        )
+        .await
+        .unwrap();
+    manager.acquire_service_lock(held, &tid).unwrap();
+    let held_id = manager.service_net_id_for_name(held);
+    let pending = manager.pending_txns.get_mut(&tid).unwrap();
+    pending.service_locked.insert(held_id);
+    // A previous composed operation owns these participants; waiting locally
+    // must not abort them or discard their buffered work.
+    pending.participants.insert(Address::new("remote:1234"));
+    let prior_locked = pending.locked.clone();
+    let prior_service_locked = pending.service_locked.clone();
+    let prior_participants = pending.participants.clone();
+    let prior_written = pending.written.clone();
+    let prior_read_cache = pending.read_cache.clone();
+    manager.acquire_write_lock(s, y, &foreign, false).unwrap();
+    let result = manager
+        .handle_lock_request(
+            tid.clone(),
+            HashMap::from([
+                (
+                    "freshlock".into(),
+                    LockGroup {
+                        service_level_lock: true,
+                        reads: HashSet::new(),
+                        writes: HashSet::new(),
+                    },
+                ),
+                (
+                    "s".into(),
+                    LockGroup {
+                        service_level_lock: false,
+                        reads: HashSet::from(["z".into()]),
+                        writes: HashSet::new(),
+                    },
+                ),
+            ]),
+        )
+        .await;
+    assert!(matches!(result, Err(EvalError::WaitOn(_))), "{result:?}");
+    assert!(manager.services[&s].vars[&x].lock.is_held_by(&tid));
+    assert_eq!(manager.services[&held].service_lock.as_ref(), Some(&tid));
+    assert!(manager.services[&fresh].service_lock.is_none());
+    assert!(matches!(
+        manager.services[&s].vars[&z].lock,
+        VarLock::Unlocked
+    ));
+    assert!(manager.services[&s].vars[&y].lock.is_held_by(&foreign));
+    let pending = &manager.pending_txns[&tid];
+    assert_eq!(pending.locked, prior_locked);
+    assert_eq!(pending.service_locked, prior_service_locked);
+    assert_eq!(pending.participants, prior_participants);
+    assert_eq!(pending.written, prior_written);
+    assert_eq!(pending.read_cache, prior_read_cache);
+    assert!(!manager.running.contains(&tid));
+    manager.abort_participant(&tid).await;
+    assert!(manager.pending_txns.is_empty());
+    assert!(matches!(
+        manager.services[&s].vars[&x].lock,
+        VarLock::Unlocked
+    ));
+    assert!(manager.services[&held].service_lock.is_none());
+}
+
+#[tokio::test]
 async fn update_reports_contention_without_exposing_wait_keys() {
     for whole_service in [false, true] {
         let (mut manager, _) = node("s").await;

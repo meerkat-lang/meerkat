@@ -4335,6 +4335,8 @@ impl Manager {
             .map_err(|e| EvalError::RuntimeError(e.to_string()))?;
 
         let mut txn = self.checkout_transaction(txn_id.clone());
+        let prior_locked = txn.locked.clone();
+        let prior_service_locked = txn.service_locked.clone();
         let result = self.acquire_lock_group_internal(&mut txn, &services).await;
 
         match txn.finish(result) {
@@ -4344,24 +4346,25 @@ impl Manager {
                 }
                 Ok(())
             }
-            // CRITICAL: All-or-Nothing Eager Lock Group Release
-            // If a lock group acquisition encounters contention and
-            // yields `WaitOn`, we MUST NOT hold onto partial locks.
-            // Holding partial locks while parked would stall incoming
-            // atomic updates that require those same locks.
-            // On `WaitOn`, we immediately release all partial locks taken
-            // so far and clear the transaction's lock tracking sets,
-            // ensuring the transaction yields completely and retries
-            // from scratch when unparked
             Err(EvalError::WaitOn(key)) => {
-                self.release_all_locks(&txn);
-                txn.locked.clear();
-                txn.service_locked.clear();
-
-                // Abort sub-participants to release remote partial locks
-                self.abort_participants(&txn).await;
-                txn.participants.clear();
-                txn.finish(Ok(()))?;
+                // Release this request's partial acquisition before parking,
+                // preserving locks that protect earlier work under the same ID.
+                let acquired = txn
+                    .locked
+                    .difference(&prior_locked)
+                    .map(|(sid, member)| WaitKey::Member(sid.clone(), *member))
+                    .chain(
+                        txn.service_locked
+                            .difference(&prior_service_locked)
+                            .cloned()
+                            .map(WaitKey::Service),
+                    )
+                    .collect();
+                self.release_locks(&acquired, &txn.id);
+                txn.locked = prior_locked;
+                txn.service_locked = prior_service_locked;
+                // WaitOn is local: acquisition has not sent any remote requests.
+                // Existing participants belong to earlier work and must survive.
 
                 if let Some(txn) = txn.park_locks() {
                     self.pending_txns.insert(txn_id, txn);
@@ -7519,7 +7522,7 @@ mod tests {
         services.insert(tc.manager.interner.get(tc.s1).to_string(), lg);
 
         // Seed the older transaction in `pending_txns` with a dummy
-        // participant address to verify that `participants` are drained
+        // participant address to verify that earlier work is preserved
         let mut pre_txn = crate::runtime::txn::Transaction::new(older.clone());
         pre_txn
             .participants
@@ -7547,9 +7550,13 @@ mod tests {
             crate::runtime::txn::VarLock::Unlocked
         ));
 
-        // Assert all-or-nothing: `participants` were drained on `WaitOn`
+        // Local contention occurs before remote acquisition. Preserve participants
+        // from earlier operations instead of aborting their buffered work.
         let parked_txn = tc.manager.pending_txns.get(&older).unwrap();
-        assert!(parked_txn.participants.is_empty());
+        assert_eq!(
+            parked_txn.participants,
+            HashSet::from([Address::new("remote:1234")])
+        );
     }
 
     /// Verify that handle_lock_request rejects requests with invalid identifiers before interning
